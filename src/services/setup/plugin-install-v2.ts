@@ -19,8 +19,8 @@ import {toErrorMessage} from '../../shared/errors.js'
  * The OpenCode V2 plugin install (TypeScript port of `deploy/scripts/install-opencode-v2-plugins.sh`, probe P10).
  *
  * The server finds a plugin by its spec in the npm cache. A plugin that is not cached is installed by the server at boot,
- * and `opencode plugin add` and that boot install have no timeout: a hung registry leaves `GET /api/agent` answering
- * 503 for as long as it hangs. So the Action installs both plugins itself, before the spawn, each under its own bound,
+ * and `opencode plugin add` and that boot install have no timeout: a hung registry leaves the plugins unlisted in
+ * `GET /api/plugin` (and, up to 2.2.6, `GET /api/agent` answering 503) for as long as it hangs. So the Action installs both plugins itself, before the spawn, each under its own bound,
  * and a failure of any kind fails startup with a named error. Nothing is installed at boot unless setup was skipped.
  *
  * What the port keeps from the shell script, and how:

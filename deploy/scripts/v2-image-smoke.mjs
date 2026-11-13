@@ -16,7 +16,8 @@
 // 2. with no network, both plugins load FROM THE IMAGE'S CACHE, so nothing installs at boot;
 // 3. both are listed `active` under the ids the workspace agent's plugin gate expects.
 //
-// It is the same sequence the workspace agent's supervisor runs (readiness on /api/agent, then /api/plugin), minus the
+// It is the same sequence the workspace agent's supervisor runs (readiness on /api/agent, then /api/plugin polled until
+// the expected ids are active), minus the
 // permission gate, which needs the TypeScript config builder and is pinned by the supervisor's own tests and by the
 // real-binary test. Plain Node ESM, no dependencies, so it needs nothing in the image beyond Node.
 
@@ -103,7 +104,8 @@ async function main(specs) {
       },
       deadline,
     )
-    // 503 here means plugins are still activating; a hung boot-time install would stay 503 until the bound.
+    // Up to v2.2.6 a 503 here means plugins are still activating (a hung boot-time install stays 503 until the bound).
+    // From v2.2.7 this answers 200 at once, so it only proves the server is up, not that its plugins are.
     await waitFor(
       '/api/agent (plugin activation)',
       async () => {
@@ -112,9 +114,20 @@ async function main(specs) {
       },
       deadline,
     )
-    const plugins = await get('/api/plugin', authorization)
-    const inactive = findInactivePlugins(plugins.body, EXPECTED_PLUGIN_IDS)
-    if (inactive.length > 0) throw new Error(`plugins not active: ${inactive.join(', ')}`)
+    // v2.2.7+: /api/agent no longer waits for plugin activation (anomalyco/opencode#62796), and GET /api/plugin answers
+    // `data: []` on a cold Location until activation lands. Poll until the expected ids are active, within the bound.
+    let inactive = EXPECTED_PLUGIN_IDS
+    await waitFor(
+      '/api/plugin (expected plugins active)',
+      async () => {
+        const result = await get('/api/plugin', authorization)
+        inactive = result.status === 200 ? findInactivePlugins(result.body, EXPECTED_PLUGIN_IDS) : EXPECTED_PLUGIN_IDS
+        return inactive.length === 0 ? {done: true, value: true} : {done: false, note: `not active: ${inactive.join(', ')}`}
+      },
+      deadline,
+    ).catch(() => {
+      throw new Error(`plugins not active: ${inactive.join(', ')}`)
+    })
     console.log(`v2-image-smoke: ok (uid ${process.getuid()}, plugins active: ${EXPECTED_PLUGIN_IDS.join(', ')})`)
   } finally {
     child.stdin.end()

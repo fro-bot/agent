@@ -85,7 +85,7 @@ async function startServer(options: {
   const authorization = `Basic ${Buffer.from(`opencode:${password}`).toString('base64')}`
 
   return {
-    // `/api/agent` answers 503 until location plugins finish activating.
+    // Up to 2.2.6 `/api/agent` answers 503 until location plugins finish activating; from 2.2.7 it answers at once.
     listAgents: async () => {
       const deadline = Date.now() + 30_000
       for (;;) {

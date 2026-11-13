@@ -21,8 +21,10 @@ import {buildSetprivDropArgs} from './sandbox-identity.js'
  * Facts this module is built on, all measured against v2.2.0 (probe results P1, P10, P11, P13, P15):
  * - `--stdio` exits when stdin closes, and exits after about 150 ms if stdin is `ignore`, so stdin is a held pipe.
  * - Without `--port` upstream binds 4096 and increments, so the port is always explicit.
- * - `GET /api/info` answers 200 while plugins are still activating. `GET /api/agent` answers 503
- *   ("Location plugins did not finish activating") until they finish, so readiness gates on `/api/agent`.
+ * - `GET /api/info` answers 200 while plugins are still activating. Up to v2.2.6 `GET /api/agent` answers 503
+ *   ("Location plugins did not finish activating") until they finish. From v2.2.7 (anomalyco/opencode#62796) it
+ *   answers 200 at once and `GET /api/plugin` lists `data: []` until activation lands, so only the plugin gate proves
+ *   activation. Both gates stay, and the code does not depend on which version it talks to.
  * - Nothing upstream bounds a hung plugin activation. Every wait here has its own bound.
  * - A failed plugin leaves the server up and shows only as `state.status: 'failed'` in `GET /api/plugin`, whose
  *   error string carries paths and a stack. Only ids and statuses are ever reported here.
@@ -40,11 +42,15 @@ export interface OpenCodeV2Timeouts {
   /** Time for `GET /api/info` to answer 200. */
   readonly infoTimeoutMs: number
   /**
-   * Time for `GET /api/agent` to stop answering 503. Covers a hung plugin activation, which upstream never
-   * bounds (P10). Plugins are installed before the spawn, so a healthy activation takes seconds.
+   * Time for `GET /api/agent` to stop answering 503. Up to v2.2.6 this covers a hung plugin activation, which
+   * upstream never bounds (P10); from v2.2.7 `/api/agent` answers 200 at once, so `pluginGateTimeoutMs` bounds it.
+   * Plugins are installed before the spawn, so a healthy activation takes seconds.
    */
   readonly agentReadyTimeoutMs: number
-  /** Time, after `/api/agent` is ready, for every expected plugin to be listed active. The list is final by then. */
+  /**
+   * Time, after `/api/agent` is ready, for every expected plugin to be listed active. From v2.2.7 the list is empty
+   * until activation lands, so this gate polls rather than reading once. An expected id listed `failed` ends it at once.
+   */
   readonly pluginGateTimeoutMs: number
   /** Cap on a single gate or shutdown request, so one unanswered request cannot consume a whole phase. */
   readonly requestTimeoutMs: number
@@ -61,7 +67,8 @@ export const DEFAULT_OPENCODE_V2_TIMEOUTS: OpenCodeV2Timeouts = {
   listenTimeoutMs: 30_000,
   infoTimeoutMs: 15_000,
   agentReadyTimeoutMs: 120_000,
-  pluginGateTimeoutMs: 10_000,
+  // Since 2.2.7 `/api/agent` no longer waits for plugins, so this gate alone bounds their activation.
+  pluginGateTimeoutMs: 60_000,
   requestTimeoutMs: 10_000,
   pollIntervalMs: 100,
   interruptSettleTimeoutMs: 10_000,
@@ -761,7 +768,7 @@ export async function startOpenCodeV2Server(
         const problems = classifyExpectedPlugins(options.expectedPluginIds, entries)
         lastProblems = problems
         if (problems.length === 0) return {kind: 'done', value: true}
-        // A listed failure is final: activation already finished, so waiting changes nothing.
+        // A listed failure is final for that plugin: waiting does not turn it active.
         if (problems.some(problem => problem.status === 'failed'))
           return {kind: 'fail', error: pluginGateError(problems)}
         return {kind: 'retry', note: 'expected plugins not active yet'}
