@@ -216,7 +216,7 @@ sequenceDiagram
 
 ## Implementation Units
 
-- [ ] **Unit 1: Provider resolution and bypass refusal**
+- [x] **Unit 1: Provider resolution and bypass refusal**
 
 **Goal:** A pure function maps the `auth-json` keys and operator config to a proxy route map. It refuses any config that would bypass the proxy.
 
@@ -266,7 +266,7 @@ sequenceDiagram
 
 **Verification:** Every provider shape that callers use today resolves, and every bypass field is refused with a message that names the fix.
 
-- [ ] **Unit 2: Proxy core**
+- [x] **Unit 2: Proxy core**
 
 **Goal:** A node-only request handler and server that enforces R5, R6, R9 and R10 and injects credentials.
 
@@ -321,7 +321,7 @@ sequenceDiagram
 
 **Verification:** Every control has a test that fails when the control is removed.
 
-- [ ] **Unit 3: Child entry and supervisor**
+- [x] **Unit 3: Child entry and supervisor**
 
 **Goal:** Ship `dist/key-proxy.js`, plus a supervisor that spawns the proxy, waits for its ready line, watches for exit and stops it with confirmation.
 
@@ -356,7 +356,7 @@ sequenceDiagram
 
 **Verification:** Two builds produce identical `dist/`. The preflight requires `dist/key-proxy.js` as a regular file.
 
-- [ ] **Unit 4: Wire into the isolated start**
+- [x] **Unit 4: Wire into the isolated start**
 
 **Goal:** Isolated runs use the proxy and write no key files. Runs without isolation are unchanged.
 
@@ -392,7 +392,7 @@ sequenceDiagram
 
 **Verification:** Revert-checks fail when the release hook or the key-file skip is removed.
 
-- [ ] **Unit 5: Start-up probe**
+- [x] **Unit 5: Start-up probe**
 
 **Goal:** A bounded probe of each provider's upstream through the proxy, with a distinct error for each failure class.
 
@@ -424,7 +424,7 @@ Messages name the provider and the class, never a body.
 
 **Verification:** A fake upstream that rejects the key fails the run at the `key-proxy` stage.
 
-- [ ] **Unit 6: Preflight remedies, real-runner suite, docs**
+- [x] **Unit 6: Preflight remedies, real-runner suite, docs**
 
 **Goal:** Every refusal names its fix, the sandbox suite proves the key is out of reach, and the docs state the new guarantee.
 

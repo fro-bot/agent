@@ -108,8 +108,9 @@ inputs:
       Run the OpenCode server, and every model tool and shell under it, as a separate unprivileged local user
       (default false). GitHub-hosted Linux runners only, with passwordless sudo; the run fails before setup on any
       other runner. This stops the agent from reading the Action's process environment (which holds the workflow
-      token), the workflow command files and the runner's private directories. The provider key and the server
-      password stay readable by the agent. Requires a published `fro-bot/agent@<ref>`; a local `uses: ./` install or an
+      token), the workflow command files and the runner's private directories. The provider key stays in a key
+      proxy outside the agent's user and is not readable by it; the server password stays readable. Providers the
+      proxy can't serve (Bedrock, Vertex) and settings that would skip it are refused. Requires a published `fro-bot/agent@<ref>`; a local `uses: ./` install or an
       alias to one is refused because the Action's own files must not be writable by the agent. Checkout content the agent
       wrote stays untrusted for later steps. See the README for the full list of what
       is and is not blocked.
