@@ -52,7 +52,8 @@ function publishedEntries(root: string, work = WORK): Map<string, EntryKind> {
     entries.set(current, 'directory')
   }
   entries.set(`${root}/dist`, 'directory')
-  for (const file of ['action.yaml', 'dist/main.js', 'dist/post.js']) entries.set(`${root}/${file}`, 'file')
+  for (const file of ['action.yaml', 'dist/main.js', 'dist/post.js', 'dist/key-proxy.js'])
+    entries.set(`${root}/${file}`, 'file')
   return entries
 }
 
@@ -303,6 +304,8 @@ describe('runSandboxPreflight', () => {
       ['main.js is a symlink', `${PUBLISHED_ROOT}/dist/main.js`, 'symlink'],
       ['post.js is a symlink', `${PUBLISHED_ROOT}/dist/post.js`, 'symlink'],
       ['post.js is a FIFO or device', `${PUBLISHED_ROOT}/dist/post.js`, 'other'],
+      ['key-proxy.js is a symlink', `${PUBLISHED_ROOT}/dist/key-proxy.js`, 'symlink'],
+      ['key-proxy.js is a directory', `${PUBLISHED_ROOT}/dist/key-proxy.js`, 'directory'],
     ] as const)('refuses an install where %s', async (_label, target, kind) => {
       // #given the file the runner reloads or executes is not a regular file
       const entries = publishedEntries(PUBLISHED_ROOT)
@@ -311,6 +314,16 @@ describe('runSandboxPreflight', () => {
 
       // #when / #then
       await expectRefused(deps, getExecOutput, /regular file/)
+    })
+
+    it('refuses an install that has no key-proxy.js, because the proxy child is the program that holds the keys', async () => {
+      // #given an install without the proxy entry
+      const entries = publishedEntries(PUBLISHED_ROOT)
+      entries.delete(`${PUBLISHED_ROOT}/dist/key-proxy.js`)
+      const {deps, getExecOutput} = withInstall(PUBLISHED_ROOT, {entries})
+
+      // #when / #then
+      await expectRefused(deps, getExecOutput, /key-proxy\.js is not a regular file/)
     })
 
     it('accepts action.yml in place of action.yaml, and refuses neither being present', async () => {
