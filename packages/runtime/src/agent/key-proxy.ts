@@ -59,6 +59,8 @@ export interface KeyProxyLimits {
   readonly idleTimeoutMs: number
   /** For the client to finish sending its request. */
   readonly requestTimeoutMs: number
+  /** How long a socket that was refused outside the request path (CONNECT, Upgrade, malformed) stays open after the answer. */
+  readonly rejectLingerMs: number
 }
 
 export const DEFAULT_KEY_PROXY_LIMITS: KeyProxyLimits = {
@@ -70,6 +72,7 @@ export const DEFAULT_KEY_PROXY_LIMITS: KeyProxyLimits = {
   headersTimeoutMs: 10 * 60_000,
   idleTimeoutMs: 10 * 60_000,
   requestTimeoutMs: 5 * 60_000,
+  rejectLingerMs: 100,
 }
 
 export interface StartKeyProxyOptions {
@@ -120,6 +123,12 @@ const FORWARDED_REQUEST_HEADERS: readonly string[] = [
   'openai-beta',
   'user-agent',
 ]
+
+/** Non-secret OpenAI routing headers. Copied on the OpenAI (Bearer) routes only. */
+const OPENAI_ROUTING_HEADERS: readonly string[] = ['openai-organization', 'openai-project']
+
+/** Longest a refused socket may take to flush its answer before it is destroyed. */
+const REJECT_FLUSH_BOUND_MS = 2000
 
 /** Upstream response headers passed to the client on a 2xx. */
 const SUCCESS_RESPONSE_HEADERS: readonly string[] = [
@@ -315,7 +324,11 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
   const outboundHeaders = (req: IncomingMessage, matched: MatchedRoute, hasBody: boolean): http.OutgoingHttpHeaders => {
     const nominated = nominatedHeaders(req.headers)
     const headers: http.OutgoingHttpHeaders = {}
-    for (const name of FORWARDED_REQUEST_HEADERS) {
+    const names =
+      matched.route.auth === 'bearer'
+        ? [...FORWARDED_REQUEST_HEADERS, ...OPENAI_ROUTING_HEADERS]
+        : FORWARDED_REQUEST_HEADERS
+    for (const name of names) {
       const value = headerValue(req.headers[name])
       if (value === undefined || HOP_BY_HOP.has(name) || nominated.has(name)) continue
       headers[name] = value
@@ -544,11 +557,33 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
   server.keepAliveTimeout = 60_000
   server.timeout = 0
 
+  // Sockets Node hands over for CONNECT, Upgrade and malformed requests are detached from the HTTP server: it removes its
+  // own error handler and no longer counts them for `closeAllConnections`. They are tracked here instead.
+  const detached = new Set<Duplex>()
+
+  /**
+   * Answers a refused socket and closes it. An error handler goes on first, because a reset after the answer would
+   * otherwise be an uncaught exception. The answer is flushed, the socket lingers briefly so the client can read it, then
+   * it is destroyed: a client that keeps its write half open cannot hold a connection slot. A bound covers a flush that
+   * never completes, and `close` destroys whatever is left.
+   */
   const endSocket = (socket: Duplex, status: number): void => {
+    socket.on('error', () => undefined)
     if (socket.destroyed || !socket.writable) {
       socket.destroy()
       return
     }
+    detached.add(socket)
+    const timers: ReturnType<typeof setTimeout>[] = []
+    const destroy = (): void => {
+      socket.destroy()
+    }
+    timers.push(setTimeout(destroy, limits.rejectLingerMs + REJECT_FLUSH_BOUND_MS))
+    socket.once('finish', () => timers.push(setTimeout(destroy, limits.rejectLingerMs)))
+    socket.once('close', () => {
+      detached.delete(socket)
+      for (const timer of timers) clearTimeout(timer)
+    })
     const body = LOCAL_BODIES[status] ?? ''
     socket.end(`HTTP/1.1 ${status} ${body.trim()}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`)
   }
@@ -583,6 +618,7 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
       if (closing) return
       closing = true
       for (const request of inflight) request.destroy()
+      for (const socket of detached) socket.destroy()
       agent.destroy()
       await new Promise<void>(resolve => {
         server.close(() => resolve())

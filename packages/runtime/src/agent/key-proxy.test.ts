@@ -6,7 +6,7 @@ import {Buffer} from 'node:buffer'
 import http from 'node:http'
 import net from 'node:net'
 import {gzipSync} from 'node:zlib'
-import {afterEach, describe, expect, it} from 'vitest'
+import {afterEach, describe, expect, it, vi} from 'vitest'
 
 import {buildKeyProxyUpstream} from './key-proxy-routes.js'
 import {startTlsUpstream} from './key-proxy-test-kit.js'
@@ -431,6 +431,48 @@ describe('key proxy: header handling', () => {
     expect(JSON.stringify(seen)).not.toContain('client-')
   })
 
+  it.each([['/openai/responses'], ['/openai/chat/completions']])(
+    'forwards OpenAI-Organization and OpenAI-Project on %s',
+    async path => {
+      // #given an OpenAI route and a client that names its organization and project
+      const h = await setup(okJson)
+
+      // #when it sends them
+      await h.send(path, {body: '{}', headers: {'openai-organization': 'org-abc', 'openai-project': 'proj_xyz'}})
+
+      // #then both reach the upstream, beside the real key
+      const seen = h.upstream.requests[0]?.headers ?? {}
+      expect(seen['openai-organization']).toBe('org-abc')
+      expect(seen['openai-project']).toBe('proj_xyz')
+      expect(seen.authorization).toBe(`Bearer ${OPENAI_KEY}`)
+    },
+  )
+
+  it('forwards OpenAI-Organization and OpenAI-Project on the OpenAI models route', async () => {
+    const h = await setup(okJson)
+
+    await h.send('/openai/models', {
+      method: 'GET',
+      headers: {'openai-organization': 'org-abc', 'openai-project': 'proj_xyz'},
+    })
+
+    expect(h.upstream.requests[0]?.headers['openai-organization']).toBe('org-abc')
+    expect(h.upstream.requests[0]?.headers['openai-project']).toBe('proj_xyz')
+  })
+
+  it('does not forward OpenAI-Organization or OpenAI-Project on a Messages route', async () => {
+    const h = await setup(okJson)
+
+    await h.send('/anthropic/messages', {
+      body: '{}',
+      headers: {'openai-organization': 'org-abc', 'openai-project': 'proj_xyz'},
+    })
+
+    const seen = h.upstream.requests[0]?.headers ?? {}
+    expect(seen['openai-organization']).toBeUndefined()
+    expect(seen['openai-project']).toBeUndefined()
+  })
+
   it('does not forward a client Authorization header on a Messages route', async () => {
     const h = await setup(okJson)
     await h.send('/anthropic/messages', {body: '{}', headers: {authorization: 'Bearer client-evil'}})
@@ -829,6 +871,172 @@ describe('key proxy: malformed input and limits', () => {
     ]) {
       expect(log).not.toContain(needle)
     }
+  })
+})
+
+/** Connects, writes `text` and resolves with what the proxy answered; the client socket stays open (write half included). */
+async function rejectedConnection(
+  port: number,
+  text: string,
+): Promise<{readonly socket: net.Socket; readonly raw: string}> {
+  return new Promise((resolve, reject) => {
+    // `allowHalfOpen`: after the proxy's FIN this client does not close its own side, as a hostile client would not.
+    const socket = net.connect({port, host: '127.0.0.1', allowHalfOpen: true})
+    const timer = setTimeout(() => {
+      socket.destroy()
+      reject(new Error('no answer from the proxy'))
+    }, 3000)
+    socket.once('data', chunk => {
+      clearTimeout(timer)
+      resolve({socket, raw: chunk.toString('latin1')})
+    })
+    socket.once('error', error => {
+      clearTimeout(timer)
+      reject(error)
+    })
+    socket.write(text)
+  })
+}
+
+const CONNECT_REQUEST = 'CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n'
+const UPGRADE_REQUEST = `GET /openai/responses HTTP/1.1\r\nHost: x\r\nauthorization: Bearer ${PLACEHOLDER}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: abc\r\n\r\n`
+
+describe('key proxy: rejected CONNECT and Upgrade sockets', () => {
+  it.each([
+    ['CONNECT', CONNECT_REQUEST],
+    ['Upgrade', UPGRADE_REQUEST],
+  ])('survives a TCP reset after a rejected %s, even when the reset races the answer', async (_name, request) => {
+    // #given a proxy, and a listener that would see the crash an unhandled socket error causes
+    const uncaught: unknown[] = []
+    const onUncaught = (error: unknown): void => {
+      uncaught.push(error)
+    }
+    process.on('uncaughtException', onUncaught)
+    cleanups.push(async () => {
+      process.off('uncaughtException', onUncaught)
+    })
+    const h = await setup(okJson)
+
+    // #when a client resets right after reading the rejection, and another resets before reading it
+    const first = await rejectedConnection(h.proxy.port, request)
+    expect(first.raw).toMatch(/^HTTP\/1\.1 40[45]/)
+    first.socket.resetAndDestroy()
+    const second = net.connect(h.proxy.port, '127.0.0.1')
+    second.on('error', () => undefined)
+    second.write(request, () => second.resetAndDestroy())
+    await new Promise(resolve => setTimeout(resolve, 300))
+
+    // #then nothing escaped, and the proxy serves the next request
+    expect(uncaught).toEqual([])
+    expect((await h.send('/openai/chat/completions', {body: '{}'})).status).toBe(200)
+  })
+
+  it.each([
+    ['CONNECT', CONNECT_REQUEST],
+    ['Upgrade', UPGRADE_REQUEST],
+  ])('reclaims the slots of 64 half-open rejected %s sockets', async (_name, request) => {
+    // #given the default cap of 64, and 64 clients that keep their write half open after the rejection
+    const h = await setup(okJson, {limits: {rejectLingerMs: 50}})
+    const held: net.Socket[] = []
+    for (let index = 0; index < 64; index += 1) held.push((await rejectedConnection(h.proxy.port, request)).socket)
+    cleanups.push(async () => {
+      for (const socket of held) socket.destroy()
+    })
+
+    // #when the short linger passes
+    await new Promise(resolve => setTimeout(resolve, 400))
+
+    // #then the proxy closed them, so the next requests are served instead of dropped at the cap
+    expect(held.every(socket => socket.destroyed || socket.readableEnded || !socket.writable)).toBe(true)
+    expect((await h.send('/openai/chat/completions', {body: '{}'})).status).toBe(200)
+    for (let index = 0; index < 6; index += 1) {
+      expect((await rejectedConnection(h.proxy.port, request)).raw).toMatch(/^HTTP\/1\.1 40[45]/)
+    }
+  })
+
+  it('closes detached sockets that are still open at shutdown, without waiting for the linger', async () => {
+    // #given rejected sockets that the proxy would hold for a long linger
+    const h = await setup(okJson, {limits: {rejectLingerMs: 60_000}})
+    const held = await Promise.all([
+      rejectedConnection(h.proxy.port, CONNECT_REQUEST),
+      rejectedConnection(h.proxy.port, UPGRADE_REQUEST),
+      rejectedConnection(h.proxy.port, CONNECT_REQUEST),
+    ])
+    cleanups.push(async () => {
+      for (const {socket} of held) socket.destroy()
+    })
+
+    // #when the proxy shuts down with them open
+    const started = Date.now()
+    await h.proxy.close()
+
+    // #then it finished at once and every client socket was closed
+    expect(Date.now() - started).toBeLessThan(1500)
+    await new Promise(resolve => setTimeout(resolve, 100))
+    expect(held.every(({socket}) => socket.destroyed || socket.readableEnded)).toBe(true)
+  })
+
+  it('answers a malformed request on a connection that resets, without crashing', async () => {
+    const uncaught: unknown[] = []
+    const onUncaught = (error: unknown): void => {
+      uncaught.push(error)
+    }
+    process.on('uncaughtException', onUncaught)
+    cleanups.push(async () => {
+      process.off('uncaughtException', onUncaught)
+    })
+    const h = await setup(okJson)
+
+    const socket = net.connect(h.proxy.port, '127.0.0.1')
+    socket.on('error', () => undefined)
+    socket.write('NOT HTTP AT ALL\r\n\r\n', () => socket.resetAndDestroy())
+    await new Promise(resolve => setTimeout(resolve, 300))
+
+    expect(uncaught).toEqual([])
+    expect((await h.send('/openai/chat/completions', {body: '{}'})).status).toBe(200)
+  })
+})
+
+describe('key proxy: a partial upload', () => {
+  it('aborts the upstream request when the client disconnects mid-body, and keeps serving', async () => {
+    // #given an upstream that records requests as they begin
+    const h = await setup(okJson)
+
+    // #when an authorized client sends the headers and part of the body, then vanishes
+    const socket = net.connect(h.proxy.port, '127.0.0.1')
+    socket.on('error', () => undefined)
+    socket.write(
+      `POST /openai/chat/completions HTTP/1.1\r\nHost: x\r\nauthorization: Bearer ${PLACEHOLDER}\r\ncontent-type: application/json\r\ncontent-length: 1000\r\n\r\n{"partial":`,
+    )
+    await vi.waitFor(() => {
+      expect(h.upstream.connections.size).toBe(1)
+    })
+    socket.destroy()
+
+    // #then the upstream request is aborted, it never completed, and the next request is served
+    await vi.waitFor(() => {
+      expect(h.upstream.connections.size).toBe(0)
+    })
+    expect(h.upstream.requests).toHaveLength(0)
+    expect((await h.send('/openai/chat/completions', {body: '{}'})).status).toBe(200)
+  })
+
+  it('aborts the upstream request when the client resets mid-body', async () => {
+    const h = await setup(okJson)
+    const socket = net.connect(h.proxy.port, '127.0.0.1')
+    socket.on('error', () => undefined)
+    socket.write(
+      `POST /openai/chat/completions HTTP/1.1\r\nHost: x\r\nauthorization: Bearer ${PLACEHOLDER}\r\ncontent-length: 1000\r\n\r\n{"partial":`,
+    )
+    await vi.waitFor(() => {
+      expect(h.upstream.connections.size).toBe(1)
+    })
+    socket.resetAndDestroy()
+
+    await vi.waitFor(() => {
+      expect(h.upstream.connections.size).toBe(0)
+    })
+    expect((await h.send('/openai/chat/completions', {body: '{}'})).status).toBe(200)
   })
 })
 

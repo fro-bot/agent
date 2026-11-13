@@ -338,3 +338,184 @@ describe('resolveKeyProxyProviders', () => {
     })
   })
 })
+
+describe('resolveKeyProxyProviders: every scope of the provider config', () => {
+  const SECRET = 'sk-CANARY-scope-walk-0002'
+  const OTHER = 'https://other.example/v1'
+
+  const refusal = (config: unknown) => {
+    const result = resolve(['openai'], config)
+    expect(result.success).toBe(false)
+    if (result.success) throw new Error('expected a refusal')
+    // Every refusal names the provider and a fix, and holds no value from the config.
+    expect(result.error.kind).toBe('bypass-field')
+    expect(result.error.message).toContain('provider "openai"')
+    expect(result.error.message).toMatch(/Fix: /)
+    expect(result.error.message).toContain('isolate-agent: false')
+    for (const value of [SECRET, 'other.example', 'Bearer']) expect(result.error.message).not.toContain(value)
+    return result.error.message
+  }
+
+  const native = (provider: Record<string, unknown>) => ({providers: {openai: provider}})
+  const legacy = (provider: Record<string, unknown>) => ({provider: {openai: provider}})
+
+  describe('credentials, in the native and legacy shapes', () => {
+    it.each([
+      ['native provider headers', native({headers: {Authorization: `Bearer ${SECRET}`}}), 'headers', null],
+      ['native provider settings.accessToken', native({settings: {accessToken: SECRET}}), 'accessToken', null],
+      ['native provider settings.refreshToken', native({settings: {refreshToken: SECRET}}), 'refreshToken', null],
+      ['native model settings.apiKey', native({models: {m: {settings: {apiKey: SECRET}}}}), 'apiKey', 'model "m"'],
+      [
+        'native model settings.authToken',
+        native({models: {m: {settings: {authToken: SECRET}}}}),
+        'authToken',
+        'model "m"',
+      ],
+      ['native model headers', native({models: {m: {headers: {'X-Api-Key': SECRET}}}}), 'headers', 'model "m"'],
+      [
+        'native model settings.headers',
+        native({models: {m: {settings: {headers: {authorization: SECRET}}}}}),
+        'headers',
+        'model "m"',
+      ],
+      [
+        'native variant settings.apiKey',
+        native({models: {m: {variants: [{id: 'v', settings: {apiKey: SECRET}}]}}}),
+        'apiKey',
+        'model "m" variant "v"',
+      ],
+      [
+        'native variant headers',
+        native({models: {m: {variants: [{id: 'v', headers: {Authorization: SECRET}}]}}}),
+        'headers',
+        'model "m" variant "v"',
+      ],
+      [
+        'native variant settings.headers',
+        native({models: {m: {variants: [{id: 'v', settings: {headers: {'x-api-key': SECRET}}}]}}}),
+        'headers',
+        'model "m" variant "v"',
+      ],
+      ['legacy model options.apiKey', legacy({models: {m: {options: {apiKey: SECRET}}}}), 'apiKey', 'model "m"'],
+      ['legacy model headers', legacy({models: {m: {headers: {Authorization: SECRET}}}}), 'headers', 'model "m"'],
+      [
+        'legacy variant options.apiKey (map form)',
+        legacy({models: {m: {variants: {fast: {options: {apiKey: SECRET}}}}}}),
+        'apiKey',
+        'model "m" variant "fast"',
+      ],
+      [
+        'legacy variant headers (map form)',
+        legacy({models: {m: {variants: {fast: {headers: {Authorization: SECRET}}}}}}),
+        'headers',
+        'model "m" variant "fast"',
+      ],
+      [
+        'a variant that sets the key directly (map form)',
+        legacy({models: {m: {variants: {fast: {apiKey: SECRET}}}}}),
+        'apiKey',
+        'model "m" variant "fast"',
+      ],
+    ])('refuses %s', (_name, config, field, scope) => {
+      const message = refusal(config)
+      expect(message).toContain(field)
+      expect(message).toContain(scope ?? '')
+    })
+
+    it('refuses a model-level reference too, because it would replace the placeholder', () => {
+      expect(refusal(native({models: {m: {settings: {apiKey: '{env:OPENAI_API_KEY}'}}}}))).toContain('model "m"')
+    })
+  })
+
+  describe('endpoint overrides, in the native and legacy shapes', () => {
+    it.each([
+      [
+        'native variant settings.baseURL',
+        native({models: {m: {variants: [{id: 'direct', settings: {baseURL: OTHER}}]}}}),
+        'baseURL',
+        'model "m" variant "direct"',
+      ],
+      [
+        'native variant settings.endpoint',
+        native({models: {m: {variants: [{id: 'v', settings: {endpoint: OTHER}}]}}}),
+        'endpoint',
+        'model "m" variant "v"',
+      ],
+      ['native model settings.baseURL', native({models: {m: {settings: {baseURL: OTHER}}}}), 'baseURL', 'model "m"'],
+      ['native model settings.api', native({models: {m: {settings: {api: OTHER}}}}), 'api', 'model "m"'],
+      ['legacy model options.baseURL', legacy({models: {m: {options: {baseURL: OTHER}}}}), 'baseURL', 'model "m"'],
+      ['legacy model provider.api', legacy({models: {m: {provider: {api: OTHER}}}}), 'api', 'model "m"'],
+      [
+        'legacy variant options.baseURL (map form)',
+        legacy({models: {m: {variants: {direct: {options: {baseURL: OTHER}}}}}}),
+        'baseURL',
+        'model "m" variant "direct"',
+      ],
+      [
+        'legacy variant provider.api (map form)',
+        legacy({models: {m: {variants: {direct: {provider: {api: OTHER}}}}}}),
+        'api',
+        'model "m" variant "direct"',
+      ],
+      [
+        'an endpoint nested in another provider-level object',
+        native({settings: {transport: {endpoint: OTHER}}}),
+        'endpoint',
+        null,
+      ],
+    ])('refuses %s', (_name, config, field, scope) => {
+      const message = refusal(config)
+      expect(message).toContain(field)
+      expect(message).toContain(scope ?? '')
+    })
+  })
+
+  describe('query parameters', () => {
+    it.each([
+      ['legacy provider options', legacy({options: {queryParams: {'api-version': '1'}}})],
+      ['native provider settings', native({settings: {queryParams: {'api-version': '1'}}})],
+      ['native model settings', native({models: {m: {settings: {queryParams: {x: '1'}}}}})],
+    ])('refuses queryParams in %s, with the remedy', (_name, config) => {
+      const message = refusal(config)
+      expect(message).toContain('queryParams')
+      expect(message).toMatch(/no query string|drop `queryParams`|remove `queryParams`/)
+    })
+  })
+
+  describe('settings that do not bypass the proxy', () => {
+    it('accepts benign provider, model and variant settings in both shapes', () => {
+      const result = resolve(['openai'], {
+        providers: {
+          openai: {
+            settings: {timeout: 600_000, headers: {'x-team': 'a'}},
+            models: {
+              m: {
+                name: 'M',
+                limit: {context: 1000, output: 100},
+                settings: {maxTokens: 50, reasoning: {effort: 'high', budget_tokens: 10}},
+                headers: {'x-model': 'b'},
+                variants: [{id: 'high', settings: {reasoningEffort: 'high'}}],
+              },
+            },
+          },
+        },
+        provider: {
+          openai: {models: {m: {options: {temperature: 0.2}, variants: {fast: {options: {reasoningEffort: 'low'}}}}}},
+        },
+      })
+
+      expect(result.success).toBe(true)
+    })
+
+    it('does not read a harmless header that happens to be named like a setting', () => {
+      const result = resolve(['openai'], native({models: {m: {headers: {'x-api': 'a', 'x-endpoint': 'b'}}}}))
+
+      expect(result.success).toBe(true)
+    })
+
+    it('does not echo a model or variant id that is not a plain identifier', () => {
+      const message = refusal(native({models: {'bad id\n{env:LEAK}': {settings: {apiKey: SECRET}}}}))
+      expect(message).not.toContain('LEAK')
+    })
+  })
+})

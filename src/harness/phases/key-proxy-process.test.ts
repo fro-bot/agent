@@ -3,6 +3,7 @@ import {Buffer} from 'node:buffer'
 import {execFileSync, spawn} from 'node:child_process'
 import * as fs from 'node:fs/promises'
 import http from 'node:http'
+import net from 'node:net'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import process from 'node:process'
@@ -143,6 +144,64 @@ describe('key-proxy-process', () => {
       expect(stopped.outcome).toBe('stopped')
       expect(stopped.crashed).toBe(false)
       expect(proxy.died.aborted).toBe(false)
+    })
+
+    it.each([
+      ['CONNECT', 'CONNECT 127.0.0.1:443 HTTP/1.1\r\nHost: x\r\n\r\n'],
+      ['Upgrade', 'GET /openai/responses HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n'],
+    ])('survives a rejected %s that is reset, serves the next request and stops cleanly', async (_name, request) => {
+      // #given the real child
+      const upstream = await startTlsUpstream((_request, res) => {
+        res.writeHead(200, {'content-type': 'application/json'})
+        res.end('{}')
+      })
+      cleanups.push(upstream.close)
+      const {started} = await startWith(realLauncher(), {
+        providers: [{...OPENAI, baseUrl: `${upstream.origin}/v1`}],
+        testing: {upstreamCa: upstream.ca},
+      })
+      if (!started.success) throw new Error(started.error.message)
+      const proxy: KeyProxyProcess = started.data
+
+      // #when clients send the request and reset: one after reading the answer, one before
+      const answered = await new Promise<string>(resolve => {
+        const socket = net.connect(proxy.port, '127.0.0.1')
+        socket.on('error', () => undefined)
+        socket.once('data', chunk => {
+          socket.resetAndDestroy()
+          resolve(chunk.toString('latin1'))
+        })
+        socket.write(request)
+      })
+      const early = net.connect(proxy.port, '127.0.0.1')
+      early.on('error', () => undefined)
+      early.write(request, () => early.resetAndDestroy())
+      await new Promise(resolve => setTimeout(resolve, 300))
+
+      // #then the child is alive and serves, and an intentional stop is not a crash
+      expect(answered).toMatch(/^HTTP\/1\.1 40[45]/)
+      expect(proxy.crashed()).toBe(false)
+      const status = await new Promise<number>((resolve, reject) => {
+        const req = http.request(
+          {
+            host: '127.0.0.1',
+            port: proxy.port,
+            path: '/openai/chat/completions',
+            method: 'POST',
+            headers: {authorization: `Bearer ${proxy.placeholder}`},
+          },
+          res => {
+            res.resume()
+            res.on('end', () => resolve(res.statusCode ?? 0))
+          },
+        )
+        req.on('error', reject)
+        req.end('{}')
+      })
+      expect(status).toBe(200)
+      const stopped = await proxy.stop()
+      expect(stopped.outcome).toBe('stopped')
+      expect(stopped.crashed).toBe(false)
     })
 
     it('keeps the key out of the child argv and environment, which is empty', async () => {

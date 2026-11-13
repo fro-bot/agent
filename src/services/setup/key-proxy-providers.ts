@@ -118,15 +118,144 @@ function isPresent(value: unknown): boolean {
   return value !== undefined && value !== null && value !== ''
 }
 
-/** A model's own base URL or endpoint, in any of the shapes the server reads. */
-function modelRedirects(model: Bag): boolean {
-  if (isPresent(model.baseURL) || isPresent(model.endpoint) || isPresent(model.api)) return true
-  if (isRecord(model.provider) && (isPresent(model.provider.api) || isPresent(model.provider.baseURL))) return true
-  return bagsOf(model).some(bag => isPresent(bag.baseURL) || isPresent(bag.endpoint) || isPresent(bag.api))
+const CREDENTIAL_KEY =
+  /^(?:api[-_]?key|auth[-_]?token|access[-_]?token|refresh[-_]?token|id[-_]?token|bearer[-_]?token|token|client[-_]?secret|secret|password)$/i
+const ENDPOINT_KEY = /^(?:base[-_]?url|endpoint|api|api[-_]?url)$/i
+/** Provider-level keys the resolver reads and checks itself: the walk below leaves them alone at provider level. */
+const PROVIDER_LEVEL_HANDLED = new Set(['baseURL', 'api', 'apiKey', 'authToken', 'accessToken', 'token', 'endpoint'])
+const PLAIN_ID = /^[\w.:@/+-]{1,100}$/
+
+type BypassKind = 'credential' | 'endpoint' | 'header' | 'query'
+
+interface BypassHit {
+  readonly kind: BypassKind
+  readonly field: string
+  /** `model "m"`, `model "m" variant "v"`, or null for the provider scope. Ids that are not plain identifiers are not echoed. */
+  readonly scope: string | null
 }
 
-function modelHasCredentialHeader(model: Bag): boolean {
-  return hasCredentialHeader(model.headers) || bagsOf(model).some(bag => hasCredentialHeader(bag.headers))
+interface Scope {
+  readonly model?: string
+  readonly variant?: string
+}
+
+function describeScope(scope: Scope): string | null {
+  if (scope.model === undefined) return null
+  const model = `model "${PLAIN_ID.test(scope.model) ? scope.model : '<unnamed>'}"`
+  if (scope.variant === undefined) return model
+  return `${model} variant "${PLAIN_ID.test(scope.variant) ? scope.variant : '<unnamed>'}"`
+}
+
+/** What a key and value would do to a request, wherever the key sits. `providerLevel` leaves the provider's own fields. */
+function bypassKind(key: string, value: unknown, providerLevel: boolean): BypassKind | null {
+  const lower = key.toLowerCase()
+  if (lower === 'queryparams' && isPresent(value)) return 'query'
+  if (lower === 'headers') return hasCredentialHeader(value) ? 'header' : null
+  if (!isPresent(value)) return null
+  if (providerLevel) return CREDENTIAL_KEY.test(key) && !PROVIDER_LEVEL_HANDLED.has(key) ? 'credential' : null
+  if (ENDPOINT_KEY.test(key)) return 'endpoint'
+  return CREDENTIAL_KEY.test(key) ? 'credential' : null
+}
+
+/** The first credential, credential header, endpoint or query setting under `value`, in any nested object or list. */
+function findBypass(value: unknown, scope: Scope): BypassHit | null {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const hit = findBypass(item, scope)
+      if (hit !== null) return hit
+    }
+    return null
+  }
+  if (!isRecord(value)) return null
+  for (const [key, child] of Object.entries(value)) {
+    const kind = bypassKind(key, child, false)
+    if (kind !== null) return {kind, field: kind === 'header' ? 'headers' : key, scope: describeScope(scope)}
+    const hit = descend(key, child, scope)
+    if (hit !== null) return hit
+  }
+  return null
+}
+
+/** Recurses into a child, entering a model or variant scope where the key names one. */
+function descend(key: string, child: unknown, scope: Scope): BypassHit | null {
+  // Header names are checked once, as names; they are not settings.
+  if (key.toLowerCase() === 'headers') return null
+  if (key === 'models' && isRecord(child)) {
+    for (const [modelId, model] of Object.entries(child)) {
+      const hit = findBypass(model, {model: modelId})
+      if (hit !== null) return hit
+    }
+    return null
+  }
+  if (key === 'variants') {
+    const entries: [string, unknown][] = Array.isArray(child)
+      ? child.map((item, index): [string, unknown] => [
+          isRecord(item) && typeof item.id === 'string' ? item.id : `#${index}`,
+          item,
+        ])
+      : isRecord(child)
+        ? Object.entries(child)
+        : []
+    for (const [variantId, variant] of entries) {
+      const hit = findBypass(variant, {...scope, variant: variantId})
+      if (hit !== null) return hit
+    }
+    return null
+  }
+  return findBypass(child, scope)
+}
+
+/**
+ * Scans a provider block, and every nested scope under it (models, variants, any other object), for settings that would put
+ * a credential in the sandbox or send a request around the proxy. The provider's own base URL and key reference are
+ * checked by the caller.
+ */
+function findProviderBypass(block: Bag): BypassHit | null {
+  for (const node of [block, ...bagsOf(block)]) {
+    for (const [key, child] of Object.entries(node)) {
+      if (node === block && (key === 'options' || key === 'settings')) continue
+      const kind = bypassKind(key, child, true)
+      if (kind !== null) return {kind, field: kind === 'header' ? 'headers' : key, scope: null}
+      if (PROVIDER_LEVEL_HANDLED.has(key)) continue
+      const hit = descend(key, child, {})
+      if (hit !== null) return hit
+    }
+  }
+  return null
+}
+
+function bypassRefusal(providerId: string, hit: BypassHit): Result<never, KeyProxyResolutionError> {
+  const at = hit.scope === null ? 'in its provider settings' : `on ${hit.scope}`
+  switch (hit.kind) {
+    case 'credential':
+      return refuse(
+        'bypass-field',
+        providerId,
+        `sets \`${hit.field}\` ${at}, which the sandbox could read`,
+        'put the key in the auth-json input and remove the setting',
+      )
+    case 'endpoint':
+      return refuse(
+        'bypass-field',
+        providerId,
+        `sets \`${hit.field}\` ${at}, which sends requests around the key proxy`,
+        'remove it and set one provider-level `baseURL` (an https URL)',
+      )
+    case 'header':
+      return refuse(
+        'bypass-field',
+        providerId,
+        `sets a credential-bearing entry in \`headers\` ${at}, which the key proxy does not carry`,
+        'remove the Authorization or API-key header and put the key in the auth-json input',
+      )
+    case 'query':
+      return refuse(
+        'bypass-field',
+        providerId,
+        `sets \`queryParams\` ${at}, which the key proxy does not forward (its routes take no query string)`,
+        'remove `queryParams`',
+      )
+  }
 }
 
 function modelPackages(model: Bag): string[] {
@@ -199,24 +328,8 @@ function resolveProvider(operator: Bag, providerId: string): Result<KeyProxyProv
         )
       }
     }
-    for (const model of modelsOf(block)) {
-      if (modelRedirects(model)) {
-        return refuse(
-          'bypass-field',
-          providerId,
-          'sets a model-level base URL or endpoint, which sends requests around the key proxy',
-          'remove it from the model and set one provider-level `baseURL`',
-        )
-      }
-      if (modelHasCredentialHeader(model)) {
-        return refuse(
-          'bypass-field',
-          providerId,
-          'sets a credential-bearing entry in a model `headers`, which the key proxy does not carry',
-          'remove the Authorization or API-key header and put the key in the auth-json input',
-        )
-      }
-    }
+    const hit = findProviderBypass(block)
+    if (hit !== null) return bypassRefusal(providerId, hit)
   }
 
   // One literal base URL. A legacy and a V2 spelling must agree.

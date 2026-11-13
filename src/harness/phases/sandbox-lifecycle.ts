@@ -322,6 +322,8 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   let proxyStart: Promise<unknown> | undefined
   let proxyStartController: AbortController | undefined
   let proxyUnconfirmed = false
+  // Set once the teardown has taken its decision about the proxy. A proxy that turns up after that is stopped on the spot.
+  let proxyTeardownDone = false
   const closeAdmission = (): void => {
     admissionClosed = true
     for (const controller of pendingLaunches.values()) controller.abort()
@@ -401,6 +403,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
 
   /** Stops the key proxy, if the lifecycle owns one, and says what became of it. */
   const stopProxy = async (): Promise<'crashed' | 'none' | 'stopped' | 'unconfirmed'> => {
+    proxyTeardownDone = true
     if (proxy === null) return proxyUnconfirmed ? 'unconfirmed' : 'none'
     try {
       const result = await proxy.stop()
@@ -587,7 +590,17 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       try {
         const report = await start({signal: controller.signal})
         if (report.unconfirmed) proxyUnconfirmed = true
-        if (report.proxy !== null) proxy = report.proxy
+        if (report.proxy === null) return null
+        if (proxyTeardownDone) {
+          // The release gave up waiting for this start (the run is already `unsafe`), and it was ready after all: nothing
+          // may be left running, and the caller is not handed a proxy it must not use.
+          logger.error('The key proxy became ready after the teardown; stopping it')
+          await report.proxy.stop().catch((error: unknown) => {
+            logger.error('Stopping the late key proxy threw', {error: toErrorMessage(error)})
+          })
+          return null
+        }
+        proxy = report.proxy
         return report.proxy
       } catch (error) {
         // Whether it started something before throwing is unknown.
