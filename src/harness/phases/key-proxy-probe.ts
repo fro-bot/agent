@@ -57,8 +57,11 @@ export async function probeKeyProxy(options: ProbeKeyProxyOptions): Promise<KeyP
 
   const timeout = AbortSignal.timeout(options.timeoutMs ?? KEY_PROXY_PROBE_TIMEOUT_MS)
   const signal = options.signal === undefined ? timeout : AbortSignal.any([options.signal, timeout])
+  // The forwarder copies the OpenAI routing headers on Bearer routes only, so the probe carries them there only.
   const credential =
-    route.auth === 'x-api-key' ? {'x-api-key': proxy.placeholder} : {authorization: `Bearer ${proxy.placeholder}`}
+    route.auth === 'x-api-key'
+      ? {'x-api-key': proxy.placeholder}
+      : {...plan.routingHeaders, authorization: `Bearer ${proxy.placeholder}`}
 
   let status: number
   try {

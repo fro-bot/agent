@@ -37,7 +37,7 @@ import {
   resolveCredentialBaseDir,
   writeCredentialFilesV2,
 } from '../../services/setup/credential-files-v2.js'
-import {resolveKeyProxyProviders} from '../../services/setup/key-proxy-providers.js'
+import {checkConfigForKeys, resolveKeyProxyProviders} from '../../services/setup/key-proxy-providers.js'
 import {
   arePluginsCachedV2,
   installPluginsV2,
@@ -404,6 +404,18 @@ export async function startActionOpenCodeV2(
       logger,
     )
     if (!builtConfig.success) return stageError('config', `Invalid OpenCode configuration: ${builtConfig.error}`)
+
+    // Last check before anything is handed to the sandbox user: no auth-json key value may be in the config it will read.
+    // `OPENCODE_CONFIG_CONTENT` is the only config the sandbox gets (the proxy holds the keys, not a file).
+    if (options.sandbox != null) {
+      const clean = checkConfigForKeys({
+        keys: keys.data,
+        configs: [
+          {label: 'the OpenCode config (OPENCODE_CONFIG_CONTENT)', text: JSON.stringify(builtConfig.data.content)},
+        ],
+      })
+      if (!clean.success) return stageError('config', clean.error)
+    }
 
     // --- 4. Held claims ----------------------------------------------------------------------------------------
     owned.facts = deps.readDatabaseFacts(options.dbPath)

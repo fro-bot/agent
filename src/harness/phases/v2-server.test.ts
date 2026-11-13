@@ -1820,6 +1820,42 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
       expect(sandbox.prepare).not.toHaveBeenCalled()
     })
 
+    it('refuses a config that holds an auth-json key value before the hand-over, without printing it', async () => {
+      // #given the real key written at the provider root of opencode-config, where the placeholder rewrite does not reach
+      const server = fakeServer()
+      const deps = depsFor(server)
+      const sandbox = fakeSandbox()
+
+      // #when
+      const result = await startActionOpenCodeV2({
+        binaryPath: '/opt/opencode',
+        workspacePath: '/workspace',
+        authJson: JSON.stringify({anthropic: {type: 'api', key: CANARY}}),
+        opencodeConfig: JSON.stringify({providers: {anthropic: {apiKey: CANARY}}}),
+        credential: 'provision',
+        systematicVersion: 'latest',
+        model: 'anthropic/claude-sonnet',
+        dbPath,
+        authPath,
+        env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
+        runId: 42,
+        runAttempt: 1,
+        logger: createMockLogger(),
+        sandbox: sandbox.sandbox,
+        deps,
+      })
+
+      // #then the run stops at the config stage with a remedy, nothing was handed to the sandbox, and the lifecycle was released
+      const error = unwrapErr(result)
+      expect(error.stage).toBe('config')
+      expect(error.message).toContain('anthropic')
+      expect(error.message).toContain('Fix:')
+      expect(error.message).not.toContain(CANARY)
+      expect(sandbox.prepare).not.toHaveBeenCalled()
+      expect(deps.startServer).not.toHaveBeenCalled()
+      expect(sandbox.release).toHaveBeenCalledTimes(1)
+    })
+
     it('starts no proxy when there are no API keys', async () => {
       const server = fakeServer()
       const deps = depsFor(server)
@@ -1882,6 +1918,39 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
         deps,
       })
     }
+
+    it('hands the probe the selected provider’s configured routing headers', async () => {
+      // #given an operator-configured OpenAI organization on the selected provider
+      const server = fakeServer()
+      const deps = depsFor(server)
+      const sandbox = fakeSandbox()
+      const logger = createMockLogger()
+
+      // #when an isolated run starts
+      const result = await startActionOpenCodeV2({
+        binaryPath: '/opt/opencode',
+        workspacePath: '/workspace',
+        authJson: JSON.stringify({openai: {type: 'api', key: CANARY}}),
+        opencodeConfig: JSON.stringify({provider: {openai: {options: {headers: {'OpenAI-Organization': 'org-team'}}}}}),
+        credential: 'provision',
+        systematicVersion: 'latest',
+        model: 'openai/gpt-x',
+        dbPath,
+        authPath,
+        env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
+        runId: 42,
+        runAttempt: 1,
+        logger,
+        sandbox: sandbox.sandbox,
+        deps,
+      })
+
+      // #then the probe's plan carries it
+      expect(result.success).toBe(true)
+      expect(vi.mocked(deps.probeKeyProxy).mock.calls[0]?.[0].plan.routingHeaders).toEqual({
+        'openai-organization': 'org-team',
+      })
+    })
 
     it('probes only the provider of the selected model, through the owned proxy', async () => {
       // #given two configured providers and a model on the first

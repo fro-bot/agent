@@ -18,6 +18,11 @@ export interface KeyProxyProviderPlan {
   /** The operator's literal base URL, or null for the provider's built-in default upstream. */
   readonly baseUrl: string | null
   readonly protocols: readonly KeyProxyProtocol[]
+  /**
+   * The provider's own `OpenAI-Organization` and `OpenAI-Project` header values, lowercase names, as the server sends them
+   * for inference and the forwarder copies them on. Absent when the operator set none. A `{env:}`/`{file:}` value is left out.
+   */
+  readonly routingHeaders?: Readonly<Record<string, string>>
 }
 
 export type KeyProxyResolutionErrorKind =
@@ -55,9 +60,6 @@ function refuse(
     ...(providerId === undefined ? {} : {providerId}),
   })
 }
-
-const REFERENCE_OPENING = /^\{(?:env|file):/
-const CREDENTIAL_HEADER_NAME = /auth|api[-_]?key|token|secret|cookie|credential/i
 
 type PackageClass = 'anthropic' | 'openai' | 'openai-compatible' | 'signing' | 'unknown'
 
@@ -110,22 +112,18 @@ function bagsOf(block: Bag): Bag[] {
   return [block.options, block.settings].filter(isRecord)
 }
 
-function hasCredentialHeader(headers: unknown): boolean {
-  return isRecord(headers) && Object.keys(headers).some(name => CREDENTIAL_HEADER_NAME.test(name))
-}
-
 function isPresent(value: unknown): boolean {
   return value !== undefined && value !== null && value !== ''
 }
 
-const CREDENTIAL_KEY =
-  /^(?:api[-_]?key|auth[-_]?token|access[-_]?token|refresh[-_]?token|id[-_]?token|bearer[-_]?token|token|client[-_]?secret|secret|password)$/i
 const ENDPOINT_KEY = /^(?:base[-_]?url|endpoint|api|api[-_]?url)$/i
-/** Provider-level keys the resolver reads and checks itself: the walk below leaves them alone at provider level. */
-const PROVIDER_LEVEL_HANDLED = new Set(['baseURL', 'api', 'apiKey', 'authToken', 'accessToken', 'token', 'endpoint'])
 const PLAIN_ID = /^[\w.:@/+-]{1,100}$/
 
-type BypassKind = 'credential' | 'endpoint' | 'header' | 'query'
+/**
+ * What a setting could do to a request, by its name. Credentials are not judged by name: a settings key called `token` may
+ * be a schema property. The exact-value check on the serialized config (`findKeysInConfig`) catches a real key wherever it sits.
+ */
+type BypassKind = 'endpoint' | 'query'
 
 interface BypassHit {
   readonly kind: BypassKind
@@ -146,18 +144,15 @@ function describeScope(scope: Scope): string | null {
   return `${model} variant "${PLAIN_ID.test(scope.variant) ? scope.variant : '<unnamed>'}"`
 }
 
-/** What a key and value would do to a request, wherever the key sits. `providerLevel` leaves the provider's own fields. */
-function bypassKind(key: string, value: unknown, providerLevel: boolean): BypassKind | null {
+/** Whether a key and value would send a request around the proxy, wherever the key sits. Header names are not settings. */
+function bypassKind(key: string, value: unknown): BypassKind | null {
   const lower = key.toLowerCase()
-  if (lower === 'queryparams' && isPresent(value)) return 'query'
-  if (lower === 'headers') return hasCredentialHeader(value) ? 'header' : null
-  if (!isPresent(value)) return null
-  if (providerLevel) return CREDENTIAL_KEY.test(key) && !PROVIDER_LEVEL_HANDLED.has(key) ? 'credential' : null
-  if (ENDPOINT_KEY.test(key)) return 'endpoint'
-  return CREDENTIAL_KEY.test(key) ? 'credential' : null
+  if (lower === 'headers' || !isPresent(value)) return null
+  if (lower === 'queryparams') return 'query'
+  return ENDPOINT_KEY.test(key) ? 'endpoint' : null
 }
 
-/** The first credential, credential header, endpoint or query setting under `value`, in any nested object or list. */
+/** The first endpoint or query setting under `value`, in any nested object or list. */
 function findBypass(value: unknown, scope: Scope): BypassHit | null {
   if (Array.isArray(value)) {
     for (const item of value) {
@@ -168,8 +163,8 @@ function findBypass(value: unknown, scope: Scope): BypassHit | null {
   }
   if (!isRecord(value)) return null
   for (const [key, child] of Object.entries(value)) {
-    const kind = bypassKind(key, child, false)
-    if (kind !== null) return {kind, field: kind === 'header' ? 'headers' : key, scope: describeScope(scope)}
+    const kind = bypassKind(key, child)
+    if (kind !== null) return {kind, field: key, scope: describeScope(scope)}
     const hit = descend(key, child, scope)
     if (hit !== null) return hit
   }
@@ -178,7 +173,7 @@ function findBypass(value: unknown, scope: Scope): BypassHit | null {
 
 /** Recurses into a child, entering a model or variant scope where the key names one. */
 function descend(key: string, child: unknown, scope: Scope): BypassHit | null {
-  // Header names are checked once, as names; they are not settings.
+  // Header names are not settings.
   if (key.toLowerCase() === 'headers') return null
   if (key === 'models' && isRecord(child)) {
     for (const [modelId, model] of Object.entries(child)) {
@@ -206,17 +201,20 @@ function descend(key: string, child: unknown, scope: Scope): BypassHit | null {
 }
 
 /**
- * Scans a provider block, and every nested scope under it (models, variants, any other object), for settings that would put
- * a credential in the sandbox or send a request around the proxy. The provider's own base URL and key reference are
- * checked by the caller.
+ * Scans a provider block, and every nested scope under it (models, variants, any other object), for settings that send a
+ * request around the proxy. The one exception at each place is the field `resolveProvider` reads as the provider's own base
+ * URL (`api` on the block, `baseURL` in `options` and `settings`): it checks those, string or not, itself.
  */
 function findProviderBypass(block: Bag): BypassHit | null {
-  for (const node of [block, ...bagsOf(block)]) {
+  const nodes: readonly (readonly [Bag, string])[] = [
+    [block, 'api'],
+    ...bagsOf(block).map((bag): readonly [Bag, string] => [bag, 'baseURL']),
+  ]
+  for (const [node, ownBaseUrlKey] of nodes) {
     for (const [key, child] of Object.entries(node)) {
-      if (node === block && (key === 'options' || key === 'settings')) continue
-      const kind = bypassKind(key, child, true)
-      if (kind !== null) return {kind, field: kind === 'header' ? 'headers' : key, scope: null}
-      if (PROVIDER_LEVEL_HANDLED.has(key)) continue
+      if (key === ownBaseUrlKey || (node === block && (key === 'options' || key === 'settings'))) continue
+      const kind = bypassKind(key, child)
+      if (kind !== null) return {kind, field: key, scope: null}
       const hit = descend(key, child, {})
       if (hit !== null) return hit
     }
@@ -227,26 +225,12 @@ function findProviderBypass(block: Bag): BypassHit | null {
 function bypassRefusal(providerId: string, hit: BypassHit): Result<never, KeyProxyResolutionError> {
   const at = hit.scope === null ? 'in its provider settings' : `on ${hit.scope}`
   switch (hit.kind) {
-    case 'credential':
-      return refuse(
-        'bypass-field',
-        providerId,
-        `sets \`${hit.field}\` ${at}, which the sandbox could read`,
-        'put the key in the auth-json input and remove the setting',
-      )
     case 'endpoint':
       return refuse(
         'bypass-field',
         providerId,
         `sets \`${hit.field}\` ${at}, which sends requests around the key proxy`,
         'remove it and set one provider-level `baseURL` (an https URL)',
-      )
-    case 'header':
-      return refuse(
-        'bypass-field',
-        providerId,
-        `sets a credential-bearing entry in \`headers\` ${at}, which the key proxy does not carry`,
-        'remove the Authorization or API-key header and put the key in the auth-json input',
       )
     case 'query':
       return refuse(
@@ -256,6 +240,29 @@ function bypassRefusal(providerId: string, hit: BypassHit): Result<never, KeyPro
         'remove `queryParams`',
       )
   }
+}
+
+const OPENAI_ROUTING_HEADER_NAMES: ReadonlySet<string> = new Set(['openai-organization', 'openai-project'])
+/** A header value a request can carry as written: printable ASCII, no reference the server would resolve later. */
+const PLAIN_HEADER_VALUE = /^[\x21-\x7E](?:[\x20-\x7E]*[\x21-\x7E])?$/
+
+/**
+ * The provider's own `OpenAI-Organization` and `OpenAI-Project` headers (block, `options` and `settings` `headers`; a later
+ * one wins), for the start-up probe to send as the server does for inference. Only a literal value is taken.
+ */
+function routingHeadersOf(blocks: readonly Bag[]): Record<string, string> {
+  const found: Record<string, string> = {}
+  for (const block of blocks) {
+    for (const node of [block, ...bagsOf(block)]) {
+      if (!isRecord(node.headers)) continue
+      for (const [name, value] of Object.entries(node.headers)) {
+        const lower = name.toLowerCase()
+        if (!OPENAI_ROUTING_HEADER_NAMES.has(lower) || typeof value !== 'string') continue
+        if (PLAIN_HEADER_VALUE.test(value) && !/\{(?:env|file):/.test(value)) found[lower] = value
+      }
+    }
+  }
+  return found
 }
 
 function modelPackages(model: Bag): string[] {
@@ -294,39 +301,7 @@ function resolveProvider(operator: Bag, providerId: string): Result<KeyProxyProv
   for (const block of blocks) {
     if (isPresent(block.api)) baseUrls.push(block.api)
     for (const bag of bagsOf(block)) {
-      if (isPresent(bag.endpoint)) {
-        return refuse(
-          'bypass-field',
-          providerId,
-          'sets `endpoint`, which sends requests around the key proxy',
-          `remove \`endpoint\` from the provider options and use \`baseURL\` (an https URL) instead`,
-        )
-      }
       if (isPresent(bag.baseURL)) baseUrls.push(bag.baseURL)
-      if (isPresent(bag.apiKey) && !(typeof bag.apiKey === 'string' && REFERENCE_OPENING.test(bag.apiKey))) {
-        return refuse(
-          'bypass-field',
-          providerId,
-          'sets a literal `apiKey` in opencode-config, which the sandbox could read',
-          'put the key in the auth-json input and remove `apiKey` from the provider options',
-        )
-      }
-      if (isPresent(bag.authToken) || isPresent(bag.accessToken) || isPresent(bag.token)) {
-        return refuse(
-          'bypass-field',
-          providerId,
-          'sets an `authToken` or `accessToken` in opencode-config, which the sandbox could read',
-          'put the key in the auth-json input and remove the token from the provider options',
-        )
-      }
-      if (hasCredentialHeader(bag.headers)) {
-        return refuse(
-          'bypass-field',
-          providerId,
-          'sets a credential-bearing entry in `headers`, which the key proxy does not carry',
-          'remove the Authorization or API-key header and put the key in the auth-json input',
-        )
-      }
     }
     const hit = findProviderBypass(block)
     if (hit !== null) return bypassRefusal(providerId, hit)
@@ -419,7 +394,13 @@ function resolveProvider(operator: Bag, providerId: string): Result<KeyProxyProv
       'use an https base URL with no credentials, query or fragment that is not a cloud metadata host',
     )
   }
-  return ok({providerId, baseUrl, protocols: ordered})
+  const routingHeaders = routingHeadersOf(blocks)
+  return ok({
+    providerId,
+    baseUrl,
+    protocols: ordered,
+    ...(Object.keys(routingHeaders).length === 0 ? {} : {routingHeaders}),
+  })
 }
 
 export function resolveKeyProxyProviders(
@@ -469,4 +450,36 @@ export function resolveKeyProxyProviders(
     plans.push(resolved.data)
   }
   return ok(plans)
+}
+
+export interface ConfigTextToCheck {
+  /** What the text is, for the message: `OPENCODE_CONFIG_CONTENT`, a file name. Never a value. */
+  readonly label: string
+  readonly text: string
+}
+
+/**
+ * The last check before a config reaches the sandbox user: no `auth-json` key value may appear in any config text it will
+ * read, raw or JSON-escaped. This is by value, not by field name, so it holds for a key written anywhere in `opencode-config`
+ * (a root `apiKey`, a nested `api` object, a model setting) however the resolver or the config builder treats that field.
+ * The refusal names the provider and the text, never the value.
+ */
+export function checkConfigForKeys(options: {
+  readonly keys: readonly ProviderKeyEntryV2[]
+  readonly configs: readonly ConfigTextToCheck[]
+}): Result<null, string> {
+  for (const {providerId, key} of options.keys) {
+    if (key.length === 0) continue
+    const escaped = JSON.stringify(key).slice(1, -1)
+    for (const {label, text} of options.configs) {
+      if (text.includes(key) || text.includes(escaped)) {
+        return err(
+          `isolate-agent: the API key for provider "${providerId}" appears in ${label}, which the sandbox user can read. ` +
+            'Fix: remove the value from the `opencode-config` input (isolation keeps only `auth-json` keys out of the sandbox; ' +
+            'values written into `opencode-config` stay visible to it), or set `isolate-agent: false`.',
+        )
+      }
+    }
+  }
+  return ok(null)
 }

@@ -1,6 +1,8 @@
 import type {ProviderKeyEntryV2} from './credential-files-v2.js'
 import {describe, expect, it} from 'vitest'
-import {resolveKeyProxyProviders} from './key-proxy-providers.js'
+import {createMockLogger} from '../../shared/test-helpers.js'
+import {buildCIConfigV2} from './ci-config-v2.js'
+import {checkConfigForKeys, resolveKeyProxyProviders} from './key-proxy-providers.js'
 
 const CANARY = 'sk-CANARY-do-not-print-0001'
 
@@ -203,17 +205,10 @@ describe('resolveKeyProxyProviders', () => {
 
     it.each([
       ['a provider Authorization header', {provider: {openai: {options: {headers: {Authorization: 'Bearer x'}}}}}],
-      ['a provider x-api-key header', {provider: {openai: {options: {headers: {'X-Api-Key': 'x'}}}}}],
-      ['a V2 settings header', {providers: {openai: {settings: {headers: {authorization: 'x'}}}}}],
+      ['a V2 settings x-api-key header', {providers: {openai: {settings: {headers: {'x-api-key': 'x'}}}}}],
       ['a model header', {provider: {openai: {models: {'gpt-x': {headers: {Authorization: 'Bearer x'}}}}}}],
-      [
-        'a V2 model settings header',
-        {providers: {openai: {models: {'gpt-x': {settings: {headers: {'api-key': 'x'}}}}}}},
-      ],
-    ])('refuses a credential-bearing header (%s)', (_name, config) => {
-      const error = expectRefusal(resolve(['openai'], config), 'openai')
-      expect(error.kind).toBe('bypass-field')
-      expect(error.message).toContain('headers')
+    ])('does not judge headers by name (%s): the exact-value check catches a real key', (_name, config) => {
+      expect(resolve(['openai'], config).success).toBe(true)
     })
 
     it.each([
@@ -286,14 +281,10 @@ describe('resolveKeyProxyProviders', () => {
 
     it.each([
       ['a literal apiKey', {provider: {openai: {options: {apiKey: 'sk-literal'}}}}],
-      ['a literal authToken', {provider: {anthropic: {options: {authToken: 'tok'}}}}],
       ['a V2 literal apiKey', {providers: {openai: {settings: {apiKey: 'sk-literal'}}}}],
-    ])('refuses %s', (_name, config) => {
-      const providerId = JSON.stringify(config).includes('anthropic') ? 'anthropic' : 'openai'
-      const error = expectRefusal(resolve([providerId], config), providerId)
-      expect(error.kind).toBe('bypass-field')
-      expect(error.message).not.toContain('sk-literal')
-      expect(error.message).not.toContain('"tok"')
+      ['a literal authToken', {provider: {openai: {options: {authToken: 'tok'}}}}],
+    ])('accepts %s that is not an auth-json key, because the placeholder replaces it', (_name, config) => {
+      expect(resolve(['openai'], config).success).toBe(true)
     })
 
     it('accepts an apiKey reference, which the placeholder replaces', () => {
@@ -359,71 +350,31 @@ describe('resolveKeyProxyProviders: every scope of the provider config', () => {
   const native = (provider: Record<string, unknown>) => ({providers: {openai: provider}})
   const legacy = (provider: Record<string, unknown>) => ({provider: {openai: provider}})
 
-  describe('credentials, in the native and legacy shapes', () => {
+  describe('credentials are not judged by name', () => {
     it.each([
-      ['native provider headers', native({headers: {Authorization: `Bearer ${SECRET}`}}), 'headers', null],
-      ['native provider settings.accessToken', native({settings: {accessToken: SECRET}}), 'accessToken', null],
-      ['native provider settings.refreshToken', native({settings: {refreshToken: SECRET}}), 'refreshToken', null],
-      ['native model settings.apiKey', native({models: {m: {settings: {apiKey: SECRET}}}}), 'apiKey', 'model "m"'],
+      ['a model settings.apiKey', native({models: {m: {settings: {apiKey: SECRET}}}})],
+      ['a variant settings.authToken', native({models: {m: {variants: [{id: 'v', settings: {authToken: SECRET}}]}}})],
+      ['a model headers entry', native({models: {m: {headers: {Authorization: SECRET}}}})],
+      ['a model-level {env:} reference', native({models: {m: {settings: {apiKey: '{env:OPENAI_API_KEY}'}}}})],
       [
-        'native model settings.authToken',
-        native({models: {m: {settings: {authToken: SECRET}}}}),
-        'authToken',
-        'model "m"',
+        'a structured-output schema with a `token` property',
+        native({
+          models: {
+            m: {
+              settings: {
+                body: {
+                  response_format: {
+                    type: 'json_schema',
+                    json_schema: {name: 'r', schema: {type: 'object', properties: {token: {type: 'string'}}}},
+                  },
+                },
+              },
+            },
+          },
+        }),
       ],
-      ['native model headers', native({models: {m: {headers: {'X-Api-Key': SECRET}}}}), 'headers', 'model "m"'],
-      [
-        'native model settings.headers',
-        native({models: {m: {settings: {headers: {authorization: SECRET}}}}}),
-        'headers',
-        'model "m"',
-      ],
-      [
-        'native variant settings.apiKey',
-        native({models: {m: {variants: [{id: 'v', settings: {apiKey: SECRET}}]}}}),
-        'apiKey',
-        'model "m" variant "v"',
-      ],
-      [
-        'native variant headers',
-        native({models: {m: {variants: [{id: 'v', headers: {Authorization: SECRET}}]}}}),
-        'headers',
-        'model "m" variant "v"',
-      ],
-      [
-        'native variant settings.headers',
-        native({models: {m: {variants: [{id: 'v', settings: {headers: {'x-api-key': SECRET}}}]}}}),
-        'headers',
-        'model "m" variant "v"',
-      ],
-      ['legacy model options.apiKey', legacy({models: {m: {options: {apiKey: SECRET}}}}), 'apiKey', 'model "m"'],
-      ['legacy model headers', legacy({models: {m: {headers: {Authorization: SECRET}}}}), 'headers', 'model "m"'],
-      [
-        'legacy variant options.apiKey (map form)',
-        legacy({models: {m: {variants: {fast: {options: {apiKey: SECRET}}}}}}),
-        'apiKey',
-        'model "m" variant "fast"',
-      ],
-      [
-        'legacy variant headers (map form)',
-        legacy({models: {m: {variants: {fast: {headers: {Authorization: SECRET}}}}}}),
-        'headers',
-        'model "m" variant "fast"',
-      ],
-      [
-        'a variant that sets the key directly (map form)',
-        legacy({models: {m: {variants: {fast: {apiKey: SECRET}}}}}),
-        'apiKey',
-        'model "m" variant "fast"',
-      ],
-    ])('refuses %s', (_name, config, field, scope) => {
-      const message = refusal(config)
-      expect(message).toContain(field)
-      expect(message).toContain(scope ?? '')
-    })
-
-    it('refuses a model-level reference too, because it would replace the placeholder', () => {
-      expect(refusal(native({models: {m: {settings: {apiKey: '{env:OPENAI_API_KEY}'}}}}))).toContain('model "m"')
+    ])('resolves %s (an exact auth-json value is caught later, on the serialized config)', (_name, config) => {
+      expect(resolve(['openai'], config).success).toBe(true)
     })
   })
 
@@ -457,6 +408,17 @@ describe('resolveKeyProxyProviders: every scope of the provider config', () => {
         'api',
         'model "m" variant "direct"',
       ],
+      ['an object api in provider settings', native({settings: {api: {apiKey: SECRET}}}), 'api', null],
+      ['an object api in legacy provider options', legacy({options: {api: {apiKey: SECRET}}}), 'api', null],
+      ['an object endpoint at the provider root', native({endpoint: {url: OTHER}}), 'endpoint', null],
+      [
+        'a string api in provider settings (not the provider’s own base URL)',
+        native({settings: {api: OTHER}}),
+        'api',
+        null,
+      ],
+      ['a root baseURL', native({baseURL: OTHER}), 'baseURL', null],
+      ['an object api on a model', native({models: {m: {settings: {api: {x: 1}}}}}), 'api', 'model "m"'],
       [
         'an endpoint nested in another provider-level object',
         native({settings: {transport: {endpoint: OTHER}}}),
@@ -468,6 +430,15 @@ describe('resolveKeyProxyProviders: every scope of the provider config', () => {
       expect(message).toContain(field)
       expect(message).toContain(scope ?? '')
     })
+  })
+
+  it('refuses an object api at the provider root as a base URL that is not a string', () => {
+    const result = resolve(['openai'], native({api: {apiKey: SECRET}}))
+
+    expect(result.success).toBe(false)
+    if (result.success) throw new Error('expected a refusal')
+    expect(result.error.kind).toBe('unsafe-upstream')
+    expect(result.error.message).not.toContain(SECRET)
   })
 
   describe('query parameters', () => {
@@ -514,8 +485,153 @@ describe('resolveKeyProxyProviders: every scope of the provider config', () => {
     })
 
     it('does not echo a model or variant id that is not a plain identifier', () => {
-      const message = refusal(native({models: {'bad id\n{env:LEAK}': {settings: {apiKey: SECRET}}}}))
+      const message = refusal(native({models: {'bad id\n{env:LEAK}': {settings: {baseURL: SECRET}}}}))
       expect(message).not.toContain('LEAK')
     })
+  })
+})
+
+describe('resolveKeyProxyProviders: routing headers for the start-up probe', () => {
+  it('collects the OpenAI organization and project headers from options, settings and the block, any case', () => {
+    // #given headers in every place the server reads them
+    const result = resolve(['openai'], {
+      provider: {openai: {options: {headers: {'OpenAI-Organization': 'org-a', 'x-team': 'a'}}}},
+      providers: {openai: {settings: {headers: {'openai-project': 'proj-b'}}}},
+    })
+
+    // #then only the two routing headers are carried, lowercased
+    expect(result.success && result.data[0]?.routingHeaders).toEqual({
+      'openai-organization': 'org-a',
+      'openai-project': 'proj-b',
+    })
+  })
+
+  it('leaves the field out when there are none, and skips references and non-printable values', () => {
+    const none = resolve(['openai'])
+    expect(none.success && none.data[0]).toEqual({
+      providerId: 'openai',
+      baseUrl: null,
+      protocols: ['openai-responses', 'openai-chat'],
+    })
+    const skipped = resolve(['openai'], {
+      provider: {openai: {options: {headers: {'OpenAI-Organization': '{env:ORG}', 'OpenAI-Project': 'a\r\nb'}}}},
+    })
+    expect(skipped.success && skipped.data[0]?.routingHeaders).toBeUndefined()
+  })
+})
+
+describe('checkConfigForKeys: an auth-json key value in the config the sandbox reads', () => {
+  const KEY = 'sk-live-EXACT-VALUE-0003'
+  const authKeys = [{providerId: 'openai', key: KEY}]
+  const PROXIED = {openai: {baseURL: 'http://127.0.0.1:41999/openai', apiKey: 'placeholder-0123456789'}}
+
+  /** The path `startActionOpenCodeV2` takes: resolve, build the proxied config, serialize, check. */
+  function deliver(config: unknown, keys: {providerId: string; key: string}[] = authKeys) {
+    const opencodeConfig = JSON.stringify(config)
+    const resolved = resolveKeyProxyProviders({keys, opencodeConfig})
+    if (!resolved.success) throw new Error(`resolver refused: ${resolved.error.message}`)
+    const built = buildCIConfigV2(
+      {
+        opencodeConfig,
+        credential: 'withhold',
+        plugins: [],
+        runnerTemp: '/tmp/runner',
+        runId: 1,
+        runAttempt: 1,
+        proxiedProviders: PROXIED,
+      },
+      createMockLogger(),
+    )
+    if (!built.success) throw new Error(`build failed: ${built.error}`)
+    return checkConfigForKeys({
+      keys,
+      configs: [{label: 'the OpenCode config', text: JSON.stringify(built.data.content)}],
+    })
+  }
+
+  it('refuses a root providers.openai.apiKey equal to the auth-json value, without printing it', () => {
+    // #given the real key written at the provider root, where the placeholder rewrite never reaches
+    const result = deliver({providers: {openai: {apiKey: KEY}}})
+
+    // #then the run stops with a remedy that names the provider and not the value
+    expect(result.success).toBe(false)
+    if (result.success) throw new Error('expected a refusal')
+    expect(result.error).toContain('provider "openai"')
+    expect(result.error).toMatch(/Fix: /)
+    expect(result.error).not.toContain(KEY)
+  })
+
+  it('refuses settings.api = {apiKey: <the value>} already at resolution, without printing it', () => {
+    // #given the key inside an object-valued `api` setting, which the config builder would keep
+    const result = resolve(['openai'], {providers: {openai: {settings: {api: {apiKey: 'unused'}}}}})
+
+    // #then the resolver refuses the object `api` outright
+    expect(result.success).toBe(false)
+    if (result.success) throw new Error('expected a refusal')
+    expect(result.error.message).toContain('`api`')
+    expect(result.error.message).not.toContain('unused')
+
+    // #and the exact-value check still holds if a config like it ever got past the resolver
+    expect(
+      checkConfigForKeys({
+        keys: authKeys,
+        configs: [{label: 'the config', text: JSON.stringify({providers: {openai: {settings: {api: {apiKey: KEY}}}}})}],
+      }).success,
+    ).toBe(false)
+  })
+
+  it('refuses a value that needs JSON escaping, in its escaped form', () => {
+    // #given a key with a quote and a backslash, which JSON.stringify writes escaped
+    const tricky = String.raw`sk-"quoted"\back-0004`
+    const result = checkConfigForKeys({
+      keys: [{providerId: 'openai', key: tricky}],
+      configs: [{label: 'the config', text: JSON.stringify({a: {b: tricky}})}],
+    })
+
+    // #then the escaped form in the serialized text is found
+    expect(result.success).toBe(false)
+    expect(JSON.stringify({a: {b: tricky}})).not.toContain(tricky)
+  })
+
+  it('refuses the raw form too, in a text that is not JSON', () => {
+    // #given a key whose raw and JSON-escaped forms differ, written raw into a non-JSON config file
+    const tricky = String.raw`sk-"quoted"\back-0005`
+    const result = checkConfigForKeys({
+      keys: [{providerId: 'openai', key: tricky}],
+      configs: [{label: 'a config file', text: `token = ${tricky}\n`}],
+    })
+
+    // #then the raw form is found
+    expect(result.success).toBe(false)
+  })
+
+  it('accepts a literal value that is not an auth-json key', () => {
+    const result = deliver({providers: {openai: {apiKey: 'sk-not-a-real-key', settings: {apiKey: 'also-not'}}}})
+
+    expect(result.success).toBe(true)
+  })
+
+  it('accepts a structured-output schema with a `token` property', () => {
+    const result = deliver({
+      providers: {
+        openai: {
+          models: {
+            m: {
+              settings: {
+                body: {response_format: {json_schema: {schema: {properties: {token: {type: 'string'}}}}}},
+              },
+            },
+          },
+        },
+      },
+    })
+
+    expect(result.success).toBe(true)
+  })
+
+  it('ignores an empty key, which would match any text', () => {
+    expect(
+      checkConfigForKeys({keys: [{providerId: 'openai', key: ''}], configs: [{label: 'c', text: '{}'}]}).success,
+    ).toBe(true)
   })
 })

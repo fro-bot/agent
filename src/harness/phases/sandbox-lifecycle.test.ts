@@ -1357,9 +1357,10 @@ describe('createSandboxLifecycle', () => {
 
       // #and the start then produces its proxy
       ready.resolve()
-      await starting
+      const started = await starting
 
-      // #then that proxy is stopped, once, and the memoized outcome is unchanged
+      // #then the caller is handed no proxy (not a stopped one), that proxy is stopped once, and the outcome is unchanged
+      expect(started).toEqual({success: true, data: null})
       await vi.waitFor(() => {
         expect(stop).toHaveBeenCalledTimes(1)
       })
@@ -1400,7 +1401,9 @@ describe('createSandboxLifecycle', () => {
 
       await lifecycle.release()
       ready.resolve()
-      await expect(starting).resolves.toBeDefined()
+
+      // #then the caller is handed no proxy, whatever the stop did
+      await expect(starting).resolves.toEqual({success: true, data: null})
 
       await vi.waitFor(() => {
         expect(stop).toHaveBeenCalledTimes(1)

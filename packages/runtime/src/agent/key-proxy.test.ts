@@ -1040,6 +1040,35 @@ describe('key proxy: a partial upload', () => {
   })
 })
 
+describe('key proxy: invalid chunked framing after the upstream request exists', () => {
+  it.each([
+    ['a chunk size that is not hexadecimal', 'zz\r\n'],
+    ['a chunk that overruns its declared size', '2\r\nabcdef\r\n'],
+  ])('aborts the upstream request on %s, and keeps serving', async (_name, badFraming) => {
+    // #given an authorized chunked upload whose first chunk is valid, so the upstream request is under way
+    const h = await setup(okJson)
+    const socket = net.connect(h.proxy.port, '127.0.0.1')
+    socket.on('error', () => undefined)
+    socket.write(
+      `POST /openai/chat/completions HTTP/1.1\r\nHost: x\r\nauthorization: Bearer ${PLACEHOLDER}\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n9\r\n{"partial\r\n`,
+    )
+    await vi.waitFor(() => {
+      expect(h.upstream.connections.size).toBe(1)
+    })
+
+    // #when the client then sends bytes that are not valid chunk framing, and keeps the socket open
+    socket.write(badFraming)
+
+    // #then the upstream request is aborted, it never completed, and the next request is served
+    await vi.waitFor(() => {
+      expect(h.upstream.connections.size).toBe(0)
+    })
+    expect(h.upstream.requests).toHaveLength(0)
+    expect((await h.send('/openai/chat/completions', {body: '{}'})).status).toBe(200)
+    socket.destroy()
+  })
+})
+
 describe('key proxy: streaming', () => {
   it('delivers the last bytes before closing', async () => {
     // #given an upstream that writes its terminal frame and ends at once

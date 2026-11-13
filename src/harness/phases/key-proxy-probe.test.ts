@@ -80,6 +80,51 @@ describe('probeKeyProxy', () => {
     expect(logger.warning).not.toHaveBeenCalled()
   })
 
+  it('sends the provider’s configured organization and project headers on a Bearer route', async () => {
+    // #given a gateway that answers 403 unless the routing headers the forwarder sends for inference are present
+    const plan: KeyProxyProviderPlan = {
+      ...OPENAI,
+      routingHeaders: {'openai-organization': 'org-team', 'openai-project': 'proj-ci'},
+    }
+    const gated = (req: http.IncomingMessage, res: http.ServerResponse): void => {
+      const ok = req.headers['openai-organization'] === 'org-team' && req.headers['openai-project'] === 'proj-ci'
+      res.writeHead(ok ? 200 : 403, {'content-type': 'application/json'})
+      res.end('{}')
+    }
+    const seen: http.IncomingHttpHeaders[] = []
+    const server = http.createServer((req, res) => {
+      seen.push(req.headers)
+      gated(req, res)
+    })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    const {port} = server.address() as AddressInfo
+    closers.push(async () => {
+      server.closeAllConnections()
+      await new Promise<void>(resolve => server.close(() => resolve()))
+    })
+    const proxy = {baseUrl: (id: string) => `http://127.0.0.1:${port}/${id}`, placeholder: PLACEHOLDER}
+
+    // #when the plan with the headers is probed, and the same provider without them
+    const withHeaders = await probeKeyProxy({plan, proxy, logger: createMockLogger()})
+    const without = await probeKeyProxy({plan: OPENAI, proxy, logger: createMockLogger()})
+
+    // #then the headers carry the probe through, and their absence is the 403 this fixes
+    expect(withHeaders).toEqual({status: 'passed'})
+    expect(seen[0]?.authorization).toBe(`Bearer ${PLACEHOLDER}`)
+    expect(without.status).toBe('failed')
+  })
+
+  it('does not send the OpenAI routing headers on a Messages route', async () => {
+    // #given a Messages plan that somehow carries routing headers
+    const plan: KeyProxyProviderPlan = {...ANTHROPIC, routingHeaders: {'openai-organization': 'org-team'}}
+
+    // #when probed
+    const {seen} = await probe(plan, answer(200, '{}'))
+
+    // #then the forwarder would not copy them on this route, so the probe does not either
+    expect(seen[0]?.headers['openai-organization']).toBeUndefined()
+  })
+
   it('uses x-api-key for a Messages provider', async () => {
     const {result, seen} = await probe(ANTHROPIC, answer(200, '{}'))
 
