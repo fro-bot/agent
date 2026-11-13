@@ -1,7 +1,13 @@
 import * as path from 'node:path'
 import {describe, expect, it} from 'vitest'
 
-import {sanitizeKeyComponent, validateDownloadPath, validateEndpoint, validatePrefix} from './validation.js'
+import {
+  sanitizeKeyComponent,
+  validateDownloadPath,
+  validateEndpoint,
+  validatePrefix,
+  validateUpstreamUrl,
+} from './validation.js'
 
 describe('validateEndpoint', () => {
   it('rejects insecure internal endpoints by default', () => {
@@ -345,5 +351,42 @@ describe('validateDownloadPath', () => {
     const result = validateDownloadPath(storagePath, relativePath)
 
     expect(result.success).toBe(false)
+  })
+})
+
+describe('validateUpstreamUrl', () => {
+  it.each([
+    ['a public https host', 'https://api.anthropic.com/v1'],
+    ['a private address', 'https://10.0.0.5:8443/v1'],
+    ['a loopback address', 'https://127.0.0.1:8443'],
+    ['a localhost name', 'https://localhost/v1'],
+  ])('accepts %s', (_name, value) => {
+    // #given an https upstream
+    // #when it is validated
+    const result = validateUpstreamUrl(value)
+
+    // #then it is accepted, private ranges included
+    expect(result.success).toBe(true)
+  })
+
+  it.each([
+    ['plain http', 'http://api.example.com/v1'],
+    ['userinfo', 'https://user:secret@api.example.com/v1'],
+    ['a password only', 'https://:secret@api.example.com/v1'],
+    ['a query', 'https://api.example.com/v1?key=1'],
+    ['a fragment', 'https://api.example.com/v1#x'],
+    ['the AWS metadata address', 'https://169.254.169.254/latest'],
+    ['the GCP metadata name', 'https://metadata.google.internal/'],
+    ['a non-URL', 'api.example.com'],
+  ])('refuses %s without quoting the value', (_name, value) => {
+    // #given an unsafe upstream
+    // #when it is validated
+    const result = validateUpstreamUrl(value)
+
+    // #then it is refused and the message does not carry the value
+    expect(result.success).toBe(false)
+    const message = result.success ? '' : result.error
+    expect(message).not.toContain('secret')
+    expect(message).not.toContain('example.com')
   })
 })

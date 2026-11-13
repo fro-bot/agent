@@ -109,6 +109,19 @@ export type {ClearHeldClaimsOutcome} from './held-claims-v2.js'
 export {createInactivityTimer} from './inactivity-timer.js'
 export type {InactivityTimer} from './inactivity-timer.js'
 export {
+  buildKeyProxyUpstream,
+  KEY_PROXY_DEFAULT_PROVIDER_IDS,
+  KEY_PROXY_PROTOCOLS,
+  matchKeyProxyRoute,
+} from './key-proxy-routes.js'
+export type {
+  BuildKeyProxyUpstreamOptions,
+  KeyProxyAuthStyle,
+  KeyProxyProtocol,
+  KeyProxyRoute,
+  KeyProxyUpstream,
+} from './key-proxy-routes.js'
+export {
   createV2LedgerReconcileAdapter,
   DEFAULT_V2_LIST_MAX_PAGES,
   DEFAULT_V2_LIST_PAGE_SIZE,
