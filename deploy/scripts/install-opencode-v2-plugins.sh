@@ -7,7 +7,8 @@
 # Why this exists (probe P10, v2.2.0):
 # - `opencode plugin add` has no timeout. A hung registry hangs it forever, so every install runs under `timeout`.
 # - A plugin that is not cached is installed by the server at boot, and a hung boot install leaves `GET /api/agent`
-#   answering 503 for as long as it hangs. The image therefore carries every plugin before it ever starts.
+#   answering 503 for as long as it hangs (from 2.2.7 the plugins are instead unlisted in `GET /api/plugin`). The image
+#   therefore carries every plugin before it ever starts.
 # - `plugin add` writes the global config. The workspace entrypoint owns that file and rewrites it at start, so any
 #   plugin entry in it would be lost. The plugins are listed in the config content the workspace agent passes at
 #   spawn (the server finds them in the cache by spec), and the file `plugin add` wrote is removed here.
