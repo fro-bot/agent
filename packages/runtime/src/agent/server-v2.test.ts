@@ -11,7 +11,7 @@ import {getEventListeners} from 'node:events'
 import process from 'node:process'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 import {createFixture} from './server-v2-test-kit.js'
-import {startOpenCodeV2Server} from './server-v2.js'
+import {DEFAULT_OPENCODE_V2_TIMEOUTS, startOpenCodeV2Server} from './server-v2.js'
 
 const FAST: Partial<OpenCodeV2Timeouts> = {
   listenTimeoutMs: 3000,
@@ -598,6 +598,31 @@ describe('startOpenCodeV2Server', () => {
 
       // #then
       expect(result.success).toBe(true)
+    })
+
+    it('bounds plugin activation by the gate alone for 60 s, because /api/agent no longer waits for plugins (2.2.7)', () => {
+      // #given OpenCode 2.2.7 answers /api/agent 200 before any plugin is listed, so only this gate waits for activation
+      // #when the default bound is read
+      // #then it covers a cold runner's activation, as /api/agent's 120 s retry did on 2.2.6
+      expect(DEFAULT_OPENCODE_V2_TIMEOUTS.pluginGateTimeoutMs).toBe(60_000)
+    })
+
+    it('waits for plugins that are listed only after /api/agent already answered 200 (2.2.7)', async () => {
+      // #given /api/agent is ready at once and both plugins are listed 300 ms later
+      const created = fixture({
+        plugins: [
+          {id: 'systematic', status: 'active', appearAfterMs: 300},
+          {id: 'fro-bot', status: 'active', appearAfterMs: 300},
+        ],
+      })
+
+      // #when
+      const result = await start(created, {expectedPluginIds: ['systematic', 'fro-bot']})
+
+      // #then the gate polled through the empty list instead of failing on it
+      expect(result.success).toBe(true)
+      const log = created.readLog()
+      expect(log.filter(line => line.startsWith('req GET /api/plugin')).length).toBeGreaterThan(1)
     })
 
     it('treats an id-less failed entry as a non-match: the expected id is absent', async () => {

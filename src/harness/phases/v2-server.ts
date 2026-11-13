@@ -149,8 +149,9 @@ export interface StartActionOpenCodeV2Deps {
 const GATE_REQUEST_TIMEOUT_MS = 5_000
 
 /**
- * `GET /api/agent` waits for plugin activation, and the server gives up on that wait after 5 s with a 503. A client
- * attempt bound above that lets the server's own 503 arrive first; a gate that failed on a slow activation (measured
+ * Up to OpenCode 2.2.6, `GET /api/agent` waits for plugin activation, and the server gives up on that wait after 5 s
+ * with a 503 (2.2.7 and later answer at once; the plugin gate in `startOpenCodeV2Server` covers activation there). A
+ * client attempt bound above that lets the server's own 503 arrive first; a gate that failed on a slow activation (measured
  * 4.0-4.2 s on a healthy run) then retries instead of failing the run. The deadline bounds every attempt and backoff:
  * the gate has no other outer timeout (the spawn's readiness waits end before it), only the caller's `signal`.
  */

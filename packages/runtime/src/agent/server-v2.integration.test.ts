@@ -272,13 +272,21 @@ describe.skipIf(!hasBinary)('startOpenCodeV2Server against the real stock binary
     const first = await boot(box)
     expect(first.success).toBe(true)
     if (!first.success) return
-    const listing = (await json(first.data, '/api/plugin')) as {data: {id?: string; state: {status: string}}[]}
-    const builtin = listing.data.find(entry => entry.id !== undefined && entry.state.status === 'active')?.id
+    // (from 2.2.7 the list is empty until activation lands, so poll for it rather than reading once)
+    let builtin: string | undefined
+    for (let attempt = 0; attempt < 100 && builtin === undefined; attempt++) {
+      const listing = (await json(first.data, '/api/plugin')) as {data: {id?: string; state: {status: string}}[]}
+      builtin = listing.data.find(entry => entry.id !== undefined && entry.state.status === 'active')?.id
+      if (builtin === undefined) await new Promise(resolve => setTimeout(resolve, 100))
+    }
     expect(builtin).toBeDefined()
     await first.data.shutdown()
 
     // #when started again expecting that id
-    const present = await boot(box, {expectedPluginIds: [builtin as string]})
+    const present = await boot(box, {
+      expectedPluginIds: [builtin as string],
+      timeouts: {...TIMEOUTS, pluginGateTimeoutMs: 30_000},
+    })
 
     // #then it passes
     expect(present.success).toBe(true)

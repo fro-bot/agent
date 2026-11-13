@@ -461,8 +461,9 @@ describe.skipIf(!hasBinary)('the workspace V2 runner against the real stock bina
         expect(lines).not.toContain('error opencode-server-v2: permission gate failed')
 
         // #and both plugins are listed active under the ids the workspace expects
-        // (plugins activate per location, so a location the gates did not ask about answers /api/agent 503 until its
-        // own activation finishes; the supervisor's location is box.reposRoot)
+        // (plugins activate per location, so up to 2.2.6 a location the gates did not ask about answers /api/agent 503
+        // until its own activation finishes, and from 2.2.7 lists no plugins until then; the supervisor's location is
+        // box.reposRoot)
         // (read straight from the loopback server: /api/plugin is not a route the gateway calls, so the proxy refuses it)
         const listPlugins = async (): Promise<string[]> => {
           const response = await fetch(`${workspace.upstreamUrl}/api/plugin`, {
