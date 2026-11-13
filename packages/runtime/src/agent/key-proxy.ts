@@ -370,7 +370,7 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
       copyHeaders(res, upstreamRes.headers, GENERIC_ERROR_RESPONSE_HEADERS)
       res.setHeader('content-type', 'application/json')
       res.setHeader('content-length', String(Buffer.byteLength(GENERIC_UPSTREAM_ERROR)))
-      res.writeHead(status)
+      res.statusCode = status
       res.end(GENERIC_UPSTREAM_ERROR)
     }
 
@@ -405,7 +405,7 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
       for (const secret of provider.secrets) body = replaceAll(body, secret, Buffer.from(REDACTED))
       copyHeaders(res, upstreamRes.headers, ERROR_RESPONSE_HEADERS)
       res.setHeader('content-length', String(body.length))
-      res.writeHead(status)
+      res.statusCode = status
       res.end(body)
     })
   }
@@ -507,7 +507,7 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
         return
       }
       copyHeaders(res, upstreamRes.headers, SUCCESS_RESPONSE_HEADERS)
-      res.writeHead(status)
+      res.statusCode = status
       pipeline(upstreamRes, res)
         .catch(() => {
           // The upstream died or the client left. The head is out, so the only honest ending is an aborted stream.
