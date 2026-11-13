@@ -1,4 +1,5 @@
 import type {OpenCodeV2ServerHandle, OpenCodeV2ShutdownResult} from '@fro-bot/runtime'
+import type {KeyProxyProcess} from './key-proxy-process.js'
 import type {SandboxLifecycle} from './sandbox-lifecycle.js'
 import type {StartActionOpenCodeV2Deps, StartActionOpenCodeV2Options} from './v2-server.js'
 import * as fs from 'node:fs'
@@ -204,6 +205,68 @@ describe('startActionOpenCodeV2', () => {
     ])
     // the config JSON holds the reference, never the key
     expect(JSON.stringify(startArgs?.config)).not.toContain(CANARY)
+  })
+
+  it('produces the config and credential files it always did, and starts no proxy, when isolation is off', async () => {
+    // #given two API keys and an operator config that sets a base URL, a timeout and a key reference
+    const server = fakeServer()
+    const startKeyProxy = vi.fn()
+    const deps = recordingDeps(server, {startKeyProxy})
+    const opencodeConfig = JSON.stringify({
+      provider: {
+        anthropic: {options: {baseURL: 'https://gw.example/v1', timeout: 600_000}},
+        openai: {options: {apiKey: '{env:OPENAI_API_KEY}'}},
+      },
+    })
+
+    // #when started without a sandbox
+    const result = await startActionOpenCodeV2(
+      options({
+        deps,
+        opencodeConfig,
+        authJson: JSON.stringify({anthropic: {type: 'api', key: CANARY}, openai: {type: 'api', key: `${CANARY}-oai`}}),
+      }),
+    )
+
+    // #then the spawn options carry exactly the keys they always did
+    expect(result.success).toBe(true)
+    const startArgs = vi.mocked(deps.startServer as StartServer).mock.calls[0]?.[0]
+    expect(Object.keys(startArgs ?? {}).sort()).toEqual([
+      'binaryPath',
+      'config',
+      'directory',
+      'env',
+      'expectedPluginIds',
+    ])
+
+    // #then each provider keeps its operator settings and gains only a {file:} key reference; no baseURL is rewritten
+    const content = startArgs?.config as Record<string, unknown>
+    const credentialsDir = fs.readdirSync(runnerTemp).find(name => name.startsWith('fro-bot-credentials-')) ?? ''
+    const reference = (name: string): string => `{file:${path.join(runnerTemp, credentialsDir, `${name}.key`)}}`
+    expect(content.provider).toEqual({
+      anthropic: {options: {baseURL: 'https://gw.example/v1', timeout: 600_000, apiKey: reference('anthropic')}},
+      openai: {options: {apiKey: reference('openai')}},
+    })
+    expect(content).not.toHaveProperty('providers')
+    expect(content.plugins).toEqual([...PLUGIN_SPECS])
+    expect(Object.keys(content).sort()).toEqual(
+      ['default_agent', 'experimental', 'permissions', 'plugins', 'provider', 'update'].sort(),
+    )
+    expect(content.update).toBe('disable')
+    expect(content.default_agent).toBe('build')
+    expect(content.experimental).toEqual({subagent_depth: 1})
+
+    // #then the credential directory holds exactly the two 0600 key files, in a 0700 directory under RUNNER_TEMP
+    const directory = path.join(runnerTemp, credentialsDir)
+    expect(fs.readdirSync(runnerTemp).filter(name => name.startsWith('fro-bot-credentials-'))).toHaveLength(1)
+    expect(fs.statSync(directory).mode & 0o777).toBe(0o700)
+    expect(fs.readdirSync(directory).sort()).toEqual(['anthropic.key', 'openai.key'])
+    expect(fs.readFileSync(path.join(directory, 'anthropic.key'), 'utf8')).toBe(CANARY)
+    expect(fs.readFileSync(path.join(directory, 'openai.key'), 'utf8')).toBe(`${CANARY}-oai`)
+    expect(fs.statSync(path.join(directory, 'anthropic.key')).mode & 0o777).toBe(0o600)
+
+    // #then no proxy was involved
+    expect(startKeyProxy).not.toHaveBeenCalled()
   })
 
   it('installs the plugins under the bound before the spawn when a matching binary meets an empty plugin cache', async () => {
@@ -1196,16 +1259,36 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
   interface LaunchLog {
     readonly reports: {readonly value: unknown; readonly unconfirmed: boolean}[]
     readonly signals: AbortSignal[]
+    readonly proxyReports: {readonly proxy: unknown; readonly unconfirmed: boolean}[]
+  }
+
+  const PROXY_PLACEHOLDER = 'placeholder-fake-0123456789abcdefghijklmnopqrstuv'
+
+  function fakeKeyProxy() {
+    const died = new AbortController()
+    const stop = vi.fn(async () => ({outcome: 'stopped' as const, crashed: false}))
+    const proxy: KeyProxyProcess = {
+      pid: 7,
+      port: 43_111,
+      placeholder: PROXY_PLACEHOLDER,
+      baseUrl: providerId => `http://127.0.0.1:43111/${providerId}`,
+      died: died.signal,
+      crashed: () => false,
+      stop,
+    }
+    return {proxy, died, stop}
   }
 
   function fakeSandbox(
     prepare?: SandboxLifecycle['prepare'],
     refuseLaunch?: string,
+    refuseProxy?: string,
   ): {
     readonly sandbox: SandboxLifecycle
     readonly prepare: ReturnType<typeof vi.fn>
     readonly release: ReturnType<typeof vi.fn>
     readonly launch: ReturnType<typeof vi.fn>
+    readonly startKeyProxy: ReturnType<typeof vi.fn>
     readonly log: LaunchLog
     readonly abort: () => void
   } {
@@ -1221,7 +1304,14 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
       return {stop: 'stopped' as const, restore: 'restored' as const}
     })
     const controller = new AbortController()
-    const log: LaunchLog = {reports: [], signals: []}
+    const log: LaunchLog = {reports: [], signals: [], proxyReports: []}
+    const startKeyProxy = vi.fn(async (start: Parameters<SandboxLifecycle['startKeyProxy']>[0]) => {
+      if (refuseProxy !== undefined) return err(refuseProxy)
+      order.push('proxy-start')
+      const report = await start({signal: controller.signal})
+      log.proxyReports.push(report)
+      return ok(report.proxy)
+    })
     const launch = vi.fn(async (spawn: Parameters<SandboxLifecycle['launch']>[0]) => {
       if (refuseLaunch !== undefined) return err(refuseLaunch)
       log.signals.push(controller.signal)
@@ -1230,10 +1320,11 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
       return ok(report.value)
     })
     return {
-      sandbox: {prepare: prepareMock, release, launch} as unknown as SandboxLifecycle,
+      sandbox: {prepare: prepareMock, release, launch, startKeyProxy} as unknown as SandboxLifecycle,
       prepare: prepareMock,
       release,
       launch,
+      startKeyProxy,
       log,
       abort: () => controller.abort(),
     }
@@ -1263,8 +1354,12 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
     })
   }
 
+  let keyProxy: ReturnType<typeof fakeKeyProxy>
+
   function depsFor(server: FakeServer, overrides: Partial<StartActionOpenCodeV2Deps> = {}) {
+    keyProxy = fakeKeyProxy()
     return {
+      startKeyProxy: vi.fn<StartActionOpenCodeV2Deps['startKeyProxy']>(async () => ok(keyProxy.proxy)),
       startServer: vi.fn<StartServer>(async spawnOptions => {
         order.push('spawn')
         server.loadConfig(spawnOptions.config)
@@ -1290,12 +1385,11 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
     // #when started
     const result = await run(sandbox.sandbox, deps)
 
-    // #then the runner's last database write precedes the handoff, which precedes the spawn
+    // #then the proxy starts first, the runner's last database write precedes the handoff, and the handoff precedes the spawn
     expect(result.success).toBe(true)
-    expect(order).toEqual(['clear-claims', 'prepare', 'spawn'])
+    expect(order).toEqual(['proxy-start', 'clear-claims', 'prepare', 'spawn'])
     const prepared = sandbox.prepare.mock.calls[0]?.[0] as {keyFilePaths: string[]; ghConfigDir: null; repoSkills: null}
-    expect(prepared.keyFilePaths).toHaveLength(1)
-    expect(prepared.keyFilePaths[0]).toMatch(/anthropic\.key$/)
+    expect(prepared.keyFilePaths).toEqual([])
     expect(vi.mocked(deps.startServer).mock.calls[0]?.[0].sandbox).toEqual(LAUNCH)
     expect(sandbox.release).not.toHaveBeenCalled()
   })
@@ -1451,6 +1545,306 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
     expect(sandbox.release).toHaveBeenCalledTimes(1)
   })
 
+  describe('the key proxy', () => {
+    const OPENAI_CANARY = 'sk-oai-CANARY-v2-server-5678'
+
+    it('configures each provider with the loopback URL and the placeholder, writes no key file and hands none over', async () => {
+      // #given two keys and an operator config that sets a real upstream and a timeout
+      const server = fakeServer()
+      const deps = depsFor(server)
+      const sandbox = fakeSandbox()
+      const logger = createMockLogger()
+
+      // #when an isolated run starts
+      const result = await startActionOpenCodeV2({
+        binaryPath: '/opt/opencode',
+        workspacePath: '/workspace',
+        authJson: JSON.stringify({anthropic: {type: 'api', key: CANARY}, openai: {type: 'api', key: OPENAI_CANARY}}),
+        opencodeConfig: JSON.stringify({
+          provider: {anthropic: {options: {baseURL: 'https://gw.example/v1', timeout: 600_000}}},
+        }),
+        credential: 'provision',
+        systematicVersion: 'latest',
+        model: 'anthropic/claude-sonnet',
+        dbPath,
+        authPath,
+        env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
+        runId: 42,
+        runAttempt: 1,
+        logger,
+        sandbox: sandbox.sandbox,
+        deps,
+      })
+
+      // #then the server config points at the proxy with the placeholder and holds no key reference
+      expect(result.success).toBe(true)
+      const content = vi.mocked(deps.startServer).mock.calls[0]?.[0].config as Record<string, unknown>
+      expect(content.provider).toEqual({
+        anthropic: {
+          options: {
+            baseURL: 'http://127.0.0.1:43111/anthropic',
+            timeout: 600_000,
+            apiKey: PROXY_PLACEHOLDER,
+          },
+        },
+        openai: {options: {baseURL: 'http://127.0.0.1:43111/openai', apiKey: PROXY_PLACEHOLDER}},
+      })
+      const serialized = JSON.stringify(content)
+      expect(serialized).not.toContain('{file:')
+      expect(serialized).not.toContain(CANARY)
+      expect(serialized).not.toContain(OPENAI_CANARY)
+      expect(serialized).not.toContain('gw.example')
+
+      // #then no credential file or directory exists, and nothing is handed over
+      expect(fs.readdirSync(runnerTemp).filter(name => name.startsWith('fro-bot-credentials-'))).toEqual([])
+      expect((sandbox.prepare.mock.calls[0]?.[0] as {keyFilePaths: string[]}).keyFilePaths).toEqual([])
+
+      // #then the real keys went only to the proxy starter, and no log line holds a key
+      const starterOptions = vi.mocked(deps.startKeyProxy).mock.calls[0]?.[0]
+      expect(starterOptions?.providers).toEqual([
+        {providerId: 'anthropic', key: CANARY, baseUrl: 'https://gw.example/v1', protocols: ['anthropic-messages']},
+        {
+          providerId: 'openai',
+          key: OPENAI_CANARY,
+          baseUrl: null,
+          protocols: ['openai-responses', 'openai-chat'],
+        },
+      ])
+      expect(serializeLoggerCalls(logger)).not.toContain(CANARY)
+      expect(serializeLoggerCalls(logger)).not.toContain(OPENAI_CANARY)
+    })
+
+    it('masks the placeholder in the Action log', async () => {
+      const server = fakeServer()
+      const deps = depsFor(server)
+      const masked: string[] = []
+      const sandbox = fakeSandbox()
+
+      await startActionOpenCodeV2({
+        binaryPath: '/opt/opencode',
+        workspacePath: '/workspace',
+        authJson: JSON.stringify({anthropic: {type: 'api', key: CANARY}}),
+        opencodeConfig: null,
+        credential: 'provision',
+        systematicVersion: 'latest',
+        model: 'anthropic/claude-sonnet',
+        dbPath,
+        authPath,
+        env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
+        runId: 42,
+        runAttempt: 1,
+        logger: createMockLogger(),
+        sandbox: sandbox.sandbox,
+        maskSecret: value => masked.push(value),
+        deps,
+      })
+
+      expect(masked).toContain(PROXY_PLACEHOLDER)
+    })
+
+    it('fails at the key-proxy stage without spawning a server or preparing an account, and releases', async () => {
+      // #given a proxy that cannot start
+      const server = fakeServer()
+      const deps = depsFor(server, {
+        startKeyProxy: vi.fn<StartActionOpenCodeV2Deps['startKeyProxy']>(async () =>
+          err({kind: 'ready-timeout', message: 'The key proxy did not become ready in time'}),
+        ),
+      })
+      const sandbox = fakeSandbox()
+
+      // #when
+      const result = await run(sandbox.sandbox, deps)
+
+      // #then the stage and the reason surface, no server or account exists, and the lifecycle was released
+      const error = unwrapErr(result)
+      expect(error.stage).toBe('key-proxy')
+      expect(error.message).toContain('did not become ready')
+      expect(deps.startServer).not.toHaveBeenCalled()
+      expect(sandbox.prepare).not.toHaveBeenCalled()
+      expect(sandbox.release).toHaveBeenCalledTimes(1)
+    })
+
+    it('tells the lifecycle when a failed proxy start could not confirm its child is gone', async () => {
+      const server = fakeServer()
+      const deps = depsFor(server, {
+        startKeyProxy: vi.fn<StartActionOpenCodeV2Deps['startKeyProxy']>(async () =>
+          err({kind: 'ready-timeout', message: 'late', cleanup: 'unconfirmed'}),
+        ),
+      })
+      const sandbox = fakeSandbox()
+
+      await run(sandbox.sandbox, deps)
+
+      expect(sandbox.log.proxyReports).toEqual([{proxy: null, unconfirmed: true}])
+    })
+
+    it('fails at the key-proxy stage when the lifecycle refuses the proxy, and releases', async () => {
+      const server = fakeServer()
+      const deps = depsFor(server)
+      const sandbox = fakeSandbox(undefined, undefined, 'the teardown has begun')
+
+      const result = await run(sandbox.sandbox, deps)
+
+      expect(unwrapErr(result).stage).toBe('key-proxy')
+      expect(deps.startKeyProxy).not.toHaveBeenCalled()
+      expect(sandbox.release).toHaveBeenCalledTimes(1)
+    })
+
+    it('releases, which stops the proxy, when the server launch fails after the proxy is up', async () => {
+      // #given a spawn that fails
+      const server = fakeServer()
+      const deps = depsFor(server, {
+        startServer: vi.fn<StartServer>(async () => ({
+          success: false,
+          error: {kind: 'exited-early', message: 'exited', cleanup: 'forced'},
+        })),
+      })
+      const sandbox = fakeSandbox()
+
+      // #when
+      const result = await run(sandbox.sandbox, deps)
+
+      // #then the lifecycle (which owns the proxy) was released
+      expect(result.success).toBe(false)
+      expect(sandbox.release).toHaveBeenCalledTimes(1)
+      expect(order).toEqual(['proxy-start', 'clear-claims', 'prepare', 'release'])
+    })
+
+    it('releases the lifecycle when the config builder rejects its inputs after the proxy is up', async () => {
+      // #given a proxy that starts and a RUNNER_TEMP the config builder refuses
+      const server = fakeServer()
+      const deps = depsFor(server)
+      const sandbox = fakeSandbox()
+
+      // #when
+      const result = await run(sandbox.sandbox, deps, {
+        RUNNER_TEMP: 'relative/runner-temp',
+        PATH: '/usr/bin',
+        XDG_CACHE_HOME: cacheHome,
+      })
+
+      // #then it failed at the config stage and the lifecycle (which owns the proxy) was released
+      expect(unwrapErr(result).stage).toBe('config')
+      expect(sandbox.release).toHaveBeenCalledTimes(1)
+      expect(deps.startServer).not.toHaveBeenCalled()
+    })
+
+    it('releases the lifecycle when clearing held claims fails, after the proxy is up', async () => {
+      const server = fakeServer()
+      const deps = depsFor(server, {
+        clearClaims: vi.fn<typeof clearHeldClaims>(async () => err(new Error('locked'))),
+      })
+      const sandbox = fakeSandbox()
+
+      const result = await run(sandbox.sandbox, deps)
+
+      expect(unwrapErr(result).stage).toBe('held-claims')
+      expect(sandbox.release).toHaveBeenCalledTimes(1)
+      expect(deps.startServer).not.toHaveBeenCalled()
+    })
+
+    it('releases the lifecycle and rethrows when something throws between the proxy start and the spawn', async () => {
+      const server = fakeServer()
+      const deps = depsFor(server, {
+        clearClaims: vi.fn<typeof clearHeldClaims>(async () => Promise.reject(new Error('disk gone'))),
+      })
+      const sandbox = fakeSandbox()
+
+      await expect(run(sandbox.sandbox, deps)).rejects.toThrow('disk gone')
+
+      expect(sandbox.release).toHaveBeenCalledTimes(1)
+    })
+
+    it('releases the lifecycle when the sandbox setup fails after the proxy is up', async () => {
+      const server = fakeServer()
+      const deps = depsFor(server)
+      const sandbox = fakeSandbox(async () => err('Sandbox handoff failed: checkout ACL failed'))
+
+      const result = await run(sandbox.sandbox, deps)
+
+      expect(unwrapErr(result).stage).toBe('sandbox')
+      expect(sandbox.release).toHaveBeenCalledTimes(1)
+    })
+
+    it('aborts the server and the gates when the proxy dies', async () => {
+      // #given a running isolated start
+      const server = fakeServer()
+      const deps = depsFor(server)
+      const sandbox = fakeSandbox()
+      await run(sandbox.sandbox, deps)
+      const spawnSignal = vi.mocked(deps.startServer).mock.calls[0]?.[0].signal
+      expect(spawnSignal?.aborted).toBe(false)
+
+      // #when the proxy exits on its own
+      keyProxy.died.abort(new Error('exited'))
+
+      // #then the server's lifetime signal is aborted
+      expect(spawnSignal?.aborted).toBe(true)
+    })
+
+    it('refuses a config that would bypass the proxy before starting anything, naming the fix', async () => {
+      // #given an operator provider that sets `endpoint`
+      const server = fakeServer()
+      const deps = depsFor(server)
+      const sandbox = fakeSandbox()
+
+      // #when
+      const result = await startActionOpenCodeV2({
+        binaryPath: '/opt/opencode',
+        workspacePath: '/workspace',
+        authJson: JSON.stringify({anthropic: {type: 'api', key: CANARY}}),
+        opencodeConfig: JSON.stringify({provider: {anthropic: {options: {endpoint: 'https://x.example'}}}}),
+        credential: 'provision',
+        systematicVersion: 'latest',
+        model: 'anthropic/claude-sonnet',
+        dbPath,
+        authPath,
+        env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
+        runId: 42,
+        runAttempt: 1,
+        logger: createMockLogger(),
+        sandbox: sandbox.sandbox,
+        deps,
+      })
+
+      // #then nothing was started and the message names the provider and the fix
+      const error = unwrapErr(result)
+      expect(error.stage).toBe('config')
+      expect(error.message).toContain('anthropic')
+      expect(error.message).toContain('Fix:')
+      expect(deps.startKeyProxy).not.toHaveBeenCalled()
+      expect(sandbox.prepare).not.toHaveBeenCalled()
+    })
+
+    it('starts no proxy when there are no API keys', async () => {
+      const server = fakeServer()
+      const deps = depsFor(server)
+      const sandbox = fakeSandbox()
+
+      const result = await startActionOpenCodeV2({
+        binaryPath: '/opt/opencode',
+        workspacePath: '/workspace',
+        authJson: '{}',
+        opencodeConfig: null,
+        credential: 'provision',
+        systematicVersion: 'latest',
+        model: null,
+        dbPath,
+        authPath,
+        env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
+        runId: 42,
+        runAttempt: 1,
+        logger: createMockLogger(),
+        sandbox: sandbox.sandbox,
+        deps,
+      })
+
+      expect(result.success).toBe(true)
+      expect(deps.startKeyProxy).not.toHaveBeenCalled()
+      expect(sandbox.startKeyProxy).not.toHaveBeenCalled()
+    })
+  })
+
   describe('the sandbox launch', () => {
     it('spawns through the lifecycle, handing the server the launch spec and the lifecycle abort signal', async () => {
       // #given a prepared sandbox
@@ -1466,7 +1860,9 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
       expect(sandbox.launch).toHaveBeenCalledTimes(1)
       const startOptions = vi.mocked(deps.startServer).mock.calls[0]?.[0]
       expect(startOptions?.sandbox).toBe(LAUNCH)
-      expect(startOptions?.signal).toBe(sandbox.log.signals[0])
+      expect(startOptions?.signal?.aborted).toBe(false)
+      sandbox.abort()
+      expect(startOptions?.signal?.aborted).toBe(true)
       expect(sandbox.log.reports.map(report => report.unconfirmed)).toEqual([false])
     })
 

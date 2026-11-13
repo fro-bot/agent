@@ -886,6 +886,84 @@ describe('run with isolate-agent', () => {
     expect(vi.mocked(core.setFailed)).toHaveBeenCalledWith(expect.stringContaining(outcome.reason))
   })
 
+  it('fails the run, with no response read and no save, when the key proxy exited on its own', async () => {
+    // #given a sandbox that restored cleanly but whose key proxy died before the teardown asked it to stop
+    const core = await import('@actions/core')
+    const {runFinalizeWithResult} = await import('./phases/finalize.js')
+    const {runCleanup} = await import('./phases/cleanup.js')
+    await arrangeIsolated({stop: 'stopped', restore: 'restored', proxy: 'crashed'})
+
+    // #when
+    const exitCode = await run()
+
+    // #then the run fails before anything is published, and persistence is declined; the sandbox output stays trusted
+    expect(exitCode).toBe(1)
+    expect(vi.mocked(runFinalizeWithResult)).not.toHaveBeenCalled()
+    expect(vi.mocked(runCleanup).mock.calls[0]?.[0]).toMatchObject({
+      skipSessionPersistence: true,
+      sandboxOutputUntrusted: false,
+    })
+    expect(
+      String(
+        (vi.mocked(runCleanup).mock.calls[0]?.[0] as {persistenceDeclineReason?: string}).persistenceDeclineReason,
+      ),
+    ).toContain('key proxy')
+    expect(vi.mocked(core.saveState)).toHaveBeenCalledWith('should-save-cache', 'false')
+    expect(vi.mocked(core.setFailed)).toHaveBeenCalledWith(expect.stringContaining('key proxy'))
+  })
+
+  it('treats a key proxy whose exit was not confirmed like an unsafe sandbox: nothing is read or saved', async () => {
+    // #given a release that reports the proxy unconfirmed (which makes the restore unsafe)
+    const {runFinalizeWithResult} = await import('./phases/finalize.js')
+    const {runCleanup} = await import('./phases/cleanup.js')
+    await arrangeIsolated({
+      stop: 'stopped',
+      restore: 'unsafe',
+      reason: 'the key proxy exit could not be confirmed, so the run cannot be trusted',
+      proxy: 'unconfirmed',
+    })
+
+    // #when
+    const exitCode = await run()
+
+    // #then
+    expect(exitCode).toBe(1)
+    expect(vi.mocked(runFinalizeWithResult)).not.toHaveBeenCalled()
+    expect(vi.mocked(runCleanup).mock.calls[0]?.[0]).toMatchObject({
+      skipSessionPersistence: true,
+      sandboxOutputUntrusted: true,
+    })
+  })
+
+  it('stops the key proxy (inside the sandbox release) before cleanup saves anything', async () => {
+    // #given a clean isolated run that owned a proxy
+    const {runCleanup} = await import('./phases/cleanup.js')
+    const {release} = await arrangeIsolated({stop: 'stopped', restore: 'restored', proxy: 'stopped'})
+
+    // #when
+    const exitCode = await run()
+
+    // #then the release (which stops the proxy last) ran before cleanup, and persistence was not declined
+    expect(exitCode).toBe(0)
+    expect(release.mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(runCleanup).mock.invocationCallOrder[0] ?? 0)
+    expect(vi.mocked(runCleanup).mock.calls[0]?.[0]).toMatchObject({skipSessionPersistence: false})
+  })
+
+  it('declines persistence when the exception path finds the key proxy died', async () => {
+    // #given an exception mid-execution and a proxy that had already died
+    const {runCleanup} = await import('./phases/cleanup.js')
+    await arrangeIsolated({stop: 'stopped', restore: 'restored', proxy: 'crashed'}, {executeError: new Error('boom')})
+
+    // #when
+    await run()
+
+    // #then
+    expect(vi.mocked(runCleanup).mock.calls[0]?.[0]).toMatchObject({
+      skipSessionPersistence: true,
+      sandboxOutputUntrusted: false,
+    })
+  })
+
   describe('a start that fails after the sandbox was prepared', () => {
     it('reads and publishes no sandbox-writable log when the release after the failed start was unsafe', async () => {
       // #given the V2 start failed after the sandbox was prepared, and its release was not confirmed restored

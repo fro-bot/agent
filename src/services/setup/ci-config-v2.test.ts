@@ -1029,3 +1029,92 @@ describe('buildCIConfigV2', () => {
     })
   })
 })
+
+function providerOf(content: Readonly<Record<string, unknown>>): Record<string, {options: Record<string, unknown>}> {
+  return content.provider as Record<string, {options: Record<string, unknown>}>
+}
+
+describe('buildCIConfigV2 proxied providers (isolate-agent key proxy)', () => {
+  const PLACEHOLDER = 'placeholder-0123456789abcdefghijklmnopqrstuvwxyz'
+  const PROXIED = {
+    anthropic: {baseURL: 'http://127.0.0.1:43111/anthropic', apiKey: PLACEHOLDER},
+    openai: {baseURL: 'http://127.0.0.1:43111/openai', apiKey: PLACEHOLDER},
+  } as const
+
+  it('gives each proxied provider the loopback base URL and the placeholder, and no key file reference', () => {
+    // #given two proxied providers
+    // #when the config is built
+    const {content} = build({proxiedProviders: PROXIED})
+
+    // #then each carries only the loopback URL and the placeholder
+    expect(providerOf(content)).toEqual({
+      anthropic: {options: PROXIED.anthropic},
+      openai: {options: PROXIED.openai},
+    })
+    expect(JSON.stringify(content)).not.toContain('{file:')
+  })
+
+  it('keeps the operator settings that do not bypass the proxy and replaces their base URL and key', () => {
+    // #given an operator provider with a timeout, a base URL and a key reference
+    const opencodeConfig = JSON.stringify({
+      provider: {
+        anthropic: {
+          npm: '@ai-sdk/anthropic',
+          options: {timeout: 600_000, baseURL: 'https://gw.example/v1', apiKey: '{env:ANTHROPIC_API_KEY}'},
+        },
+      },
+    })
+
+    // #when built with that provider proxied
+    const {content} = build({opencodeConfig, proxiedProviders: {anthropic: PROXIED.anthropic}})
+
+    // #then the timeout and package stay; the URL and key are the proxy's
+    expect(providerOf(content).anthropic).toEqual({
+      npm: '@ai-sdk/anthropic',
+      options: {timeout: 600_000, baseURL: PROXIED.anthropic.baseURL, apiKey: PLACEHOLDER},
+    })
+  })
+
+  it('rewrites the V2 providers.<id>.settings spelling too, so no spelling keeps the real upstream', () => {
+    // #given an operator config in the V2 shape, plus a provider-level `api` URL
+    const opencodeConfig = JSON.stringify({
+      providers: {openai: {settings: {baseURL: 'https://gw.example/v1', apiKey: 'x', retries: 2}}},
+      provider: {openai: {api: 'https://gw.example/v1'}},
+    })
+
+    // #when built
+    const {content} = build({opencodeConfig, proxiedProviders: {openai: PROXIED.openai}})
+
+    // #then every spelling points at the proxy
+    const v2 = content.providers as Record<string, {settings: Record<string, unknown>}>
+    expect(v2.openai?.settings).toEqual({baseURL: PROXIED.openai.baseURL, apiKey: PLACEHOLDER, retries: 2})
+    expect(providerOf(content).openai).toEqual({options: PROXIED.openai})
+    expect(JSON.stringify(content)).not.toContain('gw.example')
+  })
+
+  it('refuses to combine key files with proxied providers', () => {
+    const result = buildCIConfigV2(
+      {...BASE_INPUTS, proxiedProviders: PROXIED, providerKeyFiles: {anthropic: '/tmp/keys/anthropic.key'}},
+      createMockLogger(),
+    )
+    expect(unwrapErr(result)).toMatch(/key files and proxied providers/)
+  })
+
+  it.each([
+    ['a remote URL', 'https://gw.example/anthropic'],
+    ['a non-loopback host', 'http://10.0.0.5:4000/anthropic'],
+    ['another provider prefix', 'http://127.0.0.1:43111/openai'],
+    ['no port', 'http://127.0.0.1/anthropic'],
+    ['a trailing path', 'http://127.0.0.1:43111/anthropic/v1'],
+  ])('refuses a proxied base URL that is %s', (_name, baseURL) => {
+    const result = buildCIConfigV2(
+      {...BASE_INPUTS, proxiedProviders: {anthropic: {baseURL, apiKey: PLACEHOLDER}}},
+      createMockLogger(),
+    )
+    expect(unwrapErr(result)).toMatch(/anthropic/)
+  })
+
+  it('leaves the config as it was when nothing is proxied', () => {
+    expect(build({proxiedProviders: {}}).content).toEqual(build().content)
+  })
+})
