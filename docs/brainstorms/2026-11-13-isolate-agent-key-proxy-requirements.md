@@ -32,11 +32,11 @@ The key is a cliproxy key. One key authenticates every cliproxy route, with no p
 - R6. The proxy discards every client-supplied credential header and hop-by-hop header, then sets its own credential. It accepts origin-form requests only, never follows a redirect, and never logs request or response headers.
 - R7. The proxy refuses to start unless every upstream is HTTPS. The upstream map is fixed at start and nothing a request carries can change it.
 - R8. The proxy runs as its own process holding only the keys and the upstream map, not the Action's environment. It receives the keys over a channel the sandbox user cannot read, and never through argv.
-- R9. The proxy binds an ephemeral loopback port, serves only requests that carry the run's placeholder, lives for the run only, and stops before session state is saved.
+- R9. The proxy serves on an ephemeral loopback port for the run only, and stops before session state is saved. It does not authenticate local callers: it ignores any credential the caller sends and always uses the configured key.
 - R10. A malformed or oversized request gets an error, and the proxy keeps serving. If the proxy cannot start or stops serving, the run fails closed and never falls back to handing the sandbox the real key.
 
 **Start-up check**
-- R11. At start, a bounded probe of the selected provider's model-list route goes through the proxy. A 401 or 403 fails the run before the model starts. Any other non-2xx, a rate limit, or no answer within the bound logs a warning that names the case, and the run continues. A 2xx means only that the upstream did not reject the key. If an upstream's model list needs no auth, the probe proves only that the upstream is reachable.
+- R11. At start, a bounded probe of the selected provider's model-list route goes through the proxy. A 401 fails the run before the model starts. A 403 can be a scope or project limit on the models route, so it logs a warning (`forbidden`) and the run continues, like any other non-2xx, a rate limit, or no answer within the bound logs a warning that names the case, and the run continues. A 2xx means only that the upstream did not reject the key. If an upstream's model list needs no auth, the probe proves only that the upstream is reachable.
 
 **Errors and docs**
 - R12. Every isolation preflight refusal names its fix in the error, for example `persist-credentials: false`, a published `fro-bot/agent@<ref>`, a GitHub-hosted Linux runner, or `isolate-agent: false`.
@@ -52,7 +52,7 @@ The key is a cliproxy key. One key authenticates every cliproxy route, with no p
 ## Acceptance Examples
 
 - AE1. **Covers R1, R3.** In an isolated run, a prompt-injected model runs `cat` on every file it can reach, reads `/proc/*/environ`, queries the server's config and provider routes, and uses the `read` tool on the credential paths. None of that output contains the provider key, and the model's normal requests still get streamed answers.
-- AE2. **Covers R5.** In an isolated run, the model sends the proxy a request with the placeholder, the correct provider host and a path outside the allowlist (a cliproxy management route, say). The proxy answers locally, and no request carrying the key goes upstream.
+- AE2. **Covers R5.** In an isolated run, the model sends the proxy a request with any credential, the correct provider host and a path outside the allowlist (a cliproxy management route, say). The proxy answers locally, and no request carrying the key goes upstream.
 - AE3. **Covers R6.** In an isolated run, the model sends a request through the proxy with its own `x-api-key` or `Authorization` header, or an upstream answers with a 3xx. The proxy forwards only its own credential and does not follow the redirect.
 - AE4. **Covers R10.** In an isolated run, the model sends the proxy a malformed or oversized request. It gets an error, and later model requests still work. If the proxy process dies, the next model request fails and the run fails.
 - AE5. **Covers R11.** In an isolated run where the upstream rejects the key with a 401, the run fails at start with a credential error before the model runs. If the upstream serves only inference and answers 404 on the model list, the run warns and continues.

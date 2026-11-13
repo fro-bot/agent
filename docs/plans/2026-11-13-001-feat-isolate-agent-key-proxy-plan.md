@@ -26,9 +26,9 @@ When `isolate-agent` is on, the Action starts a key proxy before the sandboxed O
 - R6. Client credential headers and hop-by-hop headers are dropped, and only origin-form requests are accepted. The proxy follows no redirects and logs no headers.
 - R7. Every upstream must be HTTPS. The upstream map is fixed when the proxy starts.
 - R8. The proxy runs as its own process, holding only the keys and the upstream map. Keys reach it over stdin, never through argv or env.
-- R9. The proxy listens on an ephemeral loopback port and requires the per-run placeholder. It lives for the run only and stops before session state is saved.
+- R9. The proxy serves on an ephemeral loopback port for the run only, and stops before session state is saved. It does not authenticate local callers: it ignores any credential the caller sends and always uses the configured key.
 - R10. Malformed input gets an error and the proxy keeps serving. If the proxy can't start or dies, the run fails closed.
-- R11. A bounded probe of the selected provider runs at start-up. A 401 or 403 fails the run as `auth-rejected`. A 429, a timeout, or any other non-2xx response logs a warning naming that class, and the run continues. A 2xx only means the upstream did not reject the key.
+- R11. A bounded probe of the selected provider runs at start-up. A 401 fails the run as `auth-rejected`. A 403 (which can be a scope or project limit on the models route), a 429, a timeout, or any other non-2xx response logs a warning naming that class (`forbidden` for a 403), and the run continues. A 2xx only means the upstream did not reject the key.
 - R12. Every isolation preflight refusal names its fix.
 - R13. One canonical docs section covers what is hidden and what isn't. That includes the trusted-upstream residual and the fact that the proxy is not egress control.
 
@@ -57,7 +57,7 @@ When `isolate-agent` is on, the Action starts a key proxy before the sandboxed O
 - `startActionOpenCodeV2` and `runGates` in `src/harness/phases/v2-server.ts` hold the start order and the gates. The start stages are typed as `V2StartStage`.
 - `src/harness/phases/sandbox-lifecycle.ts` derives `handedOver` from the dirnames of `keyFilePaths`. It also provides a memoized `release()`, signal ownership (`holdSignalOwnership`), and `lifecycle.launch`.
 - `packages/runtime/src/agent/credential-gate-v2.ts` is a presence-only gate, and the workspace also uses it. This plan leaves it unchanged.
-- `isForwardableTarget` in `apps/workspace-agent/src/opencode-proxy-v2.ts` checks for canonical origin-form requests. This plan extracts it into runtime and makes the route table a parameter. `createOpencodeProxyV2` serves as a pattern reference for SSE and timing-safe compare only.
+- `isForwardableTarget` in `apps/workspace-agent/src/opencode-proxy-v2.ts` checks for canonical origin-form requests. This plan extracts it into runtime and makes the route table a parameter. `createOpencodeProxyV2` serves as a pattern reference for SSE handling only.
 - `validateEndpoint` in `packages/runtime/src/object-store/validation.ts` is a pattern for literal-URL checks. This plan requires HTTPS, no userinfo, no fragment and no metadata host, and allows private ranges.
 - `startOpenCodeV2Server`, `trackChild` and `terminateChild` in `packages/runtime/src/agent/server-v2.ts` show how to spawn a child, close stdin as the shutdown signal, and confirm the kill.
 - `deploy/scripts/fake-anthropic-provider.mjs` is a fake that records a verdict for each header and never echoes the key. `generateSelfSignedCert` in `apps/workspace-agent/src/update-fixtures/helpers.ts` provides a TLS fake.
@@ -155,7 +155,7 @@ When `isolate-agent` is on, the Action starts a key proxy before the sandboxed O
   - an operator provider that has no `auth-json` key.
 
   Each refusal says how to fix it.
-- **One placeholder per run.** It is a 32-byte CSPRNG value shared by every provider prefix. It must arrive in the credential header the protocol uses (`x-api-key` for Messages, `Authorization: Bearer` for Responses and Chat). Any other client credential header is stripped and never forwarded.
+- **One placeholder per run, and the proxy does not check it.** It is a 32-byte CSPRNG value that goes in the server config, because OpenCode needs some `apiKey` there, and it never reaches the proxy child. A model-level `apiKey` override would otherwise be refused locally, so the proxy ignores whatever credential a caller sends: every client credential header is stripped and never forwarded, and the configured key is set last. The proxy does not authenticate local callers; it serves on an ephemeral loopback port for the run only.
 - **The upstream is trusted, and keys are redacted from error bodies.** 2xx responses stream through unchanged.
   - The proxy always sends `accept-encoding: identity` upstream and never forwards the client's value.
   - A non-2xx body that is uncompressed and within the bound is buffered whole. Every exact occurrence of the key is replaced, and the result is forwarded with its status, so OpenCode's retry, quota and overflow classification keeps working.
@@ -167,7 +167,7 @@ When `isolate-agent` is on, the Action starts a key proxy before the sandboxed O
 - **The proxy is a separate child built as a third tsdown entry.** `dist/key-proxy.js` is spawned with `process.execPath`, `env: {}` and `stdio: ['pipe', 'pipe', 'ignore']`. A framed JSON config arrives on stdin, and the pipe stays open, since EOF means shutdown. The child prints one ready line with its port. A config that fails to parse or exceeds the size bound exits with a fixed code and a fixed message that never quotes input. A top-level handler prints no stack. Provider prefixes are looked up in a `Map`. Local error responses use fixed text and never name an upstream host.
 - **Test seams can't be reached from production input.** The launcher (`bun` on the TypeScript entry) and the test CA can be set only through the supervisor's test-only options. No Action input, env var or `opencode-config` value can populate them.
 - **The run owns the proxy before it spawns.** The lifecycle takes signal ownership and opens an admission point for the proxy launch before the spawn, not inside `prepare()`. `release()` closes admission synchronously, then aborts or awaits an in-flight launch. It stops the proxy on every branch, including one where no sandbox account was ever created. The proxy stop runs after sandbox take-back and before cleanup and save, within the existing signal budget. If the proxy exits unexpectedly, that is latched, and an owned abort controller fails the run. A stop that can't be confirmed records `unsafe`, so nothing is persisted.
-- **The probe runs in the Action and leaves the shared gate alone.** It is a new `key-proxy` stage in `runGates` for isolated runs. It probes only the provider of the run's selected `model`, with `GET` on that provider's models route through the proxy and a 10 s limit. Only a 401 or 403 fails the run. Every other outcome logs a warning with its class (`rate-limited`, `unreachable`, `unverifiable`), and the first model request surfaces any real problem through the existing provider-auth handling. The shared credential gate stays in `runGates` because the workspace uses it. The placeholder satisfies it trivially, so for isolated runs the probe is the real check.
+- **The probe runs in the Action and leaves the shared gate alone.** It is a new `key-proxy` stage in `runGates` for isolated runs. It probes only the provider of the run's selected `model`, with `GET` on that provider's models route through the proxy and a 10 s limit. Only a 401 fails the run. Every other outcome logs a warning with its class (`forbidden`, `rate-limited`, `unreachable`, `unverifiable`), and the first model request surfaces any real problem through the existing provider-auth handling. The shared credential gate stays in `runGates` because the workspace uses it. The placeholder satisfies it trivially, so for isolated runs the probe is the real check.
 - **This is not egress control.** The model can still use the server password to configure a direct provider and send traffic out that way. The guarantee is only that `auth-json` keys stay out of the sandbox.
 
 ## Open Questions
@@ -186,7 +186,7 @@ When `isolate-agent` is on, the Action starts a key proxy before the sandboxed O
 - The stdin framing and the ready-line format.
 - Timeout values: connect, response headers, idle SSE, and total upload. Long, quiet reasoning streams must not be cut off. Start with an idle limit of at least 10 minutes and no total lifetime.
 - How the default-upstream table is sourced: hard-coded or read from the bundled catalog.
-- Whether each provider's models route costs anything, and what rate limits apply. Marcus's one-off `curl` against his gateway answers this for cliproxy. Because the probe only fails on 401 or 403, a cost or limit surprise can't block runs.
+- Whether each provider's models route costs anything, and what rate limits apply. Marcus's one-off `curl` against his gateway answers this for cliproxy. Because the probe only fails on 401, a cost or limit surprise can't block runs.
 - Whether `Sandbox integration` needs a `ci.yaml` change. If the harness picks the source launcher itself, it doesn't. Any CI edit needs Marcus's approval.
 
 ## High-Level Technical Design
@@ -200,7 +200,7 @@ sequenceDiagram
   participant S as OpenCode server + tools (sandbox uid)
   participant U as Upstream (HTTPS)
   A->>A: parse auth-json + opencode-config, resolve providers, refuse bypasses
-  A->>P: spawn (env {}), stdin: keys + upstream map + placeholder
+  A->>P: spawn (env {}), stdin: keys + upstream map
   P-->>A: ready {port}
   A->>A: build config: baseURL=http://127.0.0.1:port/<id>/…, apiKey=placeholder
   A->>S: sandbox.prepare (no key dirs) + launch
@@ -281,7 +281,7 @@ sequenceDiagram
 
 **Approach:**
 - Bind on `127.0.0.1:0`.
-- Accept a request only when the protocol's own credential header (`x-api-key` or `Authorization: Bearer`) carries the placeholder. Compare it with `timingSafeEqual`. Strip any other client credential header.
+- Do not authenticate the caller. Strip every client credential header and ignore its value, then inject the real credential last. An upstream 101 (Upgrade) is never followed: destroy the upgraded socket and answer the client with the fixed 502.
 - Accept only an exact `/<id>` prefix plus an allowlisted method, path and query. Reject CONNECT, Upgrade, absolute-form targets and `Expect`.
 - Build each outbound request from a short allowlist of client headers. Strip every hop-by-hop header, including any named in `Connection`, then inject the real credential last.
 - Send requests with `https.request` to the fixed upstream. Stream in both directions with backpressure. Abort the upstream request when the client disconnects.
@@ -295,12 +295,13 @@ sequenceDiagram
 
 **Execution note:** Write the tests first. Each control gets a test that fails when the control is removed.
 
-**Patterns to follow:** `createOpencodeProxyV2` (SSE handling, timing-safe compare, SSE-aware idle timer).
+**Patterns to follow:** `createOpencodeProxyV2` (SSE handling, SSE-aware idle timer).
 
 **Test scenarios:**
-- Happy path: a POST to the Messages route with the placeholder arrives upstream carrying the real `x-api-key`. The SSE chunks reach the client in order, and the final bytes arrive before close.
+- Happy path: a POST to the Messages route arrives upstream carrying the real `x-api-key`. The SSE chunks reach the client in order, and the final bytes arrive before close.
 - Happy path: a POST to the Responses or Chat route arrives upstream with a Bearer token.
-- Error path: a missing or wrong placeholder in the protocol's header → 401 locally, and the upstream sees no request.
+- Happy path: a request with no credential header, or with a different `x-api-key` or `Authorization` (a model-level override), still reaches the upstream with only the configured key.
+- Error path: an upstream 101 → a bounded fixed 502 for the client, and the next request is served.
 - Error path: a path that isn't allowlisted on the correct prefix (a gateway management route) → 404 locally, and the upstream sees nothing.
 - Error path: an absolute-form target, CONNECT, an Upgrade request, `//` or `%2f` in the path, or a dot segment → rejected locally.
 - Error path: the client sends its own `x-api-key` or `Authorization` → the upstream sees only the real credential.
@@ -407,7 +408,8 @@ sequenceDiagram
 
 **Approach:** Probe only the provider of the run's selected `model`. Send `GET` to its models route through the proxy using the placeholder, with a 10 s limit.
 - A 2xx passes.
-- A 401 or 403 fails the run as `auth-rejected`.
+- A 401 fails the run as `auth-rejected`.
+- A 403 is `forbidden`: a warning, and the run continues.
 - A 429 is `rate-limited`, a timeout is `unreachable`, and any other non-2xx or malformed response is `unverifiable`. Each of these logs a warning, and the run continues.
 
 Messages name the provider and the class, never a body.
@@ -416,7 +418,7 @@ Messages name the provider and the class, never a body.
 
 **Test scenarios:**
 - Happy path: 200 → pass.
-- Error path: 401 and 403 → `auth-rejected`, so the run fails before the model starts.
+- Error path: 401 → `auth-rejected`, so the run fails before the model starts. 403 → a `forbidden` warning, and the run continues.
 - Edge case: 429 → a `rate-limited` warning, and the run continues.
 - Edge case: 404 or 405 from an inference-only gateway, 500, or a malformed body → an `unverifiable` warning, and the run continues.
 - Edge case: a timeout → an `unreachable` warning within 10 s, and the run continues.
@@ -446,7 +448,8 @@ Messages name the provider and the class, never a body.
 
 **Test scenarios:**
 - Integration: a canary key never appears in any probe output from the sandbox shell. This covers `cat` across the filesystem, `/proc/*/environ`, `/proc/*/cmdline`, and the server config and provider routes read with the password. A runner-side positive control can read it.
-- Integration: a sandbox `curl` with the placeholder to a route that isn't allowlisted → refused, and the fake upstream records no request.
+- Integration: a sandbox `curl` to a route that isn't allowlisted → refused, and the fake upstream records no request. A `curl` with a wrong credential, or none, is served with the real key.
+- Integration: the file-leak detector counts a readable canary file under an ordinary name (positive control) and finds no copy of the key in the real run.
 - Integration: a sandbox request carrying its own `x-api-key` → the upstream records the real key only.
 - Integration: a model turn streams through the proxy and the response file is delivered (the injected-deny lesson).
 - Integration: kill the proxy mid-run → the run fails and nothing is saved.

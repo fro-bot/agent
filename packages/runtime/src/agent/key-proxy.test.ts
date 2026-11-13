@@ -48,7 +48,6 @@ interface SendInit {
   readonly headers?: Record<string, string>
   readonly body?: string | Buffer
   readonly credential?: 'none' | 'x-api-key' | 'bearer'
-  readonly placeholder?: string
 }
 
 async function setup(
@@ -81,7 +80,6 @@ async function setup(
   }
   const {logger, lines} = recordingLogger()
   const started = await startKeyProxy({
-    placeholder: PLACEHOLDER,
     providers: (options.providers ?? defaultProviders)(upstream.origin),
     logger,
     ...(options.untrusted === true ? {} : {ca: upstream.ca}),
@@ -101,10 +99,9 @@ async function setup(
 async function sendTo(port: number, path: string, init: SendInit = {}): Promise<Reply> {
   const method = init.method ?? 'POST'
   const headers: Record<string, string> = {...init.headers}
-  const placeholder = init.placeholder ?? PLACEHOLDER
   const style = init.credential ?? (path.includes('/anthropic/') ? 'x-api-key' : 'bearer')
-  if (style === 'x-api-key') headers['x-api-key'] = placeholder
-  if (style === 'bearer') headers.authorization = `Bearer ${placeholder}`
+  if (style === 'x-api-key') headers['x-api-key'] = PLACEHOLDER
+  if (style === 'bearer') headers.authorization = `Bearer ${PLACEHOLDER}`
   return new Promise<Reply>((resolve, reject) => {
     const req = http.request({host: '127.0.0.1', port, path, method, headers}, res => {
       const chunks: Buffer[] = []
@@ -229,54 +226,79 @@ describe('key proxy: routing and credentials', () => {
     expect(headerOf(h.upstream.requests[1], 'authorization')).toBe(`Bearer ${OPENAI_KEY}`)
   })
 
+  const ANTHROPIC_CREDENTIAL = {header: 'x-api-key', value: ANTHROPIC_KEY, absent: 'authorization'} as const
+  const OPENAI_CREDENTIAL = {header: 'authorization', value: `Bearer ${OPENAI_KEY}`, absent: 'x-api-key'} as const
+
   it.each([
-    ['no credential', {credential: 'none' as const}],
-    ['a wrong placeholder', {placeholder: 'not-the-placeholder-0123456789abcdefghijklmn'}],
-    ['a placeholder of another length', {placeholder: 'short'}],
-    ['the placeholder in the wrong header style', {credential: 'x-api-key' as const}],
-  ])('answers 401 locally for %s and sends nothing upstream', async (_name, init) => {
-    // #given an upstream that would answer
+    [
+      'an x-api-key that is not the placeholder',
+      '/anthropic/messages',
+      {'x-api-key': 'model-level-override'},
+      ANTHROPIC_CREDENTIAL,
+    ],
+    [
+      'an Authorization that is not the placeholder',
+      '/openai/chat/completions',
+      {authorization: 'Bearer override'},
+      OPENAI_CREDENTIAL,
+    ],
+    ['an x-api-key on a Bearer route', '/openai/chat/completions', {'x-api-key': 'override'}, OPENAI_CREDENTIAL],
+    [
+      'an Authorization on a Messages route',
+      '/anthropic/messages',
+      {authorization: 'Bearer override'},
+      ANTHROPIC_CREDENTIAL,
+    ],
+    [
+      'a non-Bearer Authorization',
+      '/openai/chat/completions',
+      {authorization: 'Basic b3ZlcnJpZGU='},
+      OPENAI_CREDENTIAL,
+    ],
+  ])('ignores %s and forwards only the configured key', async (_name, path, headers, want) => {
+    // #given an upstream that records requests
     const h = await setup(okJson)
 
-    // #when a Chat request arrives with a bad credential
-    const reply = await h.send('/openai/chat/completions', {body: '{}', ...init})
+    // #when a request carries its own credential, as a model-level override would, and not the placeholder
+    const reply = await h.send(path, {body: '{}', credential: 'none', headers})
 
-    // #then the proxy answers and the upstream never sees a request
-    expect(reply.status).toBe(401)
-    expect(h.upstream.requests).toHaveLength(0)
+    // #then it still reaches the upstream, with only the configured key and nothing the client sent
+    expect(reply.status).toBe(200)
+    const seen = h.upstream.requests[0]?.headers ?? {}
+    expect(seen[want.header]).toBe(want.value)
+    expect(seen[want.absent]).toBeUndefined()
+    expect(JSON.stringify(seen)).not.toMatch(/override|b3ZlcnJpZGU/)
   })
 
-  it('answers 401 for a Messages request that carries the placeholder as a Bearer token', async () => {
+  it.each([
+    ['/anthropic/messages', 'POST', ANTHROPIC_CREDENTIAL],
+    ['/openai/chat/completions', 'POST', OPENAI_CREDENTIAL],
+    ['/openai/models', 'GET', OPENAI_CREDENTIAL],
+  ])('forwards %s with the configured key when the request carries no credential', async (path, method, want) => {
+    // #given an upstream that records requests
     const h = await setup(okJson)
-    const reply = await h.send('/anthropic/messages', {body: '{}', credential: 'bearer'})
-    expect(reply.status).toBe(401)
-    expect(h.upstream.requests).toHaveLength(0)
+
+    // #when a request carries no credential header at all
+    const reply = await h.send(path, {method, credential: 'none', ...(method === 'POST' ? {body: '{}'} : {})})
+
+    // #then it is forwarded with the configured key
+    expect(reply.status).toBe(200)
+    expect(h.upstream.requests[0]?.headers[want.header]).toBe(want.value)
   })
 
-  it('rejects a duplicated credential header', async () => {
-    // #given a request that repeats x-api-key
+  it('strips every repeated client credential header and sends one configured key', async () => {
+    // #given a request that repeats Authorization and x-api-key
     const h = await setup(okJson)
     const raw = await rawExchange(
       h.proxy.port,
-      `POST /anthropic/messages HTTP/1.1\r\nHost: x\r\nx-api-key: ${PLACEHOLDER}\r\nx-api-key: ${PLACEHOLDER}\r\ncontent-length: 2\r\n\r\n{}`,
+      'POST /openai/chat/completions HTTP/1.1\r\nHost: x\r\nauthorization: Bearer one\r\nauthorization: Bearer two\r\nx-api-key: a\r\nx-api-key: b\r\ncontent-length: 2\r\n\r\n{}',
     )
 
-    // #then it is refused locally
-    expect(raw).toMatch(/^HTTP\/1\.1 401/)
-    expect(h.upstream.requests).toHaveLength(0)
-  })
-
-  it('rejects a repeated Authorization header even when the first one is valid', async () => {
-    // #given a request whose first Authorization carries the placeholder and whose second does not
-    const h = await setup(okJson)
-    const raw = await rawExchange(
-      h.proxy.port,
-      `POST /openai/chat/completions HTTP/1.1\r\nHost: x\r\nauthorization: Bearer ${PLACEHOLDER}\r\nauthorization: Bearer other\r\ncontent-length: 2\r\n\r\n{}`,
-    )
-
-    // #then it is ambiguous and refused locally
-    expect(raw).toMatch(/^HTTP\/1\.1 401/)
-    expect(h.upstream.requests).toHaveLength(0)
+    // #then it is forwarded and the upstream sees only the configured key
+    expect(raw).toMatch(/^HTTP\/1\.1 200/)
+    const seen = h.upstream.requests[0]?.headers ?? {}
+    expect(seen.authorization).toBe(`Bearer ${OPENAI_KEY}`)
+    expect(seen['x-api-key']).toBeUndefined()
   })
 
   it.each([
@@ -357,19 +379,6 @@ describe('key proxy: routing and credentials', () => {
 
     // #then it is refused as a plain 404 (so the client falls back to POST) and nothing is forwarded
     expect(raw).toMatch(/^HTTP\/1\.1 404/)
-    expect(h.upstream.requests).toHaveLength(0)
-  })
-
-  it('rejects a repeated x-api-key header even when the first one is valid', async () => {
-    // #given a Messages request whose first x-api-key is the placeholder and whose second is not
-    const h = await setup(okJson)
-    const raw = await rawExchange(
-      h.proxy.port,
-      `POST /anthropic/messages HTTP/1.1\r\nHost: x\r\nx-api-key: ${PLACEHOLDER}\r\nx-api-key: other\r\ncontent-length: 2\r\n\r\n{}`,
-    )
-
-    // #then it is ambiguous and refused locally
-    expect(raw).toMatch(/^HTTP\/1\.1 401/)
     expect(h.upstream.requests).toHaveLength(0)
   })
 
@@ -596,6 +605,32 @@ describe('key proxy: redirects and error bodies', () => {
     const reply = await h.send('/openai/chat/completions', {body: '{}'})
     expect(reply.status).toBe(502)
     expect(reply.headers.location).toBeUndefined()
+  })
+
+  it('answers a bounded 502 when the upstream answers 101 and closes, and keeps serving', async () => {
+    // #given an upstream that switches protocols for the first request, then closes the socket
+    let first = true
+    const h = await setup((_request, res, req) => {
+      if (first) {
+        first = false
+        req.socket.end('HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n')
+        return
+      }
+      okJson(_request, res, req)
+    })
+
+    // #when a request is answered with the 101
+    const started = Date.now()
+    const reply = await h.send('/openai/chat/completions', {body: '{}'})
+
+    // #then the client gets the fixed 502 at once, with nothing of the upstream in it
+    expect(reply.status).toBe(502)
+    expect(reply.body.toString()).toBe('Bad Gateway\n')
+    expect(reply.headers.upgrade).toBeUndefined()
+    expect(Date.now() - started).toBeLessThan(5000)
+
+    // #then the next request is served
+    expect((await h.send('/openai/chat/completions', {body: '{}'})).status).toBe(200)
   })
 
   it('redacts the key from an upstream 400 and keeps the rest of the error JSON', async () => {
@@ -1209,7 +1244,6 @@ describe('key proxy: start', () => {
 
     // #when the proxy starts
     const started = await startKeyProxy({
-      placeholder: PLACEHOLDER,
       providers: [{id: 'openai', key: OPENAI_KEY, origin: 'http://api.example.com', routes: []}],
       logger,
     })
@@ -1219,16 +1253,10 @@ describe('key proxy: start', () => {
     expect(started.success ? '' : started.error).not.toContain(OPENAI_KEY)
   })
 
-  it('refuses to start with a short placeholder', async () => {
-    const {logger} = recordingLogger()
-    const started = await startKeyProxy({placeholder: 'short', providers: [], logger})
-    expect(started.success).toBe(false)
-  })
-
   it('refuses to start with a duplicate provider id', async () => {
     const {logger} = recordingLogger()
     const provider = {id: 'openai', key: OPENAI_KEY, origin: 'https://api.openai.com', routes: []}
-    const started = await startKeyProxy({placeholder: PLACEHOLDER, providers: [provider, provider], logger})
+    const started = await startKeyProxy({providers: [provider, provider], logger})
     expect(started.success).toBe(false)
   })
 

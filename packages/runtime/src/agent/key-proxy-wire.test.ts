@@ -9,12 +9,9 @@ import {
   readKeyProxyFrameLength,
 } from './key-proxy-wire.js'
 
-const PLACEHOLDER = 'placeholder-0123456789abcdefghijklmnopqrstuvwxyz'
-
 function validConfig(): Record<string, unknown> {
   return {
     version: 1,
-    placeholder: PLACEHOLDER,
     providers: [
       {
         id: 'openai',
@@ -65,7 +62,7 @@ describe('encodeKeyProxyConfig / readKeyProxyFrameLength', () => {
   it('refuses to encode a config over the bound', () => {
     const config = parseKeyProxyConfig(validConfig())
     if (!config.success) throw new Error('fixture')
-    const huge = {...config.data, placeholder: 'x'.repeat(KEY_PROXY_MAX_CONFIG_BYTES)}
+    const huge = {...config.data, ca: 'x'.repeat(KEY_PROXY_MAX_CONFIG_BYTES)}
     expect(() => encodeKeyProxyConfig(huge)).toThrow(/too large/)
   })
 })
@@ -87,8 +84,10 @@ describe('parseKeyProxyConfig', () => {
     ['not an object', 'text'],
     ['an array', []],
     ['a wrong version', {...validConfig(), version: 2}],
-    ['no placeholder', {...validConfig(), placeholder: undefined}],
-    ['a non-string placeholder', {...validConfig(), placeholder: 5}],
+    [
+      'a placeholder field, which the wire no longer carries',
+      {...validConfig(), placeholder: 'placeholder-0123456789abcdefghijklmnopqrstuvwxyz'},
+    ],
     ['providers not an array', {...validConfig(), providers: {}}],
     ['an unknown top-level field', {...validConfig(), extra: true}],
     [

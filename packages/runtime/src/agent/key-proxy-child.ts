@@ -96,7 +96,6 @@ export function runKeyProxyChild(io: KeyProxyChildIo): KeyProxyChild {
       return
     }
     const started = await startKeyProxy({
-      placeholder: config.data.placeholder,
       providers: config.data.providers,
       logger: SILENT_LOGGER,
       ...(config.data.ca === undefined ? {} : {ca: config.data.ca}),

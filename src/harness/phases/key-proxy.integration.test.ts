@@ -201,7 +201,7 @@ describe.skipIf(!enabled)('the key proxy against the real OpenCode V2 binary', (
   it.each([
     [200, 'passed'],
     [401, 'failed'],
-    [403, 'failed'],
+    [403, 'warned'],
     [429, 'warned'],
   ] as const)(
     'probes the models route through the real proxy: upstream %i is %s',

@@ -1415,26 +1415,27 @@ describe.skipIf(!gated)('isolate-agent key proxy through a real model shell', ()
     const bearer = `Authorization: Bearer ${proxy?.placeholder ?? ''}`
     return [
       {
-        // The positive control for the rows below: the placeholder is accepted and the request reaches the upstream.
+        // The request reaches the upstream with the placeholder, as the server's own requests do.
         id: 'proxy_models_with_placeholder',
         category: 'works',
         cmd: curlStatus('proxy_models_with_placeholder', bearer, '/fake/models', '200', 'WORKS'),
       },
       {
-        id: 'proxy_refuses_wrong_credential',
-        category: 'blocked',
+        // The proxy does not authenticate its callers: a credential of the model's own choosing changes nothing.
+        id: 'proxy_ignores_wrong_credential',
+        category: 'works',
         cmd: curlStatus(
-          'proxy_refuses_wrong_credential',
+          'proxy_ignores_wrong_credential',
           'Authorization: Bearer not-the-placeholder',
           '/fake/models',
-          '401',
-          'BLOCKED',
+          '200',
+          'WORKS',
         ),
       },
       {
-        id: 'proxy_refuses_missing_credential',
-        category: 'blocked',
-        cmd: curlStatus('proxy_refuses_missing_credential', null, '/fake/models', '401', 'BLOCKED'),
+        id: 'proxy_serves_without_credential',
+        category: 'works',
+        cmd: curlStatus('proxy_serves_without_credential', null, '/fake/models', '200', 'WORKS'),
       },
       {
         id: 'proxy_refuses_unlisted_route',
@@ -1447,13 +1448,22 @@ describe.skipIf(!gated)('isolate-agent key proxy through a real model shell', ()
         cmd: curlStatus('proxy_refuses_unknown_provider', bearer, '/other/models', '404', 'BLOCKED'),
       },
       {
-        // grep must work (control), then the real key must be in none of the places the sandbox can read.
+        // The key is assembled at run time from two halves, so the command text (which the server stores with the tool
+        // call) never holds it. Two controls prove each detector can see a copy before either is trusted to find none:
+        // one readable file under an ordinary name for the file scan, one piped line for the content check.
         id: 'real_key_absent',
         category: 'blocked',
         cmd:
-          `printf %s ${q(REAL_KEY)} | grep -qF ${q(REAL_KEY)} || { R real_key_absent FAILED "grep control"; exit 0; }; ${String.raw`hits=$( { tr '\0' '\n' < /proc/$PPID/environ; tr '\0' '\n' < /proc/self/environ; `}cat /proc/${proxy?.pid}/cmdline /proc/${proxy?.pid}/environ; ` +
-          `grep -rIlF ${q(REAL_KEY)} "$HOME" "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME" ${q(responseDir)} ${q(workspace)}; } 2>/dev/null | grep -cF ${q(REAL_KEY)} ); ` +
-          `[ "$hits" = 0 ] && R real_key_absent BLOCKED "no copy of the key in env, proxy argv or readable files" || R real_key_absent OPEN "copies=$hits"`,
+          `KEY=${q(REAL_KEY.slice(0, 9))}${q(REAL_KEY.slice(9))}; ` +
+          `leaks(){ grep -rIlF -- "$KEY" "$@" 2>/dev/null </dev/null | wc -l | tr -d ' '; }; ` +
+          `ctl=$(mktemp -d) && printf %s "$KEY" > "$ctl/notes.txt" || { R real_key_absent FAILED "control setup"; exit 0; }; ` +
+          `[ "$(leaks "$ctl")" = 1 ] || { rm -rf "$ctl"; R real_key_absent FAILED "file detector control"; exit 0; }; rm -rf "$ctl"; ` +
+          `[ "$(printf %s "$KEY" | grep -caF -- "$KEY")" = 1 ] || { R real_key_absent FAILED "content detector control"; exit 0; }; ` +
+          `procs=$( { ${String.raw`tr '\0' '\n'`} < /proc/$PPID/environ; ${String.raw`tr '\0' '\n'`} < /proc/self/environ; ` +
+          `cat /proc/${proxy?.pid}/cmdline /proc/${proxy?.pid}/environ; } 2>/dev/null | grep -caF -- "$KEY" ); ` +
+          // An unset root is skipped: an empty operand would make some grep builds scan the current directory.
+          `set --; for d in "$HOME" "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME" ${q(responseDir)} ${q(workspace)}; do [ -n "$d" ] && set -- "$@" "$d"; done; files=$(leaks "$@"); ` +
+          `[ "$procs" = 0 ] && [ "$files" = 0 ] && R real_key_absent BLOCKED "no copy of the key in env, proxy argv or readable files" || R real_key_absent OPEN "process_copies=$procs files=$files"`,
       },
     ]
   }
@@ -1525,16 +1535,18 @@ describe.skipIf(!gated)('isolate-agent key proxy through a real model shell', ()
     }
   }, 120_000)
 
-  it('accepts the placeholder on the proxy, and refuses a wrong or missing credential, an unlisted route and an unknown provider', () => {
+  it('serves a request whatever credential it carries, and refuses an unlisted route and an unknown provider', () => {
     // #given the scripted model's own shell, as the sandbox user
-    // #then the one accepted request is the positive control for the four refusals
-    expect(failuresFor(rows, 'proxy_models_with_placeholder', 'WORKS')).toEqual([])
+    // #then a request with the placeholder, with another credential and with none all reach the upstream
     for (const id of [
-      'proxy_refuses_wrong_credential',
-      'proxy_refuses_missing_credential',
-      'proxy_refuses_unlisted_route',
-      'proxy_refuses_unknown_provider',
+      'proxy_models_with_placeholder',
+      'proxy_ignores_wrong_credential',
+      'proxy_serves_without_credential',
     ]) {
+      expect(failuresFor(rows, id, 'WORKS')).toEqual([])
+    }
+    // #then the allowlist still holds
+    for (const id of ['proxy_refuses_unlisted_route', 'proxy_refuses_unknown_provider']) {
       expect(failuresFor(rows, id, 'BLOCKED')).toEqual([])
     }
   })

@@ -8,7 +8,7 @@ import {err, ok} from '../shared/types.js'
  * What the Action and the key-proxy child say to each other.
  *
  * Action to child, on stdin: one frame (a 4-byte big-endian length, then that many bytes of UTF-8 JSON) holding the
- * provider keys, the upstream map and the placeholder. The pipe then stays open; closing it is the shutdown signal.
+ * provider keys and the upstream map. The pipe then stays open; closing it is the shutdown signal.
  *
  * Child to Action, on stdout: one JSON line, either `{"ready":true,"port":N}` or `{"error":"<code>"}` with a fixed code.
  * An error line never quotes input.
@@ -29,7 +29,6 @@ export type KeyProxyChildErrorCode = 'internal' | 'invalid-config' | 'start-fail
 
 export interface KeyProxyWireConfig {
   readonly version: 1
-  readonly placeholder: string
   readonly providers: readonly KeyProxyProviderConfig[]
   /** Extra TLS trust for the upstream (PEM). Set only by the supervisor's test options. */
   readonly ca?: string
@@ -77,16 +76,14 @@ function parseProvider(value: unknown): KeyProxyProviderConfig | null {
 
 /** Validates the decoded JSON. The error is a fixed code: nothing of the input is ever quoted. */
 export function parseKeyProxyConfig(value: unknown): Result<KeyProxyWireConfig, 'invalid-config'> {
-  if (!isRecord(value) || !hasOnly(value, ['version', 'placeholder', 'providers', 'ca'])) return err('invalid-config')
+  if (!isRecord(value) || !hasOnly(value, ['version', 'providers', 'ca'])) return err('invalid-config')
   if (value.version !== KEY_PROXY_CONFIG_VERSION) return err('invalid-config')
-  if (!nonEmptyString(value.placeholder)) return err('invalid-config')
   if (!Array.isArray(value.providers) || value.providers.length > MAX_PROVIDERS) return err('invalid-config')
   const providers = value.providers.map(parseProvider)
   if (providers.includes(null)) return err('invalid-config')
   if (value.ca !== undefined && !nonEmptyString(value.ca)) return err('invalid-config')
   return ok({
     version: KEY_PROXY_CONFIG_VERSION,
-    placeholder: value.placeholder,
     providers: providers as KeyProxyProviderConfig[],
     ...(value.ca === undefined ? {} : {ca: value.ca}),
   })

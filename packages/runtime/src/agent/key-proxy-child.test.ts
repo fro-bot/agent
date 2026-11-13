@@ -9,7 +9,6 @@ import {buildKeyProxyUpstream} from './key-proxy-routes.js'
 import {startTlsUpstream} from './key-proxy-test-kit.js'
 import {encodeKeyProxyConfig, KEY_PROXY_MAX_CONFIG_BYTES} from './key-proxy-wire.js'
 
-const PLACEHOLDER = 'placeholder-0123456789abcdefghijklmnopqrstuvwxyz'
 const REAL_KEY = 'sk-CHILD-REAL-CANARY-0007'
 
 const cleanups: (() => Promise<void>)[] = []
@@ -72,7 +71,6 @@ async function configFor(origin: string, ca: string): Promise<KeyProxyWireConfig
   if (!built.success) throw new Error('fixture')
   return {
     version: 1,
-    placeholder: PLACEHOLDER,
     providers: [{id: 'openai', key: REAL_KEY, origin: built.data.origin, routes: built.data.routes}],
     ca,
   }
@@ -86,7 +84,6 @@ async function post(port: number): Promise<number> {
         port,
         path: '/openai/chat/completions',
         method: 'POST',
-        headers: {authorization: `Bearer ${PLACEHOLDER}`},
       },
       res => {
         res.resume()
@@ -130,7 +127,6 @@ describe('runKeyProxyChild', () => {
     expect(await r.waitForExit()).toBe(0)
     await expect(post(ready.port)).rejects.toThrow()
     expect(r.output()).not.toContain(REAL_KEY)
-    expect(r.output()).not.toContain(PLACEHOLDER)
   })
 
   it('ignores bytes after the frame and keeps serving', async () => {
@@ -157,7 +153,7 @@ describe('runKeyProxyChild', () => {
     header.writeUInt32BE(500)
 
     // #when stdin ends early
-    r.stdin.write(Buffer.concat([header, Buffer.from(`{"placeholder":"${PLACEHOLDER}","k":"${REAL_KEY}"`)]))
+    r.stdin.write(Buffer.concat([header, Buffer.from(`{"version":1,"k":"${REAL_KEY}"`)]))
     r.stdin.end()
 
     // #then the child exits 64 with the fixed message
@@ -186,15 +182,12 @@ describe('runKeyProxyChild', () => {
 
   it('exits 64 for JSON of the wrong shape, without quoting it', async () => {
     const r = run()
-    const payload = Buffer.from(
-      JSON.stringify({version: 1, placeholder: PLACEHOLDER, providers: 'x', secret: REAL_KEY}),
-    )
+    const payload = Buffer.from(JSON.stringify({version: 1, providers: 'x', secret: REAL_KEY}))
     const header = Buffer.alloc(4)
     header.writeUInt32BE(payload.length)
     r.stdin.write(Buffer.concat([header, payload]))
     expect(await r.waitForExit()).toBe(64)
     expect(r.output()).not.toContain(REAL_KEY)
-    expect(r.output()).not.toContain(PLACEHOLDER)
   })
 
   it('exits 64 when no frame arrives in time', async () => {
@@ -209,7 +202,6 @@ describe('runKeyProxyChild', () => {
     r.stdin.write(
       encodeKeyProxyConfig({
         version: 1,
-        placeholder: PLACEHOLDER,
         providers: [{id: 'openai', key: REAL_KEY, origin: 'http://api.example.com', routes: []}],
       }),
     )

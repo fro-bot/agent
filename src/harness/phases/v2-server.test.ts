@@ -2036,7 +2036,7 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
       expect(deps.waitForImport).not.toHaveBeenCalled()
     })
 
-    it.each(['rate-limited', 'unreachable', 'unverifiable'] as const)(
+    it.each(['forbidden', 'rate-limited', 'unreachable', 'unverifiable'] as const)(
       'continues the run on a %s warning',
       async warningClass => {
         const server = fakeServer()

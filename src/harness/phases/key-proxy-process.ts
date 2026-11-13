@@ -14,8 +14,8 @@ import {buildKeyProxyUpstream, encodeKeyProxyConfig, parseKeyProxyChildLine} fro
  * Runs the key proxy as a child process and supervises it.
  *
  * The child (`dist/key-proxy.js`) holds the provider keys; this module holds only the child handle and the run's
- * placeholder. The keys, the upstream map and the placeholder reach the child as one framed config on its stdin, which
- * then stays open: closing it is how the child is told to stop, and also how it learns the Action is gone.
+ * placeholder (which the child never sees). The keys and the upstream map reach the child as one framed config on its
+ * stdin, which then stays open: closing it is how the child is told to stop, and also how it learns the Action is gone.
  *
  * SECURITY INVARIANTS:
  * 1. The child gets an empty environment, no arguments but its script, and no key anywhere but its stdin.
@@ -93,7 +93,7 @@ export interface KeyProxyStopResult {
 export interface KeyProxyProcess {
   readonly pid: number
   readonly port: number
-  /** The per-run credential the sandboxed server presents. Not a real key. */
+  /** The per-run value the server config carries as its API key. Not a real key, and the proxy does not check it. */
   readonly placeholder: string
   /** The `baseURL` for a provider: `http://127.0.0.1:<port>/<providerId>`. */
   readonly baseUrl: (providerId: string) => string
@@ -158,7 +158,6 @@ export async function startKeyProxyProcess(
   const placeholder = randomBytes(32).toString('base64url')
   const frame = encodeKeyProxyConfig({
     version: 1,
-    placeholder,
     providers: providers.data,
     ...(options.testing?.upstreamCa === undefined ? {} : {ca: options.testing.upstreamCa}),
   })

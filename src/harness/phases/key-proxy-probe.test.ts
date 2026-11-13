@@ -108,10 +108,10 @@ describe('probeKeyProxy', () => {
     const withHeaders = await probeKeyProxy({plan, proxy, logger: createMockLogger()})
     const without = await probeKeyProxy({plan: OPENAI, proxy, logger: createMockLogger()})
 
-    // #then the headers carry the probe through, and their absence is the 403 this fixes
+    // #then the headers carry the probe through, and their absence is a forbidden warning, not a failure
     expect(withHeaders).toEqual({status: 'passed'})
     expect(seen[0]?.authorization).toBe(`Bearer ${PLACEHOLDER}`)
-    expect(without.status).toBe('failed')
+    expect(without).toEqual({status: 'warned', class: 'forbidden'})
   })
 
   it('does not send the OpenAI routing headers on a Messages route', async () => {
@@ -140,10 +140,10 @@ describe('probeKeyProxy', () => {
     expect(result).toEqual({status: 'passed'})
   })
 
-  it.each([401, 403])('fails as auth-rejected on a %i, naming the provider and never the body', async status => {
+  it('fails as auth-rejected on a 401, naming the provider and never the body', async () => {
     // #given the upstream rejects the key
     // #when probed
-    const {result, logger} = await probe(OPENAI, answer(status))
+    const {result, logger} = await probe(OPENAI, answer(401))
 
     // #then the probe fails with the class and a message that names the provider and holds no body
     expect(result.status).toBe('failed')
@@ -157,6 +157,7 @@ describe('probeKeyProxy', () => {
   })
 
   it.each([
+    [403, 'forbidden'],
     [429, 'rate-limited'],
     [404, 'unverifiable'],
     [405, 'unverifiable'],

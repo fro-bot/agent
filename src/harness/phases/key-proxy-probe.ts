@@ -6,18 +6,19 @@ import {buildKeyProxyUpstream} from '@fro-bot/runtime'
  * Start-up probe of an `isolate-agent` run: one bounded `GET` to the selected provider's models route, through the owned
  * key proxy with the run's placeholder. It tells a rejected key from a working one before the model starts.
  *
- * A 2xx only means the upstream did not reject the key: some gateways serve the model list without auth. Only a 401 or 403
- * fails the run. Every other outcome logs one warning with its class and lets the run continue; the first model request
+ * A 2xx only means the upstream did not reject the key: some gateways serve the model list without auth. Only a 401 fails
+ * the run. A 403 is not proof of a bad key (it can be a scope, project or organization limit on the models route), so
+ * it warns, like every other outcome: one warning with its class, and the run continues. The first model request
  * surfaces any real problem. A response body is never read, logged or put in a message.
  */
 
 export const KEY_PROXY_PROBE_TIMEOUT_MS = 10_000
 
-export type KeyProxyProbeWarningClass = 'rate-limited' | 'unreachable' | 'unverifiable'
+export type KeyProxyProbeWarningClass = 'forbidden' | 'rate-limited' | 'unreachable' | 'unverifiable'
 
 export type KeyProxyProbeResult =
   | {readonly status: 'passed'}
-  /** The upstream rejected the key (401 or 403): the run must fail. */
+  /** The upstream rejected the key (401): the run must fail. */
   | {readonly status: 'failed'; readonly class: 'auth-rejected'; readonly message: string}
   /** The probe could not prove the key good or bad: log and continue. */
   | {readonly status: 'warned'; readonly class: KeyProxyProbeWarningClass}
@@ -80,12 +81,13 @@ export async function probeKeyProxy(options: ProbeKeyProxyOptions): Promise<KeyP
   }
 
   if (status >= 200 && status < 300) return {status: 'passed'}
-  if (status === 401 || status === 403) {
+  if (status === 401) {
     return {
       status: 'failed',
       class: 'auth-rejected',
       message: `Provider "${providerId}" rejected its key at start-up (auth-rejected, HTTP ${status}). Check the key for it in the auth-json input.`,
     }
   }
+  if (status === 403) return warn('forbidden')
   return warn(status === 429 ? 'rate-limited' : 'unverifiable')
 }

@@ -4,7 +4,6 @@ import type {Logger} from '../shared/logger.js'
 import type {Result} from '../shared/types.js'
 import type {KeyProxyRoute} from './key-proxy-routes.js'
 import {Buffer} from 'node:buffer'
-import {timingSafeEqual} from 'node:crypto'
 import http from 'node:http'
 import https from 'node:https'
 import {Transform} from 'node:stream'
@@ -16,7 +15,7 @@ import {matchKeyProxyRoute} from './key-proxy-routes.js'
 
 /**
  * The key proxy: a loopback HTTP server that holds provider API keys and attaches one to a model request on its way to
- * the provider's fixed HTTPS upstream. The sandboxed server and its tools see only a per-run placeholder.
+ * the provider's fixed HTTPS upstream. The sandboxed server and its tools never hold a real key.
  *
  * Node-only: no Action, SDK or logger dependency beyond the injected `Logger`, so the child entry stays small.
  *
@@ -24,11 +23,12 @@ import {matchKeyProxyRoute} from './key-proxy-routes.js'
  * 1. A request is forwarded only when its target is canonical origin-form, its first segment is a configured provider id
  *    (a `Map` lookup), and its method, path and query are one of that provider's routes. Everything else is answered
  *    locally and sends nothing upstream.
- * 2. The credential header the route's protocol uses must carry the run's placeholder, compared with `timingSafeEqual`
- *    (a different length is refused first; the length is fixed and public). No other client credential header is forwarded, and the real credential is set last.
+ * 2. The proxy does not authenticate its local callers and ignores any credential a caller sends. No client credential
+ *    header is ever forwarded (only an allowlist is copied), and the configured real credential is set last.
  * 3. Outbound headers are built from a short allowlist. Hop-by-hop headers, and any header named in `Connection`, are
  *    dropped. `accept-encoding` is always `identity`.
- * 4. A 3xx from the upstream is never followed and never passed on: the client gets a local 502.
+ * 4. A 3xx from the upstream is never followed and never passed on: the client gets a local 502. An upstream 101
+ *    (Upgrade) is never followed either: the upgraded socket is destroyed and the client gets the same 502.
  * 5. A non-2xx body is forwarded only when it is uncompressed and within the bound, with every exact occurrence of the key
  *    (raw and JSON-escaped) replaced. Any other non-2xx body becomes a fixed generic error with the same status.
  * 6. Response headers come from a short allowlist. Local error bodies are fixed text and never name the upstream.
@@ -76,8 +76,6 @@ export const DEFAULT_KEY_PROXY_LIMITS: KeyProxyLimits = {
 }
 
 export interface StartKeyProxyOptions {
-  /** A per-run secret of at least 32 characters. Accepted in the protocol's credential header. */
-  readonly placeholder: string
   readonly providers: readonly KeyProxyProviderConfig[]
   readonly logger: Logger
   /** Extra TLS trust for the upstream, PEM. Tests only: the supervisor sets it only through its own test options. */
@@ -93,12 +91,10 @@ export interface KeyProxyServer {
 }
 
 const LOOPBACK = '127.0.0.1'
-const MIN_PLACEHOLDER_LENGTH = 32
 const REDACTED = '[REDACTED]'
 
 const LOCAL_BODIES: Readonly<Record<number, string>> = {
   400: 'Bad Request\n',
-  401: 'Unauthorized\n',
   404: 'Not Found\n',
   405: 'Method Not Allowed\n',
   413: 'Payload Too Large\n',
@@ -177,23 +173,6 @@ interface MatchedRoute {
 /** Set on the byte counter when the request body outgrows the bound. */
 const REQUEST_TOO_LARGE = new Error('request body too large')
 
-/**
- * Constant-time compare of the presented credential with the run's placeholder. The placeholder's length is fixed and
- * public, so a length mismatch is answered at once and leaks nothing.
- */
-function matchesPlaceholder(presented: string, placeholder: Buffer): boolean {
-  const bytes = Buffer.from(presented)
-  return bytes.length === placeholder.length && timingSafeEqual(bytes, placeholder)
-}
-
-function countRawHeader(rawHeaders: readonly string[], name: string): number {
-  let count = 0
-  for (let index = 0; index < rawHeaders.length; index += 2) {
-    if (rawHeaders[index]?.toLowerCase() === name) count += 1
-  }
-  return count
-}
-
 function replaceAll(source: Buffer, needle: Buffer, replacement: Buffer): Buffer {
   if (needle.length === 0) return source
   const parts: Buffer[] = []
@@ -263,14 +242,10 @@ function buildProviders(providers: readonly KeyProxyProviderConfig[]): Result<Ma
 export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Result<KeyProxyServer, string>> {
   const {logger} = options
   const limits: KeyProxyLimits = {...DEFAULT_KEY_PROXY_LIMITS, ...options.limits}
-  if (options.placeholder.length < MIN_PLACEHOLDER_LENGTH) {
-    return err(`the placeholder must be at least ${MIN_PLACEHOLDER_LENGTH} characters`)
-  }
   const providers = buildProviders(options.providers)
   if (!providers.success) return err(providers.error)
   const byId = providers.data
 
-  const placeholderBytes = Buffer.from(options.placeholder)
   const agent = new https.Agent({
     keepAlive: false,
     rejectUnauthorized: true,
@@ -303,22 +278,6 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
     if (provider === undefined) return undefined
     const route = matchKeyProxyRoute(provider.routes, method, `/${segments.slice(2).join('/')}`, query)
     return route === undefined ? undefined : {provider, route, query}
-  }
-
-  const presentedCredential = (req: IncomingMessage, route: KeyProxyRoute): string | undefined => {
-    if (route.auth === 'x-api-key') {
-      if (countRawHeader(req.rawHeaders, 'x-api-key') !== 1) return undefined
-      return headerValue(req.headers['x-api-key'])
-    }
-    if (countRawHeader(req.rawHeaders, 'authorization') !== 1) return undefined
-    const match = /^Bearer (\S+)$/.exec(headerValue(req.headers.authorization) ?? '')
-    return match?.[1]
-  }
-
-  const isAuthorized = (req: IncomingMessage, route: KeyProxyRoute): boolean => {
-    const presented = presentedCredential(req, route)
-    if (presented === undefined) return false
-    return matchesPlaceholder(presented, placeholderBytes)
   }
 
   const outboundHeaders = (req: IncomingMessage, matched: MatchedRoute, hasBody: boolean): http.OutgoingHttpHeaders => {
@@ -421,7 +380,6 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
     })
     if (!forwardable || found.route === undefined) return refuse(res, 404, 'route')
     const target = found.route
-    if (!isAuthorized(req, target.route)) return refuse(res, 401, 'credential', target.provider.id)
 
     const declared = req.headers['content-length']
     const declaredBytes = declared === undefined ? 0 : Number(declared)
@@ -488,6 +446,19 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
       stop()
       logger.warning('key-proxy: upstream request failed', {category: 'upstream-error', provider: target.provider.id})
       refuse(res, 502, 'upstream-error', target.provider.id)
+    })
+
+    upstream.once('upgrade', (_upstreamRes, socket) => {
+      // A 101 never comes through `response`. Nothing is tunnelled: the upgraded socket is closed and the client is told.
+      failed = true
+      req.unpipe()
+      req.resume()
+      socket.destroy()
+      upstream.destroy()
+      stop()
+      logger.warning('key-proxy: upstream upgrade refused', {category: 'upgrade', provider: target.provider.id})
+      if (res.headersSent) res.destroy()
+      else refuse(res, 502, 'upgrade', target.provider.id)
     })
 
     upstream.once('response', upstreamRes => {
