@@ -47,7 +47,7 @@ export interface CredentialFilesV2 {
  * A provider id names a file, so it must start alphanumeric (no `.`, `..`, hidden names) and hold only word
  * characters, dots and hyphens (no separator, no `}` that would end a `{file:...}` reference early).
  */
-const PROVIDER_ID_PATTERN = /^[A-Z0-9][\w.-]*$/i
+export const PROVIDER_ID_PATTERN = /^[A-Z0-9][\w.-]*$/i
 
 /**
  * The directory path ends up inside a `{file:<path>}` reference in JSON text, and the server's substitution ends the

@@ -1,13 +1,17 @@
 import type {Result} from '@bfra.me/es/result'
 import type {
+  BuiltConfigV2,
   CredentialDisposition,
   OpenCodeV2SandboxLaunch,
   OpenCodeV2ServerHandle,
   StartOpenCodeV2ServerOptions,
 } from '@fro-bot/runtime'
+import type {ProviderKeyEntryV2} from '../../services/setup/credential-files-v2.js'
+import type {KeyProxyProviderPlan} from '../../services/setup/key-proxy-providers.js'
 import type {InstallPluginsV2Options, PluginInstallV2Error} from '../../services/setup/plugin-install-v2.js'
 import type {RepoSkillsSource} from '../../services/setup/repo-skills.js'
 import type {Logger} from '../../shared/logger.js'
+import type {KeyProxyProcess, KeyProxyStartError, StartKeyProxyProcessOptions} from './key-proxy-process.js'
 import type {SandboxLifecycle} from './sandbox-lifecycle.js'
 import type {V1DatabaseFacts, V1ImportWaitError, WaitForV1ImportOptions} from './v1-import-wait.js'
 import * as path from 'node:path'
@@ -33,6 +37,7 @@ import {
   resolveCredentialBaseDir,
   writeCredentialFilesV2,
 } from '../../services/setup/credential-files-v2.js'
+import {checkConfigForKeys, resolveKeyProxyProviders} from '../../services/setup/key-proxy-providers.js'
 import {
   arePluginsCachedV2,
   installPluginsV2,
@@ -41,6 +46,8 @@ import {
 } from '../../services/setup/plugin-install-v2.js'
 import {admitRepoSkills, discardRepoSkillsStaging} from '../../services/setup/repo-skills.js'
 import {toErrorMessage} from '../../shared/errors.js'
+import {probeKeyProxy} from './key-proxy-probe.js'
+import {startKeyProxyProcess} from './key-proxy-process.js'
 import {readV1DatabaseFacts, waitForV1Import} from './v1-import-wait.js'
 
 /**
@@ -79,6 +86,7 @@ export type V2StartStage =
   | 'credentials'
   | 'held-claims'
   | 'import-wait'
+  | 'key-proxy'
   | 'permission-gate'
   | 'plugins'
   | 'sandbox'
@@ -142,6 +150,15 @@ export interface StartActionOpenCodeV2Deps {
   readonly waitForImport: (options: WaitForV1ImportOptions) => Promise<Result<unknown, V1ImportWaitError>>
   readonly readDatabaseFacts: (dbPath: string) => V1DatabaseFacts
   readonly startOptions?: Partial<StartOpenCodeV2ServerOptions>
+  /** Starts the key proxy child of an `isolate-agent` run. */
+  readonly startKeyProxy: typeof startKeyProxyProcess
+  /** The start-up probe of the selected provider through the key proxy (isolated runs only). */
+  readonly probeKeyProxy: typeof probeKeyProxy
+  /**
+   * Test seams for the key proxy supervisor (launcher, upstream CA, timeouts). Production never sets them: nothing reachable
+   * from an input, the environment or `opencode-config` can.
+   */
+  readonly keyProxyOptions?: Partial<Pick<StartKeyProxyProcessOptions, 'deps' | 'launcher' | 'testing' | 'timeouts'>>
   /** Overrides the permission gate's agent-list retry timing (tests). */
   readonly agentListRetry?: Partial<AgentListRetryPolicy>
 }
@@ -222,6 +239,8 @@ async function readAgentList(
 
 const defaultDeps: StartActionOpenCodeV2Deps = {
   startServer: startOpenCodeV2Server,
+  startKeyProxy: startKeyProxyProcess,
+  probeKeyProxy,
   installPlugins: async installOptions => installPluginsV2({...installOptions, execAdapter: createExecAdapter()}),
   clearClaims: clearHeldClaims,
   admitRepoSkills,
@@ -248,6 +267,22 @@ export async function startActionOpenCodeV2(
   const keys = parseProviderKeysV2(authConfig)
   if (!keys.success) return stageError('credentials', `Invalid auth-json for OpenCode V2: ${keys.error.message}`)
 
+  // `isolate-agent`: the keys stay with the key proxy and never reach a file the sandbox could read. Which providers it can
+  // serve, and which operator settings would bypass it, are decided before anything is written or started.
+  let proxyPlans: readonly KeyProxyProviderPlan[] = []
+  if (options.sandbox != null) {
+    const resolved = resolveKeyProxyProviders({keys: keys.data, opencodeConfig: options.opencodeConfig})
+    if (!resolved.success) {
+      return stageError(
+        'config',
+        resolved.error.kind === 'invalid-config'
+          ? `Invalid OpenCode configuration: ${resolved.error.message}`
+          : resolved.error.message,
+      )
+    }
+    proxyPlans = resolved.data
+  }
+
   const specs = resolvePluginSpecsV2(options.systematicVersion)
   if (!specs.success) return stageError('plugins', specs.error.message)
 
@@ -256,12 +291,16 @@ export async function startActionOpenCodeV2(
   } catch (error) {
     return stageError('credentials', toErrorMessage(error))
   }
-  const files = await writeCredentialFilesV2({
-    entries: keys.data,
-    baseDir: resolveCredentialBaseDir(options.env),
-    logger,
-  })
-  if (!files.success) return stageError('credentials', files.error.message)
+  let keyFiles: Readonly<Record<string, string>> = {}
+  if (options.sandbox == null) {
+    const files = await writeCredentialFilesV2({
+      entries: keys.data,
+      baseDir: resolveCredentialBaseDir(options.env),
+      logger,
+    })
+    if (!files.success) return stageError('credentials', files.error.message)
+    keyFiles = files.data.keyFiles
+  }
 
   // --- 2. Plugin preparation ---------------------------------------------------------------------------------
   const cacheHome = resolveCacheHome(options.env)
@@ -322,53 +361,114 @@ export async function startActionOpenCodeV2(
     }
   }
 
-  const built = buildCIConfigV2(
-    {
-      opencodeConfig: options.opencodeConfig,
-      credential: options.credential,
-      plugins: specs.data.specs,
-      runnerTemp: options.env.RUNNER_TEMP,
-      runId: options.runId,
-      runAttempt: options.runAttempt,
-      ...(options.env.FRO_BOT_INTEGRATION_WORK_DIR === undefined
-        ? {}
-        : {integrationWorkDir: options.env.FRO_BOT_INTEGRATION_WORK_DIR}),
-      providerKeyFiles: files.data.keyFiles,
-      bundledSkillsDirectories,
-      ...(repoSkillsDirectory === undefined ? {} : {repoSkillsDirectory}),
-    },
-    logger,
-  )
-  if (!built.success) return stageError('config', `Invalid OpenCode configuration: ${built.error}`)
+  // With a sandbox, the key proxy starts first (its port is in the config) and belongs to the lifecycle from before it
+  // spawns: a signal, a failure or a throw anywhere below releases the lifecycle, which stops the proxy. Without one this is
+  // exactly the config and held-claim work it always was.
+  // Set by `prepareRun` once the lifecycle owns a proxy; read below for the run's signal.
+  const owned: {proxy: KeyProxyProcess | null; facts: V1DatabaseFacts} = {
+    proxy: null,
+    facts: {bytes: null, sessions: null},
+  }
+  const prepareRun = async (): Promise<
+    Result<{readonly built: BuiltConfigV2; readonly childEnv: NodeJS.ProcessEnv}, V2StartError>
+  > => {
+    let proxied: Record<string, {baseURL: string; apiKey: string}> = {}
+    if (options.sandbox != null && proxyPlans.length > 0) {
+      const started = await startProxyUnderLifecycle(options.sandbox, proxyPlans, keys.data, deps, options, logger)
+      if (!started.success) return started
+      owned.proxy = started.data
+      options.maskSecret?.(started.data.placeholder)
+      proxied = Object.fromEntries(
+        proxyPlans.map(plan => [
+          plan.providerId,
+          {baseURL: started.data.baseUrl(plan.providerId), apiKey: started.data.placeholder},
+        ]),
+      )
+    }
 
-  // --- 4. Held claims ----------------------------------------------------------------------------------------
-  const facts = deps.readDatabaseFacts(options.dbPath)
-  const cleared = await deps.clearClaims(options.dbPath, logger)
-  if (!cleared.success) {
-    return stageError('held-claims', 'Could not clear held execution claims in the restored OpenCode database')
+    const builtConfig = buildCIConfigV2(
+      {
+        opencodeConfig: options.opencodeConfig,
+        credential: options.credential,
+        plugins: specs.data.specs,
+        runnerTemp: options.env.RUNNER_TEMP,
+        runId: options.runId,
+        runAttempt: options.runAttempt,
+        ...(options.env.FRO_BOT_INTEGRATION_WORK_DIR === undefined
+          ? {}
+          : {integrationWorkDir: options.env.FRO_BOT_INTEGRATION_WORK_DIR}),
+        ...(options.sandbox == null ? {providerKeyFiles: keyFiles} : {proxiedProviders: proxied}),
+        bundledSkillsDirectories,
+        ...(repoSkillsDirectory === undefined ? {} : {repoSkillsDirectory}),
+      },
+      logger,
+    )
+    if (!builtConfig.success) return stageError('config', `Invalid OpenCode configuration: ${builtConfig.error}`)
+
+    // Last check before anything is handed to the sandbox user: no auth-json key value may be in the config it will read.
+    // `OPENCODE_CONFIG_CONTENT` is the only config the sandbox gets (the proxy holds the keys, not a file).
+    if (options.sandbox != null) {
+      const clean = checkConfigForKeys({
+        keys: keys.data,
+        configs: [
+          {label: 'the OpenCode config (OPENCODE_CONFIG_CONTENT)', text: JSON.stringify(builtConfig.data.content)},
+        ],
+      })
+      if (!clean.success) return stageError('config', clean.error)
+    }
+
+    // --- 4. Held claims ----------------------------------------------------------------------------------------
+    owned.facts = deps.readDatabaseFacts(options.dbPath)
+    const cleared = await deps.clearClaims(options.dbPath, logger)
+    if (!cleared.success) {
+      return stageError('held-claims', 'Could not clear held execution claims in the restored OpenCode database')
+    }
+
+    // --- 4b. Sandbox account and handoff (isolate-agent) -----------------------------------------------------
+    //
+    // After the last runner-side write to the restored database (the claim clear) and before the spawn. A failure here
+    // has already rolled itself back inside `prepare`.
+    let sandboxEnv = options.env
+    if (options.sandbox != null) {
+      const ghConfigDir = provisionedGhConfigDir(options.env)
+      // A `GH_CONFIG_DIR` that is not the provisioned temp dir (an ambient one from an earlier step) is not handed over,
+      // so it must not reach the child as a path the sandbox cannot read.
+      sandboxEnv = withoutKey(options.env, 'GH_CONFIG_DIR')
+      const prepared = await options.sandbox.prepare({
+        // Nothing to hand over: the keys are in the proxy, not in files.
+        keyFilePaths: Object.values(keyFiles),
+        ghConfigDir,
+        repoSkills:
+          options.repoSkills == null
+            ? null
+            : {stagingRoot: options.repoSkills.stagingRoot, admittedDir: repoSkillsDirectory ?? null},
+      })
+      if (!prepared.success) return stageError('sandbox', `isolate-agent setup failed: ${prepared.error}`)
+      if (ghConfigDir !== null) sandboxEnv = {...sandboxEnv, GH_CONFIG_DIR: ghConfigDir}
+    }
+    return ok({built: builtConfig.data, childEnv: sandboxEnv})
   }
 
-  // --- 4b. Sandbox account and handoff (isolate-agent) -----------------------------------------------------
-  //
-  // After the last runner-side write to the restored database (the claim clear) and before the spawn. A failure here
-  // has already rolled itself back inside `prepare`.
-  let childEnv = options.env
-  if (options.sandbox != null) {
-    const ghConfigDir = provisionedGhConfigDir(options.env)
-    // A `GH_CONFIG_DIR` that is not the provisioned temp dir (an ambient one from an earlier step) is not handed over,
-    // so it must not reach the child as a path the sandbox cannot read.
-    childEnv = withoutKey(options.env, 'GH_CONFIG_DIR')
-    const prepared = await options.sandbox.prepare({
-      keyFilePaths: Object.values(files.data.keyFiles),
-      ghConfigDir,
-      repoSkills:
-        options.repoSkills == null
-          ? null
-          : {stagingRoot: options.repoSkills.stagingRoot, admittedDir: repoSkillsDirectory ?? null},
-    })
-    if (!prepared.success) return stageError('sandbox', `isolate-agent setup failed: ${prepared.error}`)
-    if (ghConfigDir !== null) childEnv = {...childEnv, GH_CONFIG_DIR: ghConfigDir}
+  let prepared: Result<{readonly built: BuiltConfigV2; readonly childEnv: NodeJS.ProcessEnv}, V2StartError>
+  try {
+    prepared = await prepareRun()
+  } catch (error) {
+    await releaseSandboxAfterFailure(options.sandbox, logger)
+    throw error
   }
+  if (!prepared.success) {
+    await releaseSandboxAfterFailure(options.sandbox, logger)
+    return prepared
+  }
+  const built = prepared.data.built
+  const childEnv = prepared.data.childEnv
+  // The caller's signal, plus the proxy's: a proxy that dies on its own aborts the server and the gates.
+  const runSignal =
+    owned.proxy === null
+      ? options.signal
+      : options.signal === undefined
+        ? owned.proxy.died
+        : AbortSignal.any([options.signal, owned.proxy.died])
 
   // --- 5. Spawn (plugin gate inside) -------------------------------------------------------------------------
   //
@@ -379,7 +479,7 @@ export async function startActionOpenCodeV2(
     binaryPath: options.binaryPath,
     directory: options.workspacePath,
     expectedPluginIds: [SYSTEMATIC_V2_PLUGIN_ID, FRO_BOT_PLUGIN_ID],
-    config: built.data.content,
+    config: built.content,
     env: childEnv,
     ...(extra.sandbox === undefined ? {} : {sandbox: extra.sandbox}),
     ...(extra.signal === undefined ? {} : {signal: extra.signal}),
@@ -390,16 +490,13 @@ export async function startActionOpenCodeV2(
   let started: Awaited<ReturnType<typeof deps.startServer>>
   try {
     if (options.sandbox == null) {
-      started = await deps.startServer(
-        spawnOptions({...(options.signal === undefined ? {} : {signal: options.signal})}),
-        logger,
-      )
+      started = await deps.startServer(spawnOptions({...(runSignal === undefined ? {} : {signal: runSignal})}), logger)
     } else {
       const launched = await options.sandbox.launch(async context => {
         const result = await deps.startServer(
           spawnOptions({
             sandbox: context.spec,
-            signal: options.signal === undefined ? context.signal : AbortSignal.any([options.signal, context.signal]),
+            signal: runSignal === undefined ? context.signal : AbortSignal.any([runSignal, context.signal]),
           }),
           logger,
         )
@@ -452,17 +549,42 @@ export async function startActionOpenCodeV2(
       {
         // A 503 is not-ready, never "no agents" and never a pass: it is retried to the deadline and then fails.
         listAgents: async () =>
-          readAgentList(handle.fetch, {...DEFAULT_AGENT_LIST_RETRY, ...deps.agentListRetry}, logger, options.signal),
+          readAgentList(handle.fetch, {...DEFAULT_AGENT_LIST_RETRY, ...deps.agentListRetry}, logger, runSignal),
       },
-      built.data.expectations,
+      built.expectations,
       logger,
     )
     if (!permissions.success) {
       return failAfterSpawn('permission-gate', `OpenCode permission gate failed: ${permissions.error.message}`)
     }
 
-    const spawnConfig = spawnConfigFromConfig(built.data.content)
+    const spawnConfig = spawnConfigFromConfig(built.content)
     const modelProvider = modelProviderId(options.model ?? spawnConfig.model)
+
+    // --- 6b. Key proxy probe (isolate-agent) ---------------------------------------------------------------
+    //
+    // The credential gate above is satisfied by the placeholder, so for an isolated run this is the real check of the key.
+    // Only the selected model's provider is probed: another provider's bad key must not block a run that never uses it.
+    if (owned.proxy !== null) {
+      const plan =
+        modelProvider === undefined ? undefined : proxyPlans.find(entry => entry.providerId === modelProvider)
+      if (plan === undefined) {
+        logger.info('Key proxy probe skipped: the selected model is not on a provider the key proxy serves', {
+          provider: modelProvider ?? null,
+        })
+      } else {
+        const probe = await deps.probeKeyProxy({
+          plan,
+          proxy: {baseUrl: owned.proxy.baseUrl, placeholder: owned.proxy.placeholder},
+          logger,
+          ...(runSignal === undefined ? {} : {signal: runSignal}),
+        })
+        if (probe.status === 'failed' || probe.status === 'aborted') {
+          return failAfterSpawn('key-proxy', probe.message)
+        }
+      }
+    }
+
     const requiredProviders = modelProvider === undefined ? keys.data.map(entry => entry.providerId) : [modelProvider]
     if (requiredProviders.length === 0) {
       logger.info('No model or provider credentials configured, credential gate skipped')
@@ -470,7 +592,7 @@ export async function startActionOpenCodeV2(
       const credentials = await verifyCredentialGate({
         handle,
         requestTimeoutMs: GATE_REQUEST_TIMEOUT_MS,
-        ...(options.signal === undefined ? {} : {signal: options.signal}),
+        ...(runSignal === undefined ? {} : {signal: runSignal}),
         providers: requiredProviders,
         configuredAuth: spawnConfig.authenticatedProviders,
         remedy: 'Add an API-key entry for it to the auth-json input.',
@@ -484,8 +606,8 @@ export async function startActionOpenCodeV2(
     const imported = await deps.waitForImport({
       fetch: handle.fetch,
       logger,
-      facts,
-      ...(options.signal === undefined ? {} : {signal: options.signal}),
+      facts: owned.facts,
+      ...(runSignal === undefined ? {} : {signal: runSignal}),
     })
     if (!imported.success) return failAfterSpawn('import-wait', imported.error.message)
 
@@ -502,6 +624,42 @@ export async function startActionOpenCodeV2(
     await stopAfterFailure()
     throw error
   }
+}
+
+/**
+ * Starts the key proxy as the lifecycle's: the lifecycle takes signal ownership and records the attempt before the child is
+ * spawned, so a signal or a release that begins mid-start aborts it and stops what it produced. The caller releases the
+ * lifecycle on any failure returned from here.
+ */
+async function startProxyUnderLifecycle(
+  sandbox: SandboxLifecycle,
+  plans: readonly KeyProxyProviderPlan[],
+  keys: readonly ProviderKeyEntryV2[],
+  deps: StartActionOpenCodeV2Deps,
+  options: StartActionOpenCodeV2Options,
+  logger: Logger,
+): Promise<Result<KeyProxyProcess, V2StartError>> {
+  const keyById = new Map(keys.map(entry => [entry.providerId, entry.key]))
+  const failure: {error: KeyProxyStartError | null} = {error: null}
+  const started = await sandbox.startKeyProxy(async context => {
+    const result = await deps.startKeyProxy({
+      ...deps.keyProxyOptions,
+      logger,
+      providers: plans.map(plan => ({...plan, key: keyById.get(plan.providerId) ?? ''})),
+      signal: options.signal === undefined ? context.signal : AbortSignal.any([options.signal, context.signal]),
+    })
+    if (result.success) return {proxy: result.data, unconfirmed: false}
+    failure.error = result.error
+    return {proxy: null, unconfirmed: result.error.cleanup === 'unconfirmed'}
+  })
+  if (!started.success) return err({stage: 'key-proxy', message: `isolate-agent key proxy refused: ${started.error}`})
+  if (started.data === null) {
+    return err({
+      stage: 'key-proxy',
+      message: `isolate-agent key proxy failed to start: ${failure.error?.message ?? 'no reason given'}`,
+    })
+  }
+  return ok(started.data)
 }
 
 /**
