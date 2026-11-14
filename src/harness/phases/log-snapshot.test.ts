@@ -4,7 +4,12 @@ import * as path from 'node:path'
 import process from 'node:process'
 import {afterEach, beforeEach, describe, expect, it} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
-import {LOG_SNAPSHOT_MAX_BYTES, resolveLogReadPath, snapshotLogDirectory} from './log-snapshot.js'
+import {
+  LOG_SNAPSHOT_MAX_BYTES,
+  LOG_SNAPSHOT_MAX_ENTRIES,
+  resolveLogReadPath,
+  snapshotLogDirectory,
+} from './log-snapshot.js'
 
 const RUNNER_UID = process.getuid?.() ?? 0
 
@@ -134,6 +139,68 @@ describe('snapshotLogDirectory', () => {
     expect(snapshot).toBeNull()
     expect(await fs.readdir(tempRoot)).toEqual([])
     expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining('size cap'), {maxBytes: 10})
+  })
+
+  it('discards the partial snapshot when empty files exhaust the entry budget', async () => {
+    // #given five empty files and a budget of three entries: no bytes are ever counted, so only the entry cap can stop it
+    for (const name of ['a', 'b', 'c', 'd', 'e']) await fs.writeFile(path.join(source, `${name}.log`), '')
+    const logger = createMockLogger()
+
+    // #when
+    const snapshot = await snapshotLogDirectory({source, tempRoot, runnerUid: RUNNER_UID, maxEntries: 3, logger})
+
+    // #then no snapshot, the partial copy is gone, and the warning names the budget but no path
+    expect(snapshot).toBeNull()
+    expect(await fs.readdir(tempRoot)).toEqual([])
+    expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining('entry budget'), {maxEntries: 3})
+  })
+
+  it('discards the partial snapshot when a tree of only directories exhausts the entry budget', async () => {
+    // #given a chain of nested, empty directories deeper than the budget
+    await fs.mkdir(path.join(source, 'd1', 'd2', 'd3', 'd4', 'd5'), {recursive: true})
+    const logger = createMockLogger()
+
+    // #when
+    const snapshot = await snapshotLogDirectory({source, tempRoot, runnerUid: RUNNER_UID, maxEntries: 3, logger})
+
+    // #then directories spend the same budget as files
+    expect(snapshot).toBeNull()
+    expect(await fs.readdir(tempRoot)).toEqual([])
+    expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining('entry budget'), {maxEntries: 3})
+  })
+
+  it('counts files and directories against one budget, and accepts a tree exactly at it', async () => {
+    // #given two directories and two files: four entries
+    await fs.mkdir(path.join(source, 'dir1'))
+    await fs.mkdir(path.join(source, 'dir2'))
+    await fs.writeFile(path.join(source, 'dir1', 'a.log'), 'a')
+    await fs.writeFile(path.join(source, 'b.log'), 'b')
+
+    // #when the budget is exactly four, then three
+    const atBudget = await snapshotLogDirectory({
+      source,
+      tempRoot,
+      runnerUid: RUNNER_UID,
+      maxEntries: 4,
+      logger: createMockLogger(),
+    })
+    const overBudget = await snapshotLogDirectory({
+      source,
+      tempRoot,
+      runnerUid: RUNNER_UID,
+      maxEntries: 3,
+      logger: createMockLogger(),
+    })
+
+    // #then
+    expect(atBudget).not.toBeNull()
+    expect(overBudget).toBeNull()
+    expect(await fs.readdir(tempRoot)).toHaveLength(1)
+  })
+
+  it('caps at 10,000 entries by default', () => {
+    // #then the documented bound
+    expect(LOG_SNAPSHOT_MAX_ENTRIES).toBe(10_000)
   })
 
   it('caps at 100 MiB by default', () => {

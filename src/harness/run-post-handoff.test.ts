@@ -468,6 +468,68 @@ describe('run -> post handoff: session state is saved only for a run that starte
       expect(syncArtifactsToStore).not.toHaveBeenCalled()
     })
 
+    it.each([
+      [
+        'the runner preflight rejects',
+        async () => {
+          const {runSandboxPreflight} = await import('../services/setup/sandbox-preflight.js')
+          vi.mocked(runSandboxPreflight).mockResolvedValueOnce({
+            ok: false,
+            check: 'sudo',
+            message: 'isolate-agent is not supported on this runner (sudo)',
+          })
+        },
+        'true',
+      ],
+      [
+        'the checkout carries a persisted git credential',
+        async () => {
+          const {assertNoPersistedGitCredentials} = await import('../services/setup/git-credential-check.js')
+          vi.mocked(assertNoPersistedGitCredentials).mockResolvedValueOnce(err('http.extraheader found'))
+        },
+        'true',
+      ],
+      ['the isolate-agent value cannot be parsed', async () => undefined, 'banana'],
+    ])(
+      'publishes nothing from the shared log directory when isolation was requested and bootstrap fails because %s',
+      async (_label, arrangeFailure, isolateAgentInput) => {
+        // #given isolation requested, shared logs left by an earlier step, prompt artifacts on, and a bootstrap that
+        // fails before any sandbox lifecycle exists
+        await arm()
+        mocks.inputs.set('isolate-agent', isolateAgentInput)
+        await arrangeFailure()
+        await fs.mkdir(logDir(), {recursive: true})
+        await fs.writeFile(path.join(logDir(), 'earlier-step.log'), 'written by an earlier unconfirmed sandbox')
+
+        // #when the real run, cleanup and post hook execute
+        const {exitCode} = await runThenPost()
+
+        // #then the run failed in bootstrap, and no log backend read the shared directory
+        expect(exitCode).toBe(1)
+        const {uploadLogArtifact} = await import('../services/artifact/index.js')
+        expect(uploadLogArtifact).not.toHaveBeenCalled()
+        const {syncArtifactsToStore} = await import('@fro-bot/runtime')
+        expect(syncArtifactsToStore).not.toHaveBeenCalled()
+      },
+    )
+
+    it('still publishes the shared log directory for a failed bootstrap when isolation was not requested', async () => {
+      // #given the same failure without isolation: the log directory is the runner's own
+      await arm()
+      mocks.inputs.set('isolate-agent', 'false')
+      const {ensureOpenCodeAvailable} = await import('@fro-bot/runtime')
+      vi.mocked(ensureOpenCodeAvailable).mockRejectedValueOnce(new Error('download failed: 504'))
+      await fs.mkdir(logDir(), {recursive: true})
+      await fs.writeFile(path.join(logDir(), 'run.log'), 'the runner wrote this')
+
+      // #when
+      await runThenPost()
+
+      // #then behavior is unchanged
+      const {uploadLogArtifact} = await import('../services/artifact/index.js')
+      expect(uploadLogArtifact).toHaveBeenCalledWith(expect.objectContaining({logPath: logDir()}))
+    })
+
     it("invocation A's post hook uploads A's snapshot, not what a later isolated step's sandbox wrote to the shared directory", async () => {
       // #given invocation A: an isolated run that wrote a log, was confirmed restored, and whose artifact upload failed
       await arm()

@@ -23,6 +23,7 @@ import {createReviewDeliveryReceiptOperations} from '../services/github/review-d
 import {getGitHubRunAttempt, getInvocationIdentity, getOpenCodeLogPath} from '../shared/env.js'
 import {toErrorMessage} from '../shared/errors.js'
 import {createLogger} from '../shared/logger.js'
+import {isIsolationRequested} from './config/inputs.js'
 import {setActionOutputs, setInvocationOutcomeOutput} from './config/outputs.js'
 import {STATE_KEYS} from './config/state-keys.js'
 import {assessInvocationOutcome} from './outcome.js'
@@ -58,6 +59,10 @@ export async function run(): Promise<number> {
   const bootstrapLogger = createLogger({phase: 'bootstrap'})
   const metrics = createMetricsCollector()
   metrics.start()
+
+  // From the raw input, read before bootstrap: a bootstrap that fails (the runner preflight, the persisted-credential check,
+  // an unparseable value) returns before any lifecycle exists, and cleanup must still treat the run as isolated.
+  const isolationRequested = isIsolationRequested(core.getInput('isolate-agent'))
 
   let reactionCtx: ReactionContext | null = null
   let exitCode = 0
@@ -563,7 +568,7 @@ export async function run(): Promise<number> {
       leaseRenewal,
       skipSessionPersistence,
       sandboxOutputUntrusted,
-      isolatedRun: sandboxLifecycle !== null,
+      isolatedRun: isolationRequested || sandboxLifecycle !== null,
       logSnapshotPath,
       ...(persistenceDeclineReason === undefined ? {} : {persistenceDeclineReason}),
     }).finally(async () => {

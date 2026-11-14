@@ -18,6 +18,9 @@ import {getOpenCodeLogPath} from '../../shared/env.js'
 
 export const LOG_SNAPSHOT_MAX_BYTES = 100 * 1024 * 1024
 
+/** One budget for every directory entry the walk visits (files, directories and skipped links alike). */
+export const LOG_SNAPSHOT_MAX_ENTRIES = 10_000
+
 const SNAPSHOT_DIR_PREFIX = 'fro-bot-logs-'
 
 export interface SnapshotLogDirectoryOptions {
@@ -28,6 +31,7 @@ export interface SnapshotLogDirectoryOptions {
   /** Only regular files owned by this uid are copied. */
   readonly runnerUid: number
   readonly maxBytes?: number
+  readonly maxEntries?: number
   readonly logger: Logger
 }
 
@@ -35,11 +39,13 @@ interface CopyState {
   readonly root: string
   readonly runnerUid: number
   readonly maxBytes: number
+  readonly maxEntries: number
   bytes: number
+  entries: number
   skipped: number
 }
 
-type CopyOutcome = 'copied' | 'over-cap'
+type CopyOutcome = 'copied' | 'over-bytes' | 'over-entries'
 
 function errorCode(error: unknown): string | undefined {
   return (error as NodeJS.ErrnoException).code
@@ -52,7 +58,7 @@ async function copyFile(from: string, to: string, state: CopyState): Promise<Cop
     // handle for "regular". A size over the remaining budget is refused with EFBIG.
     handle = await openRegularFileNoFollow(from, {within: state.root, maxBytes: state.maxBytes - state.bytes})
   } catch (error) {
-    if (errorCode(error) === 'EFBIG') return 'over-cap'
+    if (errorCode(error) === 'EFBIG') return 'over-bytes'
     // A symlink (ELOOP), a FIFO or device (ENOTREG), a path that left the root (EOUTSIDE), a file that vanished or one the
     // runner cannot read: none is copied.
     state.skipped += 1
@@ -66,7 +72,7 @@ async function copyFile(from: string, to: string, state: CopyState): Promise<Cop
       return 'copied'
     }
     state.bytes += size
-    if (state.bytes > state.maxBytes) return 'over-cap'
+    if (state.bytes > state.maxBytes) return 'over-bytes'
     if (size === 0) {
       await fs.writeFile(to, '', {flag: 'wx', mode: 0o600})
     } else {
@@ -82,19 +88,29 @@ async function copyFile(from: string, to: string, state: CopyState): Promise<Cop
   }
 }
 
-async function copyDirectory(from: string, to: string, state: CopyState): Promise<CopyOutcome> {
-  const entries = await fs.readdir(from, {withFileTypes: true})
-  for (const entry of entries) {
-    const source = path.join(from, entry.name)
-    const target = path.join(to, entry.name)
-    if (entry.isDirectory()) {
-      await fs.mkdir(target, {mode: 0o700})
-      if ((await copyDirectory(source, target, state)) === 'over-cap') return 'over-cap'
-    } else if (entry.isFile()) {
-      if ((await copyFile(source, target, state)) === 'over-cap') return 'over-cap'
-    } else {
-      // A symlink, FIFO, socket or device: never opened.
-      state.skipped += 1
+/**
+ * Walks `root` breadth first, one directory handle open at a time, streaming entries (`opendir`) instead of listing a
+ * directory into memory. Every entry spends the shared entry budget before anything is done with it.
+ */
+async function copyTree(root: string, destRoot: string, state: CopyState): Promise<CopyOutcome> {
+  const pending: {readonly from: string; readonly to: string}[] = [{from: root, to: destRoot}]
+  for (let next = pending.shift(); next !== undefined; next = pending.shift()) {
+    const {from, to} = next
+    for await (const entry of await fs.opendir(from)) {
+      state.entries += 1
+      if (state.entries > state.maxEntries) return 'over-entries'
+      const source = path.join(from, entry.name)
+      const target = path.join(to, entry.name)
+      if (entry.isDirectory()) {
+        await fs.mkdir(target, {mode: 0o700})
+        pending.push({from: source, to: target})
+      } else if (entry.isFile()) {
+        const copied = await copyFile(source, target, state)
+        if (copied !== 'copied') return copied
+      } else {
+        // A symlink, FIFO, socket or device: never opened.
+        state.skipped += 1
+      }
     }
   }
   return 'copied'
@@ -103,12 +119,13 @@ async function copyDirectory(from: string, to: string, state: CopyState): Promis
 /**
  * Copies the regular, runner-owned files of `source` into a new `mkdtemp` directory (mode 0700) under `tempRoot` and
  * returns its path. Returns null when there is nothing to publish: no log directory, a log directory that is not a real
- * directory, a total over the size cap (the snapshot is discarded), or any failure. Never throws and never names a path
+ * directory, a total over the size cap or the entry budget (the snapshot is discarded), or any failure. Never throws and never names a path
  * or file content in a log.
  */
 export async function snapshotLogDirectory(options: SnapshotLogDirectoryOptions): Promise<string | null> {
   const {source, tempRoot, runnerUid, logger} = options
   const maxBytes = options.maxBytes ?? LOG_SNAPSHOT_MAX_BYTES
+  const maxEntries = options.maxEntries ?? LOG_SNAPSHOT_MAX_ENTRIES
   let snapshotDir: string | null = null
   try {
     const rootStats = await fs.lstat(source).catch((error: unknown) => {
@@ -124,12 +141,23 @@ export async function snapshotLogDirectory(options: SnapshotLogDirectoryOptions)
       return null
     }
     snapshotDir = await fs.mkdtemp(path.join(tempRoot, SNAPSHOT_DIR_PREFIX))
-    const state: CopyState = {root: source, runnerUid, maxBytes, bytes: 0, skipped: 0}
-    if ((await copyDirectory(source, snapshotDir, state)) === 'over-cap') {
+    const state: CopyState = {root: source, runnerUid, maxBytes, maxEntries, bytes: 0, entries: 0, skipped: 0}
+    const outcome = await copyTree(source, snapshotDir, state)
+    if (outcome !== 'copied') {
+      // Over either bound the partial copy goes: a truncated log set is not published as if it were whole.
       await fs.rm(snapshotDir, {recursive: true, force: true})
-      logger.warning('Discarding the OpenCode log snapshot: the logs exceed the size cap, so none are published', {
-        maxBytes,
-      })
+      if (outcome === 'over-bytes') {
+        logger.warning('Discarding the OpenCode log snapshot: the logs exceed the size cap, so none are published', {
+          maxBytes,
+        })
+      } else {
+        logger.warning(
+          'Discarding the OpenCode log snapshot: the logs exceed the entry budget, so none are published',
+          {
+            maxEntries,
+          },
+        )
+      }
       return null
     }
     if (state.skipped > 0) {
