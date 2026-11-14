@@ -1783,12 +1783,14 @@ function strayProcesses(pattern: string): string {
 describe.skipIf(!gated)('isolate-agent read-only view: the write boundary on a hosted runner', () => {
   const logger = createLogger({phase: 'sandbox-integration-view'})
   const scratch = path.join(runnerTemp, `sandbox-it-view-${process.pid}`)
+  // Its own XDG roots: the commondir suite above ends `unsafe` and leaves the default ones owned by the sandbox uid.
+  const xdgRoot = path.join(runnerTemp, `sandbox-it-view-xdg-${process.pid}`)
   const workspace = path.join(scratch, 'ws')
   const responseDir = path.join(scratch, 'response')
   const keyDir = path.join(scratch, 'keys')
   // The shape the Action provisions in provision mode: a `gh-config-*` directory directly under RUNNER_TEMP.
   const ghConfigDir = path.join(runnerTemp, `gh-config-view-${process.pid}`)
-  const env = hostedEnv(workspace)
+  const env = hostedEnv(workspace, xdgRoot)
   const privateMarkers = ['/tmp', '/var/tmp', '/dev/shm'].map(dir => `${dir}/${VIEW_IT_PREFIX}-priv-${VIEW_TAG}`)
   const escapeDir = matrixDirs.includes('/usr/local/bin') ? '/usr/local/bin' : (matrixDirs[0] ?? '/usr/local/bin')
   const hardlinkSource = `${escapeDir}/${VIEW_IT_PREFIX}-hl-${VIEW_TAG}`
@@ -1942,6 +1944,7 @@ describe.skipIf(!gated)('isolate-agent read-only view: the write boundary on a h
     await lifecycle?.release()
     sweepViewFiles()
     fs.rmSync(scratch, {recursive: true, force: true})
+    fs.rmSync(xdgRoot, {recursive: true, force: true})
     fs.rmSync(ghConfigDir, {recursive: true, force: true})
   }, 120_000)
 
@@ -2019,10 +2022,12 @@ describe.skipIf(!gated)('isolate-agent read-only view: the write boundary on a h
 describe.skipIf(!gated)('isolate-agent read-only view: a server torn down while it runs', () => {
   const logger = createLogger({phase: 'sandbox-integration-kill'})
   const scratch = path.join(runnerTemp, `sandbox-it-kill-${process.pid}`)
+  // Its own XDG roots: the commondir suite above ends `unsafe` and leaves the default ones owned by the sandbox uid.
+  const xdgRoot = path.join(runnerTemp, `sandbox-it-kill-xdg-${process.pid}`)
   const workspace = path.join(scratch, 'ws')
   const responseDir = path.join(scratch, 'response')
   const keyDir = path.join(scratch, 'keys')
-  const env = hostedEnv(workspace)
+  const env = hostedEnv(workspace, xdgRoot)
   const marker = `/tmp/${VIEW_IT_PREFIX}-kill-${VIEW_TAG}`
   const strayPattern = 'sleep 778[12]'
 
@@ -2081,6 +2086,7 @@ describe.skipIf(!gated)('isolate-agent read-only view: a server torn down while 
     spawnSync('sudo', ['-n', 'pkill', '-KILL', '-f', strayPattern])
     fs.rmSync(marker, {force: true})
     fs.rmSync(scratch, {recursive: true, force: true})
+    fs.rmSync(xdgRoot, {recursive: true, force: true})
   }, 120_000)
 
   it('kills every member of the namespace, stray processes included, and confirms it', () => {
@@ -2102,10 +2108,12 @@ describe.skipIf(!gated)('isolate-agent read-only view: a server torn down while 
 describe.skipIf(!gated)('isolate-agent read-only view: a second isolated run in the same job', () => {
   const logger = createLogger({phase: 'sandbox-integration-second'})
   const scratch = path.join(runnerTemp, `sandbox-it-second-${process.pid}`)
+  // Its own XDG roots: the commondir suite above ends `unsafe` and leaves the default ones owned by the sandbox uid.
+  const xdgRoot = path.join(runnerTemp, `sandbox-it-second-xdg-${process.pid}`)
   const workspace = path.join(scratch, 'ws')
   const responseDir = path.join(scratch, 'response')
   const keyDir = path.join(scratch, 'keys')
-  const env = hostedEnv(workspace)
+  const env = hostedEnv(workspace, xdgRoot)
   const markers = ['/tmp', '/var/tmp', '/dev/shm'].map(dir => `${dir}/${VIEW_IT_PREFIX}-run1-${VIEW_TAG}`)
   const homeMarker = `$HOME/${VIEW_IT_PREFIX}-run1-${VIEW_TAG}`
 
@@ -2143,6 +2151,7 @@ describe.skipIf(!gated)('isolate-agent read-only view: a second isolated run in 
   afterAll(() => {
     sweepViewFiles()
     fs.rmSync(scratch, {recursive: true, force: true})
+    fs.rmSync(xdgRoot, {recursive: true, force: true})
   }, 120_000)
 
   it('restored the first run before the second began', () => {
@@ -2163,10 +2172,12 @@ describe.skipIf(!gated)('isolate-agent read-only view: a second isolated run in 
 describe.skipIf(!gated)('isolate-agent read-only view: a launcher killed while the chain waits at its gate', () => {
   const logger = createLogger({phase: 'sandbox-integration-gate'})
   const scratch = path.join(runnerTemp, `sandbox-it-gate-${process.pid}`)
+  // Its own XDG roots: the commondir suite above ends `unsafe` and leaves the default ones owned by the sandbox uid.
+  const xdgRoot = path.join(runnerTemp, `sandbox-it-gate-xdg-${process.pid}`)
   const workspace = path.join(scratch, 'ws')
   const responseDir = path.join(scratch, 'response')
   const keyDir = path.join(scratch, 'keys')
-  const env = hostedEnv(workspace)
+  const env = hostedEnv(workspace, xdgRoot)
   const marker = path.join(workspace, `${VIEW_IT_PREFIX}-gate-ran-${VIEW_TAG}`)
   const strayPattern = 'sleep 7791'
 
@@ -2242,6 +2253,7 @@ describe.skipIf(!gated)('isolate-agent read-only view: a launcher killed while t
     await lifecycle?.release()
     spawnSync('sudo', ['-n', 'pkill', '-KILL', '-f', strayPattern])
     fs.rmSync(scratch, {recursive: true, force: true})
+    fs.rmSync(xdgRoot, {recursive: true, force: true})
   }, 120_000)
 
   it('held the chain at the gate: it reported its namespace and nothing past the gate ran', () => {
