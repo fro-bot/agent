@@ -408,6 +408,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     try {
       const result = await proxy.stop()
       if (result.outcome === 'unconfirmed' || proxyUnconfirmed) return 'unconfirmed'
+      logger.info('Key proxy stopped', {exitConfirmed: true})
       return result.crashed ? 'crashed' : 'stopped'
     } catch (error) {
       logger.error('Stopping the key proxy threw', {error: toErrorMessage(error)})

@@ -1165,6 +1165,27 @@ describe('createSandboxLifecycle', () => {
       expect(stop).toHaveBeenCalledTimes(1)
     })
 
+    it('logs a confirmed proxy stop with exitConfirmed true, and nothing when the exit is unconfirmed', async () => {
+      // #given one lifecycle whose proxy stops cleanly and one whose proxy exit cannot be confirmed
+      const stoppedLogger = createMockLogger()
+      const stopped = create(createHarness(), {logger: stoppedLogger})
+      await stopped.startKeyProxy(async () => report(fakeProxy().proxy))
+      const unconfirmedLogger = createMockLogger()
+      const unconfirmed = create(createHarness(), {logger: unconfirmedLogger})
+      await unconfirmed.startKeyProxy(async () => report(fakeProxy({outcome: 'unconfirmed'}).proxy))
+
+      // #when both are released
+      await stopped.release()
+      await unconfirmed.release()
+
+      // #then only the confirmed stop logs the line
+      expect(stoppedLogger.info).toHaveBeenCalledWith('Key proxy stopped', {exitConfirmed: true})
+      expect(unconfirmedLogger.info).not.toHaveBeenCalledWith('Key proxy stopped', expect.anything())
+      expect(unconfirmedLogger.error).toHaveBeenCalledWith(
+        'The key proxy exit could not be confirmed; the run can no longer be trusted',
+      )
+    })
+
     it('records the run unsafe when the proxy exit cannot be confirmed', async () => {
       // #given a proxy that cannot be confirmed stopped
       const harness = createHarness()
