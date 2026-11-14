@@ -17,6 +17,9 @@ const TOOLS: SandboxIdentityTools = {
   pkill: '/usr/bin/pkill',
   pgrep: '/usr/bin/pgrep',
   chmod: '/usr/bin/chmod',
+  chown: '/usr/bin/chown',
+  find: '/usr/bin/find',
+  mkdir: '/usr/bin/mkdir',
 }
 
 interface FakeSystemOptions {
@@ -26,6 +29,13 @@ interface FakeSystemOptions {
   /** Extra passwd line added by useradd, simulating a uid collision. */
   readonly collidingUid?: boolean
   readonly failChmod?: boolean
+  readonly failMkdir?: boolean
+  readonly failChown?: boolean
+  readonly failFind?: boolean
+  /** A directory already at the home path before the account is created, with the files in it. */
+  readonly existingHome?: {readonly ownerUid: number; readonly entries?: readonly string[]}
+  /** A home-setup command that is killed on its budget instead of finishing; its effect did not happen. */
+  readonly timeoutOn?: 'chmod' | 'chown' | 'find' | 'mkdir'
   /** What useradd returns instead of succeeding. */
   readonly useraddResult?: PrivilegedRunResult
   /** When useradd returns `useraddResult`, still create the account (a hung useradd that had already finished its work). */
@@ -43,18 +53,32 @@ function createFakeSystem(options: FakeSystemOptions = {}) {
   const calls: string[][] = []
   const useraddOptions: ({readonly timeoutMs?: number} | undefined)[] = []
   const infoLog: {readonly message: string; readonly context?: unknown}[] = []
+  /** Home directories by path, with the uid that owns each and what is inside. */
+  const homes = new Map<string, {uid: number; entries: readonly string[]}>(
+    options.existingHome === undefined
+      ? []
+      : [
+          [
+            `/home/${SANDBOX_ACCOUNT_NAME}`,
+            {uid: options.existingHome.ownerUid, entries: options.existingHome.entries ?? []},
+          ],
+        ],
+  )
   const state = {
     procs: [] as string[],
     /** Processes spawned by a hostile parent right after each pkill, before the next pgrep. */
     respawnAfterKill: 0,
     survivors: false,
     now: 0,
+    /** Whether chown fails; a test can clear it to retry on the same host. */
+    failChown: options.failChown === true,
   }
 
   const run: PrivilegedRun = async (argv, runOptions) => {
     calls.push([...argv])
     if (argv[0] === TOOLS.useradd) useraddOptions.push(runOptions)
     const tool = argv[0]?.split('/').pop() ?? ''
+    if (options.timeoutOn === tool) return {exitCode: null, stdout: '', stderr: '', timedOutAfterMs: 30_000}
     switch (tool) {
       case 'useradd': {
         state.now += options.useraddElapsedMs ?? 0
@@ -72,10 +96,36 @@ function createFakeSystem(options: FakeSystemOptions = {}) {
       }
       case 'chmod':
         return {exitCode: options.failChmod === true ? 1 : 0, stdout: ''}
+      case 'mkdir': {
+        const target = argv.at(-1) ?? ''
+        if (options.failMkdir === true || homes.has(target)) return {exitCode: 1, stdout: '', stderr: 'File exists'}
+        homes.set(target, {uid: 0, entries: []})
+        return {exitCode: 0, stdout: ''}
+      }
+      case 'chown': {
+        if (state.failChown) return {exitCode: 1, stdout: ''}
+        const target = argv.at(-1) ?? ''
+        const home = homes.get(target)
+        if (home !== undefined) home.uid = Number.parseInt((argv.at(-2) ?? '').split(':')[0] ?? '', 10)
+        return {exitCode: 0, stdout: ''}
+      }
+      case 'find': {
+        // Only the exact non-recursive form is modelled: an empty directory at the path, never followed or descended into.
+        if (options.failFind === true) return {exitCode: 1, stdout: '', stderr: 'find: cannot delete'}
+        const target = argv[2] ?? ''
+        const home = homes.get(target)
+        if (home !== undefined && home.entries.length === 0) homes.delete(target)
+        return {exitCode: 0, stdout: ''}
+      }
       case 'userdel': {
         const name = argv.at(-1) ?? ''
         const index = passwd.findIndex(line => line.startsWith(`${name}:`))
         if (index === -1) return {exitCode: 6, stdout: ''}
+        // Like shadow's `userdel --remove`: a home is removed only when the account owns it.
+        const fields = (passwd[index] ?? '').split(':')
+        const homePath = fields[5] ?? ''
+        const owned = homes.get(homePath)?.uid === Number.parseInt(fields[2] ?? '', 10)
+        if (argv.includes('--remove') && owned) homes.delete(homePath)
         passwd.splice(index, 1)
         const groupIndex = group.findIndex(line => line.startsWith(`${name}:`))
         if (groupIndex !== -1) group.splice(groupIndex, 1)
@@ -115,7 +165,7 @@ function createFakeSystem(options: FakeSystemOptions = {}) {
       error: () => undefined,
     },
   }
-  return {deps, calls, state, passwd, group, useraddOptions, infoLog}
+  return {deps, calls, state, passwd, group, homes, useraddOptions, infoLog}
 }
 
 const toolNames = (calls: readonly string[][]): string[] => calls.map(call => call[0]?.split('/').pop() ?? '')
@@ -136,9 +186,42 @@ describe('createSandboxAccount', () => {
       home: '/home/fro-bot-sandbox',
     })
     const useradd = system.calls.find(call => call[0] === TOOLS.useradd) ?? []
-    expect(useradd).toEqual(expect.arrayContaining(['--system', '--user-group', '--create-home']))
+    expect(useradd).toEqual(expect.arrayContaining(['--system', '--user-group', '--home-dir', '/home/fro-bot-sandbox']))
     expect(useradd).not.toContain('--groups')
     expect(system.calls).toContainEqual([TOOLS.chmod, '0700', '/home/fro-bot-sandbox'])
+  })
+
+  it('creates the account without copying /etc/skel', async () => {
+    // #given a host without the account
+    const system = createFakeSystem()
+
+    // #when the account is created
+    await createSandboxAccount(TOOLS, system.deps)
+
+    // #then useradd was told not to create the home (--create-home copies /etc/skel, about 833 MB on hosted images)
+    const useradd = system.calls.find(call => call[0] === TOOLS.useradd) ?? []
+    expect(useradd).toContain('--no-create-home')
+    expect(useradd).not.toContain('--create-home')
+    expect(useradd).not.toContain('--skel')
+  })
+
+  it('creates the home, then hands it to the read-back uid and gid, then sets mode 0700, in that order', async () => {
+    // #given a host that allocates uid 998 and gid 997
+    const system = createFakeSystem()
+
+    // #when the account is created
+    const result = await createSandboxAccount(TOOLS, system.deps)
+
+    // #then the steps after useradd are exactly these, in this order
+    expect(result.success).toBe(true)
+    const afterUseradd = system.calls.slice(system.calls.findIndex(call => call[0] === TOOLS.useradd) + 1)
+    expect(afterUseradd).toEqual([
+      [TOOLS.mkdir, '-m', '0700', '/home/fro-bot-sandbox'],
+      [TOOLS.chown, '998:997', '/home/fro-bot-sandbox'],
+      [TOOLS.chmod, '0700', '/home/fro-bot-sandbox'],
+    ])
+    // #and the home is owned by the account
+    expect(system.homes.get('/home/fro-bot-sandbox')?.uid).toBe(998)
   })
 
   describe('the useradd budget and its failure messages', () => {
@@ -364,6 +447,166 @@ describe('createSandboxAccount', () => {
   })
 })
 
+describe('createSandboxAccount: the home steps', () => {
+  const HOME = '/home/fro-bot-sandbox'
+  const accountExists = (system: ReturnType<typeof createFakeSystem>): boolean =>
+    system.passwd.some(line => line.startsWith('fro-bot-sandbox:'))
+  const FIND_HOME_ARGV = [TOOLS.find, '-P', HOME, '-maxdepth', '0', '-type', 'd', '-empty', '-delete']
+
+  it('stops at the first failed step: a failed mkdir never reaches chown, chmod or the cleanup', async () => {
+    // #given an mkdir that fails
+    const system = createFakeSystem({failMkdir: true})
+
+    // #when
+    const result = await createSandboxAccount(TOOLS, system.deps)
+
+    // #then the account is removed with a plain userdel (the home was not made here, so it is not ours to remove)
+    expect(!result.success && result.error.kind).toBe('create-failed')
+    expect(!result.success && 'timedOut' in result.error).toBe(false)
+    expect(toolNames(system.calls)).not.toContain('chown')
+    expect(toolNames(system.calls)).not.toContain('chmod')
+    expect(toolNames(system.calls)).not.toContain('find')
+    expect(system.calls).toContainEqual([TOOLS.userdel, 'fro-bot-sandbox'])
+    expect(accountExists(system)).toBe(false)
+  })
+
+  it.each([
+    ['root', 0],
+    ['the newly allocated uid', 998],
+  ] as const)(
+    'keeps a pre-existing home owned by %s, with its contents, and removes only the account',
+    async (_owner, ownerUid) => {
+      // #given a directory already at the home path with a file in it
+      const system = createFakeSystem({existingHome: {ownerUid, entries: ['precious.txt']}})
+
+      // #when creation is attempted
+      const result = await createSandboxAccount(TOOLS, system.deps)
+
+      // #then creation fails, the account is gone, and the directory and its file are untouched
+      expect(!result.success && result.error.kind).toBe('create-failed')
+      expect(accountExists(system)).toBe(false)
+      expect(system.homes.get(HOME)).toEqual({uid: ownerUid, entries: ['precious.txt']})
+      // #and nothing was asked to adopt, change or remove it
+      expect(system.calls.find(call => call[0] === TOOLS.mkdir)).not.toContain('-p')
+      for (const tool of ['chown', 'chmod', 'find']) expect(toolNames(system.calls)).not.toContain(tool)
+      expect(system.calls.filter(call => call[0] === TOOLS.userdel)).toEqual([[TOOLS.userdel, 'fro-bot-sandbox']])
+    },
+  )
+
+  it('removes the new home, then the account, when chown fails after mkdir, and a retry then succeeds', async () => {
+    // #given a chown that fails once the root-owned home exists
+    const system = createFakeSystem({failChown: true})
+
+    // #when creation is attempted
+    const result = await createSandboxAccount(TOOLS, system.deps)
+
+    // #then the half-made home is removed first (non-recursively), then the account, with a plain userdel
+    expect(!result.success && result.error.kind).toBe('create-failed')
+    expect(!result.success && 'timedOut' in result.error).toBe(false)
+    const afterMkdir = system.calls.slice(system.calls.findIndex(call => call[0] === TOOLS.mkdir))
+    expect(afterMkdir.map(call => call.join(' '))).toEqual([
+      `${TOOLS.mkdir} -m 0700 ${HOME}`,
+      `${TOOLS.chown} 998:997 ${HOME}`,
+      FIND_HOME_ARGV.join(' '),
+      `${TOOLS.userdel} fro-bot-sandbox`,
+    ])
+    expect(system.homes.has(HOME)).toBe(false)
+    expect(accountExists(system)).toBe(false)
+
+    // #and the fixed path is free again: a second attempt on the same host succeeds
+    system.state.failChown = false
+    const retry = await createSandboxAccount(TOOLS, system.deps)
+    expect(retry.success).toBe(true)
+  })
+
+  it('removes the home and the account when chmod fails after mkdir and chown', async () => {
+    // #given a chmod that fails after the home was made and handed over
+    const system = createFakeSystem({failChmod: true})
+
+    // #when creation is attempted
+    const result = await createSandboxAccount(TOOLS, system.deps)
+
+    // #then both are gone, the home first
+    expect(!result.success && result.error.kind).toBe('create-failed')
+    expect(system.homes.has(HOME)).toBe(false)
+    expect(accountExists(system)).toBe(false)
+    const tail = system.calls.slice(-2).map(call => call.join(' '))
+    expect(tail).toEqual([FIND_HOME_ARGV.join(' '), `${TOOLS.userdel} fro-bot-sandbox`])
+  })
+
+  it('cleans the half-made home with one exact, non-recursive, symlink-safe find', async () => {
+    // #given a failure after mkdir
+    const system = createFakeSystem({failChown: true})
+
+    // #when
+    await createSandboxAccount(TOOLS, system.deps)
+
+    // #then the only cleanup command is find on the path itself: no recursion, no -L, only an empty directory
+    const finds = system.calls.filter(call => call[0] === TOOLS.find)
+    expect(finds).toEqual([FIND_HOME_ARGV])
+    expect(finds[0]).toContain('-P')
+    expect(finds[0]).not.toContain('-L')
+    expect(finds[0]?.slice(finds[0].indexOf('-maxdepth'), finds[0].indexOf('-maxdepth') + 2)).toEqual([
+      '-maxdepth',
+      '0',
+    ])
+    expect(system.calls.some(call => call.includes('--remove') || call.includes('-r') || call.includes('-rf'))).toBe(
+      false,
+    )
+  })
+
+  it('reports a failed cleanup in the error message and still removes the account', async () => {
+    // #given a chown failure whose cleanup also fails
+    const system = createFakeSystem({failChown: true, failFind: true})
+
+    // #when
+    const result = await createSandboxAccount(TOOLS, system.deps)
+
+    // #then the message says the home was left, and the account is gone anyway
+    const message = result.success ? '' : result.error.message
+    expect(message).toContain(`the half-made home ${HOME} could not be removed`)
+    expect(message).toContain('Could not hand the sandbox home to the account')
+    expect(accountExists(system)).toBe(false)
+  })
+
+  it.each([{failChown: true}, {failChmod: true}] as const)(
+    'leaves the account in place when the cleanup of a half-made home is killed on its budget (%o)',
+    async failure => {
+      // #given an ordinary home-step failure whose cleanup outlives its budget
+      const system = createFakeSystem({...failure, timeoutOn: 'find'})
+
+      // #when creation is attempted
+      const result = await createSandboxAccount(TOOLS, system.deps)
+
+      // #then the account is kept (the killed find is not known to have stopped) and the failure is a timeout
+      expect(toolNames(system.calls)).toContain('find')
+      expect(toolNames(system.calls)).not.toContain('userdel')
+      expect(accountExists(system)).toBe(true)
+      expect(!result.success && 'timedOut' in result.error && result.error.timedOut).toBe(true)
+      expect(!result.success && result.error.message).toContain(`the half-made home ${HOME} could not be removed`)
+    },
+  )
+
+  it.each(['mkdir', 'chown', 'chmod'] as const)(
+    'leaves the account and the home in place, and cleans up nothing, when %s is killed on its budget',
+    async step => {
+      // #given a home step that outlives its budget
+      const system = createFakeSystem({timeoutOn: step})
+
+      // #when creation is attempted
+      const result = await createSandboxAccount(TOOLS, system.deps)
+
+      // #then neither userdel nor find ran (the killed command is not known to have stopped) and the failure is a timeout
+      expect(toolNames(system.calls)).not.toContain('userdel')
+      expect(toolNames(system.calls)).not.toContain('find')
+      expect(accountExists(system)).toBe(true)
+      expect(system.homes.has(HOME)).toBe(step !== 'mkdir')
+      expect(!result.success && 'timedOut' in result.error && result.error.timedOut).toBe(true)
+      expect(!result.success && result.error.message).toContain('timed out after 30000ms')
+    },
+  )
+})
+
 describe('stopSandboxProcesses', () => {
   it('kills the uid and confirms nothing is left', async () => {
     // #given sandbox processes
@@ -459,9 +702,10 @@ describe('deleteSandboxAccount', () => {
     // #when deleted
     const outcome = await deleteSandboxAccount(created.data, TOOLS, system.deps)
 
-    // #then the account and its home are removed
+    // #then the account and its home are removed, including a home that useradd did not create
     expect(outcome).toBe('deleted')
     expect(system.calls.at(-1)).toEqual([TOOLS.userdel, '--remove', 'fro-bot-sandbox'])
+    expect(system.homes.has('/home/fro-bot-sandbox')).toBe(false)
   })
 })
 
