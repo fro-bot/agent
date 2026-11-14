@@ -13,7 +13,7 @@ import {toErrorMessage} from '../shared/errors.js'
 import {err, ok} from '../shared/types.js'
 import {filterAgentEnv} from './filter-env.js'
 import {buildSetprivDropArgs} from './sandbox-identity.js'
-import {GATE_ERR_FILE, GATE_GO_FILE, GATE_NS_FILE, rootChainTail} from './sandbox-namespace.js'
+import {GATE_ERR_FILE, GATE_GO_FILE, GATE_NS_FILE, rootChainReport, rootChainTail} from './sandbox-namespace.js'
 
 /**
  * Spawn, authenticate to, gate and shut down a stock OpenCode V2 server (`serve --stdio`).
@@ -558,11 +558,18 @@ export function buildSandboxViewChain(view: OpenCodeV2SandboxView, command: read
   ]
 }
 
-/** The tail of the root steps' stderr for a view launch, as one line; empty without a view or without output. */
+/**
+ * What the root steps of a view launch wrote to stderr, as one message fragment: the failed stage (read from the whole file,
+ * so a long report cannot lose it to the cut) and the bounded tail. Empty without a view or without output.
+ */
 export function rootChainFailure(view: OpenCodeV2SandboxView | undefined): string {
   if (view === undefined) return ''
   try {
-    return rootChainTail(readFileSync(`${view.gate.dir}/${GATE_ERR_FILE}`, 'utf8'))
+    const text = readFileSync(`${view.gate.dir}/${GATE_ERR_FILE}`, 'utf8')
+    const tail = rootChainTail(text)
+    const {stage} = rootChainReport(text)
+    if (tail === '' && stage === null) return ''
+    return `${stage === null ? '' : `the view could not be built (stage ${stage}); `}${tail}`
   } catch {
     return ''
   }

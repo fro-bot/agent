@@ -286,6 +286,7 @@ export {
   parseNamespaceId,
   readGateNamespace,
   ROOT_CHAIN_TAIL_CHARS,
+  rootChainReport,
   rootChainTail,
   selfExcludingPattern,
   stopGateProcesses,

@@ -794,13 +794,51 @@ describe('startOpenCodeV2Server with a read-only view', () => {
     expect(result.success).toBe(false)
     expect(!result.success && result.error.kind).toBe('exited-early')
     const message = result.success ? '' : result.error.message
-    expect(message).toContain('(code 78); root steps before the server: noise {"view":"failed","stage":"seal"')
+    expect(message).toContain(
+      '(code 78); root steps before the server: the view could not be built (stage seal); noise {"view":"failed","stage":"seal"',
+    )
     expect(message).toContain('exited non-zero: mount: /x: denied')
     expect(message).not.toContain('from-the-agent')
     expect(message).not.toContain('\n')
     expect(!result.success && result.error.exitCode).toBe(78)
     expect(pids).toHaveLength(1)
     expect(pids[0]).toBeGreaterThan(0)
+  })
+
+  it('names the failed stage even when the report is longer than the tail the message shows', async () => {
+    // #given an error file whose last line is the longest report the builder prints
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'view-fail-'))
+    dirs.push(dir)
+    const gateDir = path.join(dir, 'gate')
+    mkdirSync(gateDir)
+    const report = JSON.stringify({
+      view: 'failed',
+      stage: 'verify',
+      op: `mount ${'x'.repeat(150)}`,
+      detail: `exited non-zero: ${'e'.repeat(220)}`,
+    })
+    writeFileSync(path.join(gateDir, 'err'), `${report}\n`)
+    const sudoPath = path.join(dir, 'sudo')
+    writeFileSync(sudoPath, '#!/bin/sh\nexit 78\n')
+    chmodSync(sudoPath, 0o755)
+
+    // #when started
+    const result = await startOpenCodeV2Server(
+      {
+        binaryPath: '/unused',
+        directory: dir,
+        expectedPluginIds: [],
+        timeouts: TIMEOUTS,
+        sandbox: launchSpec({sudoPath, view: {...VIEW, gate: {...VIEW.gate, dir: gateDir}}}),
+      },
+      {debug: () => undefined, info: () => undefined, warning: () => undefined, error: () => undefined},
+    )
+
+    // #then the stage is named, and the tail is still bounded
+    const message = result.success ? '' : result.error.message
+    expect(message).toContain('the view could not be built (stage verify)')
+    expect(message).not.toContain('"stage":"verify"')
+    expect(message.length).toBeLessThan(600)
   })
 
   it('keeps the message to a fixed tail of one line, and says nothing when the error file is absent', async () => {
