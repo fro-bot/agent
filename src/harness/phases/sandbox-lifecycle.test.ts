@@ -29,6 +29,7 @@ const TOOLS = Object.fromEntries(
     'mkdir',
     'env',
     'git',
+    'gh',
   ].map(name => [name, `/usr/bin/${name}`]),
 ) as unknown as SandboxToolPaths
 
@@ -216,6 +217,87 @@ describe('createSandboxLifecycle', () => {
     expect(
       harness.sudoCalls.some(call => call.includes('/usr/bin/mkdir') && call.includes('/home/fro-bot-sandbox/tmp')),
     ).toBe(true)
+  })
+
+  describe('git credential helper', () => {
+    const helperWritesOf = (harness: Harness): string[][] =>
+      harness.sudoCalls.filter(call => call.includes('--file') && call.at(-2)?.startsWith('credential.') === true)
+
+    it('routes git through the provisioned gh token when a gh config was handed over', async () => {
+      // #given provision mode: a gh config dir the sandbox holds, on the default server
+      const harness = createHarness()
+      const lifecycle = create(harness)
+
+      // #when prepared
+      await lifecycle.prepare({keyFilePaths: [], ghConfigDir: `${temp}/gh-config-abc`, repoSkills: null})
+
+      // #then the sandbox's global gitconfig resets the helper list for the host, then names the absolute gh as the helper
+      const helperWrites = helperWritesOf(harness)
+      expect(helperWrites.map(call => call.slice(-2))).toEqual([
+        ['credential.https://github.com.helper', ''],
+        ['credential.https://github.com.helper', '!/usr/bin/gh auth git-credential'],
+      ])
+      for (const call of helperWrites) {
+        expect(call.slice(0, 5)).toEqual(['/usr/bin/sudo', '-n', '--', '/usr/bin/setpriv', '--reuid=998'])
+        expect(call).toContain('/home/fro-bot-sandbox/.gitconfig')
+      }
+    })
+
+    it('keys the helper on the server the Action runs against, not on github.com', async () => {
+      // #given a GitHub Enterprise Server URL with a port, a path and a trailing slash
+      const harness = createHarness()
+      const lifecycle = create(harness, {
+        env: {
+          HOME: '/home/runner',
+          RUNNER_TEMP: temp,
+          GITHUB_SERVER_URL: 'https://ghe.example.test:8443/some/path/',
+        },
+      })
+
+      // #when prepared in provision mode
+      await lifecycle.prepare({keyFilePaths: [], ghConfigDir: `${temp}/gh-config-abc`, repoSkills: null})
+
+      // #then the helper is scoped to that origin only
+      expect(new Set(helperWritesOf(harness).map(call => call.at(-2)))).toEqual(
+        new Set(['credential.https://ghe.example.test:8443.helper']),
+      )
+    })
+
+    it('adds no helper when the credential is withheld, even when the server URL is set', async () => {
+      // #given withheld mode: no gh config was provisioned
+      const harness = createHarness()
+      const lifecycle = create(harness, {
+        env: {HOME: '/home/runner', RUNNER_TEMP: temp, GITHUB_SERVER_URL: 'https://github.com'},
+      })
+
+      // #when prepared
+      await lifecycle.prepare({keyFilePaths: [], ghConfigDir: null, repoSkills: null})
+
+      // #then the sandbox gitconfig carries no credential setting at all
+      expect(helperWritesOf(harness)).toEqual([])
+    })
+
+    it('adds no helper and warns when the server URL is not usable', async () => {
+      // #given provision mode with a malformed server URL
+      const harness = createHarness()
+      const logger = createMockLogger()
+      const lifecycle = create(harness, {
+        logger,
+        env: {HOME: '/home/runner', RUNNER_TEMP: temp, GITHUB_SERVER_URL: 'not a url'},
+      })
+
+      // #when prepared
+      const prepared = await lifecycle.prepare({
+        keyFilePaths: [],
+        ghConfigDir: `${temp}/gh-config-abc`,
+        repoSkills: null,
+      })
+
+      // #then the run still starts, without a guessed host
+      expect(prepared.success).toBe(true)
+      expect(helperWritesOf(harness)).toEqual([])
+      expect(logger.warning).toHaveBeenCalled()
+    })
   })
 
   it('refuses when the account already exists, without handing anything over', async () => {
