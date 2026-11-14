@@ -52,7 +52,7 @@ function publishedEntries(root: string, work = WORK): Map<string, EntryKind> {
     entries.set(current, 'directory')
   }
   entries.set(`${root}/dist`, 'directory')
-  for (const file of ['action.yaml', 'dist/main.js', 'dist/post.js', 'dist/key-proxy.js'])
+  for (const file of ['action.yaml', 'dist/main.js', 'dist/post.js', 'dist/key-proxy.js', 'dist/sandbox-view.js'])
     entries.set(`${root}/${file}`, 'file')
   return entries
 }
@@ -307,6 +307,8 @@ describe('runSandboxPreflight', () => {
       ['post.js is a FIFO or device', `${PUBLISHED_ROOT}/dist/post.js`, 'other'],
       ['key-proxy.js is a symlink', `${PUBLISHED_ROOT}/dist/key-proxy.js`, 'symlink'],
       ['key-proxy.js is a directory', `${PUBLISHED_ROOT}/dist/key-proxy.js`, 'directory'],
+      ['sandbox-view.js is a symlink', `${PUBLISHED_ROOT}/dist/sandbox-view.js`, 'symlink'],
+      ['sandbox-view.js is a directory', `${PUBLISHED_ROOT}/dist/sandbox-view.js`, 'directory'],
     ] as const)('refuses an install where %s', async (_label, target, kind) => {
       // #given the file the runner reloads or executes is not a regular file
       const entries = publishedEntries(PUBLISHED_ROOT)
@@ -325,6 +327,16 @@ describe('runSandboxPreflight', () => {
 
       // #when / #then
       await expectRefused(deps, getExecOutput, /key-proxy\.js is not a regular file/)
+    })
+
+    it('refuses an install that has no sandbox-view.js, because root runs the view builder before the agent starts', async () => {
+      // #given an install without the view builder
+      const entries = publishedEntries(PUBLISHED_ROOT)
+      entries.delete(`${PUBLISHED_ROOT}/dist/sandbox-view.js`)
+      const {deps, getExecOutput} = withInstall(PUBLISHED_ROOT, {entries})
+
+      // #when / #then
+      await expectRefused(deps, getExecOutput, /sandbox-view\.js is not a regular file/)
     })
 
     it('accepts action.yml in place of action.yaml, and refuses neither being present', async () => {

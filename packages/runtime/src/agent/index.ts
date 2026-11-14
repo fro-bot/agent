@@ -278,6 +278,19 @@ export type {
   SandboxIdentityTools,
   SandboxStopOutcome,
 } from './sandbox-identity.js'
+export {runSandboxViewChild, SANDBOX_VIEW_EXIT_FAILED, SANDBOX_VIEW_EXIT_INVALID_POLICY} from './sandbox-view-child.js'
+export type {SandboxViewChildIo} from './sandbox-view-child.js'
+export {
+  decodeMountPath,
+  parseMountInfo,
+  parseSandboxViewPolicy,
+  planViewBind,
+  planViewSeal,
+  SANDBOX_VIEW_TEMP_MOUNTS,
+  validateViewPolicy,
+  verifyView,
+} from './sandbox-view.js'
+export type {MountEntry, SandboxViewPolicy, SandboxViewStage, ViewOp} from './sandbox-view.js'
 export {buildSandboxLaunch, DEFAULT_OPENCODE_V2_TIMEOUTS, startOpenCodeV2Server} from './server-v2.js'
 export type {
   OpenCodeV2ExitInfo,

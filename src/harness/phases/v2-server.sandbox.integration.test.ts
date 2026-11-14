@@ -230,7 +230,7 @@ function createPublishedActionLayout(): void {
     path.join(fakeActionRoot, 'action.yaml'),
     'name: sandbox-it\nruns:\n  using: node24\n  main: dist/main.js\n',
   )
-  for (const script of ['main.js', 'post.js', 'key-proxy.js'])
+  for (const script of ['main.js', 'post.js', 'key-proxy.js', 'sandbox-view.js'])
     fs.writeFileSync(path.join(fakeActionRoot, 'dist', script), '// stand-in\n')
 }
 

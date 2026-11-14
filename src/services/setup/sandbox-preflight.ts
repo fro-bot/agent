@@ -164,7 +164,7 @@ export function discoverActionLocation(input: {readonly argv: readonly string[];
   }
 }
 
-const RUNNER_ENTRY_SCRIPTS = ['dist/main.js', 'dist/post.js', 'dist/key-proxy.js'] as const
+const RUNNER_ENTRY_SCRIPTS = ['dist/main.js', 'dist/post.js', 'dist/key-proxy.js', 'dist/sandbox-view.js'] as const
 const MANIFEST_NAMES = ['action.yaml', 'action.yml'] as const
 
 /**
