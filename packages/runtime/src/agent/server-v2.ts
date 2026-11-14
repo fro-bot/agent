@@ -1,9 +1,11 @@
 import type {ChildProcess} from 'node:child_process'
 import type {Result} from '@bfra.me/es/result'
 import type {Logger} from '../shared/logger.js'
+import type {SandboxViewPolicy} from './sandbox-view.js'
 import {Buffer} from 'node:buffer'
 import {spawn} from 'node:child_process'
 import {randomBytes} from 'node:crypto'
+import {readFileSync} from 'node:fs'
 import net from 'node:net'
 import process from 'node:process'
 import {sleep} from '../shared/async.js'
@@ -11,6 +13,7 @@ import {toErrorMessage} from '../shared/errors.js'
 import {err, ok} from '../shared/types.js'
 import {filterAgentEnv} from './filter-env.js'
 import {buildSetprivDropArgs} from './sandbox-identity.js'
+import {GATE_ERR_FILE, GATE_GO_FILE, GATE_NS_FILE, rootChainTail} from './sandbox-namespace.js'
 
 /**
  * Spawn, authenticate to, gate and shut down a stock OpenCode V2 server (`serve --stdio`).
@@ -180,6 +183,8 @@ export interface OpenCodeV2SandboxLaunch {
   readonly account: {readonly name: string; readonly uid: number; readonly gid: number; readonly home: string}
   /** Fixed `PATH` for the child. */
   readonly path: string
+  /** The read-only filesystem view to enter before the drop. Without it the launch runs in the host's mount namespace. */
+  readonly view?: OpenCodeV2SandboxView
   readonly tmpdir: string
   readonly xdg: {
     readonly data: string
@@ -189,6 +194,34 @@ export interface OpenCodeV2SandboxLaunch {
   }
   /** Further non-secret variables, e.g. `GH_CONFIG_DIR` pointing into the sandbox. Set after the drop. */
   readonly extraEnv?: Readonly<Record<string, string>>
+}
+
+/**
+ * The launch chain into a read-only view, in a private mount namespace: `unshare` makes the namespace, the builder bundle
+ * (the Action's own Node, as root) builds and verifies the view, then `pivot_root` enters it and the old root is unmounted
+ * before the drop. Every path is an absolute argument of one of two fixed scripts, never part of shell text.
+ */
+export interface OpenCodeV2SandboxView {
+  readonly unsharePath: string
+  readonly shPath: string
+  readonly pivotRootPath: string
+  readonly umountPath: string
+  /** The Node that runs the builder: the Action's own (`process.execPath`). */
+  readonly nodePath: string
+  /** `dist/sandbox-view.js` of the published install. */
+  readonly builderPath: string
+  readonly policy: SandboxViewPolicy
+  /**
+   * The gate that holds the chain at its first step until the runner has captured the launch's namespace id. The directory
+   * is created by the runner for this launch alone and is writable only by it and by root.
+   */
+  readonly gate: {
+    readonly dir: string
+    readonly readlinkPath: string
+    readonly sleepPath: string
+    /** Ticks of 0.1 s the gate waits for the go-ahead before it exits without running anything. */
+    readonly ticks: number
+  }
 }
 
 export interface StartOpenCodeV2ServerOptions {
@@ -225,6 +258,11 @@ export interface StartOpenCodeV2ServerOptions {
    */
   readonly maskSecret?: (value: string) => void
   readonly deps?: Partial<OpenCodeV2Deps>
+  /**
+   * Called synchronously with the pid of the spawned launcher, the moment it exists. A sandbox launch's privileged part
+   * outlives that process's own signals, so whoever tears the launch down needs the pid to find its mount namespace.
+   */
+  readonly onSpawn?: (pid: number) => void
 }
 
 const LOOPBACK = '127.0.0.1'
@@ -405,14 +443,39 @@ function startError(
 const SANDBOX_ENV_NAME = /^[A-Z_]\w*$/i
 
 /**
+ * The first step inside the new mount namespace, before anything is built. It writes the id of its own mount namespace to
+ * `$g/ns`, then waits for `$g/go` to hold that same id, which the runner writes only after it has read and validated the
+ * id. It gives up after `$n` ticks of 0.1 s with exit 71 having run nothing; exit 70 when it cannot record the id, 72 when
+ * it cannot wait. Arguments: readlink, sleep, gate directory, ticks, then the rest of the chain. What the root steps print
+ * to stderr is appended to `$g/err`, which the runner reads when the launch fails: this file never holds the agent's output.
+ */
+const VIEW_GATE_SCRIPT =
+  'r=$1; s=$2; g=$3; n=$4; shift 4; ' +
+  `id=$("$r" /proc/self/ns/mnt 2>>"$g/${GATE_ERR_FILE}") || exit 70; echo "$id" > "$g/${GATE_NS_FILE}" || exit 70; i=0; ` +
+  `while :; do { read -r v < "$g/${GATE_GO_FILE}"; } 2>/dev/null && [ "$v" = "$id" ] && break; ` +
+  `i=$((i+1)); [ "$i" -gt "$n" ] && { echo "gate: no go-ahead within its bound" >> "$g/${GATE_ERR_FILE}"; exit 71; }; ` +
+  '"$s" 0.1 || exit 72; done; exec "$@"'
+
+/** Runs the builder (stderr to the gate's error file), then (only if it exited 0) replaces the shell with the rest. */
+const VIEW_BUILD_SCRIPT = `"$1" "$2" "$3" 2>>"$4/${GATE_ERR_FILE}" && shift 4 && exec "$@"`
+/**
+ * Moves the old root onto put-old, makes the new root `/`, unmounts the old root lazily, then execs the rest. The error
+ * file is opened first, because the gate directory is not reachable once the root has moved, and closed before the exec so
+ * the server does not inherit it.
+ */
+const VIEW_ENTER_SCRIPT = `exec 3>>"$6/${GATE_ERR_FILE}" && "$1" "$2" "$3" 2>&3 && cd / && "$4" -l "$5" 2>&3 && exec 3>&- && shift 6 && exec "$@"`
+
+/**
  * Pure: the argv and environment of a sandboxed launch. Exported for tests that pin the exact command.
- * `baseEnv` is the already-filtered child environment, secrets included.
+ * `baseEnv` is the already-filtered child environment, secrets included. `workingDirectory` is set after entering a
+ * view, where the spawn's own working directory is lost.
  */
 export function buildSandboxLaunch(
   sandbox: OpenCodeV2SandboxLaunch,
   binaryPath: string,
   serveArgs: readonly string[],
   baseEnv: NodeJS.ProcessEnv,
+  workingDirectory = '/',
 ): {readonly command: string; readonly args: readonly string[]; readonly env: NodeJS.ProcessEnv} {
   const identityEnv: Record<string, string> = {
     HOME: sandbox.account.home,
@@ -434,21 +497,74 @@ export function buildSandboxLaunch(
     .map(([name]) => name)
   const env: NodeJS.ProcessEnv = {}
   for (const name of preserved) env[name] = baseEnv[name]
+  const {view} = sandbox
+  const dropAndRun = [
+    sandbox.setprivPath,
+    ...buildSetprivDropArgs(sandbox.account),
+    '--',
+    sandbox.envPath,
+    ...(view === undefined ? [] : ['-C', workingDirectory]),
+    ...Object.entries(identityEnv).map(([name, value]) => `${name}=${value}`),
+    binaryPath,
+    ...serveArgs,
+  ]
+  const chain = view === undefined ? dropAndRun : buildSandboxViewChain(view, dropAndRun)
   return {
     command: sandbox.sudoPath,
-    args: [
-      '-n',
-      `--preserve-env=${preserved.join(',')}`,
-      '--',
-      sandbox.setprivPath,
-      ...buildSetprivDropArgs(sandbox.account),
-      '--',
-      sandbox.envPath,
-      ...Object.entries(identityEnv).map(([name, value]) => `${name}=${value}`),
-      binaryPath,
-      ...serveArgs,
-    ],
+    args: ['-n', ...(preserved.length === 0 ? [] : [`--preserve-env=${preserved.join(',')}`]), '--', ...chain],
     env,
+  }
+}
+
+/**
+ * The part of a view launch after `sudo --`: `unshare` makes the private mount namespace, a gate script holds the chain
+ * until the runner has captured the namespace id, a second fixed script runs the builder and only then a third fixed script enters the new root, unmounts the old one and runs `command`. `command` is the
+ * argv to run inside the view. Exported so the preflight probe runs the same chain as the real launch.
+ */
+export function buildSandboxViewChain(view: OpenCodeV2SandboxView, command: readonly string[]): readonly string[] {
+  return [
+    view.unsharePath,
+    '--mount',
+    '--propagation',
+    'private',
+    '--',
+    view.shPath,
+    '-c',
+    VIEW_GATE_SCRIPT,
+    'sh',
+    view.gate.readlinkPath,
+    view.gate.sleepPath,
+    view.gate.dir,
+    String(view.gate.ticks),
+    view.shPath,
+    '-c',
+    VIEW_BUILD_SCRIPT,
+    'sh',
+    view.nodePath,
+    view.builderPath,
+    JSON.stringify(view.policy),
+    view.gate.dir,
+    view.shPath,
+    '-c',
+    VIEW_ENTER_SCRIPT,
+    'sh',
+    view.pivotRootPath,
+    view.policy.newRoot,
+    `${view.policy.newRoot}${view.policy.putOld}`,
+    view.umountPath,
+    view.policy.putOld,
+    view.gate.dir,
+    ...command,
+  ]
+}
+
+/** The tail of the root steps' stderr for a view launch, as one line; empty without a view or without output. */
+export function rootChainFailure(view: OpenCodeV2SandboxView | undefined): string {
+  if (view === undefined) return ''
+  try {
+    return rootChainTail(readFileSync(`${view.gate.dir}/${GATE_ERR_FILE}`, 'utf8'))
+  } catch {
+    return ''
   }
 }
 
@@ -512,7 +628,7 @@ export async function startOpenCodeV2Server(
   const launch =
     options.sandbox === undefined
       ? {command: options.binaryPath, args: serveArgs, env: childEnv}
-      : buildSandboxLaunch(options.sandbox, options.binaryPath, serveArgs, childEnv)
+      : buildSandboxLaunch(options.sandbox, options.binaryPath, serveArgs, childEnv, options.directory)
 
   let child: ChildProcess
   try {
@@ -557,6 +673,11 @@ export async function startOpenCodeV2Server(
     return err(failure)
   }
   const pid = child.pid
+  try {
+    options.onSpawn?.(pid)
+  } catch (error) {
+    logger.warning('The spawn observer threw', {error: scrub(toErrorMessage(error))})
+  }
 
   const fail = async (error: OpenCodeV2StartError): Promise<Result<OpenCodeV2ServerHandle, OpenCodeV2StartError>> => {
     const cleanup = (await terminateChild(state, timeouts, deps, logger)).outcome
@@ -619,10 +740,15 @@ export async function startOpenCodeV2Server(
     if (first.tag === 'spawn-error') return await fail(first.error)
     if (first.tag === 'abort') return await fail(aborted())
     if (first.tag === 'exit') {
+      // What the root steps of a view launch wrote to stderr before the drop, from the gate's error file (never the server's).
+      const chain = rootChainFailure(options.sandbox?.view)
+      const detail = chain === '' ? '' : `; root steps before the server: ${chain}`
       return await fail(
-        startError('exited-early', `The OpenCode V2 server exited before it was listening (code ${first.exit.code})`, {
-          exitCode: first.exit.code,
-        }),
+        startError(
+          'exited-early',
+          `The OpenCode V2 server exited before it was listening (code ${first.exit.code})${detail}`,
+          {exitCode: first.exit.code},
+        ),
       )
     }
     if (first.tag === 'timeout') {

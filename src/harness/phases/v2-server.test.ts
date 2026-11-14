@@ -1318,7 +1318,7 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
     const launch = vi.fn(async (spawn: Parameters<SandboxLifecycle['launch']>[0]) => {
       if (refuseLaunch !== undefined) return err(refuseLaunch)
       log.signals.push(controller.signal)
-      const report = await spawn({spec: LAUNCH, signal: controller.signal})
+      const report = await spawn({spec: LAUNCH, signal: controller.signal, noteSpawn: () => undefined})
       log.reports.push(report)
       return ok(report.value)
     })

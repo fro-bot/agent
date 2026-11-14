@@ -34,8 +34,8 @@ export interface PrivilegedRunResult {
 }
 
 /**
- * The budget of the `useradd` that creates the sandbox account. A cold hosted runner's first `useradd` was measured sitting in
- * uninterruptible I/O wait for 99 s before it exited 0, so 180 s. Pinned by a unit test; a change is a decision.
+ * The budget of the `useradd` that creates the sandbox account. It creates no home, so it takes well under a second on a
+ * hosted runner. Pinned by a unit test; a change is a decision.
  */
 export const SANDBOX_ACCOUNT_CREATE_TIMEOUT_MS = 180_000
 

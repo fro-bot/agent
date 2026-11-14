@@ -1,0 +1,1 @@
+function e(e){return{success:!0,data:e}}function t(e){return{success:!1,error:e}}export{e as n,t};

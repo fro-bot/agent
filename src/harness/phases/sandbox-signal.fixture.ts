@@ -39,6 +39,14 @@ const tools = Object.fromEntries(
     'mkdir',
     'env',
     'git',
+    'unshare',
+    'mount',
+    'umount',
+    'pivot_root',
+    'sh',
+    'lsns',
+    'readlink',
+    'sleep',
   ].map(name => [name, `/usr/bin/${name}`]),
 ) as never
 
@@ -73,6 +81,12 @@ const lifecycle = createSandboxLifecycle({
       return 'deleted'
     },
     readText: async () => null,
+    createViewRoot: async () => ({
+      newRoot: '/tmp/fixture-view/root',
+      gateRoot: '/tmp/fixture-view/gates',
+      remove: async () => undefined,
+    }),
+    readMountInfo: async () => '',
     ids: () => ({uid: process.getuid?.() ?? 1, gid: process.getgid?.() ?? 1}),
   },
 })

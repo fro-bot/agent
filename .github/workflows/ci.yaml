@@ -133,11 +133,16 @@ jobs:
 
   sandbox-integration:
     if: ${{ needs.setup.outputs.should-build == 'true' }}
-    name: Sandbox integration
+    name: Sandbox integration (${{ matrix.os }})
     needs: [setup]
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    # The read-only view depends on the image's util-linux, sudo and kernel, so both supported hosted images run the suite.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-26.04]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

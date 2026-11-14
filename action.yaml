@@ -112,8 +112,9 @@ inputs:
       proxy outside the agent's user and is not readable by it; the server password stays readable. Providers the
       proxy can't serve (Bedrock, Vertex) and settings that would skip it are refused. Requires a published `fro-bot/agent@<ref>`; a local `uses: ./` install or an
       alias to one is refused because the Action's own files must not be writable by the agent. Checkout content the agent
-      wrote stays untrusted for later steps. Known limit: the agent can still write to shared directories on the
-      runner image that the runner runs programs from, so this alone does not protect a write-capable token. See the
+      wrote stays untrusted for later steps. The agent sees a read-only view of the filesystem,
+      with writes allowed only to the checkout, its response, session and gh config directories, its own home and a
+      private temp directory. See the
       README for the full list of what is and is not blocked.
     required: false
     default: 'false'
