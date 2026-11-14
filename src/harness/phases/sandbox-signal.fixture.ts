@@ -53,6 +53,7 @@ const tools = Object.fromEntries(
 const lifecycle = createSandboxLifecycle({
   tools,
   env: {HOME: '/tmp', RUNNER_TEMP: process.env.SIGNAL_FIXTURE_TEMP ?? '/tmp'},
+  runnerPath: undefined,
   runnerHome: '/tmp',
   workspacePath: '/tmp/ws',
   responseDir: null,

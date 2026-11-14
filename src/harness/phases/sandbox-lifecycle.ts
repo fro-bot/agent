@@ -188,6 +188,11 @@ export interface SandboxLifecycleOptions {
   readonly tools: SandboxToolPaths
   readonly env: NodeJS.ProcessEnv
   readonly workspacePath: string
+  /**
+   * The runner's `PATH` from the very start of the run, before setup prepended anything to it (`core.addPath`). The agent's
+   * `PATH` is built from this value alone: the live environment's is never read here. Required, so a caller cannot forget it.
+   */
+  readonly runnerPath: string | undefined
   /** The run-scoped response directory, or null when the delivery has none. */
   readonly responseDir: string | null
   /** The run-scoped attachment directory (created here so default ACLs cover files the runner writes later). */
@@ -404,9 +409,9 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     return result
   }
   const runnerHome = options.runnerHome ?? env.HOME ?? os.userInfo().homedir
-  // The agent's `PATH` is the runner's as the Action saw it when this lifecycle was made (bootstrap), before anything the
-  // Action itself adds later. The trusted runner-side `PATH`s (trusted git, `TRUSTED_TOOL_DIRS`) are separate and unchanged.
-  const runnerPath = env.PATH
+  // The agent's `PATH` is built from the runner's as captured at the start of the run, before setup added the Action's own
+  // OpenCode directory. The trusted runner-side `PATH`s (trusted git, `TRUSTED_TOOL_DIRS`) are separate and unchanged.
+  const {runnerPath} = options
   const viewLauncher = options.viewLauncher ?? {
     nodePath: process.execPath,
     builderPath: fileURLToPath(new URL('./sandbox-view.js', import.meta.url)),

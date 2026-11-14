@@ -214,6 +214,7 @@ async function runIsolated(options: IsolatedRunOptions): Promise<IsolatedRunResu
   const lifecycle = createSandboxLifecycle({
     tools: options.tools,
     env: options.env,
+    runnerPath: options.env.PATH,
     runnerHome,
     workspacePath: options.workspace,
     responseDir: options.responseDir,
@@ -513,6 +514,7 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
     lifecycle = createSandboxLifecycle({
       tools,
       env,
+      runnerPath: env.PATH,
       runnerHome,
       workspacePath: workspace,
       responseDir,
@@ -1602,6 +1604,7 @@ describe.skipIf(!gated)('isolate-agent key proxy through a real model shell', ()
     lifecycle = createSandboxLifecycle({
       tools,
       env,
+      runnerPath: env.PATH,
       runnerHome,
       workspacePath: workspace,
       responseDir,
@@ -2064,6 +2067,7 @@ describe.skipIf(!gated)('isolate-agent read-only view: a server torn down while 
     lifecycle = createSandboxLifecycle({
       tools,
       env,
+      runnerPath: env.PATH,
       runnerHome,
       workspacePath: workspace,
       responseDir,
@@ -2202,6 +2206,7 @@ describe.skipIf(!gated)('isolate-agent read-only view: a launcher killed while t
     lifecycle = createSandboxLifecycle({
       tools,
       env,
+      runnerPath: env.PATH,
       runnerHome,
       workspacePath: workspace,
       responseDir,

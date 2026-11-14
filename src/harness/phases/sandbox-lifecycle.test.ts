@@ -207,6 +207,7 @@ describe('createSandboxLifecycle', () => {
     const lifecycle = createSandboxLifecycle({
       tools: TOOLS,
       env: {HOME: '/home/runner', RUNNER_TEMP: temp, XDG_DATA_HOME: '/custom/data'},
+      runnerPath: undefined,
       runnerHome: '/home/runner',
       workspacePath: '/home/runner/work/r/r',
       responseDir: `${temp}/fro-bot-response/1-1`,
@@ -1019,7 +1020,7 @@ describe('createSandboxLifecycle', () => {
 
     async function pathFor(env: NodeJS.ProcessEnv) {
       const harness = createHarness()
-      const lifecycle = create(harness, {env, signals: fakeHost()})
+      const lifecycle = create(harness, {env, runnerPath: env.PATH, signals: fakeHost()})
       const prepared = await lifecycle.prepare(prepareInput)
       if (!prepared.success) throw new Error(prepared.error)
       return prepared.data.path
@@ -1042,18 +1043,30 @@ describe('createSandboxLifecycle', () => {
       expect(await pathFor(baseEnv())).toBe('/usr/local/bin:/usr/bin:/bin')
     })
 
-    it('is taken when the lifecycle is made, not when the sandbox is prepared', async () => {
-      // #given an environment whose PATH changes after the lifecycle exists
+    it('is the value it was given, whatever the environment holds when the sandbox is prepared', async () => {
+      // #given a runner PATH handed in, and a live environment whose PATH has since changed (setup prepends to it)
       const harness = createHarness()
-      const env: NodeJS.ProcessEnv = {...baseEnv(), PATH: '/opt/early/bin'}
-      const lifecycle = create(harness, {env, signals: fakeHost()})
-      env.PATH = '/opt/late/bin'
+      const env: NodeJS.ProcessEnv = {...baseEnv(), PATH: '/opt/hostedtoolcache/opencode/fresh:/opt/early/bin'}
+      const lifecycle = create(harness, {env, runnerPath: '/opt/early/bin', signals: fakeHost()})
 
       // #when prepared
       const prepared = await lifecycle.prepare(prepareInput)
 
-      // #then the value from bootstrap is the one used
+      // #then the handed-in value is the one used, and the environment's is not read
       expect(prepared.success && prepared.data.path).toBe('/opt/early/bin:/usr/local/bin:/usr/bin:/bin')
+    })
+
+    it('is the system PATH alone when it was given nothing, even if the environment now holds one', async () => {
+      // #given no runner PATH handed in
+      const harness = createHarness()
+      const env: NodeJS.ProcessEnv = {...baseEnv(), PATH: '/opt/hostedtoolcache/opencode/fresh'}
+      const lifecycle = create(harness, {env, runnerPath: undefined, signals: fakeHost()})
+
+      // #when prepared
+      const prepared = await lifecycle.prepare(prepareInput)
+
+      // #then
+      expect(prepared.success && prepared.data.path).toBe('/usr/local/bin:/usr/bin:/bin')
     })
   })
 
