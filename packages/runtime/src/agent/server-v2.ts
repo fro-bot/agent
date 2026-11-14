@@ -477,34 +477,44 @@ export function buildSandboxLaunch(
     binaryPath,
     ...serveArgs,
   ]
-  const chain =
-    view === undefined
-      ? dropAndRun
-      : [
-          view.unsharePath,
-          '--mount',
-          '--propagation',
-          'private',
-          '--',
-          view.shPath,
-          '-c',
-          VIEW_BUILD_SCRIPT,
-          'sh',
-          view.nodePath,
-          view.builderPath,
-          JSON.stringify(view.policy),
-          view.shPath,
-          '-c',
-          VIEW_ENTER_SCRIPT,
-          'sh',
-          view.pivotRootPath,
-          view.policy.newRoot,
-          `${view.policy.newRoot}${view.policy.putOld}`,
-          view.umountPath,
-          view.policy.putOld,
-          ...dropAndRun,
-        ]
-  return {command: sandbox.sudoPath, args: ['-n', `--preserve-env=${preserved.join(',')}`, '--', ...chain], env}
+  const chain = view === undefined ? dropAndRun : buildSandboxViewChain(view, dropAndRun)
+  return {
+    command: sandbox.sudoPath,
+    args: ['-n', ...(preserved.length === 0 ? [] : [`--preserve-env=${preserved.join(',')}`]), '--', ...chain],
+    env,
+  }
+}
+
+/**
+ * The part of a view launch after `sudo --`: `unshare` makes the private mount namespace, a fixed script runs the builder
+ * and only then a second fixed script enters the new root, unmounts the old one and runs `command`. `command` is the
+ * argv to run inside the view. Exported so the preflight probe runs the same chain as the real launch.
+ */
+export function buildSandboxViewChain(view: OpenCodeV2SandboxView, command: readonly string[]): readonly string[] {
+  return [
+    view.unsharePath,
+    '--mount',
+    '--propagation',
+    'private',
+    '--',
+    view.shPath,
+    '-c',
+    VIEW_BUILD_SCRIPT,
+    'sh',
+    view.nodePath,
+    view.builderPath,
+    JSON.stringify(view.policy),
+    view.shPath,
+    '-c',
+    VIEW_ENTER_SCRIPT,
+    'sh',
+    view.pivotRootPath,
+    view.policy.newRoot,
+    `${view.policy.newRoot}${view.policy.putOld}`,
+    view.umountPath,
+    view.policy.putOld,
+    ...command,
+  ]
 }
 
 export async function startOpenCodeV2Server(

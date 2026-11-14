@@ -28,6 +28,8 @@ interface Overrides {
   readonly entries?: ReadonlyMap<string, EntryKind>
   /** Maps a path to its real path, as `fs.realpath` would. */
   readonly realpaths?: Readonly<Record<string, string>>
+  /** The view probe. Defaults to one that passes. */
+  readonly probeView?: SandboxPreflightDeps['probeView']
 }
 
 const HOSTED_ENV: NodeJS.ProcessEnv = {
@@ -58,6 +60,7 @@ function publishedEntries(root: string, work = WORK): Map<string, EntryKind> {
 }
 
 function createDeps(overrides: Overrides = {}) {
+  const {probeView} = overrides
   const getExecOutput = vi.fn<ExecAdapter['getExecOutput']>(async () => ({
     exitCode: overrides.sudoExitCode ?? 0,
     stdout: '',
@@ -89,6 +92,7 @@ function createDeps(overrides: Overrides = {}) {
     lstat: async absolutePath => (overrides.entries ?? publishedEntries(PUBLISHED_ROOT)).get(absolutePath) ?? null,
     realpath: async absolutePath => overrides.realpaths?.[absolutePath] ?? absolutePath,
     cwd: '/home/runner/work/repo/repo',
+    probeView: probeView ?? (async () => ({ok: true})),
     logger: createMockLogger(),
   }
   return {deps, getExecOutput}
@@ -151,6 +155,13 @@ describe('runSandboxPreflight', () => {
     ['tool', {missingTools: ['useradd']}],
     ['tool', {missingTools: ['pgrep']}],
     ['tool', {missingTools: ['gh']}],
+    ['tool', {missingTools: ['unshare']}],
+    ['tool', {missingTools: ['mount']}],
+    ['tool', {missingTools: ['umount']}],
+    ['tool', {missingTools: ['pivot_root']}],
+    ['tool', {missingTools: ['sh']}],
+    ['tool', {missingTools: ['lsns']}],
+    ['view', {probeView: async () => ({ok: false as const, message: 'the read-only view probe timed out'})}],
     ['protected-links', {sysctls: {protected_hardlinks: '0\n'}}],
     ['protected-links', {sysctls: {protected_symlinks: null}}],
   ] as const)('fails the %s check', async (check, overrides: Overrides) => {
@@ -166,6 +177,51 @@ describe('runSandboxPreflight', () => {
     expect(result.check).toBe(check)
     expect(result.message).toContain('isolate-agent')
     expect(result.message).toContain(check)
+  })
+
+  it('names the missing view tool in the message', async () => {
+    // #given a runner without pivot_root
+    const {deps} = createDeps({missingTools: ['pivot_root']})
+
+    // #when the preflight runs
+    const result = await runSandboxPreflight(deps)
+
+    // #then the tool is named
+    expect(!result.ok && result.message).toContain('pivot_root')
+  })
+
+  it('runs the view probe last, with the resolved tools, and reports its message', async () => {
+    // #given a probe that fails
+    const probeView = vi.fn<SandboxPreflightDeps['probeView']>(async () => ({
+      ok: false,
+      message: 'the read-only view could not be built (stage verify)',
+    }))
+    const {deps} = createDeps({probeView})
+
+    // #when the preflight runs
+    const result = await runSandboxPreflight(deps)
+
+    // #then the failure is the probe's, and the probe saw absolute tools
+    expect(!result.ok && result.check).toBe('view')
+    expect(!result.ok && result.message).toContain('stage verify')
+    expect(probeView).toHaveBeenCalledTimes(1)
+    expect(probeView.mock.calls[0]?.[0].pivot_root).toBe('/usr/bin/pivot_root')
+  })
+
+  it.each([
+    ['the runner is self-hosted', {env: {RUNNER_OS: 'Linux', RUNNER_ENVIRONMENT: 'self-hosted'}}],
+    ['sudo does not work', {sudoExitCode: 1}],
+    ['the install is not a published one', {bundleDir: '/elsewhere/dist'}],
+  ] as const)('never runs the probe when %s', async (_name, overrides: Overrides) => {
+    // #given a runner that fails an earlier check
+    const probeView = vi.fn<SandboxPreflightDeps['probeView']>(async () => ({ok: true}))
+    const {deps} = createDeps({...overrides, probeView})
+
+    // #when the preflight runs
+    await runSandboxPreflight(deps)
+
+    // #then nothing privileged ran as a probe
+    expect(probeView).not.toHaveBeenCalled()
   })
 
   it('reports the first failing check without probing sudo', async () => {

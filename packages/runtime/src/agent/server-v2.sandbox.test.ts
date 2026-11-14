@@ -333,8 +333,18 @@ describe('buildSandboxLaunch with a read-only view', () => {
     expect(built.args).toContain(hostile)
     const cwdIndex = built.args.indexOf('-C')
     expect(built.args[cwdIndex + 1]).toBe(`/work/${hostile}`)
-    expect((JSON.parse(built.args[14] ?? '{}') as {writable: string[]}).writable).toEqual([`/work/${hostile}`])
+    expect(
+      (JSON.parse(built.args.find(arg => arg.startsWith('{"newRoot"')) ?? '{}') as {writable: string[]}).writable,
+    ).toEqual([`/work/${hostile}`])
     expect(built.args.filter(arg => arg === BUILD_SCRIPT || arg === ENTER_SCRIPT)).toHaveLength(2)
+  })
+
+  it('omits the preserve-env option when there is nothing to preserve', () => {
+    // #given an empty environment
+    const built = buildSandboxLaunch(launchSpec({view: VIEW}), '/opt/oc/opencode', ['serve'], {}, '/work')
+
+    // #then sudo is not given an empty option
+    expect(built.args.slice(0, 2)).toEqual(['-n', '--'])
   })
 
   it('without a view the launch is the one it always was', () => {
@@ -360,7 +370,7 @@ function runChain(spec: OpenCodeV2SandboxLaunch, binary: string, cwd: string) {
   const withCwd = buildSandboxLaunch(spec, binary, ['serve'], {}, cwd)
   expect(withCwd.args.slice(0, 2)).toEqual(built.args.slice(0, 2))
   // Skip `sudo -n --preserve-env=… --`; run the rest as the namespace launcher would see it.
-  const rest = withCwd.args.slice(3)
+  const rest = withCwd.args.slice(withCwd.args.indexOf('--') + 1)
   return spawnSync(rest[0] ?? '', rest.slice(1), {encoding: 'utf8'})
 }
 

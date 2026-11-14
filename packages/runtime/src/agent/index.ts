@@ -298,12 +298,18 @@ export {
   verifyView,
 } from './sandbox-view.js'
 export type {MountEntry, SandboxViewPolicy, SandboxViewStage, ViewOp} from './sandbox-view.js'
-export {buildSandboxLaunch, DEFAULT_OPENCODE_V2_TIMEOUTS, startOpenCodeV2Server} from './server-v2.js'
+export {
+  buildSandboxLaunch,
+  buildSandboxViewChain,
+  DEFAULT_OPENCODE_V2_TIMEOUTS,
+  startOpenCodeV2Server,
+} from './server-v2.js'
 export type {
   OpenCodeV2ExitInfo,
   OpenCodeV2ExitOutcome,
   OpenCodeV2PluginProblem,
   OpenCodeV2SandboxLaunch,
+  OpenCodeV2SandboxView,
   OpenCodeV2ServerHandle,
   OpenCodeV2ShutdownOptions,
   OpenCodeV2ShutdownResult,
