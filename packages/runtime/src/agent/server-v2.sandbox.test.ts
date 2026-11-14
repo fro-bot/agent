@@ -499,6 +499,24 @@ describe('the view launch chain, run for real with stand-in privileged tools', (
     expect(readFileSync(log, 'utf8')).not.toContain('umount')
   })
 
+  it('never drops to the sandbox user or executes the server when the old root cannot be unmounted', () => {
+    // #given a builder and a pivot that succeed, and an umount of the old root that fails
+    const {spec, dir, log} = standIns('process.exit(0)')
+    script(dir, 'umount', `echo "umount $1 $2" >> ${log}\nexit 32`)
+    script(dir, 'setpriv', `echo setpriv >> ${log}\nwhile [ "$1" != "--" ]; do shift; done\nshift\nexec "$@"`)
+    const marker = path.join(dir, 'server-ran')
+    const server = script(dir, 'opencode', `echo ran > ${marker}`)
+
+    // #when the chain runs
+    const result = runChain(spec, server, dir)
+
+    // #then umount's status is the chain's, and neither the drop nor the server ran
+    expect(result.status).toBe(32)
+    expect(readFileSync(log, 'utf8')).toContain('umount -l /mnt')
+    expect(readFileSync(log, 'utf8')).not.toContain('setpriv')
+    expect(existsSync(marker)).toBe(false)
+  })
+
   it('enters the new root, unmounts the old one and only then runs the server in the working directory', () => {
     // #given a builder that succeeds
     const {spec, dir, log} = standIns('process.exit(0)')
