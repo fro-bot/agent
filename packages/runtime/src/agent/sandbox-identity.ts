@@ -255,9 +255,16 @@ export async function createSandboxAccount(
       })
     }
     // Before a successful mkdir the path is not ours: leave whatever is there and drop only the account.
-    const cleanupFailure = homeCreated ? await removeHomeWeCreated(account.home, tools, deps) : null
+    const cleanup = homeCreated ? await removeHomeWeCreated(account.home, tools, deps) : null
+    if (cleanup?.timedOut === true) {
+      return err({
+        kind: 'create-failed',
+        message: `${failure}; ${cleanup.message}; the account was left in place because the command is not known to have stopped`,
+        timedOut: true,
+      })
+    }
     await removeIfPresent(name, tools, deps)
-    return err({kind: 'create-failed', message: cleanupFailure === null ? failure : `${failure}; ${cleanupFailure}`})
+    return err({kind: 'create-failed', message: cleanup === null ? failure : `${failure}; ${cleanup.message}`})
   }
   deps.logger.info('Sandbox account created', {name, uid: account.uid})
   return ok(account)
@@ -299,17 +306,20 @@ async function removeIfPresent(
 
 /**
  * Removes the home directory this call just made. `-P` never follows a symlink, `-maxdepth 0 -type d -empty` matches
- * only the path itself and only when it is an empty directory, so nothing below it can be touched. Returns a message when
- * the cleanup failed, else `null`.
+ * only the path itself and only when it is an empty directory, so nothing below it can be touched. Returns the failure,
+ * and whether the command was killed on its budget, else `null`.
  */
 async function removeHomeWeCreated(
   home: string,
   tools: Pick<SandboxIdentityTools, 'find'>,
   deps: SandboxIdentityDeps,
-): Promise<string | null> {
+): Promise<{readonly message: string; readonly timedOut: boolean} | null> {
   const result = await deps.run([tools.find, '-P', home, '-maxdepth', '0', '-type', 'd', '-empty', '-delete'])
   if (result.exitCode === 0) return null
-  return describePrivilegedFailure(`the half-made home ${home} could not be removed:`, result)
+  return {
+    message: describePrivilegedFailure(`the half-made home ${home} could not be removed:`, result),
+    timedOut: result.timedOutAfterMs !== undefined,
+  }
 }
 
 export type SandboxStopOutcome = 'stopped' | 'unconfirmed'

@@ -35,7 +35,7 @@ interface FakeSystemOptions {
   /** A directory already at the home path before the account is created, with the files in it. */
   readonly existingHome?: {readonly ownerUid: number; readonly entries?: readonly string[]}
   /** A home-setup command that is killed on its budget instead of finishing; its effect did not happen. */
-  readonly timeoutOn?: 'chmod' | 'chown' | 'mkdir'
+  readonly timeoutOn?: 'chmod' | 'chown' | 'find' | 'mkdir'
   /** What useradd returns instead of succeeding. */
   readonly useraddResult?: PrivilegedRunResult
   /** When useradd returns `useraddResult`, still create the account (a hung useradd that had already finished its work). */
@@ -568,6 +568,24 @@ describe('createSandboxAccount: the home steps', () => {
     expect(message).toContain('Could not hand the sandbox home to the account')
     expect(accountExists(system)).toBe(false)
   })
+
+  it.each([{failChown: true}, {failChmod: true}] as const)(
+    'leaves the account in place when the cleanup of a half-made home is killed on its budget (%o)',
+    async failure => {
+      // #given an ordinary home-step failure whose cleanup outlives its budget
+      const system = createFakeSystem({...failure, timeoutOn: 'find'})
+
+      // #when creation is attempted
+      const result = await createSandboxAccount(TOOLS, system.deps)
+
+      // #then the account is kept (the killed find is not known to have stopped) and the failure is a timeout
+      expect(toolNames(system.calls)).toContain('find')
+      expect(toolNames(system.calls)).not.toContain('userdel')
+      expect(accountExists(system)).toBe(true)
+      expect(!result.success && 'timedOut' in result.error && result.error.timedOut).toBe(true)
+      expect(!result.success && result.error.message).toContain(`the half-made home ${HOME} could not be removed`)
+    },
+  )
 
   it.each(['mkdir', 'chown', 'chmod'] as const)(
     'leaves the account and the home in place, and cleans up nothing, when %s is killed on its budget',
