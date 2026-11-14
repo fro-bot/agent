@@ -177,7 +177,12 @@ describe('parseActionInputs', () => {
         expect(result.success && result.data.opencodeVersion).toBe(RECORDED_V2_PIN.version)
       })
 
-      it.each(['2.3.0', 'v2.2.5', '2.9.9', '2.2.6-beta.1', '2.2.6+build.7', 'v2.2.60', '3.0.0'])(
+      // One minor above the pin, so it never equals the pin whatever Renovate moves it to.
+      const nonPinMinor = RECORDED_V2_PIN.version.replace(
+        /^(\d+)\.(\d+)\..*$/,
+        (_match, major: string, minor: string) => `${major}.${Number(minor) + 1}.0`,
+      )
+      it.each([nonPinMinor, 'v2.2.5', '2.9.9', '2.2.6-beta.1', '2.2.6+build.7', 'v2.2.60', '3.0.0'])(
         'rejects the non-pin V2 version %s at parsing, naming the value and the pin',
         value => {
           // #given a V2 version other than the recorded release: a matching binary already on the runner would

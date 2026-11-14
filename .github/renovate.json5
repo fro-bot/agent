@@ -166,6 +166,8 @@
       matchPackageNames: ['anomalyco/opencode'],
       allowedVersions: '/^2\\./',
       commitMessageTopic: 'OpenCode V2 pin',
+      // A pin bump changes the OpenCode the Action runs, so it releases as a feature.
+      semanticCommitType: 'feat',
       automerge: false,
       postUpgradeTasks: {
         commands: ['bun install --ignore-scripts', 'bun run postupgrade', 'bun run build-release'],
