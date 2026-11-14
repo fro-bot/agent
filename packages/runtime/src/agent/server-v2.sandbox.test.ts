@@ -1,6 +1,7 @@
 import type {Fixture} from './server-v2-test-kit.js'
-import type {OpenCodeV2SandboxLaunch, OpenCodeV2ServerHandle} from './server-v2.js'
-import {chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs'
+import type {OpenCodeV2SandboxLaunch, OpenCodeV2SandboxView, OpenCodeV2ServerHandle} from './server-v2.js'
+import {spawnSync} from 'node:child_process'
+import {chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
@@ -202,5 +203,296 @@ child.on('exit', code => process.exit(code ?? 0))
 
     // #then it refuses rather than picking one
     expect(!result.success && result.error.kind).toBe('invalid-options')
+  })
+})
+
+/** The two fixed scripts of the view launch. They take every path as a positional argument. */
+const BUILD_SCRIPT = '"$1" "$2" "$3" && shift 3 && exec "$@"'
+const ENTER_SCRIPT = '"$1" "$2" "$3" && cd / && "$4" -l "$5" && shift 5 && exec "$@"'
+
+const VIEW: OpenCodeV2SandboxView = {
+  unsharePath: '/usr/bin/unshare',
+  shPath: '/usr/bin/sh',
+  pivotRootPath: '/usr/sbin/pivot_root',
+  umountPath: '/usr/bin/umount',
+  nodePath: '/opt/runner-cache/externals/node24/bin/node',
+  builderPath: '/home/runner/work/_actions/fro-bot/agent/v1/dist/sandbox-view.js',
+  policy: {
+    newRoot: '/home/runner/work/_temp/view/root',
+    putOld: '/mnt',
+    tools: {mount: '/usr/bin/mount', umount: '/usr/bin/umount'},
+    writable: ['/home/runner/work/repo/repo', '/home/fro-bot-sandbox'],
+    readOnly: [],
+    runnerHome: '/home/runner',
+    actionsDir: '/home/runner/work/_actions',
+  },
+}
+
+describe('buildSandboxLaunch with a read-only view', () => {
+  it('launches sudo, unshare with a private mount namespace, the builder, then the enter-and-drop chain', () => {
+    // #given a sandbox launch with a view
+    const built = buildSandboxLaunch(
+      launchSpec({view: VIEW}),
+      '/opt/oc/opencode',
+      ['serve', '--stdio'],
+      {FOO: 'bar'},
+      '/home/runner/work/repo/repo',
+    )
+
+    // #then the chain is exact: nothing is interpolated, every path is its own argument
+    expect(built.command).toBe('/usr/bin/sudo')
+    expect(built.args).toEqual([
+      '-n',
+      '--preserve-env=FOO',
+      '--',
+      '/usr/bin/unshare',
+      '--mount',
+      '--propagation',
+      'private',
+      '--',
+      '/usr/bin/sh',
+      '-c',
+      BUILD_SCRIPT,
+      'sh',
+      '/opt/runner-cache/externals/node24/bin/node',
+      '/home/runner/work/_actions/fro-bot/agent/v1/dist/sandbox-view.js',
+      JSON.stringify(VIEW.policy),
+      '/usr/bin/sh',
+      '-c',
+      ENTER_SCRIPT,
+      'sh',
+      '/usr/sbin/pivot_root',
+      '/home/runner/work/_temp/view/root',
+      '/home/runner/work/_temp/view/root/mnt',
+      '/usr/bin/umount',
+      '/mnt',
+      '/usr/bin/setpriv',
+      '--reuid=998',
+      '--regid=997',
+      '--clear-groups',
+      '--no-new-privs',
+      '--inh-caps=-all',
+      '--bounding-set=-all',
+      '--ambient-caps=-all',
+      '--',
+      '/usr/bin/env',
+      '-C',
+      '/home/runner/work/repo/repo',
+      'HOME=/home/fro-bot-sandbox',
+      'USER=fro-bot-sandbox',
+      'LOGNAME=fro-bot-sandbox',
+      'TMPDIR=/home/fro-bot-sandbox/tmp',
+      'PATH=/usr/local/bin:/usr/bin:/bin',
+      'XDG_DATA_HOME=/home/runner/.local/share',
+      'XDG_CONFIG_HOME=/home/runner/.config',
+      'XDG_CACHE_HOME=/home/runner/.cache',
+      'XDG_STATE_HOME=/home/runner/.local/state',
+      '/opt/oc/opencode',
+      'serve',
+      '--stdio',
+    ])
+  })
+
+  it('keeps secrets out of argv, as the launch without a view does', () => {
+    // #given the two secret carriers
+    const built = buildSandboxLaunch(
+      launchSpec({view: VIEW}),
+      '/opt/oc/opencode',
+      ['serve'],
+      {OPENCODE_PASSWORD: 'pw-secret-value', OPENCODE_CONFIG_CONTENT: '{"k":"cfg-secret"}'},
+      '/work',
+    )
+
+    // #then they are preserved by name and absent from argv
+    expect(JSON.stringify(built.args)).not.toContain('pw-secret-value')
+    expect(JSON.stringify(built.args)).not.toContain('cfg-secret')
+    expect(built.env).toEqual({OPENCODE_PASSWORD: 'pw-secret-value', OPENCODE_CONFIG_CONTENT: '{"k":"cfg-secret"}'})
+  })
+
+  it('passes a path with a space, a quote and a newline as one argument to the builder and to the server', () => {
+    // #given hostile characters in the working directory, the builder path, the binary and a policy root
+    const hostile = 'a b"c\'d\ne$(touch x);`id`'
+    const view: OpenCodeV2SandboxView = {
+      ...VIEW,
+      builderPath: `/opt/${hostile}/sandbox-view.js`,
+      policy: {...VIEW.policy, writable: [`/work/${hostile}`]},
+    }
+
+    // #when built
+    const built = buildSandboxLaunch(
+      launchSpec({view}),
+      `/opt/${hostile}/opencode`,
+      ['serve', hostile],
+      {},
+      `/work/${hostile}`,
+    )
+
+    // #then each is still a single element, byte for byte, and the scripts are the fixed text
+    expect(built.args).toContain(`/opt/${hostile}/sandbox-view.js`)
+    expect(built.args).toContain(`/opt/${hostile}/opencode`)
+    expect(built.args).toContain(hostile)
+    const cwdIndex = built.args.indexOf('-C')
+    expect(built.args[cwdIndex + 1]).toBe(`/work/${hostile}`)
+    expect((JSON.parse(built.args[14] ?? '{}') as {writable: string[]}).writable).toEqual([`/work/${hostile}`])
+    expect(built.args.filter(arg => arg === BUILD_SCRIPT || arg === ENTER_SCRIPT)).toHaveLength(2)
+  })
+
+  it('without a view the launch is the one it always was', () => {
+    // #given a spec with no view
+    const built = buildSandboxLaunch(launchSpec(), '/opt/oc/opencode', ['serve'], {FOO: 'bar'}, '/work')
+
+    // #then there is no unshare, no shell and no working-directory option
+    expect(built.args).not.toContain('--mount')
+    expect(built.args).not.toContain('-C')
+    expect(built.args.slice(3, 5)).toEqual(['/usr/bin/setpriv', '--reuid=998'])
+  })
+})
+
+function script(dir: string, name: string, body: string): string {
+  const file = path.join(dir, name)
+  writeFileSync(file, `#!/bin/sh\n${body}\n`)
+  chmodSync(file, 0o755)
+  return file
+}
+
+function runChain(spec: OpenCodeV2SandboxLaunch, binary: string, cwd: string) {
+  const built = buildSandboxLaunch(spec, binary, ['serve'], {})
+  const withCwd = buildSandboxLaunch(spec, binary, ['serve'], {}, cwd)
+  expect(withCwd.args.slice(0, 2)).toEqual(built.args.slice(0, 2))
+  // Skip `sudo -n --preserve-env=… --`; run the rest as the namespace launcher would see it.
+  const rest = withCwd.args.slice(3)
+  return spawnSync(rest[0] ?? '', rest.slice(1), {encoding: 'utf8'})
+}
+
+describe('the view launch chain, run for real with stand-in privileged tools', () => {
+  const dirs: string[] = []
+
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) rmSync(dir, {recursive: true, force: true})
+  })
+
+  /**
+   * Stand-ins for the tools that need root. `unshare` skips its own options, `pivot_root` and `umount` log and succeed,
+   * `setpriv` skips the drop and `env` understands `-C`. The shells and the quoting are the real ones.
+   */
+  function standIns(
+    builderBody: string,
+    pivotBody = 'true',
+  ): {
+    readonly view: OpenCodeV2SandboxView
+    readonly spec: OpenCodeV2SandboxLaunch
+    readonly dir: string
+    readonly log: string
+  } {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'view-chain-'))
+    dirs.push(dir)
+    const log = path.join(dir, 'log')
+    const builder = path.join(dir, 'builder.js')
+    writeFileSync(builder, builderBody)
+    const view: OpenCodeV2SandboxView = {
+      ...VIEW,
+      unsharePath: script(dir, 'unshare', 'shift 4\nexec "$@"'),
+      shPath: '/bin/sh',
+      pivotRootPath: script(dir, 'pivot_root', `echo "pivot $1 $2" >> ${log}\n${pivotBody}`),
+      umountPath: script(dir, 'umount', `echo "umount $1 $2" >> ${log}`),
+      nodePath: process.execPath,
+      builderPath: builder,
+    }
+    const spec = launchSpec({
+      view,
+      sudoPath: '/unused',
+      setprivPath: script(dir, 'setpriv', 'while [ "$1" != "--" ]; do shift; done\nshift\nexec "$@"'),
+      envPath: script(dir, 'env', 'cd "$2" || exit 97\nshift 2\nexec /usr/bin/env "$@"'),
+    })
+    return {view, spec, dir, log}
+  }
+
+  it('never executes the server when the builder exits non-zero, and passes its exit code on', () => {
+    // #given a builder that fails
+    const {spec, dir, log} = standIns('process.exit(78)')
+    const marker = path.join(dir, 'server-ran')
+    const server = script(dir, 'opencode', `echo ran > ${marker}`)
+
+    // #when the chain runs
+    const result = runChain(spec, server, dir)
+
+    // #then the server did not run, and neither did the pivot
+    expect(result.status).toBe(78)
+    expect(existsSync(marker)).toBe(false)
+    expect(existsSync(log)).toBe(false)
+  })
+
+  it('never executes the server when entering the new root fails', () => {
+    // #given a builder that succeeds and a pivot that fails
+    const {spec, dir, log} = standIns('process.exit(0)', 'exit 1')
+    const marker = path.join(dir, 'server-ran')
+    const server = script(dir, 'opencode', `echo ran > ${marker}`)
+
+    // #when the chain runs
+    const result = runChain(spec, server, dir)
+
+    // #then the old root was not unmounted and the server did not run
+    expect(result.status).toBe(1)
+    expect(existsSync(marker)).toBe(false)
+    expect(readFileSync(log, 'utf8')).not.toContain('umount')
+  })
+
+  it('enters the new root, unmounts the old one and only then runs the server in the working directory', () => {
+    // #given a builder that succeeds
+    const {spec, dir, log} = standIns('process.exit(0)')
+    const work = path.join(dir, 'work dir')
+    const server = script(dir, 'opencode', `pwd > ${path.join(dir, 'cwd')}\necho "$1" > ${path.join(dir, 'arg')}`)
+    spawnSync('mkdir', ['-p', work])
+
+    // #when the chain runs
+    const result = runChain(spec, server, work)
+
+    // #then pivot and umount ran first, with the new root and the old root's name, then the server, in the cwd
+    expect(result.status).toBe(0)
+    expect(readFileSync(log, 'utf8').trim().split('\n')).toEqual([
+      'pivot /home/runner/work/_temp/view/root /home/runner/work/_temp/view/root/mnt',
+      'umount -l /mnt',
+    ])
+    expect(readFileSync(path.join(dir, 'cwd'), 'utf8').trim()).toBe(work)
+    expect(readFileSync(path.join(dir, 'arg'), 'utf8').trim()).toBe('serve')
+  })
+})
+
+describe('startOpenCodeV2Server with a read-only view', () => {
+  const dirs: string[] = []
+
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) rmSync(dir, {recursive: true, force: true})
+  })
+
+  it('reports the spawned launch pid and names the failed stage when the view cannot be built', async () => {
+    // #given a launcher that prints the builder's failure line and exits 78
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'view-fail-'))
+    dirs.push(dir)
+    const sudoPath = path.join(dir, 'sudo')
+    writeFileSync(sudoPath, `#!/bin/sh\necho '{"view":"failed","stage":"seal"}'\nexit 78\n`)
+    chmodSync(sudoPath, 0o755)
+    const pids: number[] = []
+
+    // #when started
+    const result = await startOpenCodeV2Server(
+      {
+        binaryPath: '/unused',
+        directory: dir,
+        expectedPluginIds: [],
+        timeouts: TIMEOUTS,
+        sandbox: launchSpec({sudoPath, view: VIEW}),
+        onSpawn: pid => pids.push(pid),
+      },
+      {debug: () => undefined, info: () => undefined, warning: () => undefined, error: () => undefined},
+    )
+
+    // #then the start failed with the stage, and the pid was reported before anything else could go wrong
+    expect(result.success).toBe(false)
+    expect(!result.success && result.error.kind).toBe('exited-early')
+    expect(!result.success && result.error.message).toContain('stage seal')
+    expect(!result.success && result.error.exitCode).toBe(78)
+    expect(pids).toHaveLength(1)
+    expect(pids[0]).toBeGreaterThan(0)
   })
 })
