@@ -65,9 +65,7 @@ export interface BootstrapPhaseResult {
 }
 
 export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPhaseResult | null> {
-  // The runner's `PATH` as the run found it. Setup below calls `core.addPath` (the Action-installed OpenCode directory,
-  // prepended), and that is the only place the Action changes `PATH`: this is read before any of it, and it is the
-  // `PATH` the isolated agent's own is built from, so an earlier step's tools keep their place.
+  // The isolated agent's `PATH` is built from this, read before setup's `core.addPath` prepends the OpenCode directory.
   const runnerPath = process.env.PATH
   const inputsResult = parseActionInputs()
 
