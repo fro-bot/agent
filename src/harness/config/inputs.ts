@@ -310,6 +310,16 @@ function parseRepoSkills(input: string): boolean {
 }
 
 /**
+ * Whether the raw `isolate-agent` input asks for isolation, without parsing it: anything but unset, empty or `false` counts,
+ * an unparseable value included. `run` uses it on the paths where bootstrap failed before it could hand back the parsed
+ * input, so a run that asked for isolation never reads the shared log directory as if it had not.
+ */
+export function isIsolationRequested(input: string): boolean {
+  const value = input.trim().toLowerCase()
+  return value !== '' && value !== 'false'
+}
+
+/**
  * `isolate-agent` is a security opt-in that changes how the server is launched, so anything other than an explicit
  * `true` or `false` is an error rather than a silent opt-out. An empty value is the unset input.
  */

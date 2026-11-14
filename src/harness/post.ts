@@ -14,7 +14,6 @@ import {
   getGitHubWorkspace,
   getInvocationIdentity,
   getOpenCodeAuthPath,
-  getOpenCodeLogPath,
   getOpenCodeStoragePath,
   isOpenCodePromptArtifactEnabled,
 } from '../shared/env.js'
@@ -22,6 +21,7 @@ import {toErrorMessage} from '../shared/errors.js'
 import {createLogger} from '../shared/logger.js'
 import {STATE_KEYS} from './config/state-keys.js'
 import {LOCK_RELEASE_TIMEOUT_MS, releaseActionLockIfHeld, runWithDeadline} from './phases/acquire-lock.js'
+import {resolveLogReadPath} from './phases/log-snapshot.js'
 
 export interface PostOptions {
   logger?: Logger
@@ -121,7 +121,7 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
 }
 
 const SANDBOX_LOGS_SKIPPED =
-  'Skipping the log upload: the isolate-agent sandbox was not confirmed stopped and restored, so its log directory is not read'
+  'Skipping the log upload: this isolate-agent run has no log snapshot from a confirmed sandbox take-back, so the shared log directory is not read'
 
 async function persistRunState(logger: Logger): Promise<void> {
   const shouldSaveCache = core.getState(STATE_KEYS.SHOULD_SAVE_CACHE)
@@ -138,6 +138,13 @@ async function persistRunState(logger: Logger): Promise<void> {
   const isolatedRun = core.getState(STATE_KEYS.ISOLATED_RUN) === 'true'
   const sandboxState = core.getState(STATE_KEYS.SANDBOX_STATE)
   const logsTrusted = sandboxState === 'restored' || (sandboxState === '' && !isolatedRun)
+  // The shared log directory is re-handed to every later isolated step's sandbox, so an isolated run publishes only the
+  // copy its own main step took at its confirmed take-back, and nothing when it took none. Never the shared path.
+  const logPath = resolveLogReadPath({
+    isolated: isolatedRun,
+    trusted: logsTrusted,
+    snapshotPath: core.getState(STATE_KEYS.LOG_SNAPSHOT_DIR) || null,
+  })
 
   logger.debug('Post-action state', {
     shouldSaveCache,
@@ -325,18 +332,10 @@ async function persistRunState(logger: Logger): Promise<void> {
             objectStoreLogger,
           )
         }
-        if (logsTrusted) {
-          await syncArtifactsToStore(
-            adapter,
-            storeConfig,
-            'github',
-            repo,
-            runId,
-            getOpenCodeLogPath(),
-            objectStoreLogger,
-          )
-        } else {
+        if (logPath === null) {
           objectStoreLogger.warning(SANDBOX_LOGS_SKIPPED)
+        } else {
+          await syncArtifactsToStore(adapter, storeConfig, 'github', repo, runId, logPath, objectStoreLogger)
         }
       } catch (error) {
         logger.warning('Post-action object store sync failed (non-fatal)', {
@@ -346,15 +345,15 @@ async function persistRunState(logger: Logger): Promise<void> {
     }
   }
 
-  if (isOpenCodePromptArtifactEnabled() && !logsTrusted) {
+  if (isOpenCodePromptArtifactEnabled() && logPath === null) {
     logger.warning(SANDBOX_LOGS_SKIPPED)
-  } else if (isOpenCodePromptArtifactEnabled()) {
+  } else if (isOpenCodePromptArtifactEnabled() && logPath !== null) {
     const artifactUploaded = core.getState(STATE_KEYS.ARTIFACT_UPLOADED)
     if (artifactUploaded !== 'true') {
       try {
         const artifactLogger = createLogger({phase: 'post-artifact-upload'})
         await uploadLogArtifact({
-          logPath: getOpenCodeLogPath(),
+          logPath,
           runId: getGitHubRunId(),
           runAttempt: getGitHubRunAttempt(),
           invocationIdentity: getInvocationIdentity(),

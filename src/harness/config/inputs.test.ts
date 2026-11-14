@@ -4,7 +4,7 @@ import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {RECORDED_V2_PIN} from '../../services/setup/opencode.js'
 import {DEFAULT_OPENCODE_VERSION, DEFAULT_S3_PREFIX, DEFAULT_SYSTEMATIC_VERSION} from '../../shared/constants.js'
-import {LAST_V1_ACTION_RELEASE, parseActionInputs, parseModelInput} from './inputs.js'
+import {isIsolationRequested, LAST_V1_ACTION_RELEASE, parseActionInputs, parseModelInput} from './inputs.js'
 
 const mocks = vi.hoisted(() => ({
   getInput: vi.fn<(name: string) => string>(),
@@ -658,6 +658,19 @@ describe('parseActionInputs', () => {
   })
 
   describe('isolate-agent', () => {
+    it.each(['', '  ', 'false', 'FALSE', ' False '])('does not treat %j as an isolation request', value => {
+      // #when / #then
+      expect(isIsolationRequested(value)).toBe(false)
+    })
+
+    it.each(['true', 'TRUE', 'banana', '0', 'yes'])(
+      'treats %j as an isolation request, so an unparseable value never reads as off',
+      value => {
+        // #when / #then
+        expect(isIsolationRequested(value)).toBe(true)
+      },
+    )
+
     it('defaults to false when the input is empty', () => {
       // #given no isolate-agent input
       mockInputs({})

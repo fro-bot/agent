@@ -9,8 +9,9 @@ export const STATE_KEYS = {
   /** Whether the main action processed an event (vs skipped) */
   SHOULD_SAVE_CACHE: 'shouldSaveCache',
   /**
-   * `'true'` when the run used `isolate-agent`. The post hook never retries a session save for such a run: the sandbox
-   * user wrote that state, and only the main step can confirm it stopped and was restored.
+   * `'true'` when the run used `isolate-agent`, set at bootstrap from the input so a run whose sandbox never started
+   * still counts. The post hook never retries a session save for such a run (the sandbox user wrote that state, and only
+   * the main step can confirm it stopped and was restored), and it never reads the shared log directory for one.
    */
   ISOLATED_RUN: 'isolatedRun',
   /**
@@ -20,6 +21,13 @@ export const STATE_KEYS = {
    * all mean the main step did not finish the teardown.
    */
   SANDBOX_STATE: 'sandboxState',
+  /**
+   * The runner-owned copy of the OpenCode log directory this invocation took at its confirmed sandbox take-back (a
+   * directory under `RUNNER_TEMP`). The shared log directory is re-handed to every later isolated step's sandbox, so on an
+   * isolated run cleanup and the post hook read logs only from here. Absent: the run took none (its sandbox never started,
+   * or the copy was discarded), and no logs are published.
+   */
+  LOG_SNAPSHOT_DIR: 'logSnapshotDir',
   /** Session ID used in this run (for logging) */
   SESSION_ID: 'sessionId',
   /** Whether main action already saved cache successfully */
