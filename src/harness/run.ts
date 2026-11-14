@@ -14,12 +14,13 @@ import type {DeduplicationEntity} from '../services/cache/dedup.js'
 import type {Octokit} from '../services/github/types.js'
 import type {InvocationOutcome, InvocationVerificationFacts} from './outcome.js'
 import type {SandboxLifecycle} from './phases/sandbox-lifecycle.js'
+import process from 'node:process'
 import * as core from '@actions/core'
 import {applyTerminalReaction} from '../features/agent/index.js'
 import {createMetricsCollector, writeInvocationOutcomeSummary} from '../features/observability/index.js'
 import {resolveReviewedHeadSha} from '../features/reviews/reviewed-head.js'
 import {createReviewDeliveryReceiptOperations} from '../services/github/review-delivery-receipt.js'
-import {getGitHubRunAttempt, getInvocationIdentity} from '../shared/env.js'
+import {getGitHubRunAttempt, getInvocationIdentity, getOpenCodeLogPath} from '../shared/env.js'
 import {toErrorMessage} from '../shared/errors.js'
 import {createLogger} from '../shared/logger.js'
 import {setActionOutputs, setInvocationOutcomeOutput} from './config/outputs.js'
@@ -41,6 +42,7 @@ import {
   type ExecutePhaseResult,
 } from './phases/execute.js'
 import {runFinalizeWithResult} from './phases/finalize.js'
+import {snapshotLogDirectory} from './phases/log-snapshot.js'
 import {mergeObservedTurn, recordObservedTurn} from './phases/observed-turn-v2.js'
 import {releaseOptionsFromExecution, runReleaseV2} from './phases/release-v2.js'
 import {removeRepoSkillsStaging, runRepoSkills} from './phases/repo-skills.js'
@@ -76,6 +78,28 @@ export async function run(): Promise<number> {
   // The lifecycle itself records the `unsafe` state for the post hook on every release that is not a confirmed restore.
   const markSandboxUntrusted = (): void => {
     sandboxOutputUntrusted = true
+  }
+  // The runner-owned copy of the OpenCode logs this invocation took at its own confirmed sandbox take-back, or null. The
+  // shared log directory is re-handed to every later isolated step's sandbox, so an isolated run publishes only this.
+  let logSnapshotPath: string | null = null
+  // Called only after a release that reported `restored`. A sandbox that never started reports `not-needed` instead: it ran
+  // nothing, so there is nothing of this invocation's to copy and no snapshot exists.
+  const snapshotSandboxLogs = async (): Promise<void> => {
+    const runnerTemp = process.env.RUNNER_TEMP?.trim() ?? ''
+    const runnerUid = process.getuid?.()
+    if (runnerTemp === '' || runnerUid === undefined) {
+      bootstrapLogger.warning(
+        'Not snapshotting the OpenCode logs: no RUNNER_TEMP or runner uid, so no logs are published',
+      )
+      return
+    }
+    logSnapshotPath = await snapshotLogDirectory({
+      source: getOpenCodeLogPath(),
+      tempRoot: runnerTemp,
+      runnerUid,
+      logger: bootstrapLogger,
+    })
+    if (logSnapshotPath !== null) core.saveState(STATE_KEYS.LOG_SNAPSHOT_DIR, logSnapshotPath)
   }
   // The run-scoped repo skills staging root under RUNNER_TEMP, or null. Hoisted so the `finally` block removes it once the
   // server has stopped, whichever path the run took (fro-bot/agent#2129).
@@ -286,8 +310,6 @@ export async function run(): Promise<number> {
     serverHandleV2 = cacheRestore.serverHandle
     sandboxLifecycle = cacheRestore.sandbox ?? sandboxLifecycle
     sessionStateVouched = true
-    // Before the save is armed: the post hook must know, whenever it sees the arm, that this state came from a sandbox.
-    if (sandboxLifecycle !== null) core.saveState(STATE_KEYS.ISOLATED_RUN, 'true')
     // Armed here and nowhere earlier: the post hook retries a save only for a run that got this far.
     core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'true')
 
@@ -337,6 +359,7 @@ export async function run(): Promise<number> {
           `isolate-agent: the sandbox was not confirmed stopped and restored: ${sandboxOutcome.reason ?? 'unknown reason'}`,
         )
       }
+      await snapshotSandboxLogs()
       if (sandboxOutcome.proxy === 'crashed') {
         // The key proxy exited before the teardown asked it to: model requests after that point failed, so the run is
         // incomplete whatever the session says. Nothing is published or saved.
@@ -499,14 +522,17 @@ export async function run(): Promise<number> {
     if (sandboxLifecycle !== null && !sandboxSettled) {
       try {
         const sandboxOutcome = await sandboxLifecycle.release()
-        if (sandboxOutcome.restore !== 'restored') {
+        if (sandboxOutcome.restore === 'restored') {
+          await snapshotSandboxLogs()
+          if (sandboxOutcome.proxy === 'crashed') {
+            skipSessionPersistence = true
+            persistenceDeclineReason ??= KEY_PROXY_CRASHED_DECLINE_REASON
+            core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
+          }
+        } else {
           markSandboxUntrusted()
           skipSessionPersistence = true
           persistenceDeclineReason ??= `the isolate-agent sandbox was not confirmed stopped and restored (${sandboxOutcome.reason ?? 'unknown reason'}), so no session state is saved`
-          core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
-        } else if (sandboxOutcome.proxy === 'crashed') {
-          skipSessionPersistence = true
-          persistenceDeclineReason ??= KEY_PROXY_CRASHED_DECLINE_REASON
           core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
         }
       } catch (sandboxError) {
@@ -537,6 +563,8 @@ export async function run(): Promise<number> {
       leaseRenewal,
       skipSessionPersistence,
       sandboxOutputUntrusted,
+      isolatedRun: sandboxLifecycle !== null,
+      logSnapshotPath,
       ...(persistenceDeclineReason === undefined ? {} : {persistenceDeclineReason}),
     }).finally(async () => {
       // runCleanup shuts the V2 server down; only then is the staging root, which the server reads, safe to remove.

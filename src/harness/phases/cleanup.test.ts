@@ -205,6 +205,63 @@ describe('runCleanup', () => {
     expect(syncMetadataToStore).toHaveBeenCalled()
   })
 
+  describe('log reads on an isolated run (the shared log directory is re-handed to every later sandbox)', () => {
+    const arrange = async () => {
+      const {createS3Adapter} = await import('@fro-bot/runtime')
+      vi.mocked(createS3Adapter).mockReturnValue({
+        upload: async () => ok(undefined),
+        download: async () => ok(undefined),
+        list: async () => ok([]),
+      })
+      process.env.OPENCODE_PROMPT_ARTIFACT = 'true'
+      const {runCleanup} = await import('./cleanup.js')
+      return runCleanup
+    }
+    const base = {
+      bootstrapLogger: createMockLogger(),
+      reactionCtx: null,
+      githubClient: null,
+      attachmentResult: null,
+      storeConfig: {enabled: true, bucket: 'bucket', region: 'us-east-1', prefix: 'fro-bot-state'},
+      metrics: createMetricsCollector(),
+      agentIdentity: 'github',
+      repo: 'owner/repo',
+      runId: 'run-123',
+      lockEtag: null,
+    } as const
+
+    it("publishes only this invocation's snapshot, never the shared log directory", async () => {
+      // #given a restored isolated run that took a snapshot
+      const runCleanup = await arrange()
+      const {syncArtifactsToStore} = await import('@fro-bot/runtime')
+      const {getOpenCodeLogPath} = await import('../../shared/env.js')
+      const {uploadLogArtifact} = await import('../../services/artifact/index.js')
+
+      // #when
+      await runCleanup({...base, isolatedRun: true, logSnapshotPath: '/runner-temp/fro-bot-logs-A'})
+
+      // #then both backends read the snapshot
+      expect(vi.mocked(syncArtifactsToStore).mock.calls[0]?.[5]).toBe('/runner-temp/fro-bot-logs-A')
+      expect(vi.mocked(uploadLogArtifact).mock.calls[0]?.[0].logPath).toBe('/runner-temp/fro-bot-logs-A')
+      expect(vi.mocked(uploadLogArtifact).mock.calls[0]?.[0].logPath).not.toBe(getOpenCodeLogPath())
+    })
+
+    it('publishes no logs, and still writes metadata, when an isolated run has no snapshot (its sandbox never started)', async () => {
+      // #given an isolated run whose sandbox never started: the lifecycle reports it restored, but no snapshot exists
+      const runCleanup = await arrange()
+      const {syncArtifactsToStore, syncMetadataToStore} = await import('@fro-bot/runtime')
+      const {uploadLogArtifact} = await import('../../services/artifact/index.js')
+
+      // #when
+      await runCleanup({...base, isolatedRun: true, sandboxOutputUntrusted: false})
+
+      // #then nothing read the shared log directory
+      expect(syncArtifactsToStore).not.toHaveBeenCalled()
+      expect(uploadLogArtifact).not.toHaveBeenCalled()
+      expect(syncMetadataToStore).toHaveBeenCalled()
+    })
+  })
+
   it('does not mark cleanup metadata written when the upload fails', async () => {
     // #given the metadata upload itself fails -- the rich payload never landed, so post.ts
     // must still be free to write its own placeholder rather than silently skipping

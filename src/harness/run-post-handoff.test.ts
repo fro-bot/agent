@@ -1,11 +1,12 @@
 import type {OpenCodeV2ServerHandle} from '@fro-bot/runtime'
 import type {RoutingPhaseResult} from './phases/routing.js'
+import type {SandboxLifecycleOptions} from './phases/sandbox-lifecycle.js'
 import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {DEFAULT_OPENCODE_VERSION} from '../shared/constants.js'
-import {ok} from '../shared/types.js'
+import {err, ok} from '../shared/types.js'
 
 // Drives the REAL run() and the REAL runPost() against one shared state store, so what the post hook sees is exactly what
 // `run` wrote: no test here sets a state key by hand. Only the leaf boundaries are faked: the Actions cache, the object
@@ -75,6 +76,16 @@ vi.mock('./config/outputs.js', () => ({
   setInvocationOutcomeOutput: vi.fn(),
   setCacheSaveResultOutput: vi.fn(),
 }))
+
+vi.mock('../services/setup/sandbox-preflight.js', async importOriginal => ({
+  ...(await importOriginal<typeof import('../services/setup/sandbox-preflight.js')>()),
+  runSandboxPreflight: vi.fn(async () => ({ok: true as const, tools: {}})),
+}))
+// The REAL lifecycle by default; a test swaps in a stub or injects deps for the privileged steps it cannot run here.
+vi.mock('./phases/sandbox-lifecycle.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('./phases/sandbox-lifecycle.js')>()
+  return {...actual, createSandboxLifecycle: vi.fn(actual.createSandboxLifecycle)}
+})
 
 vi.mock('./phases/routing.js', () => ({runRouting: vi.fn()}))
 vi.mock('./phases/dedup.js', () => ({runDedup: vi.fn(), saveDedupMarker: vi.fn()}))
@@ -386,5 +397,119 @@ describe('run -> post handoff: session state is saved only for a run that starte
     // #then the state `run` wrote says "do not save", and the post hook honors it
     expect(mocks.state.get('shouldSaveCache')).toBe('false')
     await expectNothingPersisted()
+  })
+
+  describe("isolate-agent: logs are published only from this invocation's own snapshot", () => {
+    const logDir = (): string => path.join(tempDir, 'opencode', 'log')
+
+    const arm = async (): Promise<void> => {
+      mocks.inputs.set('isolate-agent', 'true')
+      process.env.OPENCODE_PROMPT_ARTIFACT = 'true'
+      await armPhasesUpToRestore()
+    }
+
+    // The privileged steps (useradd, sudo, ACLs) cannot run here, so the lifecycle's account step is injected; everything
+    // else is the real lifecycle.
+    const useLifecycleDeps = async (deps: NonNullable<SandboxLifecycleOptions['deps']>): Promise<void> => {
+      const actual = await vi.importActual<typeof import('./phases/sandbox-lifecycle.js')>(
+        './phases/sandbox-lifecycle.js',
+      )
+      const {createSandboxLifecycle} = await import('./phases/sandbox-lifecycle.js')
+      vi.mocked(createSandboxLifecycle).mockImplementationOnce(options =>
+        actual.createSandboxLifecycle({...options, deps: {...options.deps, ...deps}}),
+      )
+    }
+
+    // A lifecycle whose sandbox ran and was confirmed stopped and taken back, recording the states the real one records.
+    const useRestoredSandbox = async (): Promise<void> => {
+      const {createSandboxLifecycle} = await import('./phases/sandbox-lifecycle.js')
+      vi.mocked(createSandboxLifecycle).mockImplementationOnce(options => {
+        options.recordState?.('pending')
+        return {
+          prepare: vi.fn(),
+          launch: vi.fn(),
+          startKeyProxy: vi.fn(),
+          release: vi.fn(async () => {
+            options.recordState?.('restored')
+            return {stop: 'stopped' as const, restore: 'restored' as const}
+          }),
+        }
+      })
+    }
+
+    it('publishes nothing from the shared log directory when the sandbox never started (the account already existed)', async () => {
+      // #given an earlier step's sandbox left content in the shared log directory, and this step's createAccount refuses
+      await arm()
+      await fs.mkdir(logDir(), {recursive: true})
+      await fs.writeFile(path.join(logDir(), 'earlier-step.log'), 'written by an earlier unconfirmed sandbox')
+      await useLifecycleDeps({
+        createAccount: async () => err({kind: 'exists', message: 'already exists; refusing to adopt it'}),
+      })
+      const {runCacheRestore} = await import('./phases/cache-restore.js')
+      vi.mocked(runCacheRestore).mockImplementation(async bootstrap => {
+        await bootstrap.sandbox?.prepare({keyFilePaths: [], ghConfigDir: null, repoSkills: null})
+        await bootstrap.sandbox?.release()
+        return null
+      })
+
+      // #when the real run and the real post hook execute
+      const {exitCode} = await runThenPost()
+
+      // #then the run failed, and the lifecycle reported the sandbox as restored: the state the issue's hole depended on
+      expect(exitCode).toBe(1)
+      expect(mocks.state.get('sandboxState')).toBe('restored')
+      // #and the invocation is still marked isolated, from the input, with no snapshot to publish
+      expect(mocks.state.get('isolatedRun')).toBe('true')
+      expect(mocks.state.has('logSnapshotDir')).toBe(false)
+      // #and neither the main step's cleanup nor the post hook read or uploaded anything from the shared path
+      const {uploadLogArtifact} = await import('../services/artifact/index.js')
+      expect(uploadLogArtifact).not.toHaveBeenCalled()
+      const {syncArtifactsToStore} = await import('@fro-bot/runtime')
+      expect(syncArtifactsToStore).not.toHaveBeenCalled()
+    })
+
+    it("invocation A's post hook uploads A's snapshot, not what a later isolated step's sandbox wrote to the shared directory", async () => {
+      // #given invocation A: an isolated run that wrote a log, was confirmed restored, and whose artifact upload failed
+      await arm()
+      await fs.mkdir(logDir(), {recursive: true})
+      await fs.writeFile(path.join(logDir(), 'a.log'), 'A output')
+      await useRestoredSandbox()
+      await armStartedServer()
+      const {runExecute} = await import('./phases/execute.js')
+      vi.mocked(runExecute).mockRejectedValue(new Error('boom'))
+      const {uploadLogArtifact} = await import('../services/artifact/index.js')
+      const seen: {logPath: string; files: Record<string, string>}[] = []
+      vi.mocked(uploadLogArtifact).mockImplementation(async (options: {readonly logPath: string}) => {
+        const names = await fs.readdir(options.logPath)
+        const files = Object.fromEntries(
+          await Promise.all(
+            names.map(async (name): Promise<[string, string]> => [
+              name,
+              await fs.readFile(path.join(options.logPath, name), 'utf8'),
+            ]),
+          ),
+        )
+        seen.push({logPath: options.logPath, files})
+        return false
+      })
+      const {run} = await import('./run.js')
+      await run()
+      const snapshotDir = mocks.state.get('logSnapshotDir')
+      expect(snapshotDir).toBeDefined()
+
+      // #when a later isolated step B's sandbox writes to the shared log directory, and then A's post hook runs
+      await fs.writeFile(path.join(logDir(), 'a.log'), 'B sandbox rewrote this')
+      await fs.writeFile(path.join(logDir(), 'b.log'), 'B sandbox output')
+      const {runPost} = await import('./post.js')
+      const {createMockLogger} = await import('../shared/test-helpers.js')
+      await runPost({logger: createMockLogger()})
+
+      // #then both of A's uploads (the main step's, then the post hook's retry) read A's snapshot, with A's content only
+      expect(seen).toHaveLength(2)
+      for (const upload of seen) {
+        expect(upload.logPath).toBe(snapshotDir)
+        expect(upload.files).toEqual({'a.log': 'A output'})
+      }
+    })
   })
 })

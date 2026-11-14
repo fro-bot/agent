@@ -219,7 +219,7 @@ describe('post action', () => {
       it('uploads the Actions artifact when the teardown was restored', async () => {
         // #given an isolated run whose main step recorded a confirmed restore
         vi.stubEnv('OPENCODE_PROMPT_ARTIFACT', 'true')
-        await stubState({...armedIsolated, sandboxState: 'restored'})
+        await stubState({...armedIsolated, sandboxState: 'restored', logSnapshotDir: '/runner-temp/fro-bot-logs-A'})
         const {uploadLogArtifact} = await import('../services/artifact/index.js')
         const {runPost} = await import('./post.js')
 
@@ -228,6 +228,54 @@ describe('post action', () => {
 
         // #then
         expect(uploadLogArtifact).toHaveBeenCalledTimes(1)
+        vi.unstubAllEnvs()
+      })
+
+      it("uploads only the restored invocation's own snapshot, never the shared log directory", async () => {
+        // #given invocation A restored and snapshotted its logs, and a later isolated invocation B has since written to
+        // the shared log directory (B's own state is invisible to A's post hook: state is per invocation)
+        vi.stubEnv('OPENCODE_PROMPT_ARTIFACT', 'true')
+        const stateOfA = {
+          ...storeState,
+          ...armedIsolated,
+          sandboxState: 'restored',
+          logSnapshotDir: '/runner-temp/fro-bot-logs-A',
+          cleanupMetadataWritten: 'true',
+        }
+        await stubState(stateOfA)
+        const {uploadLogArtifact} = await import('../services/artifact/index.js')
+        const {syncArtifactsToStore} = await import('@fro-bot/runtime')
+        const {getOpenCodeLogPath} = await import('@fro-bot/runtime')
+        const {runPost} = await import('./post.js')
+
+        // #when A's post hook runs
+        await runPost({logger: createMockLogger()})
+
+        // #then the artifact upload read A's snapshot
+        expect(uploadLogArtifact).toHaveBeenCalledTimes(1)
+        expect(vi.mocked(uploadLogArtifact).mock.calls[0]?.[0].logPath).toBe('/runner-temp/fro-bot-logs-A')
+        // #and nothing read the shared path
+        expect(vi.mocked(uploadLogArtifact).mock.calls[0]?.[0].logPath).not.toBe(getOpenCodeLogPath())
+        expect(syncArtifactsToStore).not.toHaveBeenCalled()
+        vi.unstubAllEnvs()
+      })
+
+      it('uploads nothing for a restored isolated invocation that has no snapshot', async () => {
+        // #given a confirmed restore with no snapshot (it never started, or the copy was discarded over the size cap)
+        vi.stubEnv('OPENCODE_PROMPT_ARTIFACT', 'true')
+        await stubState({...storeState, ...armedIsolated, sandboxState: 'restored', cleanupMetadataWritten: 'true'})
+        const {uploadLogArtifact} = await import('../services/artifact/index.js')
+        const {syncArtifactsToStore} = await import('@fro-bot/runtime')
+        const {runPost} = await import('./post.js')
+        const logger = createMockLogger()
+
+        // #when
+        await runPost({logger})
+
+        // #then neither backend fell back to the shared log directory
+        expect(uploadLogArtifact).not.toHaveBeenCalled()
+        expect(syncArtifactsToStore).not.toHaveBeenCalled()
+        expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining('Skipping the log upload'))
         vi.unstubAllEnvs()
       })
 

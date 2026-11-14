@@ -53,6 +53,7 @@ import {STORAGE_VERSION} from '../../shared/constants.js'
 import {getGitHubRunAttempt, getInvocationIdentity} from '../../shared/env.js'
 import {createLogger} from '../../shared/logger.js'
 import {startKeyProxyProcess, type KeyProxyProcess} from './key-proxy-process.js'
+import {snapshotLogDirectory} from './log-snapshot.js'
 import {createSandboxLifecycle} from './sandbox-lifecycle.js'
 import {
   describeReconstruction,
@@ -940,6 +941,10 @@ describe.skipIf(!gated)('isolate-agent session persistence round trip', () => {
     run1: undefined as IsolatedRunResult | undefined,
     run2: undefined as IsolatedRunResult | undefined,
     sessionsAfterRun1: [] as string[],
+    logSourceFiles: [] as string[],
+    logSnapshot: undefined as string | null | undefined,
+    logSnapshotFiles: [] as string[],
+    logSnapshotLaterWrite: '',
     walBytesBeforeSave: -1,
     saveOutcome: undefined as Awaited<ReturnType<typeof saveCache>> | undefined,
     walBytesAfterSave: -1,
@@ -982,12 +987,29 @@ describe.skipIf(!gated)('isolate-agent session persistence round trip', () => {
           id: 'persist_write_storage',
           category: 'works',
           cmd:
+            `mkdir -p "$XDG_DATA_HOME/opencode/log" && echo log-from-the-sandbox > "$XDG_DATA_HOME/opencode/log/sandbox-note.log" && ` +
             `echo storage-from-the-sandbox > "$XDG_DATA_HOME/opencode/storage/sandbox-note.txt" && ` +
             `R persist_write_storage WORKS "wrote storage" || R persist_write_storage FAILED "write failed"`,
         },
       ],
     })
     facts.sessionsAfterRun1 = readSessionIds(dbPath)
+
+    // --- The log snapshot, taken the way run.ts takes it: right after the confirmed take-back ------------------------------
+    const logSource = path.join(dataDir, 'log')
+    facts.logSourceFiles = fs.readdirSync(logSource).sort()
+    facts.logSnapshot = await snapshotLogDirectory({
+      source: logSource,
+      tempRoot: scratch,
+      runnerUid: process.getuid?.() ?? -1,
+      logger,
+    })
+    // A later isolated step's sandbox writing to the shared directory after the snapshot must not reach it.
+    fs.writeFileSync(path.join(logSource, 'later-step.log'), 'written after the snapshot')
+    facts.logSnapshotFiles = facts.logSnapshot === null ? [] : fs.readdirSync(facts.logSnapshot).sort()
+    facts.logSnapshotLaterWrite = fs.existsSync(path.join(facts.logSnapshot ?? scratch, 'later-step.log'))
+      ? 'present'
+      : 'absent'
 
     // --- Checkpoint and save through the real save path ----------------------------------------------------------------------
     facts.walBytesBeforeSave = fileSizeOrZero(walPath)
@@ -1042,6 +1064,19 @@ describe.skipIf(!gated)('isolate-agent session persistence round trip', () => {
     expect(facts.run1?.released.stop).toBe('stopped')
     expect(facts.run1?.released.restore).toBe('restored')
     expect(facts.sessionsAfterRun1.length).toBeGreaterThan(0)
+  })
+
+  it('snapshots every log the sandbox wrote, as runner-owned copies, and a later write to the shared directory does not reach it', () => {
+    // #given the log directory right after the take-back: nothing may be skipped as not runner-owned
+    expect(facts.logSourceFiles).toContain('sandbox-note.log')
+    // #then the snapshot holds exactly those files, and nothing written to the shared directory afterwards
+    expect(facts.logSnapshot).not.toBeNull()
+    expect(facts.logSnapshotFiles).toEqual(facts.logSourceFiles)
+    expect(facts.logSnapshotLaterWrite).toBe('absent')
+    expect(fs.readFileSync(path.join(facts.logSnapshot ?? '', 'sandbox-note.log'), 'utf8')).toBe(
+      'log-from-the-sandbox\n',
+    )
+    expect(fs.statSync(path.join(facts.logSnapshot ?? '', 'sandbox-note.log')).uid).toBe(process.getuid?.())
   })
 
   it('saves through the real save path: persisted, the expected key and paths, a clean WAL and a sound database', () => {
