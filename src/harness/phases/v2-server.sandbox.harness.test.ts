@@ -1,104 +1,159 @@
+import {spawnSync} from 'node:child_process'
 import * as fs from 'node:fs'
-import * as os from 'node:os'
-import * as path from 'node:path'
-import {DatabaseSync} from 'node:sqlite'
-import {afterEach, beforeEach, describe, expect, it} from 'vitest'
-import {describeReconstruction, readSessionIds, safeEnvPath, safeEnvToken} from './v2-server.sandbox.harness.js'
+import os from 'node:os'
+import path from 'node:path'
+import {afterEach, describe, expect, it} from 'vitest'
+import {
+  controlCoversMatrix,
+  matrixDirectories,
+  matrixSentinels,
+  parseRows,
+  PRELUDE,
+  writeMatrixProbe,
+  writeWorksProbe,
+} from './v2-server.sandbox.harness.js'
 
-describe('safeEnvPath', () => {
-  it.each([
-    '/home/runner/work/_temp/_runner_file_commands/set_env_3f2a-1b',
-    '/home/runner/work/_temp',
-    '/var/lib/x_y+z@1.2/file.txt',
-  ])('keeps a plain absolute path: %s', value => {
-    // #given an env-derived value that is a plain absolute path
-    // #then it is used as is
-    expect(safeEnvPath(value, '/fallback')).toBe(value)
+const noFs = {isDirectory: () => true, isWritable: () => true, subdirectories: () => [] as string[]}
+
+describe('matrixDirectories', () => {
+  it('covers every absolute PATH entry, the extra directories and the tool cache with its first subdirectory, once each', () => {
+    // #given a PATH with a relative entry, an empty one and a duplicate
+    const directories = matrixDirectories(
+      {
+        pathEnv: '/usr/local/bin:relative:/usr/bin::/usr/local/bin/',
+        toolCache: '/opt/hostedtoolcache',
+        extra: ['/opt', '/usr/share'],
+      },
+      {...noFs, subdirectories: () => ['CodeQL', 'node']},
+    )
+
+    // #then
+    expect(directories).toEqual([
+      '/usr/local/bin',
+      '/usr/bin',
+      '/opt',
+      '/usr/share',
+      '/opt/hostedtoolcache',
+      '/opt/hostedtoolcache/CodeQL',
+    ])
   })
 
-  it.each([
-    ['unset', undefined],
-    ['empty', ''],
-    ['relative', 'work/_temp'],
-    ['a command separator', '/tmp/x; touch /tmp/pwned'],
-    ['a command substitution', '/tmp/$(id)'],
-    ['a backtick substitution', '/tmp/`id`'],
-    ['a single quote', "/tmp/x'y"],
-    ['a double quote', '/tmp/x"y'],
-    ['a space', '/tmp/x y'],
-    ['a newline', '/tmp/x\nid'],
-    ['a glob', '/tmp/*'],
-    ['a parent segment', '/tmp/../etc/passwd'],
-    ['a pipe', '/tmp/x|id'],
-  ])('falls back for %s', (_label, value) => {
-    // #given a value that could change the meaning of a shell command it is embedded in
-    // #then the fallback is used instead
-    expect(safeEnvPath(value, '/fallback')).toBe('/fallback')
+  it('leaves out a directory the runner cannot write, and one that is missing', () => {
+    // #given /usr/bin is not writable and /missing is not a directory
+    const directories = matrixDirectories(
+      {pathEnv: '/usr/local/bin:/usr/bin:/missing', toolCache: '/opt/hostedtoolcache', extra: []},
+      {
+        isDirectory: target => target !== '/missing',
+        isWritable: target => target !== '/usr/bin',
+        subdirectories: () => [],
+      },
+    )
+
+    // #then only what the runner could write is in the matrix
+    expect(directories).toEqual(['/usr/local/bin', '/opt/hostedtoolcache'])
+  })
+
+  it('picks the first tool cache subdirectory the runner can write', () => {
+    // #given a read-only first entry
+    const directories = matrixDirectories(
+      {pathEnv: undefined, toolCache: '/cache', extra: []},
+      {...noFs, isWritable: target => target !== '/cache/a', subdirectories: () => ['a', 'b']},
+    )
+
+    // #then
+    expect(directories).toEqual(['/cache', '/cache/b'])
   })
 })
 
-describe('safeEnvToken', () => {
-  it('keeps a plain token and falls back for anything with shell meaning', () => {
-    // #given
-    // #then only word characters, dots and dashes survive
-    expect(safeEnvToken('dummy-probe_token.1', 'fb')).toBe('dummy-probe_token.1')
-    expect(safeEnvToken('a b', 'fb')).toBe('fb')
-    expect(safeEnvToken('a;b', 'fb')).toBe('fb')
-    expect(safeEnvToken("a'b", 'fb')).toBe('fb')
-    expect(safeEnvToken(undefined, 'fb')).toBe('fb')
-  })
-})
+function run(dir: string): string {
+  const probe = writeMatrixProbe('wm_0', dir, '1', os.userInfo().uid)
+  const result = spawnSync('bash', ['-c', PRELUDE + probe.cmd], {encoding: 'utf8'})
+  return result.stdout + result.stderr
+}
 
-describe('readSessionIds', () => {
-  let dir = ''
-  beforeEach(() => {
-    dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'session-ids-')))
-  })
+const asRoot = os.userInfo().uid === 0
+
+describe('the write matrix probe, run for real on this machine', () => {
+  const dirs: string[] = []
   afterEach(() => {
-    fs.rmSync(dir, {recursive: true, force: true})
+    for (const dir of dirs.splice(0)) {
+      fs.chmodSync(dir, 0o755)
+      fs.rmSync(dir, {recursive: true, force: true})
+    }
   })
 
-  function database(statements: string): string {
-    const file = path.join(dir, 'opencode-v2.db')
-    const db = new DatabaseSync(file)
-    db.exec(statements)
-    db.close()
-    return file
+  function fixture(): {readonly dir: string; readonly sentinels: readonly string[]} {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matrix-'))
+    dirs.push(dir)
+    const sentinels = matrixSentinels(dir, '1')
+    for (const file of sentinels) fs.writeFileSync(file, 'sentinel', {mode: 0o666})
+    return {dir, sentinels}
   }
 
-  it('reads ids from session_v2, the table OpenCode 2.2.x keeps sessions in', () => {
-    // #given a database shaped like the real one (columns abbreviated)
-    const file = database(
-      "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, project_id TEXT, time_suspended INTEGER); INSERT INTO session_v2 (id, project_id) VALUES ('ses_b', 'p'), ('ses_a', 'p')",
-    )
+  it('reports OPEN with all four operations in a directory the actor can write, and cleans up after itself', () => {
+    // #given a writable directory with the runner's sentinels in it
+    const {dir, sentinels} = fixture()
 
-    // #when / #then
-    expect(readSessionIds(file)).toEqual(['ses_a', 'ses_b'])
+    // #when run as the runner (the control)
+    const rows = parseRows(run(dir))
+
+    // #then every operation worked and the control covers the matrix
+    expect(controlCoversMatrix(rows.get('wm_0'))).toBe(true)
+    // #and the append sentinel is back under its name, the new file is gone, and the unlinked one is gone
+    expect(fs.existsSync(sentinels[0] ?? '')).toBe(true)
+    expect(fs.existsSync(`${sentinels[0]}.moved`)).toBe(false)
+    expect(fs.readdirSync(dir).some(name => name.includes('-new-'))).toBe(false)
+    expect(fs.existsSync(sentinels[1] ?? '')).toBe(false)
+    // #and the sandbox's sentinels were not touched
+    expect(fs.readFileSync(sentinels[2] ?? '', 'utf8')).toBe('sentinel')
+    expect(fs.existsSync(sentinels[3] ?? '')).toBe(true)
   })
 
-  it('names the tables that exist when session_v2 is missing, instead of an opaque SQL error', () => {
-    // #given the V1 shape
-    const file = database('CREATE TABLE session (id TEXT PRIMARY KEY); CREATE TABLE message (id TEXT)')
+  // Root bypasses permission bits, so these two cannot show a refusal there.
+  it.skipIf(asRoot)('reports BLOCKED when nothing can be written', () => {
+    // #given a directory and files nobody may change (run as the sandbox actor: another uid than the runner's)
+    const {dir, sentinels} = fixture()
+    for (const file of sentinels) fs.chmodSync(file, 0o444)
+    fs.chmodSync(dir, 0o555)
+    const probe = writeMatrixProbe('wm_0', dir, '1', os.userInfo().uid + 1)
 
-    // #when / #then
-    expect(() => readSessionIds(file)).toThrow(/no session_v2 table; tables: message, session/)
+    // #when run
+    const result = spawnSync('bash', ['-c', PRELUDE + probe.cmd], {encoding: 'utf8'})
+
+    // #then no operation succeeded
+    expect(parseRows(result.stdout).get('wm_0')).toEqual([
+      {status: 'BLOCKED', evidence: 'no write operation succeeded'},
+    ])
+  })
+
+  it('does not call a control complete unless it managed all four operations', () => {
+    // #given a control row that only created
+    // #then it is not enough
+    expect(controlCoversMatrix([{status: 'OPEN', evidence: 'succeeded: create'}])).toBe(false)
+    expect(controlCoversMatrix([{status: 'BLOCKED', evidence: 'no write operation succeeded'}])).toBe(false)
+    expect(controlCoversMatrix(undefined)).toBe(false)
   })
 })
 
-describe('describeReconstruction', () => {
-  it('names the refusal reason, and reports the other outcomes', () => {
-    // #given each outcome
-    // #then a failure carries its message, so a CI assertion shows why
-    expect(describeReconstruction(undefined)).toBe('reconstruction did not run')
-    expect(
-      describeReconstruction({
-        success: false,
-        error: new Error('.gitattributes: only regular files may be reconstructed'),
-      }),
-    ).toBe('reconstruction failed: .gitattributes: only regular files may be reconstructed')
-    expect(describeReconstruction({success: true, data: {kind: 'nothing-to-deliver'}})).toBe(
-      'reconstruction returned kind nothing-to-deliver',
-    )
-    expect(describeReconstruction({success: true, data: {kind: 'changes'}})).toBe('ok')
+describe('writeWorksProbe', () => {
+  it.skipIf(asRoot)('reports WORKS for a writable directory and FAILED for one that is not', () => {
+    // #given a writable and a read-only directory
+    const writable = fs.mkdtempSync(path.join(os.tmpdir(), 'works-'))
+    const sealed = fs.mkdtempSync(path.join(os.tmpdir(), 'works-ro-'))
+    fs.chmodSync(sealed, 0o555)
+    try {
+      // #when each is probed
+      const good = spawnSync('bash', ['-c', PRELUDE + writeWorksProbe('w_ok', `'${writable}'`).cmd], {encoding: 'utf8'})
+      const bad = spawnSync('bash', ['-c', PRELUDE + writeWorksProbe('w_ro', `'${sealed}'`).cmd], {encoding: 'utf8'})
+
+      // #then
+      expect(parseRows(good.stdout).get('w_ok')?.[0]?.status).toBe('WORKS')
+      expect(parseRows(bad.stdout).get('w_ro')?.[0]?.status).toBe('FAILED')
+      expect(fs.readdirSync(writable)).toEqual([])
+    } finally {
+      fs.chmodSync(sealed, 0o755)
+      fs.rmSync(writable, {recursive: true, force: true})
+      fs.rmSync(sealed, {recursive: true, force: true})
+    }
   })
 })
