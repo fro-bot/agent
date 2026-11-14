@@ -86,6 +86,7 @@ Every one of them would need an edit.
 ## Dependencies / Assumptions
 
 - #2186 is fixed before R6.
+- The rollout waits for two fixes found after this was written. The agent's user can write to shared directories on the hosted image that the runner runs programs from, so isolation does not yet protect a write-capable token. Tools installed under the runner home (`bun`, `pnpm`) are also unusable by the agent's user.
 
 ---
 
