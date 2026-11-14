@@ -9,7 +9,7 @@
  * tool shell as the sandbox user. Each "blocked" probe has a positive control: the same command run as the runner must
  * succeed (be OPEN), otherwise a BLOCKED result proves nothing.
  *
- * Eight suites run one after another (the sandbox account name is fixed, so two never overlap):
+ * Nine suites run one after another (the sandbox account name is fixed, so two never overlap):
  *   1. the boundary: blocked and works rows, identity, quiescence, take-back;
  *   2. a provisioned `gh` config and an admitted repo skill;
  *   3. the persistence round trip (restore, isolated run, checkpoint and save, restore, isolated run);
@@ -18,7 +18,9 @@
  *   6. the read-only view: a write matrix over the shared directories (each row with a runner-side control), the places the
  *      model must still write, escape attempts, and what the runner finds afterwards (sentinels, private temp, mounts);
  *   7. a server torn down mid-run leaves no namespace member and no private mount;
- *   8. a second isolated run in the same job finds nothing of the first outside the places it may write.
+ *   8. a second isolated run in the same job finds nothing of the first outside the places it may write;
+ *   9. a launcher killed while the chain waits at its gate: nothing past the gate ran, and the teardown is not `restored`
+ *      unless it confirmed the orphaned root process gone.
  *
  * Every suite runs through the read-only view, as the Action does: the launch has no other form.
  *
@@ -28,7 +30,7 @@ import type {SandboxToolPaths} from '../../services/setup/sandbox-preflight.js'
 import type {Logger} from '../../shared/logger.js'
 import type {SandboxLifecycle, SandboxLifecycleDeps, SandboxReleaseResult} from './sandbox-lifecycle.js'
 import type {Probe, Row, ScriptedProvider} from './v2-server.sandbox.harness.js'
-import {spawnSync} from 'node:child_process'
+import {spawn, spawnSync} from 'node:child_process'
 import {createHash} from 'node:crypto'
 import * as fs from 'node:fs'
 import http from 'node:http'
@@ -38,7 +40,7 @@ import path from 'node:path'
 import process from 'node:process'
 import {DatabaseSync} from 'node:sqlite'
 import {fileURLToPath} from 'node:url'
-import {createSandboxAccount, getSessionDbBasenames} from '@fro-bot/runtime'
+import {admitLaunch, buildSandboxLaunch, createSandboxAccount, getSessionDbBasenames} from '@fro-bot/runtime'
 import {afterAll, beforeAll, describe, expect, it} from 'vitest'
 import {startTlsUpstream, type TlsUpstream} from '../../../packages/runtime/src/agent/key-proxy-test-kit.js'
 import {resolveBrokeredPushCommitMessage} from '../../features/delegated/commit-message.js'
@@ -2148,5 +2150,106 @@ describe.skipIf(!gated)('isolate-agent read-only view: a second isolated run in 
     // #then it saw no marker and no file of ours in the places the first run wrote
     expect(failuresFor(second?.rows ?? new Map(), 'run2_clean', 'WORKS')).toEqual([])
     expect(first?.rows.get('run1_markers')).toBeDefined()
+  })
+})
+
+describe.skipIf(!gated)('isolate-agent read-only view: a launcher killed while the chain waits at its gate', () => {
+  const logger = createLogger({phase: 'sandbox-integration-gate'})
+  const scratch = path.join(runnerTemp, `sandbox-it-gate-${process.pid}`)
+  const workspace = path.join(scratch, 'ws')
+  const responseDir = path.join(scratch, 'response')
+  const keyDir = path.join(scratch, 'keys')
+  const env = hostedEnv(workspace)
+  const marker = path.join(workspace, `${VIEW_IT_PREFIX}-gate-ran-${VIEW_TAG}`)
+  const strayPattern = 'sleep 7791'
+
+  let lifecycle: SandboxLifecycle | undefined
+  let released: SandboxReleaseResult | undefined
+  let gateDir = ''
+  let gateReported = false
+  let processesAtGate = 'not checked'
+  let processesAfter = 'not checked'
+  let markerAfterWait = true
+  let newNamespaces: string[] = ['not checked']
+
+  beforeAll(async () => {
+    const tools = await preflightTools(logger)
+    fs.mkdirSync(responseDir, {recursive: true})
+    const keyFile = writeKeyFile(keyDir)
+    initWorkspace(workspace)
+    const namespacesBefore = mountNamespaces()
+
+    lifecycle = createSandboxLifecycle({
+      tools,
+      env,
+      runnerHome,
+      workspacePath: workspace,
+      responseDir,
+      logger,
+      viewLauncher,
+      // The runner side never gives the go-ahead: this is a launch whose admission was cut off, as a cancellation would.
+      deps: {admit: async (pid, dir, deps, options) => admitLaunch(pid, dir, deps, {...options, isClosed: () => true})},
+    })
+    const prepared = await lifecycle.prepare({keyFilePaths: [keyFile], ghConfigDir: null, repoSkills: null})
+    if (!prepared.success) throw new Error(prepared.error)
+
+    await lifecycle.launch(async context => {
+      gateDir = context.spec.view?.gate.dir ?? ''
+      // A stand-in server: if the chain ever got past the gate it would leave the marker and a stray.
+      const built = buildSandboxLaunch(
+        context.spec,
+        tools.sh,
+        ['-c', `echo ran > ${q(marker)}; exec sleep 7791`],
+        {},
+        workspace,
+      )
+      const child = spawn(built.command, [...built.args], {
+        detached: true,
+        stdio: 'ignore',
+        env: {PATH: process.env.PATH},
+      })
+      if (child.pid === undefined) throw new Error('the launcher did not start')
+      context.noteSpawn(child.pid)
+      // Wait until the gate has reported its namespace and is waiting for a go-ahead that will never come.
+      const deadline = Date.now() + 15_000
+      while (Date.now() < deadline && !fs.existsSync(path.join(gateDir, 'ns'))) {
+        await new Promise(resolve => setTimeout(resolve, 50))
+      }
+      gateReported = fs.existsSync(path.join(gateDir, 'ns'))
+      processesAtGate = strayProcesses(path.basename(gateDir))
+      // What a group kill from the runner does: only `sudo` dies; its root child is orphaned at the gate.
+      child.kill('SIGKILL')
+      await new Promise(resolve => setTimeout(resolve, 500))
+      return {value: 'killed at the gate', unconfirmed: false}
+    })
+
+    released = await lifecycle.release()
+    // A chain that had passed the gate would have written the marker within milliseconds.
+    await new Promise(resolve => setTimeout(resolve, 3000))
+    markerAfterWait = fs.existsSync(marker)
+    processesAfter = strayProcesses(`${path.basename(gateDir)}|${strayPattern}`)
+    newNamespaces = mountNamespaces().filter(namespace => !namespacesBefore.includes(namespace))
+  }, 300_000)
+
+  afterAll(async () => {
+    await lifecycle?.release()
+    spawnSync('sudo', ['-n', 'pkill', '-KILL', '-f', strayPattern])
+    fs.rmSync(scratch, {recursive: true, force: true})
+  }, 120_000)
+
+  it('held the chain at the gate: it reported its namespace and nothing past the gate ran', () => {
+    // #given a launch whose go-ahead was never given
+    // #then the gate had written its id, was still running, and the stand-in server never started
+    expect(gateReported).toBe(true)
+    expect(processesAtGate).not.toBe('')
+    expect(markerAfterWait).toBe(false)
+  })
+
+  it('is restored only because the orphaned root process was confirmed gone', () => {
+    // #given the launcher was killed and its child orphaned
+    // #then the release confirmed the stop, and no process of the launch is left
+    expect(released).toMatchObject({stop: 'stopped', restore: 'restored'})
+    expect(processesAfter).toBe('')
+    expect(newNamespaces).toEqual([])
   })
 })
