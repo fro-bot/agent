@@ -641,7 +641,8 @@ describe('stopLaunch: what teardown does for each state of a launch', () => {
 
   it('id held back (teardown began), launcher alive: stops the namespace the gate is in', async () => {
     // #given a gate shell in the new namespace
-    const model = createModel(gateTree())
+    // #and the gate's `sleep`, in the namespace too but with no gate directory in its command line
+    const model = createModel([...gateTree(), {pid: 103, ppid: 101, ns: VIEW, cmd: 'sleep 0.1'}])
     const held: LaunchAdmission = {kind: 'held', namespace: NAMESPACE, reason: 'closed'}
 
     // #when stopped
@@ -649,7 +650,7 @@ describe('stopLaunch: what teardown does for each state of a launch', () => {
 
     // #then the gate shell, a member of that namespace, was killed
     expect(outcome).toBe('stopped')
-    expect(model.procs.some(proc => proc.pid === 101)).toBe(false)
+    expect(model.procs.filter(proc => proc.ns === VIEW)).toEqual([])
   })
 
   it('no id captured, launcher dead, the gate shell still alive in its namespace: kills it by the gate directory', async () => {

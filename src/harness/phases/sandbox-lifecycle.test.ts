@@ -1281,11 +1281,16 @@ describe('createSandboxLifecycle', () => {
       expect(harness.mocks.takeBack).not.toHaveBeenCalled()
     })
 
-    it('never gives the go-ahead once the teardown has begun, however the id arrives', async () => {
-      // #given the real admission, a live launcher, and a gate that has not reported yet
+    it('never gives the go-ahead once the teardown has begun, even to a live launcher whose id arrives late', async () => {
+      // #given the real admission, and a launcher that stays alive until the stop has run
       const {harness, lifecycle} = await preparedWith()
       harness.mocks.admit.mockImplementation(admitLaunch)
-      harness.mocks.isProcessAlive.mockReturnValue(true)
+      let launcherAlive = true
+      harness.mocks.isProcessAlive.mockImplementation(() => launcherAlive)
+      harness.mocks.stopLaunch.mockImplementation(async () => {
+        launcherAlive = false
+        return 'stopped'
+      })
       let gateDir = ''
       await lifecycle.launch(async context => {
         context.noteSpawn(100)
@@ -1293,15 +1298,15 @@ describe('createSandboxLifecycle', () => {
         return quietReport('server')
       })
 
-      // #when the release begins and only then does the gate report its id
+      // #when the admission has polled once without an id, the release begins, and only then does the gate report its id
+      await new Promise(resolve => setTimeout(resolve, 5))
       const releasing = lifecycle.release()
       harness.gateFiles.set(`${gateDir}/ns`, 'mnt:[4026532399]\n')
-      harness.mocks.isProcessAlive.mockReturnValue(false)
       await releasing
 
-      // #then no go-ahead was written, and the stop was handed the id that was seen or none
+      // #then no go-ahead was written, and the stop was handed the id that was seen
       expect(harness.gateWrites).toEqual([])
-      expect(harness.mocks.stopLaunch).toHaveBeenCalledTimes(1)
+      expect(harness.mocks.stopLaunch.mock.calls[0]?.[0].admission.kind).toBe('held')
     })
 
     it('gives the go-ahead exactly once for a valid id while the launch is live', async () => {

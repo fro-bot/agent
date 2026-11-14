@@ -161,6 +161,8 @@ describe('runSandboxPreflight', () => {
     ['tool', {missingTools: ['pivot_root']}],
     ['tool', {missingTools: ['sh']}],
     ['tool', {missingTools: ['lsns']}],
+    ['tool', {missingTools: ['readlink']}],
+    ['tool', {missingTools: ['sleep']}],
     ['view', {probeView: async () => ({ok: false as const, message: 'the read-only view probe timed out'})}],
     ['protected-links', {sysctls: {protected_hardlinks: '0\n'}}],
     ['protected-links', {sysctls: {protected_symlinks: null}}],

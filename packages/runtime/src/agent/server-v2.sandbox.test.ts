@@ -396,7 +396,8 @@ function runChain(spec: OpenCodeV2SandboxLaunch, binary: string, cwd: string) {
   expect(withCwd.args.slice(0, 2)).toEqual(built.args.slice(0, 2))
   // Skip `sudo -n --preserve-env=… --`; run the rest as the namespace launcher would see it.
   const rest = withCwd.args.slice(withCwd.args.indexOf('--') + 1)
-  return spawnSync(rest[0] ?? '', rest.slice(1), {encoding: 'utf8'})
+  // A gate without its bound would wait for ever: the timeout turns that into a failing status instead of a hung test.
+  return spawnSync(rest[0] ?? '', rest.slice(1), {encoding: 'utf8', timeout: 15_000})
 }
 
 describe('the view launch chain, run for real with stand-in privileged tools', () => {
