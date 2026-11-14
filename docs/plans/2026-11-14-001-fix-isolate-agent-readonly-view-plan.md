@@ -180,7 +180,7 @@ A second, separate gap blocks adoption: the agent's `PATH` is fixed to `/usr/loc
 - **Per-mount read-only remounts, verified from the kernel's mount table.** `ro=recursive` silently skips submounts. The builder reads `/proc/self/mountinfo` before and after, and the launch fails unless every mount outside the declared set is read-only. Mount paths are decoded from the kernel's escaped form, never parsed from tool output.
 - **The view keeps every path at its real absolute location.** The Action and the agent name the same files by the same paths: checkout, XDG directories, response directory, `GH_CONFIG_DIR`, the log directory. The view is a recursive bind of `/` entered as the new root, so nothing is relocated.
 - **The policy lists writable roots and read-only inputs.** Private temp directories are mounted first. Any listed root beneath one is then bound back, parents before children: writable roots read-write, inputs (attachments, admitted skills) read-only.
-- **The view builder is a bundled Node child, and the server launch stays an exec chain.** The builder runs as root inside the namespace, then exits. A fixed sequencing step then enters the new root, drops the uid and execs the server, so no Action-written privileged process outlives the build. `sudo` stays the parent, as today. The builder runs under the Action's own Node (`process.execPath`) from the published install, both of which the agent can't write.
+- **The view builder is a bundled Node child, and the server launch stays an exec chain.** The builder runs as root inside the namespace, then exits. A fixed sequencing step then enters the new root, drops the uid and execs the server, so no Action-written privileged process outlives the build. `sudo` stays the parent, as today. The builder runs under the Action's own Node (`process.execPath`) from the published install. It runs before the agent starts, and the view then makes both read-only to the agent.
 - **Mount-namespace membership is the handle for teardown.** A process group can be left, and the uid sweep can't see root processes. Every process of the launch, whatever its uid, session or group, is a member of the launch's private mount namespace. Teardown kills the members with the privileged tools and confirms none remain, in addition to the uid sweep. An empty namespace also means the private mounts are gone.
 - **The preflight probe proves host capability only.** It is one pass or fail run of the real builder over a fixture. The launch-time verification is the authority for the real roots.
 - **Delivery 2 mirrors the runner's `PATH` for the agent.** Absolute, existing directories, in the runner's order, de-duplicated, with the system directories appended. An entry the agent can write only lets the agent shadow its own tools, so it needs no filter.
@@ -194,18 +194,30 @@ A second, separate gap blocks adoption: the agent's `PATH` is fixed to `/usr/loc
 
 - **Does the preflight probe need the account?** No. It checks writes as `nobody`, since account creation can take over a minute and happens later.
 - **Does the cache library keep working?** Yes. Its `PATH` is untouched, so compression is unchanged.
-- **Are both hosted images supported?** Both passed every measured stage except the final all-mounts check, which the doubled `binfmt_misc` mount fails. Support depends on Unit 1 resolving that mount.
+- **Are both hosted images supported?** Yes. Both pass every measured stage, the all-mounts check included.
+
+### Settled by Unit 1
+
+Measured on both images (Ubuntu 24.04 with sudo 1.9.15, Ubuntu 26.04 with sudo-rs 0.2.13).
+
+- **The doubled `binfmt_misc` mount.** The bottom entry is an autofs trigger that stays writable under any remount order. Unmounting the stack inside the view, or mounting a fresh `proc` there instead of binding the host's, leaves zero undeclared writable mounts. `/proc/self` and `/proc/1/status` still work for the account.
+- **Process arrangement.** `sudo` stays as the parent and the final command is its direct child, in the same process group and session, with no pty. The runner can signal `sudo` only. `sudo` relays SIGTERM. A group SIGKILL from the runner kills `sudo` and orphans the final command. Closing stdin does nothing to `sudo`.
+- **Identifying the namespace.** The spawned `sudo` is in the host namespace; its child is in the new one. `readlink /proc/<pid>/ns/mnt` on the child gives the id.
+- **Listing and killing members.** `pgrep --ns <pid> --nslist mnt` and `pkill -KILL --ns <pid> --nslist mnt`, run as root, found and killed every member in one round, including processes that changed session and one reparented to init. A process-group listing missed two. Once empty, the namespace and its private mounts were gone.
+- **Entering the view.** `pivot_root`, then a lazy unmount of the old root. `chroot` also works, but a root process inside a `chroot` view can reach the original writable root, and inside a `pivot_root` view it can't. Pipes work through either, and the server stand-in exits within 3 ms of stdin closing. The working directory must be set after entering, since the spawn's own is lost.
+- **The builder.** The runner's Node is `/opt/runner-cache/externals/node24/bin/node`, in a world-writable directory chain. Root runs it inside the namespace. It runs before the agent starts, and the view makes it read-only to the agent.
+- **Timing.** Spawn to first server output took 101–179 ms.
+- **PTYs and devices.** `/dev/null`, randomness, PTY allocation, `/dev/shm` and `mktemp` all work in the view.
+- **Temp use.** A small `npm` install wrote under 3 MiB to the account's `TMPDIR` and nothing to `/tmp` or `/var/tmp`.
+- **Install roots.** `bun` is at `/home/runner/.bun` (one binary and a link to it). `pnpm` is at `/home/runner/setup-pnpm` (47 MB, 2,451 files, links that stay inside the root, its own store inside the root). Neither holds configuration or credential files. A recursive read-and-execute grant on each root, with the existing traverse entry on `/home/runner`, was enough to run both.
+- **The runner's PATH.** Entries that earlier steps add through `$GITHUB_PATH` are in a JavaScript action's `process.env.PATH`, ahead of the image's entries.
+
+Also seen, and outside this plan's write boundary: the account can connect to several sockets under `/run` (the system D-Bus, `snapd`, some `systemd` varlink sockets) and open some device nodes (`fuse`, `net/tun`, `vsock`). The Docker socket refuses it.
 
 ### Deferred to Implementation
 
-All of these are settled by Unit 1's measurements before the units that depend on them start.
-
-- How the doubled `binfmt_misc` mount becomes read-only or leaves the view. Acceptance: zero undeclared writable mounts on both images.
-- How the launch's namespace is identified from outside, and which tool lists and kills its members.
-- `chroot` or `pivot_root` to enter the view.
-- Whether PTY allocation and device nodes work when their mounts are read-only.
-- Sizes for the private tmpfs mounts.
-- The install roots of `bun` and `pnpm` on both images, for the setup-action versions callers use.
+- Whether to unmount the `binfmt_misc` stack or mount a fresh `proc`. Either passes the check.
+- Sizes for the private tmpfs mounts. Measured use is small; pick a bound that a large install can't hit by accident.
 
 ---
 
@@ -226,7 +238,7 @@ sudo -n --preserve-env=<names> --
            mount private /tmp, /var/tmp, /dev/shm
            bind listed roots back, parents before children
            re-read mountinfo; fail unless every other mount is read-only
-      2. enter the new root, then exec
+      2. pivot_root into the new root, unmount the old one, then exec
            setpriv --reuid --regid --clear-groups --no-new-privs <drop all caps> --
              env HOME=… PATH=… XDG_*=… --
                opencode serve …
@@ -237,7 +249,7 @@ Order within a run:
 1. Bootstrap preflight: resolve the tools, check the install, run the capability probe.
 2. Setup, restore, account creation, ACL handoff, sandbox gitconfig (all unchanged).
 3. Launch through the chain above, inside the lifecycle's launch admission.
-4. Shutdown: close stdin, kill and confirm the namespace's members, kill and confirm the uid.
+4. Shutdown: close stdin, kill the namespace's members with `pkill --ns` and confirm none remain, kill and confirm the uid.
 5. Take-back, then log snapshot, publication and persistence (unchanged).
 
 A failed launch goes through steps 4 and 5 as well. "Rolled back" below means that same take-back, behind the same confirmation.
@@ -248,7 +260,7 @@ A failed launch goes through steps 4 and 5 as well. "Rolled back" below means th
 
 ### Delivery 1: the boundary
 
-- [ ] **Unit 1: Hosted-runner measurements**
+- [x] **Unit 1: Hosted-runner measurements**
 
 **Goal:** Settle the open questions on real runners before code depends on them.
 
@@ -357,7 +369,7 @@ A failed launch goes through steps 4 and 5 as well. "Rolled back" below means th
 - Test: `src/services/setup/sandbox-preflight.test.ts`
 
 **Approach:**
-- Add the tools the launch and teardown need to the required list: `unshare`, `mount`, the tool that enters the view, the sequencing shell, and the tool Unit 1 chose for listing namespace members.
+- Add the tools the launch needs to the required list: `unshare`, `mount`, `umount`, `pivot_root` and the sequencing shell. Teardown uses `pkill` and `pgrep`, which are already required.
 - Require `dist/sandbox-view.js` in the install check.
 - The probe runs the real builder over a throwaway fixture, checks one refused write and one allowed write as `nobody`, and has its own short deadline. It reports pass or fail with one message.
 - A probe that times out is confirmed stopped the same way Unit 5 confirms a launch. If it can't be, the run fails and nothing is set up.
@@ -524,7 +536,7 @@ A failed launch goes through steps 4 and 5 as well. "Rolled back" below means th
 - Test: `src/harness/phases/sandbox-lifecycle.test.ts`
 
 **Approach:**
-- A short fixed list of install roots, taken from Unit 1's measurements. A root is granted only when it exists and a directory on the runner's `PATH` lies inside it.
+- A short fixed list of install roots, taken from Unit 1's measurements: `.bun` and `setup-pnpm` under the runner home. A root is granted only when it exists and a directory on the runner's `PATH` lies inside it.
 - Each granted root becomes a `readable` root in the manifest. Its ancestors join the traverse chain, so their other children stay denied.
 - Refuse any root that equals or contains the runner home.
 - Add the new roots to every place the handoff enumerates roots: the reserved-subtree check, root verification, and lock planning.
@@ -568,7 +580,7 @@ A failed launch goes through steps 4 and 5 as well. "Rolled back" below means th
 |------|------------|
 | A hosted image update changes mount behavior | The launch-time check fails the run without starting the server, and the real-runner job runs on both images on every PR. |
 | A privileged part of the launch outlives the run | Teardown kills and confirms the namespace's members; unconfirmed means `unsafe`. |
-| The stacked `binfmt_misc` mount can't be made read-only | Unit 1 resolves it before the build starts. If it can't be resolved, the plan stops there. |
+| An autofs trigger mounts something writable after the check | Unit 1 saw no new mount in any approach, and removing the trigger from the view removes the case. Unit 6 re-reads the mount table after a run. |
 | A tool the agent needs writes outside its home | Its home and the temp directories are writable; Units 6, 8 and 9 exercise real tools. Other cases surface as read-only errors, not silent damage. |
 | A hardlink aliases a sealed file into a writable root | Inside the view a link across mounts is refused, and Unit 6 tests it. A link made before handoff takes code running as the runner, which is trusted. |
 | The view breaks PTYs or device access | Unit 1 measures it, and Unit 6 tests it on both images. |
