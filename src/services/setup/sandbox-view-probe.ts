@@ -356,6 +356,8 @@ export function createViewProbe(options: {
   readonly env: NodeJS.ProcessEnv
   /** The directory of the running bundle, which holds `sandbox-view.js`. */
   readonly bundleDir: string | null
+  /** The Node that runs the builder. Defaults to the running one, as the Action's own Node. */
+  readonly nodePath?: string
 }): (tools: SandboxToolPaths) => Promise<ViewProbeResult> {
   return async tools => {
     const fail = (message: string): ViewProbeResult => ({ok: false, message})
@@ -411,7 +413,7 @@ export function createViewProbe(options: {
     return probeSandboxView(
       {
         tools,
-        nodePath: process.execPath,
+        nodePath: options.nodePath ?? process.execPath,
         builderPath: path.join(options.bundleDir, 'sandbox-view.js'),
         runnerHome: options.env.HOME ?? '/home/runner',
         actionsDir: path.join(path.dirname(path.resolve(runnerTemp)), '_actions'),

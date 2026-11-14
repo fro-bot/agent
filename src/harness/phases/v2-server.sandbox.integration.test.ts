@@ -67,6 +67,7 @@ import {snapshotLogDirectory} from './log-snapshot.js'
 import {createSandboxLifecycle} from './sandbox-lifecycle.js'
 import {
   controlCoversMatrix,
+  copyBundleWithImports,
   describeReconstruction,
   failuresFor,
   matrixDirectories,
@@ -103,8 +104,17 @@ const fakeActionRoot = path.join(path.dirname(runnerTemp), '_actions', 'fro-bot-
 /** The committed bundle of the repository under test (`dist/`, kept fresh by the pre-push hook and CI). */
 const realDist = fileURLToPath(new URL('../../../dist', import.meta.url))
 
+/**
+ * The Node that runs the view builder, as the Action's own Node does in production. Under Bun the test process is not Node,
+ * so the first `node` on PATH stands in.
+ */
+const builderNode =
+  process.versions.bun === undefined
+    ? process.execPath
+    : spawnSync('sh', ['-c', 'command -v node'], {encoding: 'utf8'}).stdout.trim() || process.execPath
+
 /** What a lifecycle needs to build the view: the Node that runs the builder, and the builder of the stand-in install. */
-const viewLauncher = {nodePath: process.execPath, builderPath: path.join(fakeActionRoot, 'dist', 'sandbox-view.js')}
+const viewLauncher = {nodePath: builderNode, builderPath: path.join(fakeActionRoot, 'dist', 'sandbox-view.js')}
 
 // --- Helpers shared by the four suites ---------------------------------------------------------------------------------
 
@@ -257,12 +267,8 @@ function createPublishedActionLayout(): void {
   )
   for (const script of ['main.js', 'post.js', 'key-proxy.js'])
     fs.writeFileSync(path.join(fakeActionRoot, 'dist', script), '// stand-in\n')
-  // The view builder is the real bundle, with the chunk it imports: the preflight probe and every launch run it as root.
-  for (const name of fs.readdirSync(realDist)) {
-    if (name === 'sandbox-view.js' || (name.startsWith('sandbox-view-') && name.endsWith('.js'))) {
-      fs.copyFileSync(path.join(realDist, name), path.join(fakeActionRoot, 'dist', name))
-    }
-  }
+  // The view builder is the real bundle with everything it imports: the preflight probe and every launch run it as root.
+  copyBundleWithImports(realDist, path.join(fakeActionRoot, 'dist'), 'sandbox-view.js')
 }
 
 afterAll(() => {
@@ -284,6 +290,7 @@ async function preflightTools(logger: Logger): Promise<SandboxToolPaths> {
       logger,
       env: process.env,
       bundleDir: path.join(fakeActionRoot, 'dist'),
+      nodePath: builderNode,
     }),
   })
   if (!preflight.ok) throw new Error(preflight.message)

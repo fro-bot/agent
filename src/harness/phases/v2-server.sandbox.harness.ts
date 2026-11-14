@@ -9,7 +9,9 @@ import type {OpenCodeV2ServerHandle} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
 import type {SandboxLifecycle} from './sandbox-lifecycle.js'
 import {Buffer} from 'node:buffer'
+import * as fs from 'node:fs'
 import http from 'node:http'
+import path from 'node:path'
 import {DatabaseSync} from 'node:sqlite'
 import {startOpenCodeV2Server} from '@fro-bot/runtime'
 
@@ -365,3 +367,25 @@ export const writeWorksProbe = (id: string, dirExpr: string): Probe => ({
     `d=${dirExpr}; t="$d/.${VIEW_IT_PREFIX}-w-$$"; ` +
     `if ( : > "$t" ) 2>/dev/null; then rm -f "$t"; R ${id} WORKS "wrote $d"; else R ${id} FAILED "no write to $d"; fi`,
 })
+
+/**
+ * Copies `entry` of a bundle directory, and every file it imports (relative `./x.js`, static or dynamic, transitively), into
+ * `target`: the stand-in published install a root process runs the view builder from. A missing import throws here, naming
+ * the file, rather than failing later as a bare exit code of a process the test cannot see into. Returns the copied names.
+ */
+export function copyBundleWithImports(sourceDir: string, targetDir: string, entry: string): readonly string[] {
+  const copied = new Set<string>()
+  const pending = [entry]
+  for (let name = pending.pop(); name !== undefined; name = pending.pop()) {
+    if (copied.has(name)) continue
+    const from = path.join(sourceDir, name)
+    if (!fs.existsSync(from)) throw new Error(`${name} is imported by the bundle but is not in ${sourceDir}`)
+    fs.copyFileSync(from, path.join(targetDir, name))
+    copied.add(name)
+    const text = fs.readFileSync(from, 'utf8')
+    for (const match of text.matchAll(/(?:from|import)\s*(?:\(\s*)?["']\.\/([^"'/]+\.js)["']/g)) {
+      if (match[1] !== undefined) pending.push(match[1])
+    }
+  }
+  return [...copied]
+}

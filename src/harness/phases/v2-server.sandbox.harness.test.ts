@@ -2,9 +2,11 @@ import {spawnSync} from 'node:child_process'
 import * as fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import {fileURLToPath} from 'node:url'
 import {afterEach, describe, expect, it} from 'vitest'
 import {
   controlCoversMatrix,
+  copyBundleWithImports,
   matrixDirectories,
   matrixSentinels,
   parseRows,
@@ -154,6 +156,66 @@ describe('writeWorksProbe', () => {
       fs.chmodSync(sealed, 0o755)
       fs.rmSync(writable, {recursive: true, force: true})
       fs.rmSync(sealed, {recursive: true, force: true})
+    }
+  })
+})
+
+describe('copyBundleWithImports', () => {
+  const dirs: string[] = []
+  const temp = (): string => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bundle-'))
+    dirs.push(dir)
+    return dir
+  }
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) fs.rmSync(dir, {recursive: true, force: true})
+  })
+
+  it('copies the entry and every file it imports, however deep, in minified and plain syntax, and nothing else', () => {
+    // #given an entry that imports a chunk, which imports a second chunk, which imports back; and an unrelated file
+    const source = temp()
+    const target = temp()
+    fs.writeFileSync(path.join(source, 'entry.js'), 'import{a as e}from"./one-AAA.js";import"./side.js";export{};')
+    fs.writeFileSync(
+      path.join(source, 'one-AAA.js'),
+      "import {b} from './two-BBB.js'\nexport const a = await import('./three.js')",
+    )
+    fs.writeFileSync(path.join(source, 'two-BBB.js'), 'import{a}from"./one-AAA.js";export const b=1')
+    for (const name of ['side.js', 'three.js', 'other.js']) fs.writeFileSync(path.join(source, name), 'export {}')
+
+    // #when copied
+    const copied = copyBundleWithImports(source, target, 'entry.js')
+
+    // #then the whole graph is there and the unrelated file is not
+    expect(copied.toSorted()).toEqual(['entry.js', 'one-AAA.js', 'side.js', 'three.js', 'two-BBB.js'])
+    expect(fs.readdirSync(target).toSorted()).toEqual(['entry.js', 'one-AAA.js', 'side.js', 'three.js', 'two-BBB.js'])
+  })
+
+  it('fails loudly, naming the file, when an import is missing from the source', () => {
+    // #given an import of a chunk that is not there
+    const source = temp()
+    fs.writeFileSync(path.join(source, 'entry.js'), 'import{a}from"./gone-XYZ.js";')
+
+    // #then it names the missing chunk instead of leaving a root process to fail on it
+    expect(() => copyBundleWithImports(source, temp(), 'entry.js')).toThrow('gone-XYZ.js')
+  })
+
+  it('copies everything the committed builder bundle needs', () => {
+    // #given the repository's own dist/ (kept fresh by the build hooks)
+    const dist = fileURLToPath(new URL('../../../dist', import.meta.url))
+    const target = temp()
+
+    // #when the builder's graph is copied
+    const copied = copyBundleWithImports(dist, target, 'sandbox-view.js')
+
+    // #then the entry is there with at least one chunk, and every relative import of every copied file resolves in the copy
+    expect(copied).toContain('sandbox-view.js')
+    expect(copied.length).toBeGreaterThan(1)
+    for (const name of copied) {
+      const text = fs.readFileSync(path.join(target, name), 'utf8')
+      for (const match of text.matchAll(/(?:from|import)\s*(?:\(\s*)?["'](\.\/[^"']+)["']/g)) {
+        expect(fs.existsSync(path.join(target, match[1] ?? ''))).toBe(true)
+      }
     }
   })
 })
