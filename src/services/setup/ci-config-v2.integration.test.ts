@@ -85,16 +85,32 @@ async function startServer(options: {
   const authorization = `Basic ${Buffer.from(`opencode:${password}`).toString('base64')}`
 
   return {
-    // Up to 2.2.6 `/api/agent` answers 503 until location plugins finish activating; from 2.2.7 it answers at once.
+    // Up to 2.2.6 `/api/agent` answers 503 until location plugins finish activating. Later versions answer at once, so
+    // right after the listening line the list can be `200 {"data":[]}`, and then the built-in agents with their default
+    // permissions, before the config rules land. Production waits for plugin activation before the gate runs; this
+    // helper does the same: it retries on 503, on an empty agent list, and until `GET /api/plugin` lists plugins that
+    // are all active (the list stays empty until activation completes, then appears whole). If the bound runs out it
+    // returns whatever the server answered, so the gate still fails visibly.
     listAgents: async () => {
+      const headers = {authorization, 'x-opencode-directory': options.checkout}
       const deadline = Date.now() + 30_000
       for (;;) {
-        const response = await fetch(`${url}/api/agent`, {
-          headers: {authorization, 'x-opencode-directory': options.checkout},
-        })
-        if (response.status !== 503 || Date.now() > deadline) {
-          if (!response.ok) throw new Error(`GET /api/agent returned ${response.status}`)
-          return response.json()
+        const expired = Date.now() > deadline
+        // Plugins first, so an agent list read after they are active cannot predate activation.
+        const plugins = (await (await fetch(`${url}/api/plugin`, {headers})).json()) as {
+          data?: {state?: {status?: string}}[]
+        }
+        const activated =
+          Array.isArray(plugins.data) &&
+          plugins.data.length > 0 &&
+          plugins.data.every(plugin => plugin.state?.status === 'active')
+        const response = await fetch(`${url}/api/agent`, {headers})
+        if (response.ok) {
+          const body = (await response.json()) as {data?: unknown}
+          const empty = Array.isArray(body.data) && body.data.length === 0
+          if ((!empty && activated) || expired) return body
+        } else if (response.status !== 503 || expired) {
+          throw new Error(`GET /api/agent returned ${response.status}`)
         }
         await new Promise(resolve => setTimeout(resolve, 250))
       }
@@ -146,7 +162,7 @@ function writeTargetedAllowCheckout(checkout: string): void {
   )
 }
 
-describe.skipIf(BIN == null)('OpenCode v2.2.0 permission gate (real binary)', () => {
+describe.skipIf(BIN == null)('OpenCode V2 permission gate (real binary)', () => {
   const logger = createMockLogger()
   const cleanup: (() => Promise<void> | void)[] = []
   let root = ''
