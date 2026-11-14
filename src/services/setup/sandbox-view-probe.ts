@@ -329,6 +329,9 @@ export async function launchWithDeadline(
     // result back, so after `exit` the drain has its own short bound.
     child.once('close', code => settle({pid, exitCode: code, timedOut, stdout, stderr}))
     child.once('exit', code => {
+      // The launcher is gone: the execution deadline no longer applies. A timeout recorded before this stays recorded; a
+      // descendant holding the pipe through the deadline must not turn an on-time exit into one.
+      if (timer !== undefined) clearTimeout(timer)
       setTimeout(() => settle({pid, exitCode: code, timedOut, stdout, stderr}), STDERR_DRAIN_MS).unref()
     })
     timer = setTimeout(() => {
