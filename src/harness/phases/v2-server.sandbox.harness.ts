@@ -220,6 +220,7 @@ export async function startScriptedSession(options: ScriptedSessionOptions): Pro
         env: options.env,
         sandbox: context.spec,
         signal: context.signal,
+        onSpawn: context.noteSpawn,
         config: {
           share: 'disabled',
           model: 'fake/fixture-model',

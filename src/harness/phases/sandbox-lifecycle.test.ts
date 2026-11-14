@@ -1,6 +1,6 @@
 import type {SandboxToolPaths} from '../../services/setup/sandbox-preflight.js'
 import type {ExecAdapter, ExecOptions} from '../../services/setup/types.js'
-import type {SandboxLifecycleDeps, SignalHost} from './sandbox-lifecycle.js'
+import type {SandboxLifecycleDeps, SandboxPrepareInput, SignalHost} from './sandbox-lifecycle.js'
 import {Buffer} from 'node:buffer'
 import {EventEmitter} from 'node:events'
 import * as fs from 'node:fs'
@@ -30,6 +30,12 @@ const TOOLS = Object.fromEntries(
     'env',
     'git',
     'gh',
+    'unshare',
+    'mount',
+    'umount',
+    'pivot_root',
+    'sh',
+    'lsns',
   ].map(name => [name, `/usr/bin/${name}`]),
 ) as unknown as SandboxToolPaths
 
@@ -43,12 +49,20 @@ interface Harness {
     readonly deleteAccount: Mock<SandboxLifecycleDeps['deleteAccount']>
     readonly handOff: Mock<SandboxLifecycleDeps['handOff']>
     readonly takeBack: Mock<SandboxLifecycleDeps['takeBack']>
+    readonly createViewRoot: Mock<SandboxLifecycleDeps['createViewRoot']>
+    readonly readMountInfo: Mock<SandboxLifecycleDeps['readMountInfo']>
+    readonly findNamespace: Mock<SandboxLifecycleDeps['findNamespace']>
+    readonly stopNamespace: Mock<SandboxLifecycleDeps['stopNamespace']>
+    readonly isProcessAlive: Mock<SandboxLifecycleDeps['isProcessAlive']>
   }
+  /** What `remove` of the view root was called with, in order. */
+  readonly viewRootRemovals: string[]
   readonly exec: ExecAdapter
   readonly sudoCalls: string[][]
 }
 
 function createHarness(): Harness {
+  const viewRootRemovals: string[] = []
   const mocks = {
     createAccount: vi.fn(async () => ok(ACCOUNT)),
     stop: vi.fn(async () => 'stopped' as const),
@@ -57,6 +71,17 @@ function createHarness(): Harness {
       ok({snapshotDir: '/x', touched: [], chowned: [], aclTrees: [], git: null, gitPresent: false}),
     ),
     takeBack: vi.fn(async () => ({status: 'restored' as const})),
+    createViewRoot: vi.fn(async (runnerTemp: string) => ({
+      newRoot: `${runnerTemp}/fro-bot-view-x/root`,
+      remove: async () => {
+        viewRootRemovals.push(runnerTemp)
+      },
+    })),
+    readMountInfo: vi.fn(async () => ''),
+    // Nothing was spawned under `launch` unless a test does so, and a launcher that is gone leaves no namespace.
+    findNamespace: vi.fn(async () => ({kind: 'launch-gone' as const})),
+    stopNamespace: vi.fn(async () => 'stopped' as const),
+    isProcessAlive: vi.fn(() => false),
   }
   const sudoCalls: string[][] = []
   const exec: ExecAdapter = {
@@ -72,7 +97,11 @@ function createHarness(): Harness {
     readText: async () => null,
     ids: () => ({uid: 1001, gid: 1001}),
   } as unknown as SandboxLifecycleDeps
-  return {deps, mocks, exec, sudoCalls}
+  return {deps, mocks, exec, sudoCalls, viewRootRemovals}
+}
+
+function mountLine(id: number, mountPoint: string): string {
+  return `${id} 1 8:1 / ${mountPoint} rw,relatime shared:1 - ext4 /dev/sda1 rw`
 }
 
 function fakeHost(): SignalHost & {readonly emitter: EventEmitter; readonly killed: string[]} {
@@ -943,6 +972,301 @@ describe('createSandboxLifecycle', () => {
       // #then the account was removed and the state says so
       expect(prepared.success).toBe(false)
       expect(states).toEqual(['pending', 'restored'])
+    })
+  })
+
+  describe('the read-only view', () => {
+    const prepareInput = {keyFilePaths: [], ghConfigDir: null, repoSkills: null}
+    const quietReport = <T>(value: T) => ({value, unconfirmed: false})
+    const FOUND = {kind: 'found' as const, namespace: {id: '4026532399', member: 501, host: '4026531832'}}
+
+    async function preparedWith(
+      input: SandboxPrepareInput = prepareInput,
+      overrides: Partial<Parameters<typeof createSandboxLifecycle>[0]> = {},
+    ) {
+      const harness = createHarness()
+      const states: string[] = []
+      const host = fakeHost()
+      const lifecycle = create(harness, {
+        signals: host,
+        recordState: state => states.push(state),
+        viewLauncher: {nodePath: '/opt/runner/node', builderPath: '/work/_actions/o/r/v1/dist/sandbox-view.js'},
+        attachmentDir: `${temp}/attach`,
+        ...overrides,
+      })
+      const result = await lifecycle.prepare(input)
+      return {harness, host, states, lifecycle, result}
+    }
+
+    it('lists exactly the checkout, the handed-over directories and the home as writable, and the inputs as read-only', async () => {
+      // #given a run with a provisioned gh config and an admitted skills tree
+      const {result} = await preparedWith({
+        keyFilePaths: [],
+        ghConfigDir: `${temp}/gh-config-abc`,
+        repoSkills: {stagingRoot: `${temp}/skills-stage`, admittedDir: `${temp}/skills-stage/admitted`},
+      })
+
+      // #then the view is built from the one manifest
+      expect(result.success).toBe(true)
+      if (!result.success) throw new Error('unreachable')
+      const view = result.data.view
+      expect(view?.policy.writable.toSorted()).toEqual(
+        [
+          '/home/runner/work/r/r',
+          '/custom/data/opencode',
+          '/home/runner/.config/opencode',
+          '/home/runner/.cache/opencode',
+          '/home/runner/.local/state/opencode',
+          `${temp}/fro-bot-response/1-1`,
+          `${temp}/gh-config-abc`,
+          '/home/fro-bot-sandbox',
+        ].toSorted(),
+      )
+      expect(view?.policy.readOnly.toSorted()).toEqual(
+        [`${temp}/attach`, `${temp}/skills-stage/admitted`, `${temp}/skills-stage`].toSorted(),
+      )
+      // #and the protected paths, the launcher and the tools are the resolved ones
+      expect(view?.policy.runnerHome).toBe('/home/runner')
+      expect(view?.policy.actionsDir).toBe(`${path.dirname(temp)}/_actions`)
+      expect(view).toMatchObject({
+        unsharePath: '/usr/bin/unshare',
+        shPath: '/usr/bin/sh',
+        pivotRootPath: '/usr/bin/pivot_root',
+        umountPath: '/usr/bin/umount',
+        nodePath: '/opt/runner/node',
+        builderPath: '/work/_actions/o/r/v1/dist/sandbox-view.js',
+      })
+      expect(view?.policy.tools).toEqual({mount: '/usr/bin/mount', umount: '/usr/bin/umount'})
+      expect(view?.policy.newRoot).toBe(`${temp}/fro-bot-view-x/root`)
+    })
+
+    it('has no gh config directory in withhold mode', async () => {
+      // #given a run with no provisioned gh config
+      const {result} = await preparedWith()
+
+      // #then no directory of that kind is writable
+      expect(result.success && result.data.view?.policy.writable.some(root => root.includes('gh-config'))).toBe(false)
+    })
+
+    it('refuses the launch before the server starts, and takes the handoff back, when a writable root has a mount beneath it', async () => {
+      // #given a mount inside the checkout
+      const harness = createHarness()
+      harness.mocks.readMountInfo.mockResolvedValue(`${mountLine(40, '/home/runner/work/r/r/node_modules')}\n`)
+      const states: string[] = []
+      const lifecycle = create(harness, {
+        signals: fakeHost(),
+        recordState: state => states.push(state),
+        viewLauncher: {nodePath: '/n', builderPath: '/b'},
+      })
+
+      // #when prepared
+      const result = await lifecycle.prepare(prepareInput)
+
+      // #then no spec was returned, the handoff was taken back, the account removed, and the root directory cleaned up
+      expect(!result.success && result.error).toContain('read-only view')
+      expect(!result.success && result.error).toContain('node_modules')
+      expect(harness.mocks.takeBack).toHaveBeenCalledTimes(1)
+      expect(harness.mocks.deleteAccount).toHaveBeenCalledTimes(1)
+      expect(harness.viewRootRemovals).toHaveLength(1)
+      expect(states).toEqual(['pending', 'restored'])
+      // #and nothing can be launched
+      const spawn = vi.fn(async () => quietReport('x'))
+      expect((await lifecycle.launch(spawn)).success).toBe(false)
+      expect(spawn).not.toHaveBeenCalled()
+    })
+
+    it('refuses the launch when the root directory cannot be created or the mount table cannot be read', async () => {
+      // #given a runner temp that refuses, and then an unreadable mount table
+      const noRoot = createHarness()
+      noRoot.mocks.createViewRoot.mockRejectedValue(new Error('EACCES'))
+      const unreadable = createHarness()
+      unreadable.mocks.readMountInfo.mockRejectedValue(new Error('ENOENT'))
+
+      // #when prepared
+      const first = await create(noRoot, {signals: fakeHost()}).prepare(prepareInput)
+      const second = await create(unreadable, {signals: fakeHost()}).prepare(prepareInput)
+
+      // #then both fail closed and take the handoff back
+      expect(first.success).toBe(false)
+      expect(second.success).toBe(false)
+      expect(noRoot.mocks.takeBack).toHaveBeenCalledTimes(1)
+      expect(unreadable.mocks.takeBack).toHaveBeenCalledTimes(1)
+    })
+
+    it('confirms the namespace is empty, then the uid, then takes back', async () => {
+      // #given a launch whose launcher was spawned and whose namespace was found
+      const {harness, lifecycle} = await preparedWith()
+      harness.mocks.findNamespace.mockResolvedValue(FOUND)
+      await lifecycle.launch(async context => {
+        context.noteSpawn(100)
+        return quietReport('server')
+      })
+
+      // #when released
+      const released = await lifecycle.release()
+
+      // #then the namespace came first, and the launcher's lookup used the pid it was given
+      expect(released).toMatchObject({stop: 'stopped', restore: 'restored'})
+      expect(harness.mocks.findNamespace.mock.calls[0]?.[0]).toBe(100)
+      expect(harness.mocks.stopNamespace).toHaveBeenCalledWith(
+        FOUND.namespace,
+        {pkill: '/usr/bin/pkill', pgrep: '/usr/bin/pgrep', lsns: '/usr/bin/lsns'},
+        expect.anything(),
+      )
+      const order = [
+        harness.mocks.stopNamespace.mock.invocationCallOrder[0] ?? 0,
+        harness.mocks.stop.mock.invocationCallOrder[0] ?? 0,
+        harness.mocks.takeBack.mock.invocationCallOrder[0] ?? 0,
+        harness.mocks.deleteAccount.mock.invocationCallOrder[0] ?? 0,
+      ]
+      expect(order).toEqual(order.toSorted((a, b) => a - b))
+      expect(order.every(call => call > 0)).toBe(true)
+      expect(harness.viewRootRemovals).toHaveLength(1)
+    })
+
+    it('still confirms the namespace and takes the handoff back when the launch failed before the server started', async () => {
+      // #given a launch that spawned its launcher and then failed (the builder refused)
+      const {harness, lifecycle} = await preparedWith()
+      harness.mocks.findNamespace.mockResolvedValue({kind: 'launch-gone'})
+      const failed = await lifecycle.launch(async context => {
+        context.noteSpawn(100)
+        return quietReport('start failed')
+      })
+      expect(failed.success).toBe(true)
+
+      // #when released
+      const released = await lifecycle.release()
+
+      // #then the handoff was taken back and the account removed
+      expect(released).toMatchObject({stop: 'stopped', restore: 'restored'})
+      expect(harness.mocks.takeBack).toHaveBeenCalledTimes(1)
+      expect(harness.mocks.deleteAccount).toHaveBeenCalledTimes(1)
+    })
+
+    it('is unsafe, keeps the account and takes nothing back when a namespace member remains', async () => {
+      // #given a namespace that cannot be confirmed empty
+      const {harness, lifecycle} = await preparedWith()
+      harness.mocks.findNamespace.mockResolvedValue(FOUND)
+      harness.mocks.stopNamespace.mockResolvedValue('unconfirmed')
+      await lifecycle.launch(async context => {
+        context.noteSpawn(100)
+        return quietReport('server')
+      })
+
+      // #when released
+      const released = await lifecycle.release()
+
+      // #then
+      expect(released).toMatchObject({stop: 'unconfirmed', restore: 'unsafe'})
+      expect(released.reason).toContain('namespace')
+      expect(harness.mocks.takeBack).not.toHaveBeenCalled()
+      expect(harness.mocks.deleteAccount).not.toHaveBeenCalled()
+      expect(harness.viewRootRemovals).toHaveLength(0)
+    })
+
+    it('is unsafe when the namespace cannot be identified and the launcher has not exited', async () => {
+      // #given a launcher that is alive and whose namespace was never seen
+      const {harness, lifecycle} = await preparedWith()
+      harness.mocks.findNamespace.mockResolvedValue({kind: 'unidentified'})
+      harness.mocks.isProcessAlive.mockReturnValue(true)
+      await lifecycle.launch(async context => {
+        context.noteSpawn(100)
+        return quietReport('server')
+      })
+
+      // #when released
+      const released = await lifecycle.release()
+
+      // #then it is unsafe and nothing was killed on a guess
+      expect(released).toMatchObject({restore: 'unsafe'})
+      expect(released.reason).toContain('could not be identified')
+      expect(harness.mocks.stopNamespace).not.toHaveBeenCalled()
+      expect(harness.mocks.takeBack).not.toHaveBeenCalled()
+      expect(harness.mocks.deleteAccount).not.toHaveBeenCalled()
+    })
+
+    it('accepts an unidentified namespace once the launcher has exited', async () => {
+      // #given a launcher that exited before its namespace was seen
+      const {harness, lifecycle} = await preparedWith()
+      harness.mocks.findNamespace.mockResolvedValue({kind: 'unidentified'})
+      harness.mocks.isProcessAlive.mockReturnValue(false)
+      await lifecycle.launch(async context => {
+        context.noteSpawn(100)
+        return quietReport('server')
+      })
+
+      // #when released
+      // #then the exit is the evidence, and the run is restored
+      expect(await lifecycle.release()).toMatchObject({restore: 'restored'})
+    })
+
+    it('kills the launcher’s group when it outlives its namespace, and is unsafe if it still does not exit', async () => {
+      // #given a namespace that stops but a launcher that stays alive
+      const {harness, lifecycle} = await preparedWith()
+      harness.mocks.findNamespace.mockResolvedValue(FOUND)
+      harness.mocks.isProcessAlive.mockReturnValue(true)
+      await lifecycle.launch(async context => {
+        context.noteSpawn(100)
+        return quietReport('server')
+      })
+
+      // #when released (the real clock would take a few seconds: shorten what the launcher wait polls)
+      vi.useFakeTimers()
+      try {
+        const releasing = lifecycle.release()
+        await vi.advanceTimersByTimeAsync(10_000)
+        const released = await releasing
+
+        // #then the group was killed as root, and the run is unsafe
+        expect(harness.sudoCalls.some(call => call.includes('-g') && call.includes('100'))).toBe(true)
+        expect(released).toMatchObject({restore: 'unsafe'})
+        expect(harness.mocks.takeBack).not.toHaveBeenCalled()
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('ends with the namespace confirmed empty when a signal arrives during the build, with no server started', async () => {
+      // #given a launch that has spawned its launcher and is still building the view
+      const {harness, host, lifecycle} = await preparedWith()
+      harness.mocks.findNamespace.mockResolvedValue(FOUND)
+      const launching = lifecycle.launch(async context => {
+        context.noteSpawn(100)
+        // The build: nothing happens until the lifecycle aborts the attempt, as the runtime does on `signal`.
+        await new Promise<void>(resolve => {
+          context.signal.addEventListener('abort', () => resolve(), {once: true})
+        })
+        return {value: 'start aborted', unconfirmed: false}
+      })
+      await vi.waitFor(() => {
+        expect(harness.mocks.findNamespace).toHaveBeenCalled()
+      })
+
+      // #when SIGTERM arrives
+      host.emitter.emit('SIGTERM')
+      await vi.waitFor(() => {
+        expect(host.killed).toEqual(['4242:SIGTERM'])
+      })
+      await launching
+
+      // #then the namespace was stopped before the take-back, and no server ever started
+      expect(harness.mocks.stopNamespace).toHaveBeenCalledTimes(1)
+      expect(harness.mocks.stopNamespace.mock.invocationCallOrder[0]).toBeLessThan(
+        harness.mocks.takeBack.mock.invocationCallOrder[0] ?? 0,
+      )
+    })
+
+    it('runs no namespace command and builds no view when nothing was launched', async () => {
+      // #given a prepared sandbox that never launched
+      const {harness, lifecycle} = await preparedWith()
+
+      // #when released
+      await lifecycle.release()
+
+      // #then no namespace was looked up or stopped, and no pkill/pgrep/lsns ran for one
+      expect(harness.mocks.findNamespace).not.toHaveBeenCalled()
+      expect(harness.mocks.stopNamespace).not.toHaveBeenCalled()
+      expect(harness.sudoCalls.some(call => call.includes('lsns'))).toBe(false)
     })
   })
 

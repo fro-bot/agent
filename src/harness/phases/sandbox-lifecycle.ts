@@ -1,9 +1,12 @@
 import type {Result} from '@bfra.me/es/result'
 import type {
+  LaunchNamespaceLookup,
   OpenCodeV2SandboxLaunch,
+  OpenCodeV2SandboxView,
   PrivilegedRun,
   SandboxAccount,
   SandboxIdentityDeps,
+  SandboxNamespaceTools,
   SandboxStopOutcome,
 } from '@fro-bot/runtime'
 import type {
@@ -20,16 +23,23 @@ import * as fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
+import {fileURLToPath} from 'node:url'
 import {err, ok} from '@bfra.me/es/result'
 import {
   buildRunAsSandboxArgv,
   createAttachmentDirExclusive,
   createSandboxAccount,
   deleteSandboxAccount,
+  findLaunchNamespace,
+  parseMountInfo,
+  stopLaunchNamespace,
   stopSandboxProcesses,
+  validateViewPolicy,
 } from '@fro-bot/runtime'
 import {createExecAdapter, holdSignalOwnership} from '../../services/setup/adapters.js'
 import {handOff, takeBack} from '../../services/setup/sandbox-handoff.js'
+import {ACTIONS_DIR_NAME} from '../../services/setup/sandbox-preflight.js'
+import {isProcessAlive} from '../../services/setup/sandbox-view-probe.js'
 import {toErrorMessage} from '../../shared/errors.js'
 
 /**
@@ -105,6 +115,11 @@ export interface KeyProxyStartReport<T extends OwnedKeyProxy> {
 export interface SandboxLaunchContext {
   readonly spec: OpenCodeV2SandboxLaunch
   readonly signal: AbortSignal
+  /**
+   * Called with the pid of the launcher the moment it is spawned. The launcher's privileged part outlives its own signals, so
+   * the teardown finds the launch's mount namespace from this pid and kills every member of it.
+   */
+  readonly noteSpawn: (pid: number) => void
 }
 
 /**
@@ -186,6 +201,8 @@ export interface SandboxLifecycleOptions {
   readonly launchSettleBudgetMs?: number
   /** Called synchronously with each state change. Must not throw. */
   readonly recordState?: (state: SandboxRunState) => void
+  /** The Node and the builder bundle that build the read-only view. Defaults to the Action's own Node and `sandbox-view.js`. */
+  readonly viewLauncher?: {readonly nodePath: string; readonly builderPath: string}
 }
 
 export interface SandboxLifecycleDeps {
@@ -196,6 +213,15 @@ export interface SandboxLifecycleDeps {
   readonly takeBack: typeof takeBack
   readonly readText: (absolutePath: string) => Promise<string | null>
   readonly ids: () => {readonly uid: number; readonly gid: number}
+  /** A fresh, empty directory under `runnerTemp` for the view's root, and how to remove it once the namespace is gone. */
+  readonly createViewRoot: (
+    runnerTemp: string,
+  ) => Promise<{readonly newRoot: string; readonly remove: () => Promise<void>}>
+  /** The host's `/proc/self/mountinfo`. */
+  readonly readMountInfo: () => Promise<string>
+  readonly findNamespace: typeof findLaunchNamespace
+  readonly stopNamespace: typeof stopLaunchNamespace
+  readonly isProcessAlive: (pid: number) => boolean
 }
 
 const defaultDeps: SandboxLifecycleDeps = {
@@ -206,7 +232,33 @@ const defaultDeps: SandboxLifecycleDeps = {
   takeBack,
   readText: async file => fs.readFile(file, 'utf8').catch(() => null),
   ids: () => ({uid: process.getuid?.() ?? -1, gid: process.getgid?.() ?? -1}),
+  createViewRoot: async runnerTemp => {
+    const directory = await fs.mkdtemp(path.join(runnerTemp, 'fro-bot-view-'))
+    const newRoot = path.join(directory, 'root')
+    await fs.mkdir(newRoot)
+    return {
+      newRoot,
+      // Plain `rmdir`, never recursive: the new root was a mount point of a namespace that is gone, and nothing may be
+      // deleted through a mount that might still exist.
+      remove: async () => {
+        await fs.rmdir(newRoot)
+        await fs.rmdir(directory)
+      },
+    }
+  },
+  readMountInfo: async () => fs.readFile('/proc/self/mountinfo', 'utf8'),
+  findNamespace: findLaunchNamespace,
+  stopNamespace: stopLaunchNamespace,
+  isProcessAlive,
 }
+
+/** Where the view's old root is moved before it is unmounted. An empty directory on every supported image. */
+const VIEW_PUT_OLD = '/mnt'
+
+/** Longest the teardown looks for a launch's namespace. Shorter than the signal teardown budget. */
+const NAMESPACE_FIND_BOUND_MS = 5000
+/** Longest the teardown waits for the launcher itself to be gone once its namespace is. */
+const LAUNCHER_EXIT_BOUND_MS = 3000
 
 /** A privileged command that takes this long is logged: slow `useradd` or `setfacl` calls are what a hung step looks like. */
 const SLOW_PRIVILEGED_COMMAND_MS = 5000
@@ -314,6 +366,11 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     return result
   }
   const runnerHome = options.runnerHome ?? env.HOME ?? os.userInfo().homedir
+  const viewLauncher = options.viewLauncher ?? {
+    nodePath: process.execPath,
+    builderPath: fileURLToPath(new URL('./sandbox-view.js', import.meta.url)),
+  }
+  const namespaceTools: SandboxNamespaceTools = {pkill: tools.pkill, pgrep: tools.pgrep, lsns: tools.lsns}
 
   let account: SandboxAccount | null = null
   let manifest: HandoffManifest | null = null
@@ -331,6 +388,10 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   const pendingLaunches = new Map<Promise<unknown>, AbortController>()
   // Set when a launcher could not confirm its own cleanup (or threw): the uid sweep cannot be trusted.
   let launchUnconfirmed = false
+  // Every launcher spawned under `launch`, with the lookup of its mount namespace that started the moment it was spawned.
+  const launches: {readonly pid: number; readonly lookup: Promise<LaunchNamespaceLookup>}[] = []
+  // The view's root directory, removed once the namespace is confirmed empty.
+  let viewRoot: {readonly remove: () => Promise<void>} | null = null
   // The key proxy: at most one, started through `startKeyProxy`, stopped last by the teardown.
   let proxy: OwnedKeyProxy | null = null
   let proxyStart: Promise<unknown> | undefined
@@ -430,6 +491,56 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     }
   }
 
+  /** Waits for the launcher to exit, polling `isProcessAlive`. */
+  const launcherGone = async (pid: number, boundMs: number): Promise<boolean> => {
+    const deadline = Date.now() + boundMs
+    while (deps.isProcessAlive(pid)) {
+      if (Date.now() >= deadline) return false
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+    return true
+  }
+
+  /**
+   * Stops and confirms every launch spawned under `launch`. Null when none is left; else why one could not be confirmed.
+   * A launch whose namespace was never identified is only acceptable if its launcher has exited, because the launcher is
+   * the parent of every process of the launch.
+   */
+  const stopLaunches = async (): Promise<string | null> => {
+    let problem: string | null = null
+    for (const launched of launches) {
+      let lookup: LaunchNamespaceLookup
+      try {
+        lookup = await launched.lookup
+      } catch {
+        lookup = {kind: 'unidentified'}
+      }
+      if (lookup.kind === 'found') {
+        const outcome = await deps.stopNamespace(lookup.namespace, namespaceTools, identityDeps())
+        if (outcome !== 'stopped') problem ??= 'the launch namespace still had members after the kill bound'
+      } else if (lookup.kind === 'unidentified' && deps.isProcessAlive(launched.pid)) {
+        problem ??= 'the launch namespace could not be identified and its launcher had not exited'
+      }
+      if (problem !== null) continue
+      // The launcher is a process of the launch too (the runner cannot signal it): it exits once its child has.
+      if (!(await launcherGone(launched.pid, LAUNCHER_EXIT_BOUND_MS))) {
+        await run([tools.pkill, '-KILL', '-g', String(launched.pid)])
+        if (!(await launcherGone(launched.pid, LAUNCHER_EXIT_BOUND_MS))) problem ??= 'the launcher did not exit'
+      }
+    }
+    return problem
+  }
+
+  const removeViewRoot = async (): Promise<void> => {
+    const current = viewRoot
+    viewRoot = null
+    try {
+      await current?.remove()
+    } catch (error) {
+      logger.warning('The read-only view directory could not be removed', {error: toErrorMessage(error)})
+    }
+  }
+
   const releaseSandbox = async (): Promise<SandboxReleaseResult> => {
     if (account === null) {
       // No account was recorded, but a `useradd` that timed out may have made one: that is not "nothing happened".
@@ -438,6 +549,9 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       }
       return {stop: 'never-started', restore: 'not-needed'}
     }
+    // Every process of the launch, whatever its uid, is a member of the launch's mount namespace: kill them and confirm the
+    // namespace is empty first. The uid sweep below cannot see a root process, and the runner cannot signal one.
+    const namespace = await stopLaunches()
     const stop = await deps.stop(account, tools, identityDeps())
     if (timedOut() !== null) {
       return {
@@ -446,6 +560,14 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
         reason: `${timedOut()}; a killed command is not known to have stopped, so the account is kept and nothing is taken back`,
       }
     }
+    if (namespace !== null) {
+      return {
+        stop: 'unconfirmed',
+        restore: 'unsafe',
+        reason: `${namespace}; the sandbox output cannot be trusted, so the account is kept and nothing is taken back`,
+      }
+    }
+    await removeViewRoot()
     if (launchUnconfirmed) {
       // Best effort above; but the launcher itself could not say its child is gone, so nothing may be trusted: no take-back,
       // and the account is kept (a live uid must not lose its account).
@@ -575,7 +697,21 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     const controller = new AbortController()
     const report = (async (): Promise<Result<unknown, string>> => {
       try {
-        const done = await spawn({spec: launchSpec, signal: controller.signal})
+        const done = await spawn({
+          spec: launchSpec,
+          signal: controller.signal,
+          noteSpawn: pid => {
+            launches.push({
+              pid,
+              lookup: deps
+                .findNamespace(pid, namespaceTools, identityDeps(), {
+                  isAlive: deps.isProcessAlive,
+                  boundMs: NAMESPACE_FIND_BOUND_MS,
+                })
+                .catch((): LaunchNamespaceLookup => ({kind: 'unidentified'})),
+            })
+          },
+        })
         if (done.unconfirmed) launchUnconfirmed = true
         return ok(done.value)
       } catch (error) {
@@ -698,12 +834,16 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       await runAsSandbox([tools.mkdir, '-m', '0700', sandboxTmp])
       await writeSandboxGitConfig(options.workspacePath, input.ghConfigDir !== null)
 
+      const view = await buildView(manifest, account, runnerTemp)
+      if (!view.success) return await failAndRelease(view.error)
+
       const spec: OpenCodeV2SandboxLaunch = {
         sudoPath: tools.sudo,
         setprivPath: tools.setpriv,
         envPath: tools.env,
         account,
         path: SANDBOX_PATH,
+        view: view.data,
         tmpdir: sandboxTmp,
         xdg: {data: dataBase, config: configBase, cache: cacheBase, state: stateBase},
         ...(input.ghConfigDir === null ? {} : {extraEnv: {GH_CONFIG_DIR: input.ghConfigDir}}),
@@ -713,6 +853,51 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     } catch (error) {
       return failAndRelease(`Sandbox setup failed: ${toErrorMessage(error)}`)
     }
+  }
+
+  /**
+   * The read-only view of the launch: writable roots are the checkout, every handed-over directory and the account's home;
+   * read-only inputs are what the manifest only lets the account read. The policy is checked against the host's mount table
+   * here, before anything is launched, and again by the builder, which is the authority.
+   */
+  async function buildView(
+    handed: HandoffManifest,
+    sandboxAccount: SandboxAccount,
+    runnerTemp: string,
+  ): Promise<Result<OpenCodeV2SandboxView, string>> {
+    const root = await deps.createViewRoot(runnerTemp).catch((error: unknown) => {
+      logger.warning('The read-only view root could not be created', {error: toErrorMessage(error)})
+      return null
+    })
+    if (root === null) return err('isolate-agent could not create the root directory of its read-only view')
+    viewRoot = root
+    const policy = {
+      newRoot: root.newRoot,
+      putOld: VIEW_PUT_OLD,
+      tools: {mount: tools.mount, umount: tools.umount},
+      writable: [...new Set([handed.workspace, ...handed.handedOver, sandboxAccount.home])],
+      readOnly: [...new Set([...handed.readable, ...handed.traverseOnly])],
+      runnerHome,
+      actionsDir: path.join(path.dirname(path.resolve(runnerTemp)), ACTIONS_DIR_NAME),
+    }
+    let mounts: ReturnType<typeof parseMountInfo>
+    try {
+      mounts = parseMountInfo(await deps.readMountInfo())
+    } catch {
+      return err('isolate-agent could not read the host mount table to check its read-only view')
+    }
+    if (!mounts.success) return err(`isolate-agent could not read the host mount table: ${mounts.error}`)
+    const checked = validateViewPolicy(policy, mounts.data)
+    if (!checked.success) return err(`isolate-agent cannot build its read-only view: ${checked.error}`)
+    return ok({
+      unsharePath: tools.unshare,
+      shPath: tools.sh,
+      pivotRootPath: tools.pivot_root,
+      umountPath: tools.umount,
+      nodePath: viewLauncher.nodePath,
+      builderPath: viewLauncher.builderPath,
+      policy,
+    })
   }
 
   async function failAndRelease(message: string): Promise<Result<never, string>> {
