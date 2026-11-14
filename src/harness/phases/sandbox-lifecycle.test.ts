@@ -58,6 +58,7 @@ interface Harness {
     readonly admit: Mock<SandboxLifecycleDeps['admit']>
     readonly stopLaunch: Mock<SandboxLifecycleDeps['stopLaunch']>
     readonly isProcessAlive: Mock<SandboxLifecycleDeps['isProcessAlive']>
+    readonly isDirectory: Mock<SandboxLifecycleDeps['isDirectory']>
   }
   /** What `remove` of the view root was called with, in order. */
   readonly viewRootRemovals: string[]
@@ -109,6 +110,7 @@ function createHarness(): Harness {
     })),
     stopLaunch: vi.fn(async () => 'stopped' as const),
     isProcessAlive: vi.fn(() => false),
+    isDirectory: vi.fn((directory: string) => !directory.includes('missing')),
   }
   const sudoCalls: string[][] = []
   const exec: ExecAdapter = {
@@ -1007,6 +1009,51 @@ describe('createSandboxLifecycle', () => {
       // #then the account was removed and the state says so
       expect(prepared.success).toBe(false)
       expect(states).toEqual(['pending', 'restored'])
+    })
+  })
+
+  describe('the agent’s PATH', () => {
+    const prepareInput = {keyFilePaths: [], ghConfigDir: null, repoSkills: null}
+    // `temp` is made per test, so the base environment is too.
+    const baseEnv = (): NodeJS.ProcessEnv => ({HOME: '/home/runner', RUNNER_TEMP: temp, XDG_DATA_HOME: '/custom/data'})
+
+    async function pathFor(env: NodeJS.ProcessEnv) {
+      const harness = createHarness()
+      const lifecycle = create(harness, {env, signals: fakeHost()})
+      const prepared = await lifecycle.prepare(prepareInput)
+      if (!prepared.success) throw new Error(prepared.error)
+      return prepared.data.path
+    }
+
+    it('is the runner’s PATH, existing entries only, once each, with the missing system directories last', async () => {
+      // #given a runner PATH with a tool-cache entry, a missing entry and a duplicate
+      const agentPath = await pathFor({
+        ...baseEnv(),
+        PATH: '/opt/hostedtoolcache/node/24/x64/bin:/opt/missing/bin:/usr/bin:/opt/hostedtoolcache/node/24/x64/bin',
+      })
+
+      // #then
+      expect(agentPath).toBe('/opt/hostedtoolcache/node/24/x64/bin:/usr/bin:/usr/local/bin:/bin')
+    })
+
+    it('is the fixed system PATH when the runner has none', async () => {
+      // #given no PATH in the Action's environment
+      // #then
+      expect(await pathFor(baseEnv())).toBe('/usr/local/bin:/usr/bin:/bin')
+    })
+
+    it('is taken when the lifecycle is made, not when the sandbox is prepared', async () => {
+      // #given an environment whose PATH changes after the lifecycle exists
+      const harness = createHarness()
+      const env: NodeJS.ProcessEnv = {...baseEnv(), PATH: '/opt/early/bin'}
+      const lifecycle = create(harness, {env, signals: fakeHost()})
+      env.PATH = '/opt/late/bin'
+
+      // #when prepared
+      const prepared = await lifecycle.prepare(prepareInput)
+
+      // #then the value from bootstrap is the one used
+      expect(prepared.success && prepared.data.path).toBe('/opt/early/bin:/usr/local/bin:/usr/bin:/bin')
     })
   })
 

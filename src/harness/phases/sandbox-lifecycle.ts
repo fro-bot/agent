@@ -44,6 +44,7 @@ import {
 import {createExecAdapter, holdSignalOwnership} from '../../services/setup/adapters.js'
 import {handOff, takeBack} from '../../services/setup/sandbox-handoff.js'
 import {ACTIONS_DIR_NAME} from '../../services/setup/sandbox-preflight.js'
+import {buildSandboxPath} from '../../services/setup/sandbox-toolchain-path.js'
 import {isProcessAlive} from '../../services/setup/sandbox-view-probe.js'
 import {toErrorMessage} from '../../shared/errors.js'
 
@@ -55,9 +56,6 @@ import {toErrorMessage} from '../../shared/errors.js'
  * one. It is called after the server's graceful shutdown on the normal path, and from the run's `finally` on every other
  * path (an exception, a failed start, a cancellation), so no exit leaves a live sandbox behind.
  */
-
-/** A fixed, tool-only `PATH` for the sandbox. The runner's own `PATH` is never used. */
-const SANDBOX_PATH = '/usr/local/bin:/usr/bin:/bin'
 
 /**
  * The origin git is pushing to: `GITHUB_SERVER_URL` (set by the runner, `https://github.com` or a GHES host), else
@@ -235,6 +233,8 @@ export interface SandboxLifecycleDeps {
   readonly admit: typeof admitLaunch
   readonly stopLaunch: typeof stopLaunch
   readonly isProcessAlive: (pid: number) => boolean
+  /** True when the path is an existing directory (following links), for the agent's `PATH`. */
+  readonly isDirectory: (directory: string) => boolean
 }
 
 const defaultDeps: SandboxLifecycleDeps = {
@@ -285,6 +285,7 @@ const defaultDeps: SandboxLifecycleDeps = {
   admit: admitLaunch,
   stopLaunch,
   isProcessAlive,
+  isDirectory: directory => fsSync.statSync(directory, {throwIfNoEntry: false})?.isDirectory() === true,
 }
 
 /** Where the view's old root is moved before it is unmounted. An empty directory on every supported image. */
@@ -403,6 +404,9 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     return result
   }
   const runnerHome = options.runnerHome ?? env.HOME ?? os.userInfo().homedir
+  // The agent's `PATH` is the runner's as the Action saw it when this lifecycle was made (bootstrap), before anything the
+  // Action itself adds later. The trusted runner-side `PATH`s (trusted git, `TRUSTED_TOOL_DIRS`) are separate and unchanged.
+  const runnerPath = env.PATH
   const viewLauncher = options.viewLauncher ?? {
     nodePath: process.execPath,
     builderPath: fileURLToPath(new URL('./sandbox-view.js', import.meta.url)),
@@ -910,7 +914,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
         setprivPath: tools.setpriv,
         envPath: tools.env,
         account,
-        path: SANDBOX_PATH,
+        path: buildSandboxPath(runnerPath, deps.isDirectory),
         view: view.data,
         tmpdir: sandboxTmp,
         xdg: {data: dataBase, config: configBase, cache: cacheBase, state: stateBase},

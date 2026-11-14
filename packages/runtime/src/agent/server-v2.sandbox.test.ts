@@ -364,6 +364,55 @@ describe('buildSandboxLaunch with a read-only view', () => {
     )
   })
 
+  it('passes a mirrored multi-entry PATH as one NAME=value argument after the drop, never in shell text', () => {
+    // #given a runner-style PATH with tool-cache entries, and one with characters a shell would treat specially
+    const mirrored =
+      '/opt/hostedtoolcache/uv/0.9.2/x86_64:/opt/hostedtoolcache/node/24/x64/bin:/opt/a b:/usr/local/bin:/usr/bin:/bin'
+    const hostile = "/opt/it's $(x):/opt/`y`:/usr/bin"
+
+    // #when built for each
+    const first = buildSandboxLaunch(
+      launchSpec({view: VIEW, path: mirrored}),
+      '/opt/oc/opencode',
+      ['serve'],
+      {},
+      '/work',
+    )
+    const second = buildSandboxLaunch(
+      launchSpec({view: VIEW, path: hostile}),
+      '/opt/oc/opencode',
+      ['serve'],
+      {},
+      '/work',
+    )
+
+    // #then it is exactly one argument, after `env -C <cwd>` (so after the drop), and no fixed script contains it
+    for (const [built, value] of [
+      [first, mirrored],
+      [second, hostile],
+    ] as const) {
+      expect(built.args.filter(arg => arg === `PATH=${value}`)).toHaveLength(1)
+      expect(built.args.indexOf(`PATH=${value}`)).toBeGreaterThan(built.args.indexOf('-C'))
+      expect(built.args.indexOf(`PATH=${value}`)).toBeGreaterThan(built.args.indexOf('--reuid=998'))
+      const scripts = built.args.filter(
+        arg => arg.startsWith('r=$1;') || arg.startsWith('"$1"') || arg.startsWith('exec 3>>'),
+      )
+      expect(scripts).toHaveLength(3)
+      for (const script of scripts) expect(script).not.toContain('/opt/')
+    }
+  })
+
+  it('does the same without a view', () => {
+    // #given the launch without a view
+    const mirrored = '/opt/hostedtoolcache/node/24/x64/bin:/usr/local/bin:/usr/bin:/bin'
+    const built = buildSandboxLaunch(launchSpec({path: mirrored}), '/opt/oc/opencode', ['serve'], {}, '/work')
+
+    // #then PATH is one argument after `setpriv … --`, and sudo's own environment does not carry it
+    expect(built.args).toContain(`PATH=${mirrored}`)
+    expect(built.args.indexOf(`PATH=${mirrored}`)).toBeGreaterThan(built.args.indexOf('--reuid=998'))
+    expect(built.env.PATH).toBeUndefined()
+  })
+
   it('omits the preserve-env option when there is nothing to preserve', () => {
     // #given an empty environment
     const built = buildSandboxLaunch(launchSpec({view: VIEW}), '/opt/oc/opencode', ['serve'], {}, '/work')
