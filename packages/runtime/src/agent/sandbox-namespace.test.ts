@@ -58,6 +58,7 @@ function createModel(initial: Proc[], options: ModelOptions = {}) {
     }
     if (tool === 'lsns') {
       if (options.lsnsFails === true) return {exitCode: 1, stdout: ''}
+      if (options.lsnsEmpty === true) return {exitCode: 0, stdout: ''}
       if (argv.includes('-p')) {
         const target = procs.find(proc => proc.pid === Number(argv.at(-1)))
         return target === undefined ? {exitCode: 1, stdout: ''} : stdout([String(target.ns)])
