@@ -80,7 +80,10 @@ export async function probeKeyProxy(options: ProbeKeyProxyOptions): Promise<KeyP
     return warn(timeout.aborted ? 'unreachable' : 'unverifiable')
   }
 
-  if (status >= 200 && status < 300) return {status: 'passed'}
+  if (status >= 200 && status < 300) {
+    logger.info('Key proxy probe passed', {provider: providerId, status})
+    return {status: 'passed'}
+  }
   if (status === 401) {
     return {
       status: 'failed',

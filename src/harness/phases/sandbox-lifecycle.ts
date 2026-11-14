@@ -44,6 +44,20 @@ import {toErrorMessage} from '../../shared/errors.js'
 /** A fixed, tool-only `PATH` for the sandbox. The runner's own `PATH` is never used. */
 const SANDBOX_PATH = '/usr/local/bin:/usr/bin:/bin'
 
+/**
+ * The origin git is pushing to: `GITHUB_SERVER_URL` (set by the runner, `https://github.com` or a GHES host), else
+ * github.com. `null` when it is set but is not an http(s) URL, so no host is guessed.
+ */
+function gitServerOrigin(serverUrl: string | undefined): string | null {
+  const raw = serverUrl === undefined || serverUrl.length === 0 ? 'https://github.com' : serverUrl
+  try {
+    const parsed = new URL(raw)
+    return parsed.protocol === 'https:' || parsed.protocol === 'http:' ? parsed.origin : null
+  } catch {
+    return null
+  }
+}
+
 export interface SandboxPrepareInput {
   /** Provider key files written by the credential step; their directories are handed over. */
   readonly keyFilePaths: readonly string[]
@@ -408,6 +422,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     try {
       const result = await proxy.stop()
       if (result.outcome === 'unconfirmed' || proxyUnconfirmed) return 'unconfirmed'
+      logger.info('Key proxy stopped', {exitConfirmed: true})
       return result.crashed ? 'crashed' : 'stopped'
     } catch (error) {
       logger.error('Stopping the key proxy threw', {error: toErrorMessage(error)})
@@ -681,7 +696,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
 
       const sandboxTmp = path.join(account.home, 'tmp')
       await runAsSandbox([tools.mkdir, '-m', '0700', sandboxTmp])
-      await writeSandboxGitConfig(options.workspacePath)
+      await writeSandboxGitConfig(options.workspacePath, input.ghConfigDir !== null)
 
       const spec: OpenCodeV2SandboxLaunch = {
         sudoPath: tools.sudo,
@@ -715,8 +730,11 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     }
   }
 
-  /** `safe.directory` for the checkout (owned by the runner) and the identity setup configured for the runner. */
-  async function writeSandboxGitConfig(workspace: string): Promise<void> {
+  /**
+   * `safe.directory` for the checkout (owned by the runner) and the identity setup configured for the runner. In provision
+   * mode (the sandbox holds a `gh` config), also a credential helper so the model's `git push` authenticates.
+   */
+  async function writeSandboxGitConfig(workspace: string, provisioned: boolean): Promise<void> {
     if (account === null) return
     const gitConfig = path.join(account.home, '.gitconfig')
     const set = async (key: string, value: string): Promise<void> => {
@@ -730,6 +748,24 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       })
       if (value.exitCode === 0 && value.stdout.trim().length > 0) await set(key, value.stdout.trim())
     }
+    if (!provisioned) return
+
+    // `actions/checkout` runs with `persist-credentials: false` under isolation, so git has no credential of its own. `gh auth
+    // git-credential` answers git from the `gh` token in `GH_CONFIG_DIR`, which the sandbox already holds (handed over and
+    // named in the server environment) and uses for `gh pr create`. It exposes nothing new. The helper lives in the sandbox
+    // user's global gitconfig, not in the checkout's `.git/config`, so the snapshot audit of that file is not involved. When
+    // the credential is withheld there is no gh config and this block does not run.
+    const origin = gitServerOrigin(env.GITHUB_SERVER_URL)
+    if (origin === null) {
+      logger.warning(
+        'GITHUB_SERVER_URL is not a usable URL; the sandbox gets no git credential helper (git push will fail)',
+      )
+      return
+    }
+    const helperKey = `credential.${origin}.helper`
+    // The empty value first: it drops any helper an outer config named for this host, so `gh` is the only one asked.
+    await set(helperKey, '')
+    await set(helperKey, `!${tools.gh} auth git-credential`)
   }
 
   // False from the moment a signal begins the teardown (not when it ends), so a caller about to spawn the server sees it.

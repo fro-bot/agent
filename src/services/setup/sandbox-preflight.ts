@@ -31,6 +31,8 @@ export const SANDBOX_TOOL_NAMES = [
   'mkdir',
   'env',
   'git',
+  // The git credential helper of the provisioned `gh` token (provision mode), so the model's `git push` authenticates.
+  'gh',
 ] as const
 
 export type SandboxToolName = (typeof SANDBOX_TOOL_NAMES)[number]
