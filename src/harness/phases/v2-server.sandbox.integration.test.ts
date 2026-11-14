@@ -2296,15 +2296,12 @@ function runnerReports(command: string): string {
 }
 
 const pathTools = gated ? {node: runnerTool('node'), uv: runnerTool('uv')} : {node: null, uv: null}
+/** The tools the CI job provisions (`setup-node`, `setup-uv`) that are not on the runner's PATH. Empty off a runner. */
 const missingPathTools = Object.entries(pathTools)
   .filter(([, found]) => found === null)
   .map(([name]) => name)
-if (gated && missingPathTools.length > 0) {
-  // A visible reason, not a silent skip: the job is expected to run `setup-node` and `setup-uv` before this suite.
-  console.warn(`Skipping the PATH suite: ${missingPathTools.join(', ')} not on the runner's PATH`)
-}
 
-describe.skipIf(!gated || missingPathTools.length > 0)("isolate-agent PATH mirrors the runner's", () => {
+describe.skipIf(!gated)("isolate-agent PATH mirrors the runner's", () => {
   const logger = createLogger({phase: 'sandbox-integration-path'})
   const scratch = path.join(runnerTemp, `sandbox-it-path-${process.pid}`)
   // Its own XDG roots: the commondir suite above ends `unsafe` and leaves the default ones owned by the sandbox uid.
@@ -2358,6 +2355,12 @@ describe.skipIf(!gated || missingPathTools.length > 0)("isolate-agent PATH mirro
     fs.rmSync(scratch, {recursive: true, force: true})
     fs.rmSync(xdgRoot, {recursive: true, force: true})
   }, 120_000)
+
+  it('starts from a runner that has the tools this suite checks', () => {
+    // #given the gated run is on, so the job is expected to have run `setup-node` and `setup-uv`
+    // #then a missing tool is a failure of the job's setup, not a reason to skip the checks below
+    expect(missingPathTools).toEqual([])
+  })
 
   it('runs the runner’s node, the version and the file the runner reports', () => {
     // #given the agent's shell ran `node -v` and `command -v node`
