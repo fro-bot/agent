@@ -688,6 +688,19 @@ describe.skipIf(!gated)('isolate-agent with a provisioned gh config and an admit
         `else R gh_auth_token FAILED "$(printf %s "$t" | ev)"; fi`,
     },
     {
+      // The sandbox's global gitconfig names gh as the credential helper for the server host, so the model's `git push`
+      // authenticates with the token it already holds. `git credential fill` runs the helper chain for real, offline.
+      id: 'git_credential_helper',
+      category: 'works',
+      cmd: [
+        String.raw`o=$(printf 'protocol=https\nhost=%s\n\n' ${q(ghHost)} | GIT_TERMINAL_PROMPT=0 git credential fill 2>&1);`,
+        `h=$(git config --global --get-all ${q(`credential.https://${ghHost}.helper`)} 2>&1);`,
+        String.raw`if printf '%s\n' "$o" | grep -qx ${q(`password=${ghDummyToken}`)} && printf '%s\n' "$h" | grep -q 'gh auth git-credential$';`,
+        'then R git_credential_helper WORKS "git credential fill answered from the provisioned gh token";',
+        `else R git_credential_helper FAILED "helper=[$(printf %s "$h" | ev)] fill=[$(printf %s "$o" | grep -v '^password=' | ev)]"; fi`,
+      ].join(' '),
+    },
+    {
       id: 'gh_runner_hosts',
       category: 'blocked',
       control: true,
@@ -777,7 +790,8 @@ describe.skipIf(!gated)('isolate-agent with a provisioned gh config and an admit
     if (admission.data.directory === null) throw new Error('the demo skill was not admitted')
     admittedDir = admission.data.directory
 
-    const env = hostedEnv(workspace)
+    // The helper is scoped to the server the Action runs against, which the dummy gh config also names.
+    const env = {...hostedEnv(workspace), GITHUB_SERVER_URL: `https://${ghHost}`}
     controls = runControls(probes(), workspace, env)
     const result = await runIsolated({
       tools,
@@ -816,6 +830,12 @@ describe.skipIf(!gated)('isolate-agent with a provisioned gh config and an admit
     // #then the model's gh reads it
     expect(failuresFor(rows, 'gh_config_dir_env', 'WORKS')).toEqual([])
     expect(failuresFor(rows, 'gh_auth_token', 'WORKS')).toEqual([])
+  })
+
+  it("lets the model's git authenticate through the provisioned gh token (credential helper in the sandbox gitconfig)", () => {
+    // #given provision mode: a gh config for the server host and the helper written into the sandbox's global gitconfig
+    // #then `git credential fill` as the sandbox returns the provisioned token, and the helper is the configured one
+    expect(failuresFor(rows, 'git_credential_helper', 'WORKS')).toEqual([])
   })
 
   it("keeps the runner's own gh config out of reach", () => {
