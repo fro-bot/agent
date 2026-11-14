@@ -85,6 +85,7 @@ export interface SandboxIdentityTools {
   readonly pgrep: string
   readonly chmod: string
   readonly chown: string
+  readonly find: string
   readonly mkdir: string
 }
 
@@ -155,9 +156,13 @@ function parseGroups(text: string): readonly GroupEntry[] {
  *
  * The home is made here, not by `useradd --create-home`, which copies `/etc/skel`. `mkdir` without `-p` refuses a path
  * that already exists, so a pre-existing home is never adopted.
+ *
+ * Rollback never uses `userdel --remove`: a home this call did not create must survive (a directory already at the path
+ * can belong to the freshly allocated uid), and one it did create may still be root-owned, which `--remove` refuses to
+ * delete. The home this call made is removed by {@link removeHomeWeCreated}, then the account by plain `userdel`.
  */
 export async function createSandboxAccount(
-  tools: Pick<SandboxIdentityTools, 'chmod' | 'chown' | 'mkdir' | 'useradd' | 'userdel'>,
+  tools: Pick<SandboxIdentityTools, 'chmod' | 'chown' | 'find' | 'mkdir' | 'useradd' | 'userdel'>,
   deps: SandboxIdentityDeps,
 ): Promise<Result<SandboxAccount, SandboxAccountError>> {
   const name = SANDBOX_ACCOUNT_NAME
@@ -233,9 +238,13 @@ export async function createSandboxAccount(
     {what: 'hand the sandbox home to the account', argv: [tools.chown, `${account.uid}:${account.gid}`, account.home]},
     {what: 'restrict the sandbox home to mode 0700', argv: [tools.chmod, '0700', account.home]},
   ]
+  let homeCreated = false
   for (const step of homeSteps) {
     const result = await deps.run(step.argv)
-    if (result.exitCode === 0) continue
+    if (result.exitCode === 0) {
+      homeCreated = true
+      continue
+    }
     const failure = describePrivilegedFailure(`Could not ${step.what}:`, result)
     if (result.timedOutAfterMs !== undefined) {
       // As for `useradd`: a killed command is not known to have stopped, so the account stays and the run is unsafe.
@@ -245,8 +254,10 @@ export async function createSandboxAccount(
         timedOut: true,
       })
     }
-    await deleteSandboxAccount(account, tools, deps)
-    return err({kind: 'create-failed', message: failure})
+    // Before a successful mkdir the path is not ours: leave whatever is there and drop only the account.
+    const cleanupFailure = homeCreated ? await removeHomeWeCreated(account.home, tools, deps) : null
+    await removeIfPresent(name, tools, deps)
+    return err({kind: 'create-failed', message: cleanupFailure === null ? failure : `${failure}; ${cleanupFailure}`})
   }
   deps.logger.info('Sandbox account created', {name, uid: account.uid})
   return ok(account)
@@ -274,6 +285,7 @@ async function readBackAccount(name: string, deps: SandboxIdentityDeps): Promise
   return {name, uid: entry.uid, gid: entry.gid, home: entry.home}
 }
 
+/** Removes the account but never its home: on these paths this call either did not create the home or already removed it. */
 async function removeIfPresent(
   name: string,
   tools: Pick<SandboxIdentityTools, 'userdel'>,
@@ -281,8 +293,23 @@ async function removeIfPresent(
 ): Promise<void> {
   const passwdText = await deps.readText('/etc/passwd')
   if (passwdText !== null && parsePasswd(passwdText).some(entry => entry.name === name)) {
-    await deps.run([tools.userdel, '--remove', name])
+    await deps.run([tools.userdel, name])
   }
+}
+
+/**
+ * Removes the home directory this call just made. `-P` never follows a symlink, `-maxdepth 0 -type d -empty` matches
+ * only the path itself and only when it is an empty directory, so nothing below it can be touched. Returns a message when
+ * the cleanup failed, else `null`.
+ */
+async function removeHomeWeCreated(
+  home: string,
+  tools: Pick<SandboxIdentityTools, 'find'>,
+  deps: SandboxIdentityDeps,
+): Promise<string | null> {
+  const result = await deps.run([tools.find, '-P', home, '-maxdepth', '0', '-type', 'd', '-empty', '-delete'])
+  if (result.exitCode === 0) return null
+  return describePrivilegedFailure(`the half-made home ${home} could not be removed:`, result)
 }
 
 export type SandboxStopOutcome = 'stopped' | 'unconfirmed'
