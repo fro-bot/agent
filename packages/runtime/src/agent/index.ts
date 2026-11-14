@@ -278,6 +278,13 @@ export type {
   SandboxIdentityTools,
   SandboxStopOutcome,
 } from './sandbox-identity.js'
+export {findLaunchNamespace, stopLaunchNamespace} from './sandbox-namespace.js'
+export type {
+  LaunchNamespace,
+  LaunchNamespaceLookup,
+  NamespaceStopOutcome,
+  SandboxNamespaceTools,
+} from './sandbox-namespace.js'
 export {runSandboxViewChild, SANDBOX_VIEW_EXIT_FAILED, SANDBOX_VIEW_EXIT_INVALID_POLICY} from './sandbox-view-child.js'
 export type {SandboxViewChildIo} from './sandbox-view-child.js'
 export {
