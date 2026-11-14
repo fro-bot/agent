@@ -1,7 +1,7 @@
 import type {Buffer} from 'node:buffer'
 import type {
-  LaunchNamespace,
-  LaunchNamespaceLookup,
+  GateDeps,
+  LaunchAdmission,
   NamespaceStopOutcome,
   OpenCodeV2SandboxView,
   PrivilegedRun,
@@ -14,7 +14,14 @@ import {spawn} from 'node:child_process'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import process from 'node:process'
-import {buildSandboxViewChain, buildSetprivDropArgs, findLaunchNamespace, stopLaunchNamespace} from '@fro-bot/runtime'
+import {
+  admitLaunch,
+  buildSandboxViewChain,
+  buildSetprivDropArgs,
+  GATE_GO_FILE,
+  GATE_NS_FILE,
+  stopLaunch,
+} from '@fro-bot/runtime'
 import {toErrorMessage} from '../../shared/errors.js'
 
 /**
@@ -31,6 +38,8 @@ import {toErrorMessage} from '../../shared/errors.js'
 export interface ProbeFixture {
   readonly dir: string
   readonly newRoot: string
+  /** The launch's gate directory: where the gate reports its namespace id and waits for the go-ahead. */
+  readonly gate: string
   readonly allowed: string
   readonly sealed: string
 }
@@ -65,9 +74,10 @@ export interface SandboxViewProbeDeps {
     args: readonly string[],
     options: {readonly timeoutMs: number; readonly onSpawn: (pid: number) => void},
   ) => Promise<ProbeLaunchResult>
-  /** Started the moment the launcher's pid exists. */
-  readonly findNamespace: (pid: number) => Promise<LaunchNamespaceLookup>
-  readonly stopNamespace: (namespace: LaunchNamespace) => Promise<NamespaceStopOutcome>
+  /** Started the moment the launcher's pid exists: reads the gate's namespace id and gives the go-ahead. */
+  readonly admit: (pid: number, gateDir: string) => Promise<LaunchAdmission>
+  /** Stops and confirms everything of the launch, by its namespace or, with no id captured, by its gate directory. */
+  readonly stopLaunch: (gateDir: string, admission: LaunchAdmission) => Promise<NamespaceStopOutcome>
   readonly isAlive: (pid: number) => boolean
   readonly logger: Logger
 }
@@ -75,6 +85,8 @@ export interface SandboxViewProbeDeps {
 /** A probe takes a few hundred milliseconds on the hosted images. */
 export const VIEW_PROBE_TIMEOUT_MS = 15_000
 const SETTLE_MS = 3000
+/** Ticks of 0.1 s the gate waits for the go-ahead: it normally gets it within milliseconds. */
+const PROBE_GATE_TICKS = 100
 const SETTLE_POLL_MS = 50
 
 /**
@@ -100,6 +112,10 @@ function describeFailure(result: ProbeLaunchResult): string {
       return 'the read-only view probe found no writable private temp directory'
     case 13:
       return 'the read-only view probe did not run as the unprivileged user'
+    case 70:
+    case 71:
+    case 72:
+      return 'the read-only view probe could not pass its launch gate'
     case null:
     default:
       return stage === undefined
@@ -132,6 +148,7 @@ export async function probeSandboxView(
       umountPath: tools.umount,
       nodePath: input.nodePath,
       builderPath: input.builderPath,
+      gate: {dir: fixture.gate, readlinkPath: tools.readlink, sleepPath: tools.sleep, ticks: PROBE_GATE_TICKS},
       policy: {
         newRoot: fixture.newRoot,
         putOld: '/mnt',
@@ -160,20 +177,24 @@ export async function probeSandboxView(
       String(input.nobody.uid),
     ]
 
-    let lookup: Promise<LaunchNamespaceLookup> | undefined
+    let admission: Promise<LaunchAdmission> | undefined
     const launched = await deps.launch(tools.sudo, ['-n', '--', ...buildSandboxViewChain(view, command)], {
       timeoutMs: VIEW_PROBE_TIMEOUT_MS,
       onSpawn: pid => {
-        lookup = deps.findNamespace(pid).catch((): LaunchNamespaceLookup => ({kind: 'unidentified'}))
+        admission = deps
+          .admit(pid, fixture.gate)
+          .catch((): LaunchAdmission => ({kind: 'refused', host: null, reason: 'no-id'}))
       },
     })
+    if (launched.pid === null) return fail('the read-only view probe could not be started')
 
-    // The probe's own namespace is confirmed empty the way the teardown confirms a launch, pass or fail.
-    if (launched.pid !== null && !(await confirmStopped(launched.pid, await lookup, deps, options.settleMs))) {
+    // The probe's own launch is stopped and confirmed the way the teardown confirms a launch, pass or fail, and a launcher
+    // that has exited is not the confirmation: with no id captured, the gate's processes are killed and counted.
+    const stopped = await confirmStopped(launched.pid, fixture.gate, await admission, deps, options.settleMs)
+    if (!stopped) {
       removable = false
       return fail('the read-only view probe could not be confirmed stopped')
     }
-    if (launched.pid === null) return fail('the read-only view probe could not be started')
     return launched.exitCode === 0 && !launched.timedOut ? {ok: true} : fail(describeFailure(launched))
   } finally {
     // Nothing is deleted while a member of the probe's namespace may still be running.
@@ -187,12 +208,14 @@ export async function probeSandboxView(
 
 async function confirmStopped(
   pid: number,
-  lookup: LaunchNamespaceLookup | undefined,
+  gateDir: string,
+  admission: LaunchAdmission | undefined,
   deps: SandboxViewProbeDeps,
   settleMs = SETTLE_MS,
 ): Promise<boolean> {
-  if (lookup?.kind === 'found' && (await deps.stopNamespace(lookup.namespace)) !== 'stopped') return false
-  // The launcher is the parent of everything in the namespace: once it has exited, so has the launch.
+  const outcome = await deps.stopLaunch(gateDir, admission ?? {kind: 'refused', host: null, reason: 'no-id'})
+  if (outcome !== 'stopped') return false
+  // The launcher itself exits once its child has; the runner cannot signal it, so it is waited for.
   const deadline = Date.now() + settleMs
   while (deps.isAlive(pid)) {
     if (Date.now() >= deadline) return false
@@ -321,28 +344,40 @@ export function createViewProbe(options: {
     const run = createPrivilegedRunFromExec(options.exec, tools.sudo)
     const identityDeps: SandboxIdentityDeps = {run, readText: async () => null, logger: options.logger}
     const namespaceTools = {pkill: tools.pkill, pgrep: tools.pgrep, lsns: tools.lsns}
+    const gateDeps: GateDeps = {
+      readText: async file => fs.readFile(file, 'utf8').catch(() => null),
+      writeText: async (file, content) => fs.writeFile(file, content, {flag: 'wx', mode: 0o600}),
+      readHostNamespace: async () => fs.readlink('/proc/self/ns/mnt').catch(() => null),
+      isAlive: isProcessAlive,
+    }
     const deps: SandboxViewProbeDeps = {
       makeFixture: async () => {
         const dir = await fs.mkdtemp(path.join(runnerTemp, 'fro-bot-view-probe-'))
         const fixture = {
           dir,
           newRoot: path.join(dir, 'root'),
+          gate: path.join(dir, 'gate'),
           allowed: path.join(dir, 'allowed'),
           sealed: path.join(dir, 'sealed'),
         }
-        for (const directory of [fixture.newRoot, fixture.allowed, fixture.sealed]) await fs.mkdir(directory)
+        for (const directory of [fixture.newRoot, fixture.gate, fixture.allowed, fixture.sealed]) {
+          await fs.mkdir(directory)
+        }
         return fixture
       },
       removeFixture: async fixture => {
         // Plain directories and files only. The new root was a mount point in a namespace that is gone, so it is empty.
         await fs.rm(fixture.allowed, {recursive: true, force: true})
         await fs.rm(fixture.sealed, {recursive: true, force: true})
+        for (const name of [GATE_NS_FILE, GATE_GO_FILE]) await fs.rm(path.join(fixture.gate, name), {force: true})
+        await fs.rmdir(fixture.gate)
         await fs.rmdir(fixture.newRoot)
         await fs.rmdir(fixture.dir)
       },
       launch: launchWithDeadline,
-      findNamespace: async pid => findLaunchNamespace(pid, namespaceTools, identityDeps, {isAlive: isProcessAlive}),
-      stopNamespace: async namespace => stopLaunchNamespace(namespace, namespaceTools, identityDeps),
+      admit: async (pid, gateDir) => admitLaunch(pid, gateDir, gateDeps, {isClosed: () => false}),
+      stopLaunch: async (gateDir, admission) =>
+        stopLaunch({gateDir, admission}, namespaceTools, identityDeps, gateDeps),
       isAlive: isProcessAlive,
       logger: options.logger,
     }

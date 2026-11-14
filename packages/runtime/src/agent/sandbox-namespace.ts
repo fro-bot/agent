@@ -1,98 +1,132 @@
-import type {PrivilegedRunResult, SandboxIdentityDeps, SandboxIdentityTools} from './sandbox-identity.js'
+import type {SandboxIdentityDeps, SandboxIdentityTools} from './sandbox-identity.js'
 import {sleep as defaultSleep} from '../shared/async.js'
 import {toErrorMessage} from '../shared/errors.js'
 
 /**
- * Finding, killing and confirming the members of a launch's private mount namespace.
+ * Admitting, killing and confirming the members of a launch's private mount namespace.
  *
  * Under `isolate-agent` every process of the launch (the privileged builder, the shells of the exec chain, the server and
  * everything its tools start) is a member of one mount namespace. The runner can signal only `sudo`, so a process group
  * kill leaves the rest running, and the uid sweep cannot see root processes. Membership of the namespace is the handle that
  * covers all of them, whatever their uid, session or group.
  *
- * Measured on both hosted images (see the plan's "Settled by Unit 1"): the launcher's direct child is the first process in
- * the new namespace and `lsns -p` reads its id; `pkill -KILL --ns <member> --nslist mnt` kills every member in one round.
- * A kill needs a living member as its reference. `pgrep --ns` against a dead reference answers "no match", which looks
- * like an empty namespace, so confirmation reads the namespace listing instead.
+ * The launcher's exit proves nothing about its children: a group kill of `sudo` orphans a root child the runner cannot
+ * signal. So a launch must be known before it may run. The first step of the chain (the gate) writes the id of its own
+ * mount namespace to a file in a directory only the runner and root can write, then waits for a go-ahead file naming that
+ * id. The runner reads and validates the id, keeps it, and only then writes the go-ahead. A launch whose id the runner
+ * never captured never gets past the gate, and the gate exits on its own bound.
  *
  * Every command is a privileged argv run through the injected {@link SandboxIdentityDeps.run}.
  */
 
 export type SandboxNamespaceTools = Pick<SandboxIdentityTools, 'pgrep' | 'pkill'> & {readonly lsns: string}
 
+/** The files of a gate directory. The gate script and the runner side agree on these names. */
+export const GATE_NS_FILE = 'ns'
+export const GATE_GO_FILE = 'go'
+
 export interface LaunchNamespace {
   /** The inode number of the launch's mount namespace. */
   readonly id: string
-  /** The launcher's child: the first process seen in the namespace. It may be dead by the time of the stop. */
-  readonly member: number
-  /** The launcher's own (host) mount namespace. Never signalled. */
+  /** The runner's own (host) mount namespace. Never signalled. */
   readonly host: string
 }
 
-export type LaunchNamespaceLookup =
-  | {readonly kind: 'found'; readonly namespace: LaunchNamespace}
-  /** The launcher exited before a new namespace was seen: nothing of the launch can be left. */
-  | {readonly kind: 'launch-gone'}
-  /** The launcher is alive and its namespace could not be identified in time. */
-  | {readonly kind: 'unidentified'}
+export type LaunchAdmission =
+  /** The id was captured and validated and the go-ahead written. */
+  | {readonly kind: 'admitted'; readonly namespace: LaunchNamespace}
+  /** The id was captured but no go-ahead was given: the teardown began, or the launcher was already gone. */
+  | {readonly kind: 'held'; readonly namespace: LaunchNamespace; readonly reason: 'closed' | 'launcher-gone'}
+  /** No usable id: no go-ahead was given, so the chain cannot have gone past the gate. */
+  | {
+      readonly kind: 'refused'
+      readonly host: string | null
+      readonly reason: 'closed' | 'host-id' | 'host-unreadable' | 'invalid-id' | 'no-id'
+    }
 
 export type NamespaceStopOutcome = 'stopped' | 'unconfirmed'
 
-const DEFAULT_FIND_BOUND_MS = 10_000
-const DEFAULT_FIND_POLL_MS = 50
+export interface GateDeps {
+  /** Reads a text file; null when it is missing or unreadable. */
+  readonly readText: (absolutePath: string) => Promise<string | null>
+  readonly writeText: (absolutePath: string, content: string) => Promise<void>
+  /** The runner's own `/proc/self/ns/mnt` link text, e.g. `mnt:[4026531841]`; null when unreadable. */
+  readonly readHostNamespace: () => Promise<string | null>
+  readonly isAlive: (pid: number) => boolean
+  readonly now?: () => number
+  readonly sleep?: (ms: number) => Promise<void>
+}
+
+const DEFAULT_ADMIT_BOUND_MS = 10_000
+const DEFAULT_ADMIT_POLL_MS = 20
 const DEFAULT_STOP_BOUND_MS = 15_000
 const DEFAULT_STOP_POLL_MS = 100
 /** One command's own ceiling inside a longer bound. */
 const COMMAND_CEILING_MS = 10_000
 
-function firstNumber(result: PrivilegedRunResult): string | null {
-  if (result.exitCode !== 0) return null
-  const match = /^\s*(\d+)\s*$/m.exec(result.stdout)
+/** `mnt:[4026532399]` to `4026532399`; null for anything else. */
+export function parseNamespaceId(text: string | null): string | null {
+  if (text === null) return null
+  const match = /^mnt:\[(\d{1,20})\]$/.exec(text.trim())
   return match?.[1] ?? null
 }
 
+type GateRead =
+  | {readonly kind: 'absent'}
+  | {readonly kind: 'invalid'}
+  | {readonly kind: 'host'}
+  | {readonly kind: 'captured'; readonly namespace: LaunchNamespace}
+
+/** What the gate wrote, judged against the runner's own namespace. An empty file is a write in progress: absent. */
+export async function readGateNamespace(
+  gateDir: string,
+  host: string,
+  deps: Pick<GateDeps, 'readText'>,
+): Promise<GateRead> {
+  const text = await deps.readText(`${gateDir}/${GATE_NS_FILE}`)
+  if (text === null || text.trim().length === 0) return {kind: 'absent'}
+  const id = parseNamespaceId(text)
+  if (id === null) return {kind: 'invalid'}
+  if (id === host) return {kind: 'host'}
+  return {kind: 'captured', namespace: {id, host}}
+}
+
 /**
- * Polls for the namespace of the launcher's child, until the child is in a namespace other than the launcher's, the
- * launcher is gone, or the bound passes. The child is in the host namespace until `unshare` has run, so equal ids are
- * not an answer yet.
+ * Waits for the gate to report its namespace and gives the go-ahead once the id is valid and differs from the runner's.
+ * `isClosed` is read immediately before the write: a go-ahead is never given after the teardown began. When the id was
+ * captured but no go-ahead was given, the result still carries the namespace, so the teardown can stop it.
  */
-export async function findLaunchNamespace(
-  launchPid: number,
-  tools: SandboxNamespaceTools,
-  deps: SandboxIdentityDeps,
-  options: {
-    readonly isAlive: (pid: number) => boolean
-    readonly boundMs?: number
-    readonly pollMs?: number
-  },
-): Promise<LaunchNamespaceLookup> {
+export async function admitLaunch(
+  launcherPid: number,
+  gateDir: string,
+  deps: GateDeps,
+  options: {readonly isClosed: () => boolean; readonly boundMs?: number; readonly pollMs?: number},
+): Promise<LaunchAdmission> {
   const now = deps.now ?? Date.now
   const sleep = deps.sleep ?? defaultSleep
-  const deadline = now() + (options.boundMs ?? DEFAULT_FIND_BOUND_MS)
-  const pollMs = options.pollMs ?? DEFAULT_FIND_POLL_MS
-  const budget = (): {readonly timeoutMs: number} => ({
-    timeoutMs: Math.max(1, Math.min(COMMAND_CEILING_MS, deadline - now())),
-  })
-  const namespaceOf = async (pid: number | string): Promise<string | null> =>
-    firstNumber(await deps.run([tools.lsns, '-n', '-t', 'mnt', '-o', 'NS', '-p', String(pid)], budget()))
+  const deadline = now() + (options.boundMs ?? DEFAULT_ADMIT_BOUND_MS)
+  const pollMs = options.pollMs ?? DEFAULT_ADMIT_POLL_MS
+
+  const host = parseNamespaceId(await deps.readHostNamespace().catch(() => null))
+  if (host === null) return {kind: 'refused', host: null, reason: 'host-unreadable'}
 
   for (;;) {
-    try {
-      const children = await deps.run([tools.pgrep, '-P', String(launchPid)], budget())
-      const host = await namespaceOf(launchPid)
-      if (children.exitCode === 0 && host !== null) {
-        for (const line of children.stdout.split('\n')) {
-          const child = Number.parseInt(line.trim(), 10)
-          if (!Number.isInteger(child) || child <= 1) continue
-          const id = await namespaceOf(child)
-          if (id !== null && id !== host) return {kind: 'found', namespace: {id, member: child, host}}
-        }
+    const read = await readGateNamespace(gateDir, host, deps).catch((): GateRead => ({kind: 'absent'}))
+    if (read.kind === 'invalid') return {kind: 'refused', host, reason: 'invalid-id'}
+    if (read.kind === 'host') return {kind: 'refused', host, reason: 'host-id'}
+    if (read.kind === 'captured') {
+      const {namespace} = read
+      if (options.isClosed()) return {kind: 'held', namespace, reason: 'closed'}
+      if (!deps.isAlive(launcherPid)) return {kind: 'held', namespace, reason: 'launcher-gone'}
+      try {
+        await deps.writeText(`${gateDir}/${GATE_GO_FILE}`, `mnt:[${namespace.id}]\n`)
+      } catch {
+        return {kind: 'held', namespace, reason: 'closed'}
       }
-    } catch (error) {
-      deps.logger.warning('Looking up the launch namespace failed', {error: toErrorMessage(error)})
+      return {kind: 'admitted', namespace}
     }
-    if (!options.isAlive(launchPid)) return {kind: 'launch-gone'}
-    if (now() >= deadline) return {kind: 'unidentified'}
+    if (options.isClosed()) return {kind: 'refused', host, reason: 'closed'}
+    if (!deps.isAlive(launcherPid) || now() >= deadline) return {kind: 'refused', host, reason: 'no-id'}
     await sleep(pollMs)
   }
 }
@@ -102,16 +136,21 @@ async function listNamespaces(
   tools: SandboxNamespaceTools,
   deps: SandboxIdentityDeps,
   timeoutMs: number,
+  host: string,
 ): Promise<ReadonlyMap<string, number> | null> {
   const listing = await deps.run([tools.lsns, '-n', '-t', 'mnt', '-o', 'NS,PID'], {timeoutMs})
   if (listing.exitCode !== 0) return null
   const rows = new Map<string, number>()
   for (const line of listing.stdout.split('\n')) {
+    if (line.trim().length === 0) continue
     const match = /^\s*(\d+)\s+(\d+)\s*$/.exec(line)
-    if (match?.[1] !== undefined && match[2] !== undefined) rows.set(match[1], Number.parseInt(match[2], 10))
+    // One row that cannot be read may be the launch's own: the whole listing is unusable.
+    if (match?.[1] === undefined || match[2] === undefined) return null
+    rows.set(match[1], Number.parseInt(match[2], 10))
   }
-  // The host's own namespace is always listed: an empty listing is a failure, not an empty answer.
-  return rows.size === 0 ? null : rows
+  // The runner's own namespace always has processes: a listing without it is cut short, and the absence of the launch's
+  // namespace from it proves nothing.
+  return rows.has(host) ? rows : null
 }
 
 /**
@@ -139,11 +178,12 @@ export async function stopLaunchNamespace(
   for (;;) {
     const budget = Math.max(1, Math.min(COMMAND_CEILING_MS, deadline - now()))
     try {
-      const rows = await listNamespaces(tools, deps, budget)
+      const rows = await listNamespaces(tools, deps, budget, namespace.host)
       if (rows !== null) {
         const member = rows.get(namespace.id)
         if (member === undefined) return 'stopped'
         if (member > 1) {
+          // Reference the lowest living member: `pkill --ns` against a dead pid matches nothing.
           await deps.run([tools.pkill, '-KILL', '--ns', String(member), '--nslist', 'mnt'], {
             timeoutMs: Math.max(1, Math.min(COMMAND_CEILING_MS, deadline - now())),
           })
@@ -158,4 +198,93 @@ export async function stopLaunchNamespace(
     }
     await sleep(pollMs)
   }
+}
+
+/**
+ * An extended regular expression that matches `text` literally, written so that it does not match its own text. The
+ * runner's `sudo pkill -f <pattern>` carries the pattern in its own argv, and `pgrep -f` would otherwise count it. The
+ * first alphanumeric character is put in a bracket: `/[h]ome/x` matches `/home/x` but not `/[h]ome/x`.
+ */
+export function selfExcludingPattern(text: string): string {
+  let bracketed = false
+  let pattern = ''
+  for (const char of text) {
+    if (!bracketed && /[A-Z0-9]/i.test(char)) {
+      pattern += `[${char}]`
+      bracketed = true
+    } else if (/[\\^$.|?*+()[\]{}]/.test(char)) {
+      pattern += `\\${char}`
+    } else {
+      pattern += char
+    }
+  }
+  return pattern
+}
+
+/**
+ * Kills every process whose command line carries the gate directory, then confirms none does. The gate directory is unique
+ * to one launch and only the gate shell (and the `sudo` that launched it) carry it: this reaches a launch whose id was never
+ * captured, which the namespace cannot. Confirmation needs positive evidence: `pgrep -c` prints `0` and exits 1 for no
+ * match, so a `sudo` that failed to run is not read as an empty answer.
+ */
+export async function stopGateProcesses(
+  gateDir: string,
+  tools: Pick<SandboxNamespaceTools, 'pgrep' | 'pkill'>,
+  deps: SandboxIdentityDeps,
+  options: {readonly boundMs?: number; readonly pollMs?: number} = {},
+): Promise<NamespaceStopOutcome> {
+  const now = deps.now ?? Date.now
+  const sleep = deps.sleep ?? defaultSleep
+  const deadline = now() + (options.boundMs ?? DEFAULT_STOP_BOUND_MS)
+  const pollMs = options.pollMs ?? DEFAULT_STOP_POLL_MS
+  const pattern = selfExcludingPattern(gateDir)
+
+  for (;;) {
+    const budget = (): {readonly timeoutMs: number} => ({
+      timeoutMs: Math.max(1, Math.min(COMMAND_CEILING_MS, deadline - now())),
+    })
+    try {
+      await deps.run([tools.pkill, '-KILL', '-f', '--', pattern], budget())
+      const count = await deps.run([tools.pgrep, '-c', '-f', '--', pattern], budget())
+      if (count.exitCode === 1 && count.stdout.trim() === '0') return 'stopped'
+    } catch (error) {
+      deps.logger.warning('Stopping the gate processes failed', {error: toErrorMessage(error)})
+    }
+    if (now() >= deadline) {
+      deps.logger.error('The processes at the launch gate could not be confirmed gone')
+      return 'unconfirmed'
+    }
+    await sleep(pollMs)
+  }
+}
+
+/**
+ * Stops everything of one launch and confirms it, whether or not its launcher is alive. The rule:
+ *
+ * - An id was captured (at admission, or by a last read of the gate file now): stop the namespace and confirm it is gone
+ *   from the listing. The launcher's state does not matter.
+ * - No id was captured: no go-ahead was ever given, so the chain cannot be past the gate. The only process it can have is
+ *   the gate shell (or the launcher), found by the gate directory in its command line: kill it and confirm none is left.
+ *
+ * A launcher that exited is never itself the confirmation.
+ */
+export async function stopLaunch(
+  launch: {readonly gateDir: string; readonly admission: LaunchAdmission},
+  tools: SandboxNamespaceTools,
+  deps: SandboxIdentityDeps,
+  gate: Pick<GateDeps, 'readText'>,
+  options: {readonly boundMs?: number; readonly pollMs?: number} = {},
+): Promise<NamespaceStopOutcome> {
+  const {admission} = launch
+  let namespace = admission.kind === 'refused' ? null : admission.namespace
+  if (namespace === null && admission.kind === 'refused' && admission.host !== null) {
+    try {
+      const late = await readGateNamespace(launch.gateDir, admission.host, gate)
+      if (late.kind === 'captured') namespace = late.namespace
+    } catch {
+      // Treated as no id: the gate directory kill below still applies.
+    }
+  }
+  if (namespace !== null) return stopLaunchNamespace(namespace, tools, deps, options)
+  return stopGateProcesses(launch.gateDir, tools, deps, options)
 }

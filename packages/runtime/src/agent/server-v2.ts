@@ -12,6 +12,7 @@ import {toErrorMessage} from '../shared/errors.js'
 import {err, ok} from '../shared/types.js'
 import {filterAgentEnv} from './filter-env.js'
 import {buildSetprivDropArgs} from './sandbox-identity.js'
+import {GATE_GO_FILE, GATE_NS_FILE} from './sandbox-namespace.js'
 
 /**
  * Spawn, authenticate to, gate and shut down a stock OpenCode V2 server (`serve --stdio`).
@@ -209,6 +210,17 @@ export interface OpenCodeV2SandboxView {
   /** `dist/sandbox-view.js` of the published install. */
   readonly builderPath: string
   readonly policy: SandboxViewPolicy
+  /**
+   * The gate that holds the chain at its first step until the runner has captured the launch's namespace id. The directory
+   * is created by the runner for this launch alone and is writable only by it and by root.
+   */
+  readonly gate: {
+    readonly dir: string
+    readonly readlinkPath: string
+    readonly sleepPath: string
+    /** Ticks of 0.1 s the gate waits for the go-ahead before it exits without running anything. */
+    readonly ticks: number
+  }
 }
 
 export interface StartOpenCodeV2ServerOptions {
@@ -429,6 +441,18 @@ function startError(
 
 const SANDBOX_ENV_NAME = /^[A-Z_]\w*$/i
 
+/**
+ * The first step inside the new mount namespace, before anything is built. It writes the id of its own mount namespace to
+ * `$g/ns`, then waits for `$g/go` to hold that same id, which the runner writes only after it has read and validated the
+ * id. It gives up after `$n` ticks of 0.1 s with exit 71 having run nothing; exit 70 when it cannot record the id, 72 when
+ * it cannot wait. Arguments: readlink, sleep, gate directory, ticks, then the rest of the chain.
+ */
+const VIEW_GATE_SCRIPT =
+  'r=$1; s=$2; g=$3; n=$4; shift 4; ' +
+  `id=$("$r" /proc/self/ns/mnt) || exit 70; echo "$id" > "$g/${GATE_NS_FILE}" || exit 70; i=0; ` +
+  `while :; do { read -r v < "$g/${GATE_GO_FILE}"; } 2>/dev/null && [ "$v" = "$id" ] && break; ` +
+  'i=$((i+1)); [ "$i" -gt "$n" ] && exit 71; "$s" 0.1 || exit 72; done; exec "$@"'
+
 /** Runs the builder, then (only if it exited 0) replaces the shell with the rest of the chain. */
 const VIEW_BUILD_SCRIPT = '"$1" "$2" "$3" && shift 3 && exec "$@"'
 /** Moves the old root onto put-old, makes the new root `/`, unmounts the old root lazily, then execs the rest. */
@@ -486,8 +510,8 @@ export function buildSandboxLaunch(
 }
 
 /**
- * The part of a view launch after `sudo --`: `unshare` makes the private mount namespace, a fixed script runs the builder
- * and only then a second fixed script enters the new root, unmounts the old one and runs `command`. `command` is the
+ * The part of a view launch after `sudo --`: `unshare` makes the private mount namespace, a gate script holds the chain
+ * until the runner has captured the namespace id, a second fixed script runs the builder and only then a third fixed script enters the new root, unmounts the old one and runs `command`. `command` is the
  * argv to run inside the view. Exported so the preflight probe runs the same chain as the real launch.
  */
 export function buildSandboxViewChain(view: OpenCodeV2SandboxView, command: readonly string[]): readonly string[] {
@@ -497,6 +521,14 @@ export function buildSandboxViewChain(view: OpenCodeV2SandboxView, command: read
     '--propagation',
     'private',
     '--',
+    view.shPath,
+    '-c',
+    VIEW_GATE_SCRIPT,
+    'sh',
+    view.gate.readlinkPath,
+    view.gate.sleepPath,
+    view.gate.dir,
+    String(view.gate.ticks),
     view.shPath,
     '-c',
     VIEW_BUILD_SCRIPT,

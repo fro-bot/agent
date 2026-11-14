@@ -1,3 +1,4 @@
+import type {LaunchAdmission} from '@fro-bot/runtime'
 import type {SandboxToolPaths} from '../../services/setup/sandbox-preflight.js'
 import type {ExecAdapter, ExecOptions} from '../../services/setup/types.js'
 import type {SandboxLifecycleDeps, SandboxPrepareInput, SignalHost} from './sandbox-lifecycle.js'
@@ -7,7 +8,7 @@ import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import {err, ok} from '@bfra.me/es/result'
-import {createSandboxAccount} from '@fro-bot/runtime'
+import {admitLaunch, createSandboxAccount} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi, type Mock} from 'vitest'
 import {isSignalOwned} from '../../services/setup/adapters.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
@@ -36,6 +37,8 @@ const TOOLS = Object.fromEntries(
     'pivot_root',
     'sh',
     'lsns',
+    'readlink',
+    'sleep',
   ].map(name => [name, `/usr/bin/${name}`]),
 ) as unknown as SandboxToolPaths
 
@@ -51,18 +54,28 @@ interface Harness {
     readonly takeBack: Mock<SandboxLifecycleDeps['takeBack']>
     readonly createViewRoot: Mock<SandboxLifecycleDeps['createViewRoot']>
     readonly readMountInfo: Mock<SandboxLifecycleDeps['readMountInfo']>
-    readonly findNamespace: Mock<SandboxLifecycleDeps['findNamespace']>
-    readonly stopNamespace: Mock<SandboxLifecycleDeps['stopNamespace']>
+    readonly createGate: Mock<SandboxLifecycleDeps['createGate']>
+    readonly admit: Mock<SandboxLifecycleDeps['admit']>
+    readonly stopLaunch: Mock<SandboxLifecycleDeps['stopLaunch']>
     readonly isProcessAlive: Mock<SandboxLifecycleDeps['isProcessAlive']>
   }
   /** What `remove` of the view root was called with, in order. */
   readonly viewRootRemovals: string[]
+  /** The gate directories whose `remove` ran. */
+  readonly gateRemovals: string[]
+  /** What the runner wrote into gate directories. */
+  readonly gateWrites: string[]
+  readonly gateFiles: Map<string, string>
   readonly exec: ExecAdapter
   readonly sudoCalls: string[][]
 }
 
 function createHarness(): Harness {
   const viewRootRemovals: string[] = []
+  const gateRemovals: string[] = []
+  const gateWrites: string[] = []
+  const gateFiles = new Map<string, string>()
+  let gates = 0
   const mocks = {
     createAccount: vi.fn(async () => ok(ACCOUNT)),
     stop: vi.fn(async () => 'stopped' as const),
@@ -73,14 +86,28 @@ function createHarness(): Harness {
     takeBack: vi.fn(async () => ({status: 'restored' as const})),
     createViewRoot: vi.fn(async (runnerTemp: string) => ({
       newRoot: `${runnerTemp}/fro-bot-view-x/root`,
+      gateRoot: `${runnerTemp}/fro-bot-view-x/gates`,
       remove: async () => {
         viewRootRemovals.push(runnerTemp)
       },
     })),
+    createGate: vi.fn((gateRoot: string) => {
+      gates += 1
+      const dir = `${gateRoot}/g-${gates}`
+      return {
+        dir,
+        remove: async () => {
+          gateRemovals.push(dir)
+        },
+      }
+    }),
     readMountInfo: vi.fn(async () => ''),
-    // Nothing was spawned under `launch` unless a test does so, and a launcher that is gone leaves no namespace.
-    findNamespace: vi.fn(async () => ({kind: 'launch-gone' as const})),
-    stopNamespace: vi.fn(async () => 'stopped' as const),
+    // Nothing was spawned under `launch` unless a test does so. The default launch is admitted into its own namespace.
+    admit: vi.fn(async (): Promise<LaunchAdmission> => ({
+      kind: 'admitted',
+      namespace: {id: '4026532399', host: '4026531832'},
+    })),
+    stopLaunch: vi.fn(async () => 'stopped' as const),
     isProcessAlive: vi.fn(() => false),
   }
   const sudoCalls: string[][] = []
@@ -96,8 +123,16 @@ function createHarness(): Harness {
     ...mocks,
     readText: async () => null,
     ids: () => ({uid: 1001, gid: 1001}),
+    gateFiles: {
+      readText: async (file: string) => gateFiles.get(file) ?? null,
+      writeText: async (file: string, content: string) => {
+        gateWrites.push(file)
+        gateFiles.set(file, content)
+      },
+      readHostNamespace: async () => 'mnt:[4026531832]',
+    },
   } as unknown as SandboxLifecycleDeps
-  return {deps, mocks, exec, sudoCalls, viewRootRemovals}
+  return {deps, mocks, exec, sudoCalls, viewRootRemovals, gateRemovals, gateWrites, gateFiles}
 }
 
 function mountLine(id: number, mountPoint: string): string {
@@ -978,7 +1013,13 @@ describe('createSandboxLifecycle', () => {
   describe('the read-only view', () => {
     const prepareInput = {keyFilePaths: [], ghConfigDir: null, repoSkills: null}
     const quietReport = <T>(value: T) => ({value, unconfirmed: false})
-    const FOUND = {kind: 'found' as const, namespace: {id: '4026532399', member: 501, host: '4026531832'}}
+    const NAMESPACE = {id: '4026532399', host: '4026531832'}
+    const admittedLaunch = async (): Promise<LaunchAdmission> => ({kind: 'admitted', namespace: NAMESPACE})
+    const refusedLaunch = async (): Promise<LaunchAdmission> => ({
+      kind: 'refused',
+      host: NAMESPACE.host,
+      reason: 'no-id',
+    })
 
     async function preparedWith(
       input: SandboxPrepareInput = prepareInput,
@@ -1093,41 +1134,68 @@ describe('createSandboxLifecycle', () => {
       expect(unreadable.mocks.takeBack).toHaveBeenCalledTimes(1)
     })
 
-    it('confirms the namespace is empty, then the uid, then takes back', async () => {
-      // #given a launch whose launcher was spawned and whose namespace was found
+    /** Spawns a launcher the way the runtime does: the pid is reported before the server can be started. */
+    const spawnLauncher = (pid = 100) =>
+      async function spawned(context: Parameters<Parameters<ReturnType<typeof create>['launch']>[0]>[0]) {
+        context.noteSpawn(pid)
+        return quietReport('server')
+      }
+
+    it('gives each launch its own gate directory and the view the gate tools', async () => {
+      // #given a prepared sandbox
       const {harness, lifecycle} = await preparedWith()
-      harness.mocks.findNamespace.mockResolvedValue(FOUND)
+      let seen: Parameters<Parameters<typeof lifecycle.launch>[0]>[0] | undefined
+
+      // #when launched
       await lifecycle.launch(async context => {
-        context.noteSpawn(100)
+        seen = context
         return quietReport('server')
       })
+
+      // #then the spec names the gate directory made for this launch, under the view's gate root, and the resolved tools
+      expect(harness.mocks.createGate).toHaveBeenCalledWith(expect.stringMatching(/\/fro-bot-view-x\/gates$/))
+      expect(seen?.spec.view?.gate.dir).toMatch(/\/gates\/g-1$/)
+      expect(seen?.spec.view?.gate).toMatchObject({
+        readlinkPath: '/usr/bin/readlink',
+        sleepPath: '/usr/bin/sleep',
+        ticks: 200,
+      })
+    })
+
+    it('stops and confirms the launch by its gate before the uid sweep and the take-back', async () => {
+      // #given a launch whose launcher was spawned and admitted
+      const {harness, lifecycle} = await preparedWith()
+      await lifecycle.launch(spawnLauncher())
 
       // #when released
       const released = await lifecycle.release()
 
-      // #then the namespace came first, and the launcher's lookup used the pid it was given
+      // #then the admission started for that pid, in the gate directory of the launch, with the closed check
       expect(released).toMatchObject({stop: 'stopped', restore: 'restored'})
-      expect(harness.mocks.findNamespace.mock.calls[0]?.[0]).toBe(100)
-      expect(harness.mocks.stopNamespace).toHaveBeenCalledWith(
-        FOUND.namespace,
+      expect(harness.mocks.admit.mock.calls[0]?.[0]).toBe(100)
+      expect(harness.mocks.admit.mock.calls[0]?.[1]).toMatch(/\/gates\/g-1$/)
+      expect(harness.mocks.stopLaunch).toHaveBeenCalledWith(
+        {gateDir: harness.mocks.admit.mock.calls[0]?.[1], admission: {kind: 'admitted', namespace: NAMESPACE}},
         {pkill: '/usr/bin/pkill', pgrep: '/usr/bin/pgrep', lsns: '/usr/bin/lsns'},
+        expect.anything(),
         expect.anything(),
       )
       const order = [
-        harness.mocks.stopNamespace.mock.invocationCallOrder[0] ?? 0,
+        harness.mocks.stopLaunch.mock.invocationCallOrder[0] ?? 0,
         harness.mocks.stop.mock.invocationCallOrder[0] ?? 0,
         harness.mocks.takeBack.mock.invocationCallOrder[0] ?? 0,
         harness.mocks.deleteAccount.mock.invocationCallOrder[0] ?? 0,
       ]
       expect(order).toEqual(order.toSorted((a, b) => a - b))
       expect(order.every(call => call > 0)).toBe(true)
+      // #and the gate directory and the view root were removed only afterwards
+      expect(harness.gateRemovals).toHaveLength(1)
       expect(harness.viewRootRemovals).toHaveLength(1)
     })
 
-    it('still confirms the namespace and takes the handoff back when the launch failed before the server started', async () => {
+    it('still stops the launch and takes the handoff back when it failed before the server started', async () => {
       // #given a launch that spawned its launcher and then failed (the builder refused)
       const {harness, lifecycle} = await preparedWith()
-      harness.mocks.findNamespace.mockResolvedValue({kind: 'launch-gone'})
       const failed = await lifecycle.launch(async context => {
         context.noteSpawn(100)
         return quietReport('start failed')
@@ -1137,78 +1205,132 @@ describe('createSandboxLifecycle', () => {
       // #when released
       const released = await lifecycle.release()
 
-      // #then the handoff was taken back and the account removed
+      // #then
       expect(released).toMatchObject({stop: 'stopped', restore: 'restored'})
+      expect(harness.mocks.stopLaunch).toHaveBeenCalledTimes(1)
       expect(harness.mocks.takeBack).toHaveBeenCalledTimes(1)
       expect(harness.mocks.deleteAccount).toHaveBeenCalledTimes(1)
     })
 
-    it('is unsafe, keeps the account and takes nothing back when a namespace member remains', async () => {
-      // #given a namespace that cannot be confirmed empty
+    it('id captured, launcher dead: the stop still runs and the result follows its outcome', async () => {
+      // #given a launcher that is gone and members that may remain
       const {harness, lifecycle} = await preparedWith()
-      harness.mocks.findNamespace.mockResolvedValue(FOUND)
-      harness.mocks.stopNamespace.mockResolvedValue('unconfirmed')
-      await lifecycle.launch(async context => {
-        context.noteSpawn(100)
-        return quietReport('server')
-      })
+      harness.mocks.isProcessAlive.mockReturnValue(false)
+      await lifecycle.launch(spawnLauncher())
+
+      // #when the stop confirms nothing is left
+      const restored = await lifecycle.release()
+
+      // #then the dead launcher was no reason to skip it
+      expect(restored).toMatchObject({stop: 'stopped', restore: 'restored'})
+      expect(harness.mocks.stopLaunch).toHaveBeenCalledTimes(1)
+    })
+
+    it.each([
+      ['id captured', admittedLaunch],
+      ['no id captured', refusedLaunch],
+    ])('%s, launcher dead, stop unconfirmed: unsafe, account kept, nothing taken back', async (_label, admission) => {
+      // #given a launcher that is dead and a stop that cannot confirm
+      const {harness, lifecycle} = await preparedWith()
+      harness.mocks.isProcessAlive.mockReturnValue(false)
+      harness.mocks.admit.mockImplementation(admission)
+      harness.mocks.stopLaunch.mockResolvedValue('unconfirmed')
+      await lifecycle.launch(spawnLauncher())
 
       // #when released
       const released = await lifecycle.release()
 
-      // #then
+      // #then a dead launcher did not make it restored
       expect(released).toMatchObject({stop: 'unconfirmed', restore: 'unsafe'})
-      expect(released.reason).toContain('namespace')
+      expect(released.reason).toContain('launch')
       expect(harness.mocks.takeBack).not.toHaveBeenCalled()
       expect(harness.mocks.deleteAccount).not.toHaveBeenCalled()
       expect(harness.viewRootRemovals).toHaveLength(0)
+      expect(harness.gateRemovals).toHaveLength(0)
     })
 
-    it('is unsafe when the namespace cannot be identified and the launcher has not exited', async () => {
-      // #given a launcher that is alive and whose namespace was never seen
+    it('no id captured, launcher dead, the gate processes confirmed gone: restored', async () => {
+      // #given a launcher that died at the gate, whose gate shell the stop killed and counted
       const {harness, lifecycle} = await preparedWith()
-      harness.mocks.findNamespace.mockResolvedValue({kind: 'unidentified'})
-      harness.mocks.isProcessAlive.mockReturnValue(true)
-      await lifecycle.launch(async context => {
-        context.noteSpawn(100)
-        return quietReport('server')
-      })
+      harness.mocks.isProcessAlive.mockReturnValue(false)
+      harness.mocks.admit.mockImplementation(refusedLaunch)
+      await lifecycle.launch(spawnLauncher())
 
       // #when released
       const released = await lifecycle.release()
 
-      // #then it is unsafe and nothing was killed on a guess
-      expect(released).toMatchObject({restore: 'unsafe'})
-      expect(released.reason).toContain('could not be identified')
-      expect(harness.mocks.stopNamespace).not.toHaveBeenCalled()
-      expect(harness.mocks.takeBack).not.toHaveBeenCalled()
-      expect(harness.mocks.deleteAccount).not.toHaveBeenCalled()
+      // #then the stop was asked with the refused admission, and the run is restored
+      expect(harness.mocks.stopLaunch.mock.calls[0]?.[0].admission.kind).toBe('refused')
+      expect(released).toMatchObject({stop: 'stopped', restore: 'restored'})
     })
 
-    it('accepts an unidentified namespace once the launcher has exited', async () => {
-      // #given a launcher that exited before its namespace was seen
+    it('never gives the go-ahead to a launcher that died before its id was captured', async () => {
+      // #given the real admission, a dead launcher and a gate that never wrote its id
       const {harness, lifecycle} = await preparedWith()
-      harness.mocks.findNamespace.mockResolvedValue({kind: 'unidentified'})
+      harness.mocks.admit.mockImplementation(admitLaunch)
       harness.mocks.isProcessAlive.mockReturnValue(false)
+      harness.mocks.stopLaunch.mockResolvedValue('unconfirmed')
+      await lifecycle.launch(spawnLauncher())
+
+      // #when released
+      const released = await lifecycle.release()
+
+      // #then the gate was never opened and the result is not restored
+      expect(harness.gateWrites).toEqual([])
+      expect(released).toMatchObject({restore: 'unsafe'})
+      expect(harness.mocks.takeBack).not.toHaveBeenCalled()
+    })
+
+    it('never gives the go-ahead once the teardown has begun, however the id arrives', async () => {
+      // #given the real admission, a live launcher, and a gate that has not reported yet
+      const {harness, lifecycle} = await preparedWith()
+      harness.mocks.admit.mockImplementation(admitLaunch)
+      harness.mocks.isProcessAlive.mockReturnValue(true)
+      let gateDir = ''
       await lifecycle.launch(async context => {
         context.noteSpawn(100)
+        gateDir = context.spec.view?.gate.dir ?? ''
         return quietReport('server')
       })
 
-      // #when released
-      // #then the exit is the evidence, and the run is restored
-      expect(await lifecycle.release()).toMatchObject({restore: 'restored'})
+      // #when the release begins and only then does the gate report its id
+      const releasing = lifecycle.release()
+      harness.gateFiles.set(`${gateDir}/ns`, 'mnt:[4026532399]\n')
+      harness.mocks.isProcessAlive.mockReturnValue(false)
+      await releasing
+
+      // #then no go-ahead was written, and the stop was handed the id that was seen or none
+      expect(harness.gateWrites).toEqual([])
+      expect(harness.mocks.stopLaunch).toHaveBeenCalledTimes(1)
+    })
+
+    it('gives the go-ahead exactly once for a valid id while the launch is live', async () => {
+      // #given the real admission and a gate that reported a valid id
+      const {harness, lifecycle} = await preparedWith()
+      harness.mocks.admit.mockImplementation(admitLaunch)
+      harness.mocks.isProcessAlive.mockReturnValue(true)
+      await lifecycle.launch(async context => {
+        harness.gateFiles.set(`${context.spec.view?.gate.dir}/ns`, 'mnt:[4026532399]\n')
+        context.noteSpawn(100)
+        return quietReport('server')
+      })
+      await vi.waitFor(() => {
+        expect(harness.gateWrites).toHaveLength(1)
+      })
+
+      // #then the go-ahead names that id, in that gate directory
+      const [file] = harness.gateWrites
+      expect(file).toMatch(/\/gates\/g-1\/go$/)
+      expect(harness.gateFiles.get(file ?? '')).toBe('mnt:[4026532399]\n')
+      harness.mocks.isProcessAlive.mockReturnValue(false)
+      await lifecycle.release()
     })
 
     it('kills the launcher’s group when it outlives its namespace, and is unsafe if it still does not exit', async () => {
       // #given a namespace that stops but a launcher that stays alive
       const {harness, lifecycle} = await preparedWith()
-      harness.mocks.findNamespace.mockResolvedValue(FOUND)
       harness.mocks.isProcessAlive.mockReturnValue(true)
-      await lifecycle.launch(async context => {
-        context.noteSpawn(100)
-        return quietReport('server')
-      })
+      await lifecycle.launch(spawnLauncher())
 
       // #when released (the real clock would take a few seconds: shorten what the launcher wait polls)
       vi.useFakeTimers()
@@ -1226,10 +1348,9 @@ describe('createSandboxLifecycle', () => {
       }
     })
 
-    it('ends with the namespace confirmed empty when a signal arrives during the build, with no server started', async () => {
+    it('ends with the launch stopped when a signal arrives during the build, with no server started', async () => {
       // #given a launch that has spawned its launcher and is still building the view
       const {harness, host, lifecycle} = await preparedWith()
-      harness.mocks.findNamespace.mockResolvedValue(FOUND)
       const launching = lifecycle.launch(async context => {
         context.noteSpawn(100)
         // The build: nothing happens until the lifecycle aborts the attempt, as the runtime does on `signal`.
@@ -1239,7 +1360,7 @@ describe('createSandboxLifecycle', () => {
         return {value: 'start aborted', unconfirmed: false}
       })
       await vi.waitFor(() => {
-        expect(harness.mocks.findNamespace).toHaveBeenCalled()
+        expect(harness.mocks.admit).toHaveBeenCalled()
       })
 
       // #when SIGTERM arrives
@@ -1249,23 +1370,41 @@ describe('createSandboxLifecycle', () => {
       })
       await launching
 
-      // #then the namespace was stopped before the take-back, and no server ever started
-      expect(harness.mocks.stopNamespace).toHaveBeenCalledTimes(1)
-      expect(harness.mocks.stopNamespace.mock.invocationCallOrder[0]).toBeLessThan(
+      // #then the launch was stopped before the take-back
+      expect(harness.mocks.stopLaunch).toHaveBeenCalledTimes(1)
+      expect(harness.mocks.stopLaunch.mock.invocationCallOrder[0]).toBeLessThan(
         harness.mocks.takeBack.mock.invocationCallOrder[0] ?? 0,
       )
     })
 
-    it('runs no namespace command and builds no view when nothing was launched', async () => {
+    it('refuses the launch, starting nothing, when its gate directory cannot be created', async () => {
+      // #given a runner temp that refuses the gate directory
+      const {harness, lifecycle} = await preparedWith()
+      harness.mocks.createGate.mockImplementation(() => {
+        throw new Error('EACCES')
+      })
+      const spawn = vi.fn(async () => quietReport('x'))
+
+      // #when launched
+      const launched = await lifecycle.launch(spawn)
+
+      // #then the spawn never ran, and the run can still be released cleanly
+      expect(launched.success).toBe(false)
+      expect(spawn).not.toHaveBeenCalled()
+      expect(await lifecycle.release()).toMatchObject({restore: 'restored'})
+      expect(harness.mocks.stopLaunch).not.toHaveBeenCalled()
+    })
+
+    it('runs no launch stop and builds no view when nothing was launched', async () => {
       // #given a prepared sandbox that never launched
       const {harness, lifecycle} = await preparedWith()
 
       // #when released
       await lifecycle.release()
 
-      // #then no namespace was looked up or stopped, and no pkill/pgrep/lsns ran for one
-      expect(harness.mocks.findNamespace).not.toHaveBeenCalled()
-      expect(harness.mocks.stopNamespace).not.toHaveBeenCalled()
+      // #then no admission or stop ran, and no pkill/pgrep/lsns ran for one
+      expect(harness.mocks.admit).not.toHaveBeenCalled()
+      expect(harness.mocks.stopLaunch).not.toHaveBeenCalled()
       expect(harness.sudoCalls.some(call => call.includes('lsns'))).toBe(false)
     })
   })

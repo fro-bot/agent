@@ -278,10 +278,21 @@ export type {
   SandboxIdentityTools,
   SandboxStopOutcome,
 } from './sandbox-identity.js'
-export {findLaunchNamespace, stopLaunchNamespace} from './sandbox-namespace.js'
+export {
+  admitLaunch,
+  GATE_GO_FILE,
+  GATE_NS_FILE,
+  parseNamespaceId,
+  readGateNamespace,
+  selfExcludingPattern,
+  stopGateProcesses,
+  stopLaunch,
+  stopLaunchNamespace,
+} from './sandbox-namespace.js'
 export type {
+  GateDeps,
+  LaunchAdmission,
   LaunchNamespace,
-  LaunchNamespaceLookup,
   NamespaceStopOutcome,
   SandboxNamespaceTools,
 } from './sandbox-namespace.js'

@@ -1,11 +1,11 @@
 import type {Fixture} from './server-v2-test-kit.js'
 import type {OpenCodeV2SandboxLaunch, OpenCodeV2SandboxView, OpenCodeV2ServerHandle} from './server-v2.js'
-import {spawnSync} from 'node:child_process'
-import {chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs'
+import {spawn, spawnSync} from 'node:child_process'
+import {chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
-import {afterEach, describe, expect, it} from 'vitest'
+import {afterEach, describe, expect, it, vi} from 'vitest'
 import {createFixture} from './server-v2-test-kit.js'
 import {buildSandboxLaunch, startOpenCodeV2Server} from './server-v2.js'
 
@@ -206,7 +206,12 @@ child.on('exit', code => process.exit(code ?? 0))
   })
 })
 
-/** The two fixed scripts of the view launch. They take every path as a positional argument. */
+/** The three fixed scripts of the view launch. They take every path as a positional argument. */
+const GATE_SCRIPT =
+  'r=$1; s=$2; g=$3; n=$4; shift 4; ' +
+  'id=$("$r" /proc/self/ns/mnt) || exit 70; echo "$id" > "$g/ns" || exit 70; i=0; ' +
+  'while :; do { read -r v < "$g/go"; } 2>/dev/null && [ "$v" = "$id" ] && break; ' +
+  'i=$((i+1)); [ "$i" -gt "$n" ] && exit 71; "$s" 0.1 || exit 72; done; exec "$@"'
 const BUILD_SCRIPT = '"$1" "$2" "$3" && shift 3 && exec "$@"'
 const ENTER_SCRIPT = '"$1" "$2" "$3" && cd / && "$4" -l "$5" && shift 5 && exec "$@"'
 
@@ -225,6 +230,12 @@ const VIEW: OpenCodeV2SandboxView = {
     readOnly: [],
     runnerHome: '/home/runner',
     actionsDir: '/home/runner/work/_actions',
+  },
+  gate: {
+    dir: '/home/runner/work/_temp/fro-bot-view-AbC123/g-XyZ789',
+    readlinkPath: '/usr/bin/readlink',
+    sleepPath: '/usr/bin/sleep',
+    ticks: 200,
   },
 }
 
@@ -250,6 +261,14 @@ describe('buildSandboxLaunch with a read-only view', () => {
       '--propagation',
       'private',
       '--',
+      '/usr/bin/sh',
+      '-c',
+      GATE_SCRIPT,
+      'sh',
+      '/usr/bin/readlink',
+      '/usr/bin/sleep',
+      '/home/runner/work/_temp/fro-bot-view-AbC123/g-XyZ789',
+      '200',
       '/usr/bin/sh',
       '-c',
       BUILD_SCRIPT,
@@ -336,7 +355,9 @@ describe('buildSandboxLaunch with a read-only view', () => {
     expect(
       (JSON.parse(built.args.find(arg => arg.startsWith('{"newRoot"')) ?? '{}') as {writable: string[]}).writable,
     ).toEqual([`/work/${hostile}`])
-    expect(built.args.filter(arg => arg === BUILD_SCRIPT || arg === ENTER_SCRIPT)).toHaveLength(2)
+    expect(built.args.filter(arg => arg === GATE_SCRIPT || arg === BUILD_SCRIPT || arg === ENTER_SCRIPT)).toHaveLength(
+      3,
+    )
   })
 
   it('omits the preserve-env option when there is nothing to preserve', () => {
@@ -357,6 +378,10 @@ describe('buildSandboxLaunch with a read-only view', () => {
     expect(built.args.slice(3, 5)).toEqual(['/usr/bin/setpriv', '--reuid=998'])
   })
 })
+
+const NAMESPACE_LINK = 'mnt:[777]'
+
+const serverRan = (dir: string): boolean => existsSync(path.join(dir, 'server-ran'))
 
 function script(dir: string, name: string, body: string): string {
   const file = path.join(dir, name)
@@ -388,6 +413,7 @@ describe('the view launch chain, run for real with stand-in privileged tools', (
   function standIns(
     builderBody: string,
     pivotBody = 'true',
+    gate: {readonly ticks?: number; readonly go?: string | null; readonly readlinkBody?: string} = {},
   ): {
     readonly view: OpenCodeV2SandboxView
     readonly spec: OpenCodeV2SandboxLaunch
@@ -399,8 +425,22 @@ describe('the view launch chain, run for real with stand-in privileged tools', (
     const log = path.join(dir, 'log')
     const builder = path.join(dir, 'builder.js')
     writeFileSync(builder, builderBody)
+    const gateDir = path.join(dir, 'gate')
+    mkdirSync(gateDir)
+    // The runner side's go-ahead, in place before the launch unless a test withholds it.
+    if (gate.go !== null) writeFileSync(path.join(gateDir, 'go'), gate.go ?? `${NAMESPACE_LINK}\n`)
     const view: OpenCodeV2SandboxView = {
       ...VIEW,
+      gate: {
+        dir: gateDir,
+        readlinkPath: script(
+          dir,
+          'readlink',
+          gate.readlinkBody ?? `echo "$1" >> ${log}.readlink\necho '${NAMESPACE_LINK}'`,
+        ),
+        sleepPath: '/bin/sleep',
+        ticks: gate.ticks ?? 50,
+      },
       unsharePath: script(dir, 'unshare', 'shift 4\nexec "$@"'),
       shPath: '/bin/sh',
       pivotRootPath: script(dir, 'pivot_root', `echo "pivot $1 $2" >> ${log}\n${pivotBody}`),
@@ -415,6 +455,13 @@ describe('the view launch chain, run for real with stand-in privileged tools', (
       envPath: script(dir, 'env', 'cd "$2" || exit 97\nshift 2\nexec /usr/bin/env "$@"'),
     })
     return {view, spec, dir, log}
+  }
+
+  /** The stand-ins plus a server that leaves a marker, so a test can tell whether the chain got that far. */
+  function counted(builderBody: string, gate: Parameters<typeof standIns>[2]) {
+    const made = standIns(builderBody, 'true', gate)
+    const server = script(made.dir, 'opencode', `echo ran > ${path.join(made.dir, 'server-ran')}`)
+    return {...made, server}
   }
 
   it('never executes the server when the builder exits non-zero, and passes its exit code on', () => {
@@ -465,6 +512,109 @@ describe('the view launch chain, run for real with stand-in privileged tools', (
     ])
     expect(readFileSync(path.join(dir, 'cwd'), 'utf8').trim()).toBe(work)
     expect(readFileSync(path.join(dir, 'arg'), 'utf8').trim()).toBe('serve')
+  })
+
+  describe('the gate', () => {
+    it('records the id of its own namespace before anything else runs, and lets the chain continue on a matching go-ahead', () => {
+      // #given a go-ahead that names the id the gate will report
+      const made = counted('process.exit(0)', {})
+      const marker = path.join(made.dir, 'builder-ran')
+      writeFileSync(made.view.builderPath, `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'x')`)
+
+      // #when the chain runs
+      const result = runChain(made.spec, made.server, made.dir)
+
+      // #then the id was recorded where the runner reads it, read from the process's own namespace link, and the chain went on
+      expect(readFileSync(path.join(made.view.gate.dir, 'ns'), 'utf8')).toBe(`${NAMESPACE_LINK}\n`)
+      expect(readFileSync(`${made.log}.readlink`, 'utf8').trim()).toBe('/proc/self/ns/mnt')
+      expect(result.status).toBe(0)
+      expect(existsSync(marker)).toBe(true)
+      expect(serverRan(made.dir)).toBe(true)
+    })
+
+    it('exits without running the builder, the pivot or the server when no go-ahead comes within its bound', () => {
+      // #given no go-ahead and a bound of three ticks
+      const made = counted('process.exit(0)', {go: null, ticks: 3})
+
+      // #when the chain runs
+      const result = runChain(made.spec, made.server, made.dir)
+
+      // #then it gave up with the gate's own exit code having recorded its id, and nothing past the gate ran
+      expect(result.status).toBe(71)
+      expect(existsSync(path.join(made.view.gate.dir, 'ns'))).toBe(true)
+      expect(existsSync(made.log)).toBe(false)
+      expect(serverRan(made.dir)).toBe(false)
+    })
+
+    it('does not accept a go-ahead that names another namespace', () => {
+      // #given a go-ahead for some other id
+      const made = counted('process.exit(0)', {go: 'mnt:[999]\n', ticks: 3})
+
+      // #when the chain runs
+      const result = runChain(made.spec, made.server, made.dir)
+
+      // #then
+      expect(result.status).toBe(71)
+      expect(serverRan(made.dir)).toBe(false)
+      expect(existsSync(made.log)).toBe(false)
+    })
+
+    it('does not accept an empty or partial go-ahead', () => {
+      // #given a go-ahead file that is still empty
+      const made = counted('process.exit(0)', {go: '', ticks: 3})
+
+      // #when the chain runs
+      const result = runChain(made.spec, made.server, made.dir)
+
+      // #then
+      expect(result.status).toBe(71)
+      expect(serverRan(made.dir)).toBe(false)
+    })
+
+    it('exits without running anything when its own namespace id cannot be read', () => {
+      // #given a readlink that fails
+      const made = counted('process.exit(0)', {readlinkBody: 'exit 1', ticks: 3})
+
+      // #when the chain runs
+      const result = runChain(made.spec, made.server, made.dir)
+
+      // #then
+      expect(result.status).toBe(70)
+      expect(serverRan(made.dir)).toBe(false)
+    })
+
+    it('exits without running anything when it cannot record its id', () => {
+      // #given a gate directory that does not exist
+      const made = counted('process.exit(0)', {go: null, ticks: 3})
+      rmSync(made.view.gate.dir, {recursive: true, force: true})
+
+      // #when the chain runs
+      const result = runChain(made.spec, made.server, made.dir)
+
+      // #then
+      expect(result.status).toBe(70)
+      expect(serverRan(made.dir)).toBe(false)
+    })
+
+    it('waits for a go-ahead that arrives after it started, and then runs the chain', async () => {
+      // #given no go-ahead yet, and a runner that writes it shortly after the gate has reported
+      const made = counted('process.exit(0)', {go: null, ticks: 100})
+      const built = buildSandboxLaunch(made.spec, made.server, ['serve'], {}, made.dir)
+      const rest = built.args.slice(built.args.indexOf('--') + 1)
+      const child = spawn(rest[0] ?? '', rest.slice(1))
+      const exited = new Promise<number | null>(resolve => child.once('exit', code => resolve(code)))
+      const goFile = path.join(made.view.gate.dir, 'go')
+      const nsFile = path.join(made.view.gate.dir, 'ns')
+
+      // #when the runner reads the id and then writes the go-ahead
+      await vi.waitFor(() => expect(existsSync(nsFile)).toBe(true), {timeout: 5000})
+      expect(serverRan(made.dir)).toBe(false)
+      writeFileSync(goFile, readFileSync(nsFile, 'utf8'))
+
+      // #then the chain ran to the server
+      expect(await exited).toBe(0)
+      expect(serverRan(made.dir)).toBe(true)
+    })
   })
 })
 

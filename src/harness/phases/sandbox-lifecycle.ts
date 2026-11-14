@@ -1,6 +1,7 @@
 import type {Result} from '@bfra.me/es/result'
 import type {
-  LaunchNamespaceLookup,
+  GateDeps,
+  LaunchAdmission,
   OpenCodeV2SandboxLaunch,
   OpenCodeV2SandboxView,
   PrivilegedRun,
@@ -19,6 +20,7 @@ import type {SandboxToolPaths} from '../../services/setup/sandbox-preflight.js'
 import type {ExecAdapter} from '../../services/setup/types.js'
 import type {Logger} from '../../shared/logger.js'
 import {Buffer} from 'node:buffer'
+import * as fsSync from 'node:fs'
 import * as fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -26,13 +28,15 @@ import process from 'node:process'
 import {fileURLToPath} from 'node:url'
 import {err, ok} from '@bfra.me/es/result'
 import {
+  admitLaunch,
   buildRunAsSandboxArgv,
   createAttachmentDirExclusive,
   createSandboxAccount,
   deleteSandboxAccount,
-  findLaunchNamespace,
+  GATE_GO_FILE,
+  GATE_NS_FILE,
   parseMountInfo,
-  stopLaunchNamespace,
+  stopLaunch,
   stopSandboxProcesses,
   validateViewPolicy,
 } from '@fro-bot/runtime'
@@ -213,14 +217,22 @@ export interface SandboxLifecycleDeps {
   readonly takeBack: typeof takeBack
   readonly readText: (absolutePath: string) => Promise<string | null>
   readonly ids: () => {readonly uid: number; readonly gid: number}
-  /** A fresh, empty directory under `runnerTemp` for the view's root, and how to remove it once the namespace is gone. */
-  readonly createViewRoot: (
-    runnerTemp: string,
-  ) => Promise<{readonly newRoot: string; readonly remove: () => Promise<void>}>
+  /**
+   * A fresh, empty directory under `runnerTemp` for the view's root and for the gates of its launches (`gateRoot`), and
+   * how to remove it once every namespace is gone. Only the runner and root can write there.
+   */
+  readonly createViewRoot: (runnerTemp: string) => Promise<{
+    readonly newRoot: string
+    readonly gateRoot: string
+    readonly remove: () => Promise<void>
+  }>
+  /** One launch's gate directory under `gateRoot`: where the gate reports its namespace id and waits for the go-ahead. */
+  readonly createGate: (gateRoot: string) => {readonly dir: string; readonly remove: () => Promise<void>}
   /** The host's `/proc/self/mountinfo`. */
   readonly readMountInfo: () => Promise<string>
-  readonly findNamespace: typeof findLaunchNamespace
-  readonly stopNamespace: typeof stopLaunchNamespace
+  readonly gateFiles: Pick<GateDeps, 'readHostNamespace' | 'readText' | 'writeText'>
+  readonly admit: typeof admitLaunch
+  readonly stopLaunch: typeof stopLaunch
   readonly isProcessAlive: (pid: number) => boolean
 }
 
@@ -235,28 +247,52 @@ const defaultDeps: SandboxLifecycleDeps = {
   createViewRoot: async runnerTemp => {
     const directory = await fs.mkdtemp(path.join(runnerTemp, 'fro-bot-view-'))
     const newRoot = path.join(directory, 'root')
+    const gateRoot = path.join(directory, 'gates')
     await fs.mkdir(newRoot)
+    await fs.mkdir(gateRoot)
     return {
       newRoot,
+      gateRoot,
       // Plain `rmdir`, never recursive: the new root was a mount point of a namespace that is gone, and nothing may be
       // deleted through a mount that might still exist.
       remove: async () => {
+        await fs.rmdir(gateRoot)
         await fs.rmdir(newRoot)
         await fs.rmdir(directory)
       },
     }
   },
+  // Synchronous: the launch registers its attempt and calls the spawn without yielding, so a release cannot slip in between.
+  createGate: gateRoot => {
+    const dir = fsSync.mkdtempSync(path.join(gateRoot, 'g-'))
+    return {
+      dir,
+      // The gate's own files, by name. The id file belongs to root: the runner removes it as the owner of the directory.
+      remove: async () => {
+        for (const name of [GATE_NS_FILE, GATE_GO_FILE]) await fs.rm(path.join(dir, name), {force: true})
+        await fs.rmdir(dir)
+      },
+    }
+  },
   readMountInfo: async () => fs.readFile('/proc/self/mountinfo', 'utf8'),
-  findNamespace: findLaunchNamespace,
-  stopNamespace: stopLaunchNamespace,
+  gateFiles: {
+    readText: async file => fs.readFile(file, 'utf8').catch(() => null),
+    // `wx`: the go-ahead is created once and never overwritten.
+    writeText: async (file, content) => fs.writeFile(file, content, {flag: 'wx', mode: 0o600}),
+    readHostNamespace: async () => fs.readlink('/proc/self/ns/mnt').catch(() => null),
+  },
+  admit: admitLaunch,
+  stopLaunch,
   isProcessAlive,
 }
 
 /** Where the view's old root is moved before it is unmounted. An empty directory on every supported image. */
 const VIEW_PUT_OLD = '/mnt'
 
-/** Longest the teardown looks for a launch's namespace. Shorter than the signal teardown budget. */
-const NAMESPACE_FIND_BOUND_MS = 5000
+/** Longest the runner waits for a launch's gate to report its namespace. Shorter than the gate's own bound. */
+const GATE_ADMIT_BOUND_MS = 10_000
+/** Ticks of 0.1 s the gate waits for the go-ahead: 20 s at least, so it outlasts the runner's wait. */
+const GATE_TICKS = 200
 /** Longest the teardown waits for the launcher itself to be gone once its namespace is. */
 const LAUNCHER_EXIT_BOUND_MS = 3000
 
@@ -388,10 +424,17 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   const pendingLaunches = new Map<Promise<unknown>, AbortController>()
   // Set when a launcher could not confirm its own cleanup (or threw): the uid sweep cannot be trusted.
   let launchUnconfirmed = false
-  // Every launcher spawned under `launch`, with the lookup of its mount namespace that started the moment it was spawned.
-  const launches: {readonly pid: number; readonly lookup: Promise<LaunchNamespaceLookup>}[] = []
+  // Every launcher spawned under `launch`, with the admission that started the moment it was spawned: the runner reads the
+  // launch's namespace id from its gate and gives the go-ahead, or does not.
+  const launches: {
+    readonly pid: number
+    readonly gateDir: string
+    readonly admission: Promise<LaunchAdmission>
+  }[] = []
+  // The gate directories created for launches, removed with the view's root once every namespace is confirmed empty.
+  const gateRemovers: (() => Promise<void>)[] = []
   // The view's root directory, removed once the namespace is confirmed empty.
-  let viewRoot: {readonly remove: () => Promise<void>} | null = null
+  let viewRoot: {readonly gateRoot: string; readonly remove: () => Promise<void>} | null = null
   // The key proxy: at most one, started through `startKeyProxy`, stopped last by the teardown.
   let proxy: OwnedKeyProxy | null = null
   let proxyStart: Promise<unknown> | undefined
@@ -502,26 +545,30 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   }
 
   /**
-   * Stops and confirms every launch spawned under `launch`. Null when none is left; else why one could not be confirmed.
-   * A launch whose namespace was never identified is only acceptable if its launcher has exited, because the launcher is
-   * the parent of every process of the launch.
+   * Stops and confirms every launch spawned under `launch`, whether or not its launcher is alive. Null when none is left;
+   * else why one could not be confirmed. The launcher's exit is never the confirmation: a group kill of `sudo` leaves its
+   * root child running, out of the runner's reach. What confirms a launch is `stopLaunch`: the namespace it was admitted
+   * under, or, for a launch whose id was never captured (and which therefore never got the go-ahead), its gate processes.
    */
   const stopLaunches = async (): Promise<string | null> => {
     let problem: string | null = null
     for (const launched of launches) {
-      let lookup: LaunchNamespaceLookup
+      let admission: LaunchAdmission
       try {
-        lookup = await launched.lookup
+        admission = await launched.admission
       } catch {
-        lookup = {kind: 'unidentified'}
+        admission = {kind: 'refused', host: null, reason: 'no-id'}
       }
-      if (lookup.kind === 'found') {
-        const outcome = await deps.stopNamespace(lookup.namespace, namespaceTools, identityDeps())
-        if (outcome !== 'stopped') problem ??= 'the launch namespace still had members after the kill bound'
-      } else if (lookup.kind === 'unidentified' && deps.isProcessAlive(launched.pid)) {
-        problem ??= 'the launch namespace could not be identified and its launcher had not exited'
+      const outcome = await deps.stopLaunch(
+        {gateDir: launched.gateDir, admission},
+        namespaceTools,
+        identityDeps(),
+        deps.gateFiles,
+      )
+      if (outcome !== 'stopped') {
+        problem ??= 'a launch could not be confirmed stopped: its namespace or its gate still had processes'
+        continue
       }
-      if (problem !== null) continue
       // The launcher is a process of the launch too (the runner cannot signal it): it exits once its child has.
       if (!(await launcherGone(launched.pid, LAUNCHER_EXIT_BOUND_MS))) {
         await run([tools.pkill, '-KILL', '-g', String(launched.pid)])
@@ -535,6 +582,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     const current = viewRoot
     viewRoot = null
     try {
+      for (const remove of gateRemovers.splice(0)) await remove()
       await current?.remove()
     } catch (error) {
       logger.warning('The read-only view directory could not be removed', {error: toErrorMessage(error)})
@@ -697,18 +745,37 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     const controller = new AbortController()
     const report = (async (): Promise<Result<unknown, string>> => {
       try {
+        const prepared = launchSpec
+        const root = viewRoot
+        if (prepared === null || root === null || prepared.view === undefined) {
+          return err('the sandbox has no read-only view to launch into')
+        }
+        // This launch's own gate, made before anything is spawned. A failure here has started nothing.
+        let gate: ReturnType<SandboxLifecycleDeps['createGate']>
+        try {
+          gate = deps.createGate(root.gateRoot)
+        } catch (error) {
+          logger.warning('The launch gate directory could not be created', {error: toErrorMessage(error)})
+          return err('isolate-agent could not create the gate directory of its launch')
+        }
+        gateRemovers.push(gate.remove)
+        const spec: OpenCodeV2SandboxLaunch = {
+          ...prepared,
+          view: {...prepared.view, gate: {...prepared.view.gate, dir: gate.dir}},
+        }
         const done = await spawn({
-          spec: launchSpec,
+          spec,
           signal: controller.signal,
           noteSpawn: pid => {
             launches.push({
               pid,
-              lookup: deps
-                .findNamespace(pid, namespaceTools, identityDeps(), {
-                  isAlive: deps.isProcessAlive,
-                  boundMs: NAMESPACE_FIND_BOUND_MS,
-                })
-                .catch((): LaunchNamespaceLookup => ({kind: 'unidentified'})),
+              gateDir: gate.dir,
+              admission: deps.admit(
+                pid,
+                gate.dir,
+                {...deps.gateFiles, isAlive: deps.isProcessAlive},
+                {isClosed: () => admissionClosed || cancelled, boundMs: GATE_ADMIT_BOUND_MS},
+              ),
             })
           },
         })
@@ -897,6 +964,8 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       nodePath: viewLauncher.nodePath,
       builderPath: viewLauncher.builderPath,
       policy,
+      // `dir` is each launch's own gate directory, made under `gateRoot` when the launch starts.
+      gate: {dir: root.gateRoot, readlinkPath: tools.readlink, sleepPath: tools.sleep, ticks: GATE_TICKS},
     })
   }
 

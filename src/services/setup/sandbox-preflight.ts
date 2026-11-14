@@ -36,13 +36,16 @@ export const SANDBOX_TOOL_NAMES = [
   // The git credential helper of the provisioned `gh` token (provision mode), so the model's `git push` authenticates.
   'gh',
   // The read-only view: a private mount namespace, the bind and remount tools, the old root's removal, and the namespace
-  // listing the teardown reads. The sequencing shell runs the two fixed scripts of the launch.
+  // listing the teardown reads. The sequencing shell runs the three fixed scripts of the launch; the first of them (the
+  // gate) reads its own namespace id with `readlink` and waits for the runner's go-ahead with `sleep`.
   'unshare',
   'mount',
   'umount',
   'pivot_root',
   'sh',
   'lsns',
+  'readlink',
+  'sleep',
 ] as const
 
 export type SandboxToolName = (typeof SANDBOX_TOOL_NAMES)[number]

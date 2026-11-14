@@ -1,13 +1,24 @@
+import type {LaunchAdmission} from '@fro-bot/runtime'
 import type {SandboxViewProbeDeps, ViewProbeInput} from './sandbox-view-probe.js'
 import {describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {probeSandboxView} from './sandbox-view-probe.js'
 
 const TOOLS = Object.fromEntries(
-  ['sudo', 'unshare', 'sh', 'pivot_root', 'umount', 'mount', 'setpriv', 'lsns', 'pkill', 'pgrep'].map(name => [
-    name,
-    `/usr/bin/${name}`,
-  ]),
+  [
+    'sudo',
+    'unshare',
+    'sh',
+    'pivot_root',
+    'umount',
+    'mount',
+    'setpriv',
+    'lsns',
+    'pkill',
+    'pgrep',
+    'readlink',
+    'sleep',
+  ].map(name => [name, `/usr/bin/${name}`]),
 ) as unknown as ViewProbeInput['tools']
 
 const INPUT: ViewProbeInput = {
@@ -22,9 +33,14 @@ const INPUT: ViewProbeInput = {
 const FIXTURE = {
   dir: '/home/runner/work/_temp/probe-1',
   newRoot: '/home/runner/work/_temp/probe-1/root',
+  gate: '/home/runner/work/_temp/probe-1/gate',
   allowed: '/home/runner/work/_temp/probe-1/allowed',
   sealed: '/home/runner/work/_temp/probe-1/sealed',
 }
+
+const NAMESPACE = {id: '4026532399', host: '4026531832'}
+const ADMITTED: LaunchAdmission = {kind: 'admitted', namespace: NAMESPACE}
+const REFUSED: LaunchAdmission = {kind: 'refused', host: NAMESPACE.host, reason: 'no-id'}
 
 function createDeps(overrides: Partial<SandboxViewProbeDeps> = {}) {
   const launches: {command: string; args: readonly string[]; timeoutMs: number}[] = []
@@ -36,8 +52,8 @@ function createDeps(overrides: Partial<SandboxViewProbeDeps> = {}) {
       options.onSpawn(500)
       return {pid: 500, exitCode: 0, timedOut: false, stdout: ''}
     }),
-    findNamespace: vi.fn(async () => ({kind: 'launch-gone' as const})),
-    stopNamespace: vi.fn(async () => 'stopped' as const),
+    admit: vi.fn(async (): Promise<LaunchAdmission> => ADMITTED),
+    stopLaunch: vi.fn(async () => 'stopped' as const),
     isAlive: () => false,
     logger: createMockLogger(),
     ...overrides,
@@ -125,9 +141,9 @@ describe('probeSandboxView', () => {
     // #when probed
     const result = await probeSandboxView(INPUT, deps)
 
-    // #then it fails, and there is no namespace to look for
+    // #then it fails, and there is nothing to stop
     expect(result.ok).toBe(false)
-    expect(deps.findNamespace).not.toHaveBeenCalled()
+    expect(deps.stopLaunch).not.toHaveBeenCalled()
   })
 
   it('fails when the fixture cannot be created, without launching anything', async () => {
@@ -146,35 +162,31 @@ describe('probeSandboxView', () => {
     expect(deps.launch).not.toHaveBeenCalled()
   })
 
-  it('fails on a timeout and confirms the probe’s namespace is empty before saying so', async () => {
-    // #given a probe that hangs, with a namespace found
-    const namespace = {id: '4026532399', member: 501, host: '4026531832'}
+  it('fails on a timeout and confirms the probe’s launch is stopped before saying so', async () => {
+    // #given a probe that hangs, with an admitted launch
     const {deps} = createDeps({
       launch: vi.fn<SandboxViewProbeDeps['launch']>(async (_command, _args, options) => {
         options.onSpawn(500)
         return {pid: 500, exitCode: null, timedOut: true, stdout: ''}
       }),
-      findNamespace: vi.fn(async () => ({kind: 'found' as const, namespace})),
     })
 
     // #when probed
     const result = await probeSandboxView(INPUT, deps)
 
-    // #then the namespace was stopped, and the failure is the timeout
-    expect(deps.stopNamespace).toHaveBeenCalledWith(namespace)
+    // #then the launch was stopped by its gate directory and admission, and the failure is the timeout
+    expect(deps.stopLaunch).toHaveBeenCalledWith(FIXTURE.gate, ADMITTED)
     expect(!result.ok && result.message).toMatch(/timed out/)
   })
 
   it('fails closed, naming it, when a timed-out probe cannot be confirmed stopped', async () => {
-    // #given a namespace that cannot be confirmed empty
-    const namespace = {id: '4026532399', member: 501, host: '4026531832'}
+    // #given a launch that cannot be confirmed stopped
     const {deps} = createDeps({
       launch: vi.fn<SandboxViewProbeDeps['launch']>(async (_command, _args, options) => {
         options.onSpawn(500)
         return {pid: 500, exitCode: null, timedOut: true, stdout: ''}
       }),
-      findNamespace: vi.fn(async () => ({kind: 'found' as const, namespace})),
-      stopNamespace: vi.fn(async () => 'unconfirmed' as const),
+      stopLaunch: vi.fn(async () => 'unconfirmed' as const),
     })
 
     // #when probed
@@ -185,12 +197,48 @@ describe('probeSandboxView', () => {
     expect(deps.removeFixture).not.toHaveBeenCalled()
   })
 
-  it('fails when a passing probe left a process behind', async () => {
-    // #given an exit 0 whose launcher is still alive and whose namespace was not identified
+  it('fails the preflight and keeps the fixture when the launcher died before its id was captured and the stop cannot confirm', async () => {
+    // #given a launcher that was killed (no exit code) at the gate, no id, and a gate shell that cannot be confirmed gone
     const {deps} = createDeps({
-      findNamespace: vi.fn(async () => ({kind: 'unidentified' as const})),
-      isAlive: () => true,
+      launch: vi.fn<SandboxViewProbeDeps['launch']>(async (_command, _args, options) => {
+        options.onSpawn(500)
+        return {pid: 500, exitCode: null, timedOut: true, stdout: ''}
+      }),
+      admit: vi.fn(async () => REFUSED),
+      stopLaunch: vi.fn(async () => 'unconfirmed' as const),
+      isAlive: () => false,
     })
+
+    // #when probed
+    const result = await probeSandboxView(INPUT, deps)
+
+    // #then a dead launcher is not the confirmation: the probe fails and leaves the fixture in place
+    expect(deps.stopLaunch).toHaveBeenCalledWith(FIXTURE.gate, REFUSED)
+    expect(!result.ok && result.message).toMatch(/could not be confirmed stopped/)
+    expect(deps.removeFixture).not.toHaveBeenCalled()
+  })
+
+  it('passes a launcher that died at the gate only as the gate failure it is, once the stop confirmed', async () => {
+    // #given a gate that gave up (exit 71) with no id captured, and a stop that confirmed
+    const {deps} = createDeps({
+      launch: vi.fn<SandboxViewProbeDeps['launch']>(async (_command, _args, options) => {
+        options.onSpawn(500)
+        return {pid: 500, exitCode: 71, timedOut: false, stdout: ''}
+      }),
+      admit: vi.fn(async () => REFUSED),
+    })
+
+    // #when probed
+    const result = await probeSandboxView(INPUT, deps)
+
+    // #then it fails with the gate message, and the fixture is removed
+    expect(!result.ok && result.message).toMatch(/launch gate/)
+    expect(deps.removeFixture).toHaveBeenCalled()
+  })
+
+  it('fails when a passing probe left its launcher behind', async () => {
+    // #given an exit 0 whose launcher is still alive after the stop confirmed
+    const {deps} = createDeps({isAlive: () => true})
 
     // #when probed
     const result = await probeSandboxView(INPUT, deps, {settleMs: 50})
@@ -199,16 +247,17 @@ describe('probeSandboxView', () => {
     expect(!result.ok && result.message).toMatch(/could not be confirmed stopped/)
   })
 
-  it('confirms a passing probe’s namespace through the same stop as the teardown', async () => {
-    // #given a probe that exits 0 with a namespace found
-    const namespace = {id: '4026532399', member: 501, host: '4026531832'}
-    const {deps} = createDeps({findNamespace: vi.fn(async () => ({kind: 'found' as const, namespace}))})
+  it('confirms a passing probe through the same stop as the teardown, with its gate directory in the chain', async () => {
+    // #given a probe that exits 0
+    const {deps, launches} = createDeps()
 
     // #when probed
     const result = await probeSandboxView(INPUT, deps)
 
-    // #then it passed after stopping the namespace
+    // #then it passed after stopping the launch, and the chain carries the gate directory
     expect(result).toEqual({ok: true})
-    expect(deps.stopNamespace).toHaveBeenCalledWith(namespace)
+    expect(deps.stopLaunch).toHaveBeenCalledWith(FIXTURE.gate, ADMITTED)
+    expect(launches[0]?.args).toContain(FIXTURE.gate)
+    expect(deps.admit).toHaveBeenCalledWith(500, FIXTURE.gate)
   })
 })
