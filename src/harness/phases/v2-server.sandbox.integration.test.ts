@@ -9,12 +9,20 @@
  * tool shell as the sandbox user. Each "blocked" probe has a positive control: the same command run as the runner must
  * succeed (be OPEN), otherwise a BLOCKED result proves nothing.
  *
- * Five suites run one after another (the sandbox account name is fixed, so two never overlap):
+ * Nine suites run one after another (the sandbox account name is fixed, so two never overlap):
  *   1. the boundary: blocked and works rows, identity, quiescence, take-back;
  *   2. a provisioned `gh` config and an admitted repo skill;
  *   3. the persistence round trip (restore, isolated run, checkpoint and save, restore, isolated run);
  *   4. hostile git state written through the model's shell, then runner-side git after take-back;
- *   5. the key proxy: the model reaches the provider only through it, and the real key is nowhere the sandbox can read.
+ *   5. the key proxy: the model reaches the provider only through it, and the real key is nowhere the sandbox can read;
+ *   6. the read-only view: a write matrix over the shared directories (each row with a runner-side control), the places the
+ *      model must still write, escape attempts, and what the runner finds afterwards (sentinels, private temp, mounts);
+ *   7. a server torn down mid-run leaves no namespace member and no private mount;
+ *   8. a second isolated run in the same job finds nothing of the first outside the places it may write;
+ *   9. a launcher killed while the chain waits at its gate: nothing past the gate ran, and the teardown is not `restored`
+ *      unless it confirmed the orphaned root process gone.
+ *
+ * Every suite runs through the read-only view, as the Action does: the launch has no other form.
  *
  *   FRO_BOT_SANDBOX_INTEGRATION=1 FRO_BOT_OPENCODE_V2_BIN=/path/to/opencode bun run test src/harness/phases/v2-server.sandbox
  */
@@ -22,7 +30,7 @@ import type {SandboxToolPaths} from '../../services/setup/sandbox-preflight.js'
 import type {Logger} from '../../shared/logger.js'
 import type {SandboxLifecycle, SandboxLifecycleDeps, SandboxReleaseResult} from './sandbox-lifecycle.js'
 import type {Probe, Row, ScriptedProvider} from './v2-server.sandbox.harness.js'
-import {spawnSync} from 'node:child_process'
+import {spawn, spawnSync} from 'node:child_process'
 import {createHash} from 'node:crypto'
 import * as fs from 'node:fs'
 import http from 'node:http'
@@ -31,7 +39,8 @@ import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import {DatabaseSync} from 'node:sqlite'
-import {createSandboxAccount, getSessionDbBasenames} from '@fro-bot/runtime'
+import {fileURLToPath} from 'node:url'
+import {admitLaunch, buildSandboxLaunch, createSandboxAccount, getSessionDbBasenames} from '@fro-bot/runtime'
 import {afterAll, beforeAll, describe, expect, it} from 'vitest'
 import {startTlsUpstream, type TlsUpstream} from '../../../packages/runtime/src/agent/key-proxy-test-kit.js'
 import {resolveBrokeredPushCommitMessage} from '../../features/delegated/commit-message.js'
@@ -49,6 +58,7 @@ import {buildCachePathsV2} from '../../services/cache/paths.js'
 import {createExecAdapter} from '../../services/setup/adapters.js'
 import {admitRepoSkills, createRepoSkillsStagingRoot} from '../../services/setup/repo-skills.js'
 import {createSandboxPreflightDeps, runSandboxPreflight} from '../../services/setup/sandbox-preflight.js'
+import {createViewProbe} from '../../services/setup/sandbox-view-probe.js'
 import {STORAGE_VERSION} from '../../shared/constants.js'
 import {getGitHubRunAttempt, getInvocationIdentity} from '../../shared/env.js'
 import {createLogger} from '../../shared/logger.js'
@@ -56,8 +66,11 @@ import {startKeyProxyProcess, type KeyProxyProcess} from './key-proxy-process.js
 import {snapshotLogDirectory} from './log-snapshot.js'
 import {createSandboxLifecycle} from './sandbox-lifecycle.js'
 import {
+  controlCoversMatrix,
   describeReconstruction,
   failuresFor,
+  matrixDirectories,
+  matrixSentinels,
   parseRows,
   PRELUDE,
   q,
@@ -67,6 +80,9 @@ import {
   safeEnvToken,
   startScriptedProvider,
   startScriptedSession,
+  VIEW_IT_PREFIX,
+  writeMatrixProbe,
+  writeWorksProbe,
 } from './v2-server.sandbox.harness.js'
 
 const BINARY = process.env.FRO_BOT_OPENCODE_V2_BIN
@@ -80,6 +96,15 @@ const gated =
 const TOKEN_MARK = safeEnvToken(process.env.PROBE_DUMMY_TOKEN, 'dummy-probe-token')
 const runnerHome = os.userInfo().homedir
 const runnerTemp = safeEnvPath(process.env.RUNNER_TEMP, path.join(runnerHome, 'work', '_temp'))
+
+/** The stand-in published install the preflight is pointed at (see `createPublishedActionLayout`). */
+const fakeActionRoot = path.join(path.dirname(runnerTemp), '_actions', 'fro-bot-sandbox-it', 'agent', 'refs', 'v1')
+
+/** The committed bundle of the repository under test (`dist/`, kept fresh by the pre-push hook and CI). */
+const realDist = fileURLToPath(new URL('../../../dist', import.meta.url))
+
+/** What a lifecycle needs to build the view: the Node that runs the builder, and the builder of the stand-in install. */
+const viewLauncher = {nodePath: process.execPath, builderPath: path.join(fakeActionRoot, 'dist', 'sandbox-view.js')}
 
 // --- Helpers shared by the four suites ---------------------------------------------------------------------------------
 
@@ -181,6 +206,7 @@ async function runIsolated(options: IsolatedRunOptions): Promise<IsolatedRunResu
     workspacePath: options.workspace,
     responseDir: options.responseDir,
     logger: options.logger,
+    viewLauncher,
   })
   options.onLifecycle?.(lifecycle)
   try {
@@ -222,7 +248,6 @@ function writeKeyFile(keyDir: string): string {
  * so the gate runs for real instead of being told where the Action lives. The suite itself runs from the checkout, so the
  * layout is a stand-in the preflight is pointed at (`bundleDir`, `invokedAs`); the walk and the file checks are the real ones.
  */
-const fakeActionRoot = path.join(path.dirname(runnerTemp), '_actions', 'fro-bot-sandbox-it', 'agent', 'refs', 'v1')
 
 function createPublishedActionLayout(): void {
   fs.mkdirSync(path.join(fakeActionRoot, 'dist'), {recursive: true})
@@ -232,6 +257,12 @@ function createPublishedActionLayout(): void {
   )
   for (const script of ['main.js', 'post.js', 'key-proxy.js'])
     fs.writeFileSync(path.join(fakeActionRoot, 'dist', script), '// stand-in\n')
+  // The view builder is the real bundle, with the chunk it imports: the preflight probe and every launch run it as root.
+  for (const name of fs.readdirSync(realDist)) {
+    if (name === 'sandbox-view.js' || (name.startsWith('sandbox-view-') && name.endsWith('.js'))) {
+      fs.copyFileSync(path.join(realDist, name), path.join(fakeActionRoot, 'dist', name))
+    }
+  }
 }
 
 afterAll(() => {
@@ -247,6 +278,13 @@ async function preflightTools(logger: Logger): Promise<SandboxToolPaths> {
     env: {...base.env, GITHUB_ACTION_PATH: fakeActionRoot, GITHUB_ACTION_REPOSITORY: 'fro-bot-sandbox-it/agent'},
     bundleDir: path.join(fakeActionRoot, 'dist'),
     invokedAs: path.join(fakeActionRoot, 'dist', 'main.js'),
+    // The real probe, pointed at the stand-in install's builder: the preflight is part of what this suite proves.
+    probeView: createViewProbe({
+      exec: createExecAdapter(),
+      logger,
+      env: process.env,
+      bundleDir: path.join(fakeActionRoot, 'dist'),
+    }),
   })
   if (!preflight.ok) throw new Error(preflight.message)
   return preflight.tools
@@ -471,6 +509,7 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
       responseDir,
       logger,
       deps: {createAccount},
+      viewLauncher,
     })
     const prepared = await lifecycle.prepare({keyFilePaths: [keyFile], ghConfigDir: null, repoSkills: null})
     if (!prepared.success) throw new Error(prepared.error)
@@ -1558,6 +1597,7 @@ describe.skipIf(!gated)('isolate-agent key proxy through a real model shell', ()
       workspacePath: workspace,
       responseDir,
       logger,
+      viewLauncher,
     })
     const started = await lifecycle.startKeyProxy(async context => {
       const result = await startKeyProxyProcess({
@@ -1647,5 +1687,569 @@ describe.skipIf(!gated)('isolate-agent key proxy through a real model shell', ()
     expect(released?.proxy).toBe('stopped')
     expect(released?.restore).toBe('restored')
     expect(reachableAfterRelease).toBe(false)
+  })
+})
+
+// --- 6. The read-only view ---------------------------------------------------------------------------------------------
+
+const VIEW_TAG = String(process.pid)
+const runnerUid = os.userInfo().uid
+const toolCache = safeEnvPath(process.env.RUNNER_TOOL_CACHE, '/opt/hostedtoolcache')
+
+/** The shared directories the runner can write, which the matrix covers. Empty off a hosted runner. */
+function listMatrixDirectories(): readonly string[] {
+  if (!gated) return []
+  return matrixDirectories(
+    {pathEnv: process.env.PATH, toolCache, extra: ['/opt', '/usr/share']},
+    {
+      isDirectory: target => {
+        try {
+          return fs.statSync(target).isDirectory()
+        } catch {
+          return false
+        }
+      },
+      isWritable: target => {
+        try {
+          fs.accessSync(target, fs.constants.W_OK)
+          return true
+        } catch {
+          return false
+        }
+      },
+      subdirectories: target => {
+        try {
+          return fs.readdirSync(target)
+        } catch {
+          return []
+        }
+      },
+    },
+  )
+}
+
+const matrixDirs = listMatrixDirectories()
+const matrixIds = matrixDirs.map((_directory, index) => `wm_${index}`)
+
+/** The host's mounts as `<mount point> <options>`, sorted: what a namespace of another process cannot change. */
+function hostMountSet(): string[] {
+  return fs
+    .readFileSync('/proc/self/mountinfo', 'utf8')
+    .split('\n')
+    .filter(line => line.length > 0)
+    .map(line => {
+      const fields = line.split(' ')
+      return `${fields[4] ?? ''} ${fields[5] ?? ''}`
+    })
+    .toSorted()
+}
+
+/** The mount namespaces on the machine, as root sees them: a namespace with no process in it is not listed. */
+function mountNamespaces(): string[] {
+  const listed = spawnSync('sudo', ['-n', 'lsns', '-t', 'mnt', '-n', '-o', 'NS'], {encoding: 'utf8'})
+  return listed.stdout
+    .split('\n')
+    .map(line => line.trim())
+    .filter(line => line.length > 0)
+    .toSorted()
+}
+
+/** Removes what a view probe may have left in the shared directories. The runner may remove any of it: they are mode 777. */
+function sweepViewFiles(): void {
+  for (const dir of [...matrixDirs, '/tmp', '/var/tmp', '/dev/shm']) {
+    try {
+      for (const name of fs.readdirSync(dir)) {
+        if (name.startsWith(`${VIEW_IT_PREFIX}-`) || name.startsWith(`.${VIEW_IT_PREFIX}-`)) {
+          fs.rmSync(path.join(dir, name), {recursive: true, force: true})
+        }
+      }
+    } catch {
+      // A directory that cannot be listed has nothing of ours in it.
+    }
+  }
+}
+
+function strayProcesses(pattern: string): string {
+  return spawnSync('pgrep', ['-d,', '-f', pattern], {encoding: 'utf8'}).stdout.trim()
+}
+
+describe.skipIf(!gated)('isolate-agent read-only view: the write boundary on a hosted runner', () => {
+  const logger = createLogger({phase: 'sandbox-integration-view'})
+  const scratch = path.join(runnerTemp, `sandbox-it-view-${process.pid}`)
+  const workspace = path.join(scratch, 'ws')
+  const responseDir = path.join(scratch, 'response')
+  const keyDir = path.join(scratch, 'keys')
+  // The shape the Action provisions in provision mode: a `gh-config-*` directory directly under RUNNER_TEMP.
+  const ghConfigDir = path.join(runnerTemp, `gh-config-view-${process.pid}`)
+  const env = hostedEnv(workspace)
+  const privateMarkers = ['/tmp', '/var/tmp', '/dev/shm'].map(dir => `${dir}/${VIEW_IT_PREFIX}-priv-${VIEW_TAG}`)
+  const escapeDir = matrixDirs.includes('/usr/local/bin') ? '/usr/local/bin' : (matrixDirs[0] ?? '/usr/local/bin')
+  const hardlinkSource = `${escapeDir}/${VIEW_IT_PREFIX}-hl-${VIEW_TAG}`
+
+  let lifecycle: SandboxLifecycle | undefined
+  let released: SandboxReleaseResult | undefined
+  let rows = new Map<string, readonly Row[]>()
+  let controls = new Map<string, Row[]>()
+  const facts = {
+    mountsBefore: [] as string[],
+    mountsAfter: [] as string[],
+    newNamespaces: [] as string[],
+    changedSentinels: [] as string[],
+    privateLeft: [] as string[],
+  }
+
+  const writesFrom = (id: string, expression: string): Probe => writeWorksProbe(id, expression)
+
+  const probes = (): Probe[] => [
+    // Blocked: create, append, rename and unlink in every shared directory the runner can write.
+    ...matrixDirs.map((dir, index) => writeMatrixProbe(`wm_${index}`, dir, VIEW_TAG, runnerUid)),
+    // Works: every place the model needs to write.
+    writesFrom('ww_checkout', q(workspace)),
+    writesFrom('ww_response', q(responseDir)),
+    writesFrom('ww_gh_config', q(ghConfigDir)),
+    writesFrom('ww_xdg_data', '"$XDG_DATA_HOME/opencode"'),
+    writesFrom('ww_xdg_config', '"$XDG_CONFIG_HOME/opencode"'),
+    writesFrom('ww_xdg_cache', '"$XDG_CACHE_HOME/opencode"'),
+    writesFrom('ww_xdg_state', '"$XDG_STATE_HOME/opencode"'),
+    writesFrom('ww_home', '"$HOME"'),
+    writesFrom('ww_tmp', '/tmp'),
+    writesFrom('ww_var_tmp', '/var/tmp'),
+    writesFrom('ww_dev_shm', '/dev/shm'),
+    {
+      id: 'ww_devices',
+      category: 'works',
+      cmd: `echo x > /dev/null && [ "$(head -c 16 /dev/urandom | wc -c | tr -d ' ')" = 16 ] && R ww_devices WORKS "null and urandom" || R ww_devices FAILED "device"`,
+    },
+    {
+      id: 'ww_pty',
+      category: 'works',
+      cmd: String.raw`python3 -c 'import os,pty; m,s=pty.openpty(); os.write(m,b"ok\n"); assert os.read(s,3)' 2>/dev/null && R ww_pty WORKS "pty allocated" || R ww_pty FAILED "no pty"`,
+    },
+    {
+      id: 'ww_shared_memory',
+      category: 'works',
+      cmd: `python3 -c 'from multiprocessing import shared_memory as s; m=s.SharedMemory(create=True,size=8); m.close(); m.unlink()' 2>/dev/null && R ww_shared_memory WORKS "shm segment" || R ww_shared_memory FAILED "no shm"`,
+    },
+    {
+      // Private temp: what the run leaves there must vanish with the namespace (asserted from the runner afterwards).
+      id: 'priv_markers',
+      category: 'info',
+      cmd: `for f in ${privateMarkers.map(q).join(' ')}; do echo x > "$f"; done; R priv_markers INFO "wrote private temp markers"`,
+    },
+    // Escapes. A write through a checkout symlink into a sealed directory, a hardlink from a sealed file into the checkout, the
+    // runner's root through /proc: each has a runner-side control. A remount and a user namespace have none: the runner's own
+    // attempt fails for the same reason, so there is nothing a control could show.
+    {
+      id: 'esc_symlink',
+      category: 'blocked',
+      control: true,
+      cmd:
+        `l=${q(workspace)}/${VIEW_IT_PREFIX}-link; rm -f "$l"; ln -s ${q(escapeDir)} "$l" 2>/dev/null; ` +
+        `if ( : > "$l/${VIEW_IT_PREFIX}-esc-$$" ) 2>/dev/null; then rm -f "$l/${VIEW_IT_PREFIX}-esc-$$"; R esc_symlink OPEN "wrote through the link"; ` +
+        `else R esc_symlink BLOCKED "write through the link refused"; fi; rm -f "$l"`,
+    },
+    {
+      id: 'esc_hardlink',
+      category: 'blocked',
+      control: true,
+      cmd:
+        `t=${q(workspace)}/${VIEW_IT_PREFIX}-hl-$$; ` +
+        `if ln ${q(hardlinkSource)} "$t" 2>/dev/null; then rm -f "$t"; R esc_hardlink OPEN "linked a sealed file into the checkout"; ` +
+        `else R esc_hardlink BLOCKED "hardlink refused"; fi`,
+    },
+    {
+      id: 'esc_proc_root',
+      category: 'blocked',
+      control: true,
+      cmd: `if ls /proc/${process.pid}/root/ >/dev/null 2>&1; then R esc_proc_root OPEN "readable"; else R esc_proc_root BLOCKED "refused"; fi`,
+    },
+    {
+      id: 'esc_remount',
+      category: 'blocked',
+      cmd: `out=$(mount -o remount,rw ${q(escapeDir)} 2>&1); rc=$?; if [ $rc -eq 0 ]; then R esc_remount OPEN "remounted"; else R esc_remount BLOCKED "rc=$rc $(printf %s "$out" | ev)"; fi`,
+    },
+    {
+      id: 'esc_userns',
+      category: 'blocked',
+      // Whether a user namespace can be created depends on the image's AppArmor policy, so the probe asks the question that
+      // matters: from inside one, with every mapped capability, can a write to the sealed directory be made to work?
+      cmd:
+        `t=${q(escapeDir)}/${VIEW_IT_PREFIX}-userns-$$; ` +
+        `unshare --user --map-root-user --mount sh -c 'mount -o remount,rw,bind "$1" "$1"; : > "$2"' sh ${q(escapeDir)} "$t" >/dev/null 2>&1; ` +
+        `if [ -e "$t" ]; then rm -f "$t"; R esc_userns OPEN "wrote from a user namespace"; else R esc_userns BLOCKED "no write from a user namespace"; fi`,
+    },
+  ]
+
+  beforeAll(async () => {
+    const tools = await preflightTools(logger)
+    for (const dir of [responseDir, ghConfigDir]) fs.mkdirSync(dir, {recursive: true})
+    const keyFile = writeKeyFile(keyDir)
+    initWorkspace(workspace)
+
+    // Disposable files in every matrix directory, mode 0666 so that only the mount can refuse the sandbox: one set for the
+    // runner's control, one for the sandbox. A hardlink source in the directory the escape probes aim at.
+    for (const dir of matrixDirs) {
+      for (const file of matrixSentinels(dir, VIEW_TAG)) {
+        fs.writeFileSync(file, 'sentinel')
+        fs.chmodSync(file, 0o666)
+      }
+    }
+    fs.writeFileSync(hardlinkSource, 'sentinel')
+    fs.chmodSync(hardlinkSource, 0o666)
+
+    controls = runControls(probes(), workspace, process.env)
+    facts.mountsBefore = hostMountSet()
+    const namespacesBefore = mountNamespaces()
+
+    const result = await runIsolated({
+      tools,
+      env,
+      workspace,
+      responseDir,
+      keyFile,
+      steps: probes(),
+      logger,
+      ghConfigDir,
+      onLifecycle: value => {
+        lifecycle = value
+      },
+    })
+    rows = new Map(result.rows)
+    released = result.released
+
+    facts.mountsAfter = hostMountSet()
+    facts.newNamespaces = mountNamespaces().filter(namespace => !namespacesBefore.includes(namespace))
+    for (const dir of matrixDirs) {
+      const [, , sandboxAppend, sandboxUnlink] = matrixSentinels(dir, VIEW_TAG)
+      for (const file of [sandboxAppend, sandboxUnlink]) {
+        if (file === undefined) continue
+        const content = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '<missing>'
+        if (content !== 'sentinel') facts.changedSentinels.push(`${file}: ${content}`)
+      }
+    }
+    if (fs.readFileSync(hardlinkSource, 'utf8') !== 'sentinel') facts.changedSentinels.push(hardlinkSource)
+    facts.privateLeft = privateMarkers.filter(marker => fs.existsSync(marker))
+  }, 600_000)
+
+  afterAll(async () => {
+    await lifecycle?.release()
+    sweepViewFiles()
+    fs.rmSync(scratch, {recursive: true, force: true})
+    fs.rmSync(ghConfigDir, {recursive: true, force: true})
+  }, 120_000)
+
+  it('covers at least the runner PATH directories, /opt, /usr/share and the tool cache, with a control for each row', () => {
+    // #given the directories the runner can write
+    // #then there are some, and each matrix row has a runner-side control that managed all four operations
+    expect(matrixDirs.length).toBeGreaterThan(0)
+    expect(uncontrolledRows(controls)).toEqual([])
+    for (const id of matrixIds) expect(controlCoversMatrix(controls.get(id))).toBe(true)
+  })
+
+  it.each(matrixIds)('blocks create, append, rename and unlink in matrix directory %s', id => {
+    // #given the scripted model ran the row in its real tool shell
+    // #then no operation worked
+    expect(failuresFor(rows, id, 'BLOCKED')).toEqual([])
+  })
+
+  it.each(['esc_symlink', 'esc_hardlink', 'esc_proc_root', 'esc_remount', 'esc_userns'])(
+    'blocks the escape attempt %s',
+    id => {
+      // #given the same real tool shell
+      // #then it was refused
+      expect(failuresFor(rows, id, 'BLOCKED')).toEqual([])
+    },
+  )
+
+  it.each([
+    'ww_checkout',
+    'ww_response',
+    'ww_gh_config',
+    'ww_xdg_data',
+    'ww_xdg_config',
+    'ww_xdg_cache',
+    'ww_xdg_state',
+    'ww_home',
+    'ww_tmp',
+    'ww_var_tmp',
+    'ww_dev_shm',
+    'ww_devices',
+    'ww_pty',
+    'ww_shared_memory',
+  ])('keeps %s working for the model', id => {
+    // #given the same real tool shell
+    // #then every place the model needs still works
+    expect(failuresFor(rows, id, 'WORKS')).toEqual([])
+  })
+
+  it('left every sentinel the runner placed unchanged', () => {
+    // #given the sandbox's disposable files and the hardlink source, read back from the runner
+    // #then none was appended to, renamed away or unlinked
+    expect(facts.changedSentinels).toEqual([])
+  })
+
+  it('left no private temp file on the host', () => {
+    // #given the markers the model wrote in /tmp, /var/tmp and /dev/shm
+    // #then none exists on the host: they lived on the namespace's own tmpfs
+    expect(rows.get('priv_markers')).toBeDefined()
+    expect(facts.privateLeft).toEqual([])
+  })
+
+  it('left no mount namespace and no change to the host mount table', () => {
+    // #given the runner's view before and after
+    // #then no new namespace remains, and the host's mounts are the same
+    expect(facts.newNamespaces).toEqual([])
+    expect(facts.mountsAfter).toEqual(facts.mountsBefore)
+  })
+
+  it('confirmed the namespace and the uid before taking everything back', () => {
+    // #given the release of the run
+    // #then it was stopped and restored
+    expect(released).toMatchObject({stop: 'stopped', restore: 'restored'})
+  })
+})
+
+describe.skipIf(!gated)('isolate-agent read-only view: a server torn down while it runs', () => {
+  const logger = createLogger({phase: 'sandbox-integration-kill'})
+  const scratch = path.join(runnerTemp, `sandbox-it-kill-${process.pid}`)
+  const workspace = path.join(scratch, 'ws')
+  const responseDir = path.join(scratch, 'response')
+  const keyDir = path.join(scratch, 'keys')
+  const env = hostedEnv(workspace)
+  const marker = `/tmp/${VIEW_IT_PREFIX}-kill-${VIEW_TAG}`
+  const strayPattern = 'sleep 778[12]'
+
+  let provider: ScriptedProvider | undefined
+  let lifecycle: SandboxLifecycle | undefined
+  let released: SandboxReleaseResult | undefined
+  let strays = 'not checked'
+  let markerLeft = true
+  let newNamespaces: string[] = ['not checked']
+  let mountsEqual = false
+
+  const steps = (): Probe[] => [
+    {
+      // A tool that leaves a private temp file and processes that leave their session, ignore SIGTERM and detach.
+      id: 'kill_setup',
+      category: 'info',
+      cmd:
+        `echo x > ${q(marker)}; (setsid sleep 7781 >/dev/null 2>&1 &); (trap '' TERM HUP; exec sleep 7782 >/dev/null 2>&1 &); ` +
+        `sleep 0.3; R kill_setup INFO "$(pgrep -d, -f 'sleep 778')"`,
+    },
+  ]
+
+  beforeAll(async () => {
+    const tools = await preflightTools(logger)
+    fs.mkdirSync(responseDir, {recursive: true})
+    const keyFile = writeKeyFile(keyDir)
+    initWorkspace(workspace)
+    provider = await startScriptedProvider(steps)
+    const mountsBefore = hostMountSet()
+    const namespacesBefore = mountNamespaces()
+
+    lifecycle = createSandboxLifecycle({
+      tools,
+      env,
+      runnerHome,
+      workspacePath: workspace,
+      responseDir,
+      logger,
+      viewLauncher,
+    })
+    const prepared = await lifecycle.prepare({keyFilePaths: [keyFile], ghConfigDir: null, repoSkills: null})
+    if (!prepared.success) throw new Error(prepared.error)
+    await startScriptedSession({binary: BINARY ?? '', workspace, env, lifecycle, keyFile, provider, logger})
+
+    // No graceful shutdown: the lifecycle is torn down with the server and its strays still running.
+    released = await lifecycle.release()
+    strays = strayProcesses(strayPattern)
+    markerLeft = fs.existsSync(marker)
+    newNamespaces = mountNamespaces().filter(namespace => !namespacesBefore.includes(namespace))
+    mountsEqual = hostMountSet().join('\n') === mountsBefore.join('\n')
+  }, 600_000)
+
+  afterAll(async () => {
+    await lifecycle?.release()
+    await provider?.close()
+    spawnSync('sudo', ['-n', 'pkill', '-KILL', '-f', strayPattern])
+    fs.rmSync(marker, {force: true})
+    fs.rmSync(scratch, {recursive: true, force: true})
+  }, 120_000)
+
+  it('kills every member of the namespace, stray processes included, and confirms it', () => {
+    // #given the teardown ran while the server was up
+    // #then it confirmed the stop, restored the handoff, and no process of the launch is left
+    expect(released).toMatchObject({stop: 'stopped', restore: 'restored'})
+    expect(strays).toBe('')
+  })
+
+  it('leaves no private mount, no private temp file and no namespace', () => {
+    // #given the runner's view afterwards
+    // #then the namespace and its mounts are gone with its last member
+    expect(markerLeft).toBe(false)
+    expect(newNamespaces).toEqual([])
+    expect(mountsEqual).toBe(true)
+  })
+})
+
+describe.skipIf(!gated)('isolate-agent read-only view: a second isolated run in the same job', () => {
+  const logger = createLogger({phase: 'sandbox-integration-second'})
+  const scratch = path.join(runnerTemp, `sandbox-it-second-${process.pid}`)
+  const workspace = path.join(scratch, 'ws')
+  const responseDir = path.join(scratch, 'response')
+  const keyDir = path.join(scratch, 'keys')
+  const env = hostedEnv(workspace)
+  const markers = ['/tmp', '/var/tmp', '/dev/shm'].map(dir => `${dir}/${VIEW_IT_PREFIX}-run1-${VIEW_TAG}`)
+  const homeMarker = `$HOME/${VIEW_IT_PREFIX}-run1-${VIEW_TAG}`
+
+  let first: IsolatedRunResult | undefined
+  let second: IsolatedRunResult | undefined
+
+  beforeAll(async () => {
+    const tools = await preflightTools(logger)
+    fs.mkdirSync(responseDir, {recursive: true})
+    const keyFile = writeKeyFile(keyDir)
+    initWorkspace(workspace)
+    const run = async (steps: readonly Probe[]): Promise<IsolatedRunResult> =>
+      runIsolated({tools, env, workspace, responseDir, keyFile, steps, logger})
+
+    first = await run([
+      {
+        id: 'run1_markers',
+        category: 'info',
+        cmd: `for f in ${markers.map(q).join(' ')} "${homeMarker}"; do echo x > "$f"; done; R run1_markers INFO ok`,
+      },
+    ])
+    second = await run([
+      {
+        id: 'run2_clean',
+        category: 'works',
+        cmd:
+          `left=$(ls ${markers.map(q).join(' ')} "${homeMarker}" 2>/dev/null); ` +
+          `files=$(ls /tmp /var/tmp /dev/shm "$HOME" 2>/dev/null | grep -c ${q(VIEW_IT_PREFIX)}); ` +
+          `if [ -z "$left" ] && [ "$files" = 0 ]; then R run2_clean WORKS "nothing of the first run"; ` +
+          `else R run2_clean FAILED "left=[$(printf %s "$left" | ev)] files=$files"; fi`,
+      },
+    ])
+  }, 900_000)
+
+  afterAll(() => {
+    sweepViewFiles()
+    fs.rmSync(scratch, {recursive: true, force: true})
+  }, 120_000)
+
+  it('restored the first run before the second began', () => {
+    // #given both runs
+    // #then each was stopped and restored
+    expect(first?.released).toMatchObject({stop: 'stopped', restore: 'restored'})
+    expect(second?.released).toMatchObject({stop: 'stopped', restore: 'restored'})
+  })
+
+  it('finds nothing of the first run in the private temp directories or the home', () => {
+    // #given the second run's own probe
+    // #then it saw no marker and no file of ours in the places the first run wrote
+    expect(failuresFor(second?.rows ?? new Map(), 'run2_clean', 'WORKS')).toEqual([])
+    expect(first?.rows.get('run1_markers')).toBeDefined()
+  })
+})
+
+describe.skipIf(!gated)('isolate-agent read-only view: a launcher killed while the chain waits at its gate', () => {
+  const logger = createLogger({phase: 'sandbox-integration-gate'})
+  const scratch = path.join(runnerTemp, `sandbox-it-gate-${process.pid}`)
+  const workspace = path.join(scratch, 'ws')
+  const responseDir = path.join(scratch, 'response')
+  const keyDir = path.join(scratch, 'keys')
+  const env = hostedEnv(workspace)
+  const marker = path.join(workspace, `${VIEW_IT_PREFIX}-gate-ran-${VIEW_TAG}`)
+  const strayPattern = 'sleep 7791'
+
+  let lifecycle: SandboxLifecycle | undefined
+  let released: SandboxReleaseResult | undefined
+  let gateDir = ''
+  let gateReported = false
+  let processesAtGate = 'not checked'
+  let processesAfter = 'not checked'
+  let markerAfterWait = true
+  let newNamespaces: string[] = ['not checked']
+
+  beforeAll(async () => {
+    const tools = await preflightTools(logger)
+    fs.mkdirSync(responseDir, {recursive: true})
+    const keyFile = writeKeyFile(keyDir)
+    initWorkspace(workspace)
+    const namespacesBefore = mountNamespaces()
+
+    lifecycle = createSandboxLifecycle({
+      tools,
+      env,
+      runnerHome,
+      workspacePath: workspace,
+      responseDir,
+      logger,
+      viewLauncher,
+      // The runner side never gives the go-ahead: this is a launch whose admission was cut off, as a cancellation would.
+      deps: {admit: async (pid, dir, deps, options) => admitLaunch(pid, dir, deps, {...options, isClosed: () => true})},
+    })
+    const prepared = await lifecycle.prepare({keyFilePaths: [keyFile], ghConfigDir: null, repoSkills: null})
+    if (!prepared.success) throw new Error(prepared.error)
+
+    await lifecycle.launch(async context => {
+      gateDir = context.spec.view?.gate.dir ?? ''
+      // A stand-in server: if the chain ever got past the gate it would leave the marker and a stray.
+      const built = buildSandboxLaunch(
+        context.spec,
+        tools.sh,
+        ['-c', `echo ran > ${q(marker)}; exec sleep 7791`],
+        {},
+        workspace,
+      )
+      const child = spawn(built.command, [...built.args], {
+        detached: true,
+        stdio: 'ignore',
+        env: {PATH: process.env.PATH},
+      })
+      if (child.pid === undefined) throw new Error('the launcher did not start')
+      context.noteSpawn(child.pid)
+      // Wait until the gate has reported its namespace and is waiting for a go-ahead that will never come.
+      const deadline = Date.now() + 15_000
+      while (Date.now() < deadline && !fs.existsSync(path.join(gateDir, 'ns'))) {
+        await new Promise(resolve => setTimeout(resolve, 50))
+      }
+      gateReported = fs.existsSync(path.join(gateDir, 'ns'))
+      processesAtGate = strayProcesses(path.basename(gateDir))
+      // What a group kill from the runner does: only `sudo` dies; its root child is orphaned at the gate.
+      child.kill('SIGKILL')
+      await new Promise(resolve => setTimeout(resolve, 500))
+      return {value: 'killed at the gate', unconfirmed: false}
+    })
+
+    released = await lifecycle.release()
+    // A chain that had passed the gate would have written the marker within milliseconds.
+    await new Promise(resolve => setTimeout(resolve, 3000))
+    markerAfterWait = fs.existsSync(marker)
+    processesAfter = strayProcesses(`${path.basename(gateDir)}|${strayPattern}`)
+    newNamespaces = mountNamespaces().filter(namespace => !namespacesBefore.includes(namespace))
+  }, 300_000)
+
+  afterAll(async () => {
+    await lifecycle?.release()
+    spawnSync('sudo', ['-n', 'pkill', '-KILL', '-f', strayPattern])
+    fs.rmSync(scratch, {recursive: true, force: true})
+  }, 120_000)
+
+  it('held the chain at the gate: it reported its namespace and nothing past the gate ran', () => {
+    // #given a launch whose go-ahead was never given
+    // #then the gate had written its id, was still running, and the stand-in server never started
+    expect(gateReported).toBe(true)
+    expect(processesAtGate).not.toBe('')
+    expect(markerAfterWait).toBe(false)
+  })
+
+  it('is restored only because the orphaned root process was confirmed gone', () => {
+    // #given the launcher was killed and its child orphaned
+    // #then the release confirmed the stop, and no process of the launch is left
+    expect(released).toMatchObject({stop: 'stopped', restore: 'restored'})
+    expect(processesAfter).toBe('')
+    expect(newNamespaces).toEqual([])
   })
 })

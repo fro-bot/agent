@@ -1,10 +1,12 @@
 import type {Logger} from '../../shared/logger.js'
+import type {ViewProbeResult} from './sandbox-view-probe.js'
 import type {ExecAdapter} from './types.js'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import process from 'node:process'
 import {fileURLToPath} from 'node:url'
 import {isWithin} from '@fro-bot/runtime'
+import {createViewProbe} from './sandbox-view-probe.js'
 
 /**
  * Fail-closed capability check for `isolate-agent: true`.
@@ -33,6 +35,17 @@ export const SANDBOX_TOOL_NAMES = [
   'git',
   // The git credential helper of the provisioned `gh` token (provision mode), so the model's `git push` authenticates.
   'gh',
+  // The read-only view: a private mount namespace, the bind and remount tools, the old root's removal, and the namespace
+  // listing the teardown reads. The sequencing shell runs the three fixed scripts of the launch; the first of them (the
+  // gate) reads its own namespace id with `readlink` and waits for the runner's go-ahead with `sleep`.
+  'unshare',
+  'mount',
+  'umount',
+  'pivot_root',
+  'sh',
+  'lsns',
+  'readlink',
+  'sleep',
 ] as const
 
 export type SandboxToolName = (typeof SANDBOX_TOOL_NAMES)[number]
@@ -47,6 +60,7 @@ export type SandboxPreflightCheck =
   | 'sudo'
   | 'tool'
   | 'protected-links'
+  | 'view'
 
 export type ActionEntryKind = 'directory' | 'file' | 'symlink' | 'other'
 
@@ -79,6 +93,8 @@ export interface SandboxPreflightDeps {
   readonly realpath: (absolutePath: string) => Promise<string>
   /** The working directory, the workspace when `GITHUB_WORKSPACE` is unset (the same fallback bootstrap uses). */
   readonly cwd: string
+  /** Builds the real read-only view over a throwaway fixture and checks it (`sandbox-view-probe.ts`). */
+  readonly probeView: (tools: SandboxToolPaths) => Promise<ViewProbeResult>
   readonly logger: Logger
 }
 
@@ -143,6 +159,10 @@ export async function runSandboxPreflight(deps: SandboxPreflightDeps): Promise<S
     }
   }
 
+  // Last: it runs the real builder as root, so every cheaper check has passed first.
+  const view = await deps.probeView(tools.paths)
+  if (!view.ok) return fail('view', view.message)
+
   deps.logger.debug('Sandbox preflight passed', {tools: tools.paths})
   return {ok: true, tools: tools.paths}
 }
@@ -164,7 +184,7 @@ export function discoverActionLocation(input: {readonly argv: readonly string[];
   }
 }
 
-const RUNNER_ENTRY_SCRIPTS = ['dist/main.js', 'dist/post.js', 'dist/key-proxy.js'] as const
+const RUNNER_ENTRY_SCRIPTS = ['dist/main.js', 'dist/post.js', 'dist/key-proxy.js', 'dist/sandbox-view.js'] as const
 const MANIFEST_NAMES = ['action.yaml', 'action.yml'] as const
 
 /**
@@ -301,8 +321,10 @@ export function createSandboxPreflightDeps(
   | 'lstat'
   | 'realpath'
   | 'cwd'
+  | 'probeView'
   | 'logger'
 > {
+  const location = discoverActionLocation({argv: process.argv, moduleUrl: import.meta.url})
   return {
     exec,
     env: process.env,
@@ -333,7 +355,7 @@ export function createSandboxPreflightDeps(
         return null
       }
     },
-    ...discoverActionLocation({argv: process.argv, moduleUrl: import.meta.url}),
+    ...location,
     lstat: async absolutePath => {
       try {
         const stats = await fs.lstat(absolutePath)
@@ -346,6 +368,7 @@ export function createSandboxPreflightDeps(
     },
     realpath: async absolutePath => fs.realpath(absolutePath),
     cwd: process.cwd(),
+    probeView: createViewProbe({exec, logger, env: process.env, bundleDir: location.bundleDir}),
     logger,
   }
 }

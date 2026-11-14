@@ -1,13 +1,14 @@
+import type {LaunchAdmission} from '@fro-bot/runtime'
 import type {SandboxToolPaths} from '../../services/setup/sandbox-preflight.js'
 import type {ExecAdapter, ExecOptions} from '../../services/setup/types.js'
-import type {SandboxLifecycleDeps, SignalHost} from './sandbox-lifecycle.js'
+import type {SandboxLifecycleDeps, SandboxPrepareInput, SignalHost} from './sandbox-lifecycle.js'
 import {Buffer} from 'node:buffer'
 import {EventEmitter} from 'node:events'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import {err, ok} from '@bfra.me/es/result'
-import {createSandboxAccount} from '@fro-bot/runtime'
+import {admitLaunch, createSandboxAccount} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi, type Mock} from 'vitest'
 import {isSignalOwned} from '../../services/setup/adapters.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
@@ -30,6 +31,14 @@ const TOOLS = Object.fromEntries(
     'env',
     'git',
     'gh',
+    'unshare',
+    'mount',
+    'umount',
+    'pivot_root',
+    'sh',
+    'lsns',
+    'readlink',
+    'sleep',
   ].map(name => [name, `/usr/bin/${name}`]),
 ) as unknown as SandboxToolPaths
 
@@ -43,12 +52,30 @@ interface Harness {
     readonly deleteAccount: Mock<SandboxLifecycleDeps['deleteAccount']>
     readonly handOff: Mock<SandboxLifecycleDeps['handOff']>
     readonly takeBack: Mock<SandboxLifecycleDeps['takeBack']>
+    readonly createViewRoot: Mock<SandboxLifecycleDeps['createViewRoot']>
+    readonly readMountInfo: Mock<SandboxLifecycleDeps['readMountInfo']>
+    readonly createGate: Mock<SandboxLifecycleDeps['createGate']>
+    readonly admit: Mock<SandboxLifecycleDeps['admit']>
+    readonly stopLaunch: Mock<SandboxLifecycleDeps['stopLaunch']>
+    readonly isProcessAlive: Mock<SandboxLifecycleDeps['isProcessAlive']>
   }
+  /** What `remove` of the view root was called with, in order. */
+  readonly viewRootRemovals: string[]
+  /** The gate directories whose `remove` ran. */
+  readonly gateRemovals: string[]
+  /** What the runner wrote into gate directories. */
+  readonly gateWrites: string[]
+  readonly gateFiles: Map<string, string>
   readonly exec: ExecAdapter
   readonly sudoCalls: string[][]
 }
 
 function createHarness(): Harness {
+  const viewRootRemovals: string[] = []
+  const gateRemovals: string[] = []
+  const gateWrites: string[] = []
+  const gateFiles = new Map<string, string>()
+  let gates = 0
   const mocks = {
     createAccount: vi.fn(async () => ok(ACCOUNT)),
     stop: vi.fn(async () => 'stopped' as const),
@@ -57,6 +84,31 @@ function createHarness(): Harness {
       ok({snapshotDir: '/x', touched: [], chowned: [], aclTrees: [], git: null, gitPresent: false}),
     ),
     takeBack: vi.fn(async () => ({status: 'restored' as const})),
+    createViewRoot: vi.fn(async (runnerTemp: string) => ({
+      newRoot: `${runnerTemp}/fro-bot-view-x/root`,
+      gateRoot: `${runnerTemp}/fro-bot-view-x/gates`,
+      remove: async () => {
+        viewRootRemovals.push(runnerTemp)
+      },
+    })),
+    createGate: vi.fn((gateRoot: string) => {
+      gates += 1
+      const dir = `${gateRoot}/g-${gates}`
+      return {
+        dir,
+        remove: async () => {
+          gateRemovals.push(dir)
+        },
+      }
+    }),
+    readMountInfo: vi.fn(async () => ''),
+    // Nothing was spawned under `launch` unless a test does so. The default launch is admitted into its own namespace.
+    admit: vi.fn(async (): Promise<LaunchAdmission> => ({
+      kind: 'admitted',
+      namespace: {id: '4026532399', host: '4026531832'},
+    })),
+    stopLaunch: vi.fn(async () => 'stopped' as const),
+    isProcessAlive: vi.fn(() => false),
   }
   const sudoCalls: string[][] = []
   const exec: ExecAdapter = {
@@ -71,8 +123,20 @@ function createHarness(): Harness {
     ...mocks,
     readText: async () => null,
     ids: () => ({uid: 1001, gid: 1001}),
+    gateFiles: {
+      readText: async (file: string) => gateFiles.get(file) ?? null,
+      writeText: async (file: string, content: string) => {
+        gateWrites.push(file)
+        gateFiles.set(file, content)
+      },
+      readHostNamespace: async () => 'mnt:[4026531832]',
+    },
   } as unknown as SandboxLifecycleDeps
-  return {deps, mocks, exec, sudoCalls}
+  return {deps, mocks, exec, sudoCalls, viewRootRemovals, gateRemovals, gateWrites, gateFiles}
+}
+
+function mountLine(id: number, mountPoint: string): string {
+  return `${id} 1 8:1 / ${mountPoint} rw,relatime shared:1 - ext4 /dev/sda1 rw`
 }
 
 function fakeHost(): SignalHost & {readonly emitter: EventEmitter; readonly killed: string[]} {
@@ -943,6 +1007,410 @@ describe('createSandboxLifecycle', () => {
       // #then the account was removed and the state says so
       expect(prepared.success).toBe(false)
       expect(states).toEqual(['pending', 'restored'])
+    })
+  })
+
+  describe('the read-only view', () => {
+    const prepareInput = {keyFilePaths: [], ghConfigDir: null, repoSkills: null}
+    const quietReport = <T>(value: T) => ({value, unconfirmed: false})
+    const NAMESPACE = {id: '4026532399', host: '4026531832'}
+    const admittedLaunch = async (): Promise<LaunchAdmission> => ({kind: 'admitted', namespace: NAMESPACE})
+    const refusedLaunch = async (): Promise<LaunchAdmission> => ({
+      kind: 'refused',
+      host: NAMESPACE.host,
+      reason: 'no-id',
+    })
+
+    async function preparedWith(
+      input: SandboxPrepareInput = prepareInput,
+      overrides: Partial<Parameters<typeof createSandboxLifecycle>[0]> = {},
+    ) {
+      const harness = createHarness()
+      const states: string[] = []
+      const host = fakeHost()
+      const lifecycle = create(harness, {
+        signals: host,
+        recordState: state => states.push(state),
+        viewLauncher: {nodePath: '/opt/runner/node', builderPath: '/work/_actions/o/r/v1/dist/sandbox-view.js'},
+        attachmentDir: `${temp}/attach`,
+        ...overrides,
+      })
+      const result = await lifecycle.prepare(input)
+      return {harness, host, states, lifecycle, result}
+    }
+
+    it('lists exactly the checkout, the handed-over directories and the home as writable, and the inputs as read-only', async () => {
+      // #given a run with a provisioned gh config and an admitted skills tree
+      const {result} = await preparedWith({
+        keyFilePaths: [],
+        ghConfigDir: `${temp}/gh-config-abc`,
+        repoSkills: {stagingRoot: `${temp}/skills-stage`, admittedDir: `${temp}/skills-stage/admitted`},
+      })
+
+      // #then the view is built from the one manifest
+      expect(result.success).toBe(true)
+      if (!result.success) throw new Error('unreachable')
+      const view = result.data.view
+      expect(view?.policy.writable.toSorted()).toEqual(
+        [
+          '/home/runner/work/r/r',
+          '/custom/data/opencode',
+          '/home/runner/.config/opencode',
+          '/home/runner/.cache/opencode',
+          '/home/runner/.local/state/opencode',
+          `${temp}/fro-bot-response/1-1`,
+          `${temp}/gh-config-abc`,
+          '/home/fro-bot-sandbox',
+        ].toSorted(),
+      )
+      expect(view?.policy.readOnly.toSorted()).toEqual(
+        [`${temp}/attach`, `${temp}/skills-stage/admitted`, `${temp}/skills-stage`].toSorted(),
+      )
+      // #and the protected paths, the launcher and the tools are the resolved ones
+      expect(view?.policy.runnerHome).toBe('/home/runner')
+      expect(view?.policy.actionsDir).toBe(`${path.dirname(temp)}/_actions`)
+      expect(view).toMatchObject({
+        unsharePath: '/usr/bin/unshare',
+        shPath: '/usr/bin/sh',
+        pivotRootPath: '/usr/bin/pivot_root',
+        umountPath: '/usr/bin/umount',
+        nodePath: '/opt/runner/node',
+        builderPath: '/work/_actions/o/r/v1/dist/sandbox-view.js',
+      })
+      expect(view?.policy.tools).toEqual({mount: '/usr/bin/mount', umount: '/usr/bin/umount'})
+      expect(view?.policy.newRoot).toBe(`${temp}/fro-bot-view-x/root`)
+    })
+
+    it('has no gh config directory in withhold mode', async () => {
+      // #given a run with no provisioned gh config
+      const {result} = await preparedWith()
+
+      // #then no directory of that kind is writable
+      expect(result.success && result.data.view?.policy.writable.some(root => root.includes('gh-config'))).toBe(false)
+    })
+
+    it('refuses the launch before the server starts, and takes the handoff back, when a writable root has a mount beneath it', async () => {
+      // #given a mount inside the checkout
+      const harness = createHarness()
+      harness.mocks.readMountInfo.mockResolvedValue(`${mountLine(40, '/home/runner/work/r/r/node_modules')}\n`)
+      const states: string[] = []
+      const lifecycle = create(harness, {
+        signals: fakeHost(),
+        recordState: state => states.push(state),
+        viewLauncher: {nodePath: '/n', builderPath: '/b'},
+      })
+
+      // #when prepared
+      const result = await lifecycle.prepare(prepareInput)
+
+      // #then no spec was returned, the handoff was taken back, the account removed, and the root directory cleaned up
+      expect(!result.success && result.error).toContain('read-only view')
+      expect(!result.success && result.error).toContain('node_modules')
+      expect(harness.mocks.takeBack).toHaveBeenCalledTimes(1)
+      expect(harness.mocks.deleteAccount).toHaveBeenCalledTimes(1)
+      expect(harness.viewRootRemovals).toHaveLength(1)
+      expect(states).toEqual(['pending', 'restored'])
+      // #and nothing can be launched
+      const spawn = vi.fn(async () => quietReport('x'))
+      expect((await lifecycle.launch(spawn)).success).toBe(false)
+      expect(spawn).not.toHaveBeenCalled()
+    })
+
+    it('refuses the launch when the root directory cannot be created or the mount table cannot be read', async () => {
+      // #given a runner temp that refuses, and then an unreadable mount table
+      const noRoot = createHarness()
+      noRoot.mocks.createViewRoot.mockRejectedValue(new Error('EACCES'))
+      const unreadable = createHarness()
+      unreadable.mocks.readMountInfo.mockRejectedValue(new Error('ENOENT'))
+
+      // #when prepared
+      const first = await create(noRoot, {signals: fakeHost()}).prepare(prepareInput)
+      const second = await create(unreadable, {signals: fakeHost()}).prepare(prepareInput)
+
+      // #then both fail closed and take the handoff back
+      expect(first.success).toBe(false)
+      expect(second.success).toBe(false)
+      expect(noRoot.mocks.takeBack).toHaveBeenCalledTimes(1)
+      expect(unreadable.mocks.takeBack).toHaveBeenCalledTimes(1)
+    })
+
+    /** Spawns a launcher the way the runtime does: the pid is reported before the server can be started. */
+    const spawnLauncher = (pid = 100) =>
+      async function spawned(context: Parameters<Parameters<ReturnType<typeof create>['launch']>[0]>[0]) {
+        context.noteSpawn(pid)
+        return quietReport('server')
+      }
+
+    it('gives each launch its own gate directory and the view the gate tools', async () => {
+      // #given a prepared sandbox
+      const {harness, lifecycle} = await preparedWith()
+      let seen: Parameters<Parameters<typeof lifecycle.launch>[0]>[0] | undefined
+
+      // #when launched
+      await lifecycle.launch(async context => {
+        seen = context
+        return quietReport('server')
+      })
+
+      // #then the spec names the gate directory made for this launch, under the view's gate root, and the resolved tools
+      expect(harness.mocks.createGate).toHaveBeenCalledWith(expect.stringMatching(/\/fro-bot-view-x\/gates$/))
+      expect(seen?.spec.view?.gate.dir).toMatch(/\/gates\/g-1$/)
+      expect(seen?.spec.view?.gate).toMatchObject({
+        readlinkPath: '/usr/bin/readlink',
+        sleepPath: '/usr/bin/sleep',
+        ticks: 200,
+      })
+    })
+
+    it('stops and confirms the launch by its gate before the uid sweep and the take-back', async () => {
+      // #given a launch whose launcher was spawned and admitted
+      const {harness, lifecycle} = await preparedWith()
+      await lifecycle.launch(spawnLauncher())
+
+      // #when released
+      const released = await lifecycle.release()
+
+      // #then the admission started for that pid, in the gate directory of the launch, with the closed check
+      expect(released).toMatchObject({stop: 'stopped', restore: 'restored'})
+      expect(harness.mocks.admit.mock.calls[0]?.[0]).toBe(100)
+      expect(harness.mocks.admit.mock.calls[0]?.[1]).toMatch(/\/gates\/g-1$/)
+      expect(harness.mocks.stopLaunch).toHaveBeenCalledWith(
+        {gateDir: harness.mocks.admit.mock.calls[0]?.[1], admission: {kind: 'admitted', namespace: NAMESPACE}},
+        {pkill: '/usr/bin/pkill', pgrep: '/usr/bin/pgrep', lsns: '/usr/bin/lsns'},
+        expect.anything(),
+        expect.anything(),
+      )
+      const order = [
+        harness.mocks.stopLaunch.mock.invocationCallOrder[0] ?? 0,
+        harness.mocks.stop.mock.invocationCallOrder[0] ?? 0,
+        harness.mocks.takeBack.mock.invocationCallOrder[0] ?? 0,
+        harness.mocks.deleteAccount.mock.invocationCallOrder[0] ?? 0,
+      ]
+      expect(order).toEqual(order.toSorted((a, b) => a - b))
+      expect(order.every(call => call > 0)).toBe(true)
+      // #and the gate directory and the view root were removed only afterwards
+      expect(harness.gateRemovals).toHaveLength(1)
+      expect(harness.viewRootRemovals).toHaveLength(1)
+    })
+
+    it('still stops the launch and takes the handoff back when it failed before the server started', async () => {
+      // #given a launch that spawned its launcher and then failed (the builder refused)
+      const {harness, lifecycle} = await preparedWith()
+      const failed = await lifecycle.launch(async context => {
+        context.noteSpawn(100)
+        return quietReport('start failed')
+      })
+      expect(failed.success).toBe(true)
+
+      // #when released
+      const released = await lifecycle.release()
+
+      // #then
+      expect(released).toMatchObject({stop: 'stopped', restore: 'restored'})
+      expect(harness.mocks.stopLaunch).toHaveBeenCalledTimes(1)
+      expect(harness.mocks.takeBack).toHaveBeenCalledTimes(1)
+      expect(harness.mocks.deleteAccount).toHaveBeenCalledTimes(1)
+    })
+
+    it('id captured, launcher dead: the stop still runs and the result follows its outcome', async () => {
+      // #given a launcher that is gone and members that may remain
+      const {harness, lifecycle} = await preparedWith()
+      harness.mocks.isProcessAlive.mockReturnValue(false)
+      await lifecycle.launch(spawnLauncher())
+
+      // #when the stop confirms nothing is left
+      const restored = await lifecycle.release()
+
+      // #then the dead launcher was no reason to skip it
+      expect(restored).toMatchObject({stop: 'stopped', restore: 'restored'})
+      expect(harness.mocks.stopLaunch).toHaveBeenCalledTimes(1)
+    })
+
+    it.each([
+      ['id captured', admittedLaunch],
+      ['no id captured', refusedLaunch],
+    ])('%s, launcher dead, stop unconfirmed: unsafe, account kept, nothing taken back', async (_label, admission) => {
+      // #given a launcher that is dead and a stop that cannot confirm
+      const {harness, lifecycle} = await preparedWith()
+      harness.mocks.isProcessAlive.mockReturnValue(false)
+      harness.mocks.admit.mockImplementation(admission)
+      harness.mocks.stopLaunch.mockResolvedValue('unconfirmed')
+      await lifecycle.launch(spawnLauncher())
+
+      // #when released
+      const released = await lifecycle.release()
+
+      // #then a dead launcher did not make it restored
+      expect(released).toMatchObject({stop: 'unconfirmed', restore: 'unsafe'})
+      expect(released.reason).toContain('launch')
+      expect(harness.mocks.takeBack).not.toHaveBeenCalled()
+      expect(harness.mocks.deleteAccount).not.toHaveBeenCalled()
+      expect(harness.viewRootRemovals).toHaveLength(0)
+      expect(harness.gateRemovals).toHaveLength(0)
+    })
+
+    it('no id captured, launcher dead, the gate processes confirmed gone: restored', async () => {
+      // #given a launcher that died at the gate, whose gate shell the stop killed and counted
+      const {harness, lifecycle} = await preparedWith()
+      harness.mocks.isProcessAlive.mockReturnValue(false)
+      harness.mocks.admit.mockImplementation(refusedLaunch)
+      await lifecycle.launch(spawnLauncher())
+
+      // #when released
+      const released = await lifecycle.release()
+
+      // #then the stop was asked with the refused admission, and the run is restored
+      expect(harness.mocks.stopLaunch.mock.calls[0]?.[0].admission.kind).toBe('refused')
+      expect(released).toMatchObject({stop: 'stopped', restore: 'restored'})
+    })
+
+    it('never gives the go-ahead to a launcher that died before its id was captured', async () => {
+      // #given the real admission, a dead launcher and a gate that never wrote its id
+      const {harness, lifecycle} = await preparedWith()
+      harness.mocks.admit.mockImplementation(admitLaunch)
+      harness.mocks.isProcessAlive.mockReturnValue(false)
+      harness.mocks.stopLaunch.mockResolvedValue('unconfirmed')
+      await lifecycle.launch(spawnLauncher())
+
+      // #when released
+      const released = await lifecycle.release()
+
+      // #then the gate was never opened and the result is not restored
+      expect(harness.gateWrites).toEqual([])
+      expect(released).toMatchObject({restore: 'unsafe'})
+      expect(harness.mocks.takeBack).not.toHaveBeenCalled()
+    })
+
+    it('never gives the go-ahead once the teardown has begun, even to a live launcher whose id arrives late', async () => {
+      // #given the real admission, and a launcher that stays alive until the stop has run
+      const {harness, lifecycle} = await preparedWith()
+      harness.mocks.admit.mockImplementation(admitLaunch)
+      let launcherAlive = true
+      harness.mocks.isProcessAlive.mockImplementation(() => launcherAlive)
+      harness.mocks.stopLaunch.mockImplementation(async () => {
+        launcherAlive = false
+        return 'stopped'
+      })
+      let gateDir = ''
+      await lifecycle.launch(async context => {
+        context.noteSpawn(100)
+        gateDir = context.spec.view?.gate.dir ?? ''
+        return quietReport('server')
+      })
+
+      // #when the admission has polled once without an id, the release begins, and only then does the gate report its id
+      await new Promise(resolve => setTimeout(resolve, 5))
+      const releasing = lifecycle.release()
+      harness.gateFiles.set(`${gateDir}/ns`, 'mnt:[4026532399]\n')
+      await releasing
+
+      // #then no go-ahead was written, and the stop was handed the id that was seen
+      expect(harness.gateWrites).toEqual([])
+      expect(harness.mocks.stopLaunch.mock.calls[0]?.[0].admission.kind).toBe('held')
+    })
+
+    it('gives the go-ahead exactly once for a valid id while the launch is live', async () => {
+      // #given the real admission and a gate that reported a valid id
+      const {harness, lifecycle} = await preparedWith()
+      harness.mocks.admit.mockImplementation(admitLaunch)
+      harness.mocks.isProcessAlive.mockReturnValue(true)
+      await lifecycle.launch(async context => {
+        harness.gateFiles.set(`${context.spec.view?.gate.dir}/ns`, 'mnt:[4026532399]\n')
+        context.noteSpawn(100)
+        return quietReport('server')
+      })
+      await vi.waitFor(() => {
+        expect(harness.gateWrites).toHaveLength(1)
+      })
+
+      // #then the go-ahead names that id, in that gate directory
+      const [file] = harness.gateWrites
+      expect(file).toMatch(/\/gates\/g-1\/go$/)
+      expect(harness.gateFiles.get(file ?? '')).toBe('mnt:[4026532399]\n')
+      harness.mocks.isProcessAlive.mockReturnValue(false)
+      await lifecycle.release()
+    })
+
+    it('kills the launcher’s group when it outlives its namespace, and is unsafe if it still does not exit', async () => {
+      // #given a namespace that stops but a launcher that stays alive
+      const {harness, lifecycle} = await preparedWith()
+      harness.mocks.isProcessAlive.mockReturnValue(true)
+      await lifecycle.launch(spawnLauncher())
+
+      // #when released (the real clock would take a few seconds: shorten what the launcher wait polls)
+      vi.useFakeTimers()
+      try {
+        const releasing = lifecycle.release()
+        await vi.advanceTimersByTimeAsync(10_000)
+        const released = await releasing
+
+        // #then the group was killed as root, and the run is unsafe
+        expect(harness.sudoCalls.some(call => call.includes('-g') && call.includes('100'))).toBe(true)
+        expect(released).toMatchObject({restore: 'unsafe'})
+        expect(harness.mocks.takeBack).not.toHaveBeenCalled()
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('ends with the launch stopped when a signal arrives during the build, with no server started', async () => {
+      // #given a launch that has spawned its launcher and is still building the view
+      const {harness, host, lifecycle} = await preparedWith()
+      const launching = lifecycle.launch(async context => {
+        context.noteSpawn(100)
+        // The build: nothing happens until the lifecycle aborts the attempt, as the runtime does on `signal`.
+        await new Promise<void>(resolve => {
+          context.signal.addEventListener('abort', () => resolve(), {once: true})
+        })
+        return {value: 'start aborted', unconfirmed: false}
+      })
+      await vi.waitFor(() => {
+        expect(harness.mocks.admit).toHaveBeenCalled()
+      })
+
+      // #when SIGTERM arrives
+      host.emitter.emit('SIGTERM')
+      await vi.waitFor(() => {
+        expect(host.killed).toEqual(['4242:SIGTERM'])
+      })
+      await launching
+
+      // #then the launch was stopped before the take-back
+      expect(harness.mocks.stopLaunch).toHaveBeenCalledTimes(1)
+      expect(harness.mocks.stopLaunch.mock.invocationCallOrder[0]).toBeLessThan(
+        harness.mocks.takeBack.mock.invocationCallOrder[0] ?? 0,
+      )
+    })
+
+    it('refuses the launch, starting nothing, when its gate directory cannot be created', async () => {
+      // #given a runner temp that refuses the gate directory
+      const {harness, lifecycle} = await preparedWith()
+      harness.mocks.createGate.mockImplementation(() => {
+        throw new Error('EACCES')
+      })
+      const spawn = vi.fn(async () => quietReport('x'))
+
+      // #when launched
+      const launched = await lifecycle.launch(spawn)
+
+      // #then the spawn never ran, and the run can still be released cleanly
+      expect(launched.success).toBe(false)
+      expect(spawn).not.toHaveBeenCalled()
+      expect(await lifecycle.release()).toMatchObject({restore: 'restored'})
+      expect(harness.mocks.stopLaunch).not.toHaveBeenCalled()
+    })
+
+    it('runs no launch stop and builds no view when nothing was launched', async () => {
+      // #given a prepared sandbox that never launched
+      const {harness, lifecycle} = await preparedWith()
+
+      // #when released
+      await lifecycle.release()
+
+      // #then no admission or stop ran, and no pkill/pgrep/lsns ran for one
+      expect(harness.mocks.admit).not.toHaveBeenCalled()
+      expect(harness.mocks.stopLaunch).not.toHaveBeenCalled()
+      expect(harness.sudoCalls.some(call => call.includes('lsns'))).toBe(false)
     })
   })
 

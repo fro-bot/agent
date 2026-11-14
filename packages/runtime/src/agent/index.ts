@@ -278,12 +278,49 @@ export type {
   SandboxIdentityTools,
   SandboxStopOutcome,
 } from './sandbox-identity.js'
-export {buildSandboxLaunch, DEFAULT_OPENCODE_V2_TIMEOUTS, startOpenCodeV2Server} from './server-v2.js'
+export {
+  admitLaunch,
+  GATE_GO_FILE,
+  GATE_NS_FILE,
+  parseNamespaceId,
+  readGateNamespace,
+  selfExcludingPattern,
+  stopGateProcesses,
+  stopLaunch,
+  stopLaunchNamespace,
+} from './sandbox-namespace.js'
+export type {
+  GateDeps,
+  LaunchAdmission,
+  LaunchNamespace,
+  NamespaceStopOutcome,
+  SandboxNamespaceTools,
+} from './sandbox-namespace.js'
+export {runSandboxViewChild, SANDBOX_VIEW_EXIT_FAILED, SANDBOX_VIEW_EXIT_INVALID_POLICY} from './sandbox-view-child.js'
+export type {SandboxViewChildIo} from './sandbox-view-child.js'
+export {
+  decodeMountPath,
+  parseMountInfo,
+  parseSandboxViewPolicy,
+  planViewBind,
+  planViewSeal,
+  SANDBOX_VIEW_TEMP_MOUNTS,
+  validateViewPolicy,
+  verifyView,
+} from './sandbox-view.js'
+export type {MountEntry, SandboxViewPolicy, SandboxViewStage, ViewOp} from './sandbox-view.js'
+export {
+  buildSandboxLaunch,
+  buildSandboxViewChain,
+  DEFAULT_OPENCODE_V2_TIMEOUTS,
+  startOpenCodeV2Server,
+} from './server-v2.js'
 export type {
   OpenCodeV2ExitInfo,
   OpenCodeV2ExitOutcome,
   OpenCodeV2PluginProblem,
   OpenCodeV2SandboxLaunch,
+  OpenCodeV2SandboxView,
   OpenCodeV2ServerHandle,
   OpenCodeV2ShutdownOptions,
   OpenCodeV2ShutdownResult,
