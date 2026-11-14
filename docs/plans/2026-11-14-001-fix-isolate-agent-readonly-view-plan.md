@@ -285,7 +285,7 @@ A failed launch goes through steps 4 and 5 as well. "Rolled back" below means th
 **Verification:**
 - Every item under "Deferred to Implementation" has a recorded answer for both images.
 
-- [ ] **Unit 2: View policy and builder**
+- [x] **Unit 2: View policy and builder**
 
 **Goal:** A tested module that turns a declared policy into mount operations and verifies the result, plus the bundled child that runs it.
 
@@ -327,7 +327,7 @@ A failed launch goes through steps 4 and 5 as well. "Rolled back" below means th
 **Verification:**
 - `dist/sandbox-view.js` is produced by the build, and two builds give identical output.
 
-- [ ] **Unit 3: Launch chain**
+- [x] **Unit 3: Launch chain**
 
 **Goal:** `buildSandboxLaunch` produces the namespace launch when a view is present.
 
@@ -356,7 +356,7 @@ A failed launch goes through steps 4 and 5 as well. "Rolled back" below means th
 **Verification:**
 - The existing tests for the launch without a view pass unchanged.
 
-- [ ] **Unit 4: Preflight**
+- [x] **Unit 4: Preflight**
 
 **Goal:** The run fails before setup when the runner can't build a view.
 
@@ -383,7 +383,7 @@ A failed launch goes through steps 4 and 5 as well. "Rolled back" below means th
 **Verification:**
 - On both images the preflight passes and adds under two seconds.
 
-- [ ] **Unit 5: Lifecycle wiring and teardown**
+- [x] **Unit 5: Lifecycle wiring and teardown**
 
 **Goal:** The lifecycle builds the view policy from the handoff manifest, launches through it, and confirms the whole launch is gone before take-back.
 
@@ -425,7 +425,7 @@ A failed launch goes through steps 4 and 5 as well. "Rolled back" below means th
 **Verification:**
 - Every path that ends `restored` has confirmed both the namespace and the uid.
 
-- [ ] **Unit 6: Real-runner suite on both images**
+- [x] **Unit 6: Real-runner suite on both images**
 
 **Goal:** The boundary is proven on real hosted runners for Ubuntu 24.04 and 26.04.
 
@@ -460,7 +460,7 @@ A failed launch goes through steps 4 and 5 as well. "Rolled back" below means th
 **Verification:**
 - Both matrix legs pass, and no probe is skipped.
 
-- [ ] **Unit 7: Docs for delivery 1**
+- [x] **Unit 7: Docs for delivery 1**
 
 **Goal:** The docs describe the boundary as built.
 
@@ -483,6 +483,17 @@ A failed launch goes through steps 4 and 5 as well. "Rolled back" below means th
 
 **Verification:**
 - No doc still says the agent can write to shared directories.
+
+### As built (Delivery 1)
+
+Divergences from the plan, with the reason:
+
+- **Namespace confirmation uses `lsns`, not `pgrep --ns`.** With the namespace leader dead, `pgrep --ns <leader>` exits 1 with no output while members remain, which reads as "empty". The confirmation lists namespaces with `lsns -n -t mnt -o NS,PID` (lowest pid of each), kills with `pkill -KILL --ns <that pid> --nslist mnt` and requires the namespace to be gone from the listing. A failed listing is never an empty answer. New module `packages/runtime/src/agent/sandbox-namespace.ts`; `lsns` joins the preflight's required tools.
+- **The probe checks the refused write as root inside the view, not as `nobody`.** `nobody` cannot traverse the runner home, so its refusal would be a permission error and prove nothing. The probe checks for the read-only error text as root, then drops to `nobody` for the drop and a private `/tmp` write.
+- **Builder bundle is split into a chunk.** `dist/sandbox-view.js` imports `dist/sandbox-view-<hash>.js`; the suite's stand-in install copies both. The preflight still names only the entry script.
+- **Extra files touched:** `src/harness/phases/sandbox-signal.fixture.ts`, `src/harness/phases/v2-server.test.ts`, `src/harness/phases/v2-server.ts` (passes the launcher's pid callback through to the spawn), `packages/runtime/src/agent/server-v2.sandbox.test.ts`. `bootstrap.ts`, `cache-restore.ts`, `run.ts` and `post.ts` needed no change: the lifecycle's `release` is the single teardown path and already ran for a failed launch.
+- **CI job name changes** to `Sandbox integration (<os>)` with the matrix; a required-status-check setting naming the old job must be updated by the owner.
+- **User-namespace probe** asks whether a write can be made to work from inside a user namespace, not whether one can be created: the hosted images may allow creation.
 
 ### Delivery 2: the agent's PATH
 

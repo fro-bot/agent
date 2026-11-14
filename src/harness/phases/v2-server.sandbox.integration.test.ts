@@ -98,8 +98,8 @@ const runnerTemp = safeEnvPath(process.env.RUNNER_TEMP, path.join(runnerHome, 'w
 /** The stand-in published install the preflight is pointed at (see `createPublishedActionLayout`). */
 const fakeActionRoot = path.join(path.dirname(runnerTemp), '_actions', 'fro-bot-sandbox-it', 'agent', 'refs', 'v1')
 
-/** The committed bundle of the repository under test (`dist/sandbox-view.js`, kept fresh by the pre-push hook and CI). */
-const realViewBuilder = fileURLToPath(new URL('../../../dist/sandbox-view.js', import.meta.url))
+/** The committed bundle of the repository under test (`dist/`, kept fresh by the pre-push hook and CI). */
+const realDist = fileURLToPath(new URL('../../../dist', import.meta.url))
 
 /** What a lifecycle needs to build the view: the Node that runs the builder, and the builder of the stand-in install. */
 const viewLauncher = {nodePath: process.execPath, builderPath: path.join(fakeActionRoot, 'dist', 'sandbox-view.js')}
@@ -255,8 +255,12 @@ function createPublishedActionLayout(): void {
   )
   for (const script of ['main.js', 'post.js', 'key-proxy.js'])
     fs.writeFileSync(path.join(fakeActionRoot, 'dist', script), '// stand-in\n')
-  // The view builder is the real bundle: the preflight probe and every launch below run it as root.
-  fs.copyFileSync(realViewBuilder, path.join(fakeActionRoot, 'dist', 'sandbox-view.js'))
+  // The view builder is the real bundle, with the chunk it imports: the preflight probe and every launch run it as root.
+  for (const name of fs.readdirSync(realDist)) {
+    if (name === 'sandbox-view.js' || (name.startsWith('sandbox-view-') && name.endsWith('.js'))) {
+      fs.copyFileSync(path.join(realDist, name), path.join(fakeActionRoot, 'dist', name))
+    }
+  }
 }
 
 afterAll(() => {
