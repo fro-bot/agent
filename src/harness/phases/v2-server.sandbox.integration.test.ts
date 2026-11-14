@@ -1865,7 +1865,12 @@ describe.skipIf(!gated)('isolate-agent read-only view: the write boundary on a h
     {
       id: 'esc_userns',
       category: 'blocked',
-      cmd: `out=$(unshare --user --map-root-user --mount true 2>&1); rc=$?; if [ $rc -eq 0 ]; then R esc_userns OPEN "user namespace opened"; else R esc_userns BLOCKED "rc=$rc $(printf %s "$out" | ev)"; fi`,
+      // Whether a user namespace can be created depends on the image's AppArmor policy, so the probe asks the question that
+      // matters: from inside one, with every mapped capability, can a write to the sealed directory be made to work?
+      cmd:
+        `t=${q(escapeDir)}/${VIEW_IT_PREFIX}-userns-$$; ` +
+        `unshare --user --map-root-user --mount sh -c 'mount -o remount,rw,bind "$1" "$1"; : > "$2"' sh ${q(escapeDir)} "$t" >/dev/null 2>&1; ` +
+        `if [ -e "$t" ]; then rm -f "$t"; R esc_userns OPEN "wrote from a user namespace"; else R esc_userns BLOCKED "no write from a user namespace"; fi`,
     },
   ]
 
