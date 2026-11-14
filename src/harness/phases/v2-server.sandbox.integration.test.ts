@@ -20,7 +20,7 @@
  */
 import type {SandboxToolPaths} from '../../services/setup/sandbox-preflight.js'
 import type {Logger} from '../../shared/logger.js'
-import type {SandboxLifecycle, SandboxReleaseResult} from './sandbox-lifecycle.js'
+import type {SandboxLifecycle, SandboxLifecycleDeps, SandboxReleaseResult} from './sandbox-lifecycle.js'
 import type {Probe, Row, ScriptedProvider} from './v2-server.sandbox.harness.js'
 import {spawnSync} from 'node:child_process'
 import {createHash} from 'node:crypto'
@@ -31,7 +31,7 @@ import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import {DatabaseSync} from 'node:sqlite'
-import {getSessionDbBasenames} from '@fro-bot/runtime'
+import {createSandboxAccount, getSessionDbBasenames} from '@fro-bot/runtime'
 import {afterAll, beforeAll, describe, expect, it} from 'vitest'
 import {startTlsUpstream, type TlsUpstream} from '../../../packages/runtime/src/agent/key-proxy-test-kit.js'
 import {resolveBrokeredPushCommitMessage} from '../../features/delegated/commit-message.js'
@@ -278,6 +278,8 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
   let controls = new Map<string, Row[]>()
   let identityLine = ''
   let straysAfterRelease = ''
+  /** The entries in the account's home right after creation; `null` when it could not be listed. */
+  let homeEntriesAfterCreation: string[] | null = null
 
   const probes = (): Probe[] => [
     {
@@ -449,6 +451,18 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
     controls = runControls(probes(), workspace, process.env)
 
     // --- Hand over, launch, drive one turn --------------------------------------------------------------------------
+    // The real account creation, timed (so the CI log shows how long it takes) and followed by a listing of the new home.
+    const createAccount: SandboxLifecycleDeps['createAccount'] = async (accountTools, accountDeps) => {
+      const started = performance.now()
+      const created = await createSandboxAccount(accountTools, accountDeps)
+      logger.info('Sandbox account creation finished', {elapsedMs: Math.round(performance.now() - started)})
+      if (created.success) {
+        const listing = await accountDeps.run([tools.find, created.data.home, '-mindepth', '1', '-maxdepth', '1'])
+        homeEntriesAfterCreation =
+          listing.exitCode === 0 ? listing.stdout.split('\n').filter(line => line.length > 0) : null
+      }
+      return created
+    }
     lifecycle = createSandboxLifecycle({
       tools,
       env,
@@ -456,6 +470,7 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
       workspacePath: workspace,
       responseDir,
       logger,
+      deps: {createAccount},
     })
     const prepared = await lifecycle.prepare({keyFilePaths: [keyFile], ghConfigDir: null, repoSkills: null})
     if (!prepared.success) throw new Error(prepared.error)
@@ -486,6 +501,12 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
     fs.rmSync(path.dirname(canaries.config), {recursive: true, force: true})
     fs.rmSync(path.dirname(canaries.cache), {recursive: true, force: true})
   }, 120_000)
+
+  it('creates the account with an empty home: /etc/skel is not copied into it', () => {
+    // #given the account was just created through the real lifecycle
+    // #then its home had no entries (`useradd --create-home` would have copied about 833 MB of /etc/skel into it)
+    expect(homeEntriesAfterCreation).toEqual([])
+  })
 
   it('has a positive control for every blocked row: the runner can do what the sandbox cannot', () => {
     // #given the controls ran as the runner before the sandbox started
