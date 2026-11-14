@@ -20,7 +20,7 @@
  */
 import type {SandboxToolPaths} from '../../services/setup/sandbox-preflight.js'
 import type {Logger} from '../../shared/logger.js'
-import type {SandboxLifecycle, SandboxReleaseResult} from './sandbox-lifecycle.js'
+import type {SandboxLifecycle, SandboxLifecycleDeps, SandboxReleaseResult} from './sandbox-lifecycle.js'
 import type {Probe, Row, ScriptedProvider} from './v2-server.sandbox.harness.js'
 import {spawnSync} from 'node:child_process'
 import {createHash} from 'node:crypto'
@@ -31,7 +31,7 @@ import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import {DatabaseSync} from 'node:sqlite'
-import {getSessionDbBasenames} from '@fro-bot/runtime'
+import {createSandboxAccount, getSessionDbBasenames} from '@fro-bot/runtime'
 import {afterAll, beforeAll, describe, expect, it} from 'vitest'
 import {startTlsUpstream, type TlsUpstream} from '../../../packages/runtime/src/agent/key-proxy-test-kit.js'
 import {resolveBrokeredPushCommitMessage} from '../../features/delegated/commit-message.js'
@@ -53,6 +53,7 @@ import {STORAGE_VERSION} from '../../shared/constants.js'
 import {getGitHubRunAttempt, getInvocationIdentity} from '../../shared/env.js'
 import {createLogger} from '../../shared/logger.js'
 import {startKeyProxyProcess, type KeyProxyProcess} from './key-proxy-process.js'
+import {snapshotLogDirectory} from './log-snapshot.js'
 import {createSandboxLifecycle} from './sandbox-lifecycle.js'
 import {
   describeReconstruction,
@@ -277,6 +278,8 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
   let controls = new Map<string, Row[]>()
   let identityLine = ''
   let straysAfterRelease = ''
+  /** The entries in the account's home right after creation; `null` when it could not be listed. */
+  let homeEntriesAfterCreation: string[] | null = null
 
   const probes = (): Probe[] => [
     {
@@ -448,6 +451,18 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
     controls = runControls(probes(), workspace, process.env)
 
     // --- Hand over, launch, drive one turn --------------------------------------------------------------------------
+    // The real account creation, timed (so the CI log shows how long it takes) and followed by a listing of the new home.
+    const createAccount: SandboxLifecycleDeps['createAccount'] = async (accountTools, accountDeps) => {
+      const started = performance.now()
+      const created = await createSandboxAccount(accountTools, accountDeps)
+      logger.info('Sandbox account creation finished', {elapsedMs: Math.round(performance.now() - started)})
+      if (created.success) {
+        const listing = await accountDeps.run([tools.find, created.data.home, '-mindepth', '1', '-maxdepth', '1'])
+        homeEntriesAfterCreation =
+          listing.exitCode === 0 ? listing.stdout.split('\n').filter(line => line.length > 0) : null
+      }
+      return created
+    }
     lifecycle = createSandboxLifecycle({
       tools,
       env,
@@ -455,6 +470,7 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
       workspacePath: workspace,
       responseDir,
       logger,
+      deps: {createAccount},
     })
     const prepared = await lifecycle.prepare({keyFilePaths: [keyFile], ghConfigDir: null, repoSkills: null})
     if (!prepared.success) throw new Error(prepared.error)
@@ -485,6 +501,12 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
     fs.rmSync(path.dirname(canaries.config), {recursive: true, force: true})
     fs.rmSync(path.dirname(canaries.cache), {recursive: true, force: true})
   }, 120_000)
+
+  it('creates the account with an empty home: /etc/skel is not copied into it', () => {
+    // #given the account was just created through the real lifecycle
+    // #then its home had no entries (`useradd --create-home` would have copied about 833 MB of /etc/skel into it)
+    expect(homeEntriesAfterCreation).toEqual([])
+  })
 
   it('has a positive control for every blocked row: the runner can do what the sandbox cannot', () => {
     // #given the controls ran as the runner before the sandbox started
@@ -687,6 +709,19 @@ describe.skipIf(!gated)('isolate-agent with a provisioned gh config and an admit
         `else R gh_auth_token FAILED "$(printf %s "$t" | ev)"; fi`,
     },
     {
+      // The sandbox's global gitconfig names gh as the credential helper for the server host, so the model's `git push`
+      // authenticates with the token it already holds. `git credential fill` runs the helper chain for real, offline.
+      id: 'git_credential_helper',
+      category: 'works',
+      cmd: [
+        String.raw`o=$(printf 'protocol=https\nhost=%s\n\n' ${q(ghHost)} | GIT_TERMINAL_PROMPT=0 git credential fill 2>&1);`,
+        `h=$(git config --global --get-all ${q(`credential.https://${ghHost}.helper`)} 2>&1);`,
+        String.raw`if printf '%s\n' "$o" | grep -qx ${q(`password=${ghDummyToken}`)} && printf '%s\n' "$h" | grep -q 'gh auth git-credential$';`,
+        'then R git_credential_helper WORKS "git credential fill answered from the provisioned gh token";',
+        `else R git_credential_helper FAILED "helper=[$(printf %s "$h" | ev)] fill=[$(printf %s "$o" | grep -v '^password=' | ev)]"; fi`,
+      ].join(' '),
+    },
+    {
       id: 'gh_runner_hosts',
       category: 'blocked',
       control: true,
@@ -776,7 +811,8 @@ describe.skipIf(!gated)('isolate-agent with a provisioned gh config and an admit
     if (admission.data.directory === null) throw new Error('the demo skill was not admitted')
     admittedDir = admission.data.directory
 
-    const env = hostedEnv(workspace)
+    // The helper is scoped to the server the Action runs against, which the dummy gh config also names.
+    const env = {...hostedEnv(workspace), GITHUB_SERVER_URL: `https://${ghHost}`}
     controls = runControls(probes(), workspace, env)
     const result = await runIsolated({
       tools,
@@ -815,6 +851,12 @@ describe.skipIf(!gated)('isolate-agent with a provisioned gh config and an admit
     // #then the model's gh reads it
     expect(failuresFor(rows, 'gh_config_dir_env', 'WORKS')).toEqual([])
     expect(failuresFor(rows, 'gh_auth_token', 'WORKS')).toEqual([])
+  })
+
+  it("lets the model's git authenticate through the provisioned gh token (credential helper in the sandbox gitconfig)", () => {
+    // #given provision mode: a gh config for the server host and the helper written into the sandbox's global gitconfig
+    // #then `git credential fill` as the sandbox returns the provisioned token, and the helper is the configured one
+    expect(failuresFor(rows, 'git_credential_helper', 'WORKS')).toEqual([])
   })
 
   it("keeps the runner's own gh config out of reach", () => {
@@ -940,6 +982,10 @@ describe.skipIf(!gated)('isolate-agent session persistence round trip', () => {
     run1: undefined as IsolatedRunResult | undefined,
     run2: undefined as IsolatedRunResult | undefined,
     sessionsAfterRun1: [] as string[],
+    logSourceFiles: [] as string[],
+    logSnapshot: undefined as string | null | undefined,
+    logSnapshotFiles: [] as string[],
+    logSnapshotLaterWrite: '',
     walBytesBeforeSave: -1,
     saveOutcome: undefined as Awaited<ReturnType<typeof saveCache>> | undefined,
     walBytesAfterSave: -1,
@@ -982,12 +1028,29 @@ describe.skipIf(!gated)('isolate-agent session persistence round trip', () => {
           id: 'persist_write_storage',
           category: 'works',
           cmd:
+            `mkdir -p "$XDG_DATA_HOME/opencode/log" && echo log-from-the-sandbox > "$XDG_DATA_HOME/opencode/log/sandbox-note.log" && ` +
             `echo storage-from-the-sandbox > "$XDG_DATA_HOME/opencode/storage/sandbox-note.txt" && ` +
             `R persist_write_storage WORKS "wrote storage" || R persist_write_storage FAILED "write failed"`,
         },
       ],
     })
     facts.sessionsAfterRun1 = readSessionIds(dbPath)
+
+    // --- The log snapshot, taken the way run.ts takes it: right after the confirmed take-back ------------------------------
+    const logSource = path.join(dataDir, 'log')
+    facts.logSourceFiles = fs.readdirSync(logSource).sort()
+    facts.logSnapshot = await snapshotLogDirectory({
+      source: logSource,
+      tempRoot: scratch,
+      runnerUid: process.getuid?.() ?? -1,
+      logger,
+    })
+    // A later isolated step's sandbox writing to the shared directory after the snapshot must not reach it.
+    fs.writeFileSync(path.join(logSource, 'later-step.log'), 'written after the snapshot')
+    facts.logSnapshotFiles = facts.logSnapshot === null ? [] : fs.readdirSync(facts.logSnapshot).sort()
+    facts.logSnapshotLaterWrite = fs.existsSync(path.join(facts.logSnapshot ?? scratch, 'later-step.log'))
+      ? 'present'
+      : 'absent'
 
     // --- Checkpoint and save through the real save path ----------------------------------------------------------------------
     facts.walBytesBeforeSave = fileSizeOrZero(walPath)
@@ -1042,6 +1105,19 @@ describe.skipIf(!gated)('isolate-agent session persistence round trip', () => {
     expect(facts.run1?.released.stop).toBe('stopped')
     expect(facts.run1?.released.restore).toBe('restored')
     expect(facts.sessionsAfterRun1.length).toBeGreaterThan(0)
+  })
+
+  it('snapshots every log the sandbox wrote, as runner-owned copies, and a later write to the shared directory does not reach it', () => {
+    // #given the log directory right after the take-back: nothing may be skipped as not runner-owned
+    expect(facts.logSourceFiles).toContain('sandbox-note.log')
+    // #then the snapshot holds exactly those files, and nothing written to the shared directory afterwards
+    expect(facts.logSnapshot).not.toBeNull()
+    expect(facts.logSnapshotFiles).toEqual(facts.logSourceFiles)
+    expect(facts.logSnapshotLaterWrite).toBe('absent')
+    expect(fs.readFileSync(path.join(facts.logSnapshot ?? '', 'sandbox-note.log'), 'utf8')).toBe(
+      'log-from-the-sandbox\n',
+    )
+    expect(fs.statSync(path.join(facts.logSnapshot ?? '', 'sandbox-note.log')).uid).toBe(process.getuid?.())
   })
 
   it('saves through the real save path: persisted, the expected key and paths, a clean WAL and a sound database', () => {

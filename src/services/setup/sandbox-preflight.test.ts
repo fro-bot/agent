@@ -150,6 +150,7 @@ describe('runSandboxPreflight', () => {
     ['tool', {missingTools: ['setfacl']}],
     ['tool', {missingTools: ['useradd']}],
     ['tool', {missingTools: ['pgrep']}],
+    ['tool', {missingTools: ['gh']}],
     ['protected-links', {sysctls: {protected_hardlinks: '0\n'}}],
     ['protected-links', {sysctls: {protected_symlinks: null}}],
   ] as const)('fails the %s check', async (check, overrides: Overrides) => {

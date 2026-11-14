@@ -631,6 +631,31 @@ describe('runBootstrap isolate-agent preflight', () => {
     expect(mocks.saveState).toHaveBeenCalledWith('sandboxState', 'pending')
   })
 
+  it('marks the run isolated from the input, before any sandbox exists, so a sandbox that never starts still counts', async () => {
+    // #given isolation on; no lifecycle method is ever called here (createAccount may refuse later, in prepare)
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: true})})
+    mocks.runSandboxPreflight.mockResolvedValue({ok: true, tools})
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when bootstrap runs
+    await runBootstrap(createMockLogger())
+
+    // #then the post hook is told, from the input alone, that this run must never read shared paths
+    expect(mocks.saveState).toHaveBeenCalledWith('isolatedRun', 'true')
+  })
+
+  it('does not mark a run isolated when isolation is off', async () => {
+    // #given the input is off
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: false})})
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when
+    await runBootstrap(createMockLogger())
+
+    // #then
+    expect(mocks.saveState).not.toHaveBeenCalledWith('isolatedRun', expect.anything())
+  })
+
   it('creates no lifecycle when isolation is off', async () => {
     // #given the input is off
     mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: false})})

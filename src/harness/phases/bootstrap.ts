@@ -90,6 +90,9 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
   // undo. Skipped entirely (no check, no log) when the input is off.
   let sandboxTools: SandboxToolPaths | null = null
   if (inputs.isolateAgent) {
+    // From the input, not from a sandbox that started: an isolated run whose sandbox never starts (the account already
+    // exists, an earlier step's sandbox is unconfirmed) still must not read or publish anything from the shared paths.
+    core.saveState(STATE_KEYS.ISOLATED_RUN, 'true')
     const preflight = await runSandboxPreflight({...createSandboxPreflightDeps(createExecAdapter(), logger)})
     if (!preflight.ok) {
       core.setFailed(preflight.message)

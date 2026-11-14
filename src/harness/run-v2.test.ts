@@ -3,7 +3,7 @@ import type {BootstrapPhaseResult} from './phases/bootstrap.js'
 import type {CacheRestorePhaseResult} from './phases/cache-restore.js'
 import type {RoutingPhaseResult} from './phases/routing.js'
 import type {SandboxLifecycle, SandboxReleaseResult} from './phases/sandbox-lifecycle.js'
-import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createLogger} from '../shared/logger.js'
 import {run} from './run.js'
 
@@ -46,7 +46,12 @@ vi.mock('./config/state-keys.js', () => ({
     CACHE_SAVED: 'cache-saved',
     ISOLATED_RUN: 'isolated-run',
     SANDBOX_STATE: 'sandbox-state',
+    LOG_SNAPSHOT_DIR: 'log-snapshot-dir',
   },
+}))
+
+vi.mock('./phases/log-snapshot.js', () => ({
+  snapshotLogDirectory: vi.fn(async () => '/runner-temp/fro-bot-logs-test'),
 }))
 
 vi.mock('./phases/acknowledge.js', () => ({
@@ -794,6 +799,11 @@ describe('run persistence: only a run that started the V2 server may save sessio
 describe('run with isolate-agent', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    vi.stubEnv('RUNNER_TEMP', '/runner-temp')
+  })
+
+  afterEach(() => {
+    vi.unstubAllEnvs()
   })
 
   function fakeSandbox(outcome: SandboxReleaseResult) {
@@ -844,15 +854,17 @@ describe('run with isolate-agent', () => {
     const order = (mock: {mock: {invocationCallOrder: number[]}}): number => mock.mock.invocationCallOrder[0] ?? 0
     expect(order(vi.mocked(runReleaseV2))).toBeLessThan(order(release))
     expect(order(release)).toBeLessThan(order(vi.mocked(runFinalizeWithResult)))
-    // #and the post hook is told this state came from a sandbox before the save is armed
-    const saved = vi.mocked(core.saveState).mock.calls.map(call => `${call[0]}=${call[1]}`)
-    expect(saved.indexOf('isolated-run=true')).toBeGreaterThanOrEqual(0)
-    expect(saved.indexOf('isolated-run=true')).toBeLessThan(saved.lastIndexOf('should-save-cache=true'))
-    // #and persistence is not declined
+    // #and persistence is not declined; the invocation is isolated and publishes only the snapshot taken after the release
     expect(vi.mocked(runCleanup).mock.calls[0]?.[0]).toMatchObject({
       skipSessionPersistence: false,
       sandboxOutputUntrusted: false,
+      isolatedRun: true,
+      logSnapshotPath: '/runner-temp/fro-bot-logs-test',
     })
+    const {snapshotLogDirectory} = await import('./phases/log-snapshot.js')
+    expect(order(release)).toBeLessThan(order(vi.mocked(snapshotLogDirectory)))
+    expect(order(vi.mocked(snapshotLogDirectory))).toBeLessThan(order(vi.mocked(runCleanup)))
+    expect(vi.mocked(core.saveState)).toHaveBeenCalledWith('log-snapshot-dir', '/runner-temp/fro-bot-logs-test')
   })
 
   it.each([
@@ -876,7 +888,11 @@ describe('run with isolate-agent', () => {
     expect(vi.mocked(runCleanup).mock.calls[0]?.[0]).toMatchObject({
       skipSessionPersistence: true,
       sandboxOutputUntrusted: true,
+      logSnapshotPath: null,
     })
+    // #and the sandbox-writable log directory was never copied
+    const {snapshotLogDirectory} = await import('./phases/log-snapshot.js')
+    expect(vi.mocked(snapshotLogDirectory)).not.toHaveBeenCalled()
     expect(
       String(
         (vi.mocked(runCleanup).mock.calls[0]?.[0] as {persistenceDeclineReason?: string}).persistenceDeclineReason,
@@ -986,6 +1002,21 @@ describe('run with isolate-agent', () => {
       })
     })
 
+    it('snapshots nothing and publishes no logs when the sandbox never started (its account already existed)', async () => {
+      // #given a start that failed before any account was created: the lifecycle reports it never started
+      const {runCleanup} = await import('./phases/cleanup.js')
+      const {snapshotLogDirectory} = await import('./phases/log-snapshot.js')
+      await arrangeFailedStart({stop: 'never-started', restore: 'not-needed'})
+
+      // #when
+      await run()
+
+      // #then no sandbox of this invocation wrote the shared log directory, so there is nothing to copy; cleanup is told the
+      // invocation is isolated and has no snapshot, so it reads nothing from the shared path
+      expect(vi.mocked(snapshotLogDirectory)).not.toHaveBeenCalled()
+      expect(vi.mocked(runCleanup).mock.calls[0]?.[0]).toMatchObject({isolatedRun: true, logSnapshotPath: null})
+    })
+
     it('keeps the log backends open when the release after the failed start was confirmed restored', async () => {
       // #given the same failed start with a clean release
       const {runCleanup} = await import('./phases/cleanup.js')
@@ -1017,6 +1048,25 @@ describe('run with isolate-agent', () => {
     expect(release.mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(runCleanup).mock.invocationCallOrder[0] ?? 0)
   })
 
+  it('snapshots the logs on the exception path too, once the sandbox is confirmed restored', async () => {
+    // #given execution that throws, and a sandbox the finally path then restores
+    const {runCleanup} = await import('./phases/cleanup.js')
+    const {snapshotLogDirectory} = await import('./phases/log-snapshot.js')
+    const {release} = await arrangeIsolated(RESTORED, {executeError: new Error('boom')})
+
+    // #when
+    await run()
+
+    // #then the copy was taken after the release and before cleanup, and cleanup publishes only it
+    const order = (mock: {mock: {invocationCallOrder: number[]}}): number => mock.mock.invocationCallOrder[0] ?? 0
+    expect(order(release)).toBeLessThan(order(vi.mocked(snapshotLogDirectory)))
+    expect(order(vi.mocked(snapshotLogDirectory))).toBeLessThan(order(vi.mocked(runCleanup)))
+    expect(vi.mocked(runCleanup).mock.calls[0]?.[0]).toMatchObject({
+      isolatedRun: true,
+      logSnapshotPath: '/runner-temp/fro-bot-logs-test',
+    })
+  })
+
   it('declines persistence when the exception path cannot restore the sandbox', async () => {
     // #given an exception and a sandbox that cannot be restored
     const {runCleanup} = await import('./phases/cleanup.js')
@@ -1043,7 +1093,11 @@ describe('run with isolate-agent', () => {
     // #when
     await run()
 
-    // #then the isolated marker is never written
-    expect(vi.mocked(core.saveState).mock.calls.some(call => call[0] === 'isolated-run')).toBe(false)
+    // #then no isolation marker or snapshot is written, and cleanup reads the shared log path as before
+    const {snapshotLogDirectory} = await import('./phases/log-snapshot.js')
+    const {runCleanup} = await import('./phases/cleanup.js')
+    expect(vi.mocked(core.saveState).mock.calls.some(call => call[0] === 'log-snapshot-dir')).toBe(false)
+    expect(vi.mocked(snapshotLogDirectory)).not.toHaveBeenCalled()
+    expect(vi.mocked(runCleanup).mock.calls[0]?.[0]).toMatchObject({isolatedRun: false, logSnapshotPath: null})
   })
 })

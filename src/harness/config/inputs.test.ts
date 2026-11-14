@@ -4,7 +4,7 @@ import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {RECORDED_V2_PIN} from '../../services/setup/opencode.js'
 import {DEFAULT_OPENCODE_VERSION, DEFAULT_S3_PREFIX, DEFAULT_SYSTEMATIC_VERSION} from '../../shared/constants.js'
-import {LAST_V1_ACTION_RELEASE, parseActionInputs, parseModelInput} from './inputs.js'
+import {isIsolationRequested, LAST_V1_ACTION_RELEASE, parseActionInputs, parseModelInput} from './inputs.js'
 
 const mocks = vi.hoisted(() => ({
   getInput: vi.fn<(name: string) => string>(),
@@ -177,7 +177,12 @@ describe('parseActionInputs', () => {
         expect(result.success && result.data.opencodeVersion).toBe(RECORDED_V2_PIN.version)
       })
 
-      it.each(['2.3.0', 'v2.2.5', '2.9.9', '2.2.6-beta.1', '2.2.6+build.7', 'v2.2.60', '3.0.0'])(
+      // One minor above the pin, so it never equals the pin whatever Renovate moves it to.
+      const nonPinMinor = RECORDED_V2_PIN.version.replace(
+        /^(\d+)\.(\d+)\..*$/,
+        (_match, major: string, minor: string) => `${major}.${Number(minor) + 1}.0`,
+      )
+      it.each([nonPinMinor, 'v2.2.5', '2.9.9', '2.2.6-beta.1', '2.2.6+build.7', 'v2.2.60', '3.0.0'])(
         'rejects the non-pin V2 version %s at parsing, naming the value and the pin',
         value => {
           // #given a V2 version other than the recorded release: a matching binary already on the runner would
@@ -653,6 +658,19 @@ describe('parseActionInputs', () => {
   })
 
   describe('isolate-agent', () => {
+    it.each(['', '  ', 'false', 'FALSE', ' False '])('does not treat %j as an isolation request', value => {
+      // #when / #then
+      expect(isIsolationRequested(value)).toBe(false)
+    })
+
+    it.each(['true', 'TRUE', 'banana', '0', 'yes'])(
+      'treats %j as an isolation request, so an unparseable value never reads as off',
+      value => {
+        // #when / #then
+        expect(isIsolationRequested(value)).toBe(true)
+      },
+    )
+
     it('defaults to false when the input is empty', () => {
       // #given no isolate-agent input
       mockInputs({})

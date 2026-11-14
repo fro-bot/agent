@@ -63,7 +63,7 @@
     "source-map-js": ">=1.2.2 <2.0.0",
     "tar": ">=7.5.21",
     "undici": ">=8.12.2",
-    "vite": "8.3.7",
+    "vite": "8.3.8",
     "yaml": ">=2.8.3"
   },
   "dependencies": {
@@ -94,7 +94,7 @@
     "eslint-plugin-prettier": "5.5.7",
     "jiti": "2.7.0",
     "lint-staged": "17.6.0",
-    "prettier": "3.9.10",
+    "prettier": "3.10.0",
     "read-package-up": "12.0.0",
     "semantic-release": "25.0.9",
     "simple-git-hooks": "2.14.0",

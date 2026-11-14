@@ -34,7 +34,6 @@ import {
   getGitHubWorkspace,
   getInvocationIdentity,
   getOpenCodeAuthPath,
-  getOpenCodeLogPath,
   getOpenCodeStoragePath,
   isOpenCodePromptArtifactEnabled,
 } from '../../shared/env.js'
@@ -43,6 +42,7 @@ import {createLogger} from '../../shared/logger.js'
 import {setCacheSaveResultOutput} from '../config/outputs.js'
 import {STATE_KEYS} from '../config/state-keys.js'
 import {ACTION_LOCK_SCOPE} from './acquire-lock.js'
+import {resolveLogReadPath} from './log-snapshot.js'
 
 export interface CleanupPhaseOptions {
   readonly bootstrapLogger: Logger
@@ -97,6 +97,14 @@ export interface CleanupPhaseOptions {
    * upload). Runner-generated metadata is unaffected.
    */
   readonly sandboxOutputUntrusted?: boolean
+  /**
+   * `true` when the invocation used `isolate-agent`, whether or not its sandbox ever started. The shared log directory is
+   * re-handed to every isolated step's sandbox, so such an invocation reads logs only from `logSnapshotPath` and never
+   * from the shared path.
+   */
+  readonly isolatedRun?: boolean
+  /** The runner-owned log snapshot this invocation took at its confirmed take-back. Absent: it took none, so no logs are published. */
+  readonly logSnapshotPath?: string | null
 }
 
 /**
@@ -141,7 +149,17 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
     skipSessionPersistence = false,
     persistenceDeclineReason,
     sandboxOutputUntrusted = false,
+    isolatedRun = false,
+    logSnapshotPath = null,
   } = options
+
+  // The one directory a log upload may read this invocation: the shared path for a normal run, only the invocation's own
+  // snapshot for an isolated one, nothing when the sandbox was not confirmed restored or no snapshot exists.
+  const logPath = resolveLogReadPath({
+    isolated: isolatedRun,
+    trusted: !sandboxOutputUntrusted,
+    snapshotPath: logSnapshotPath,
+  })
 
   // Populated below (quiescence during the shutdown step; lease continuity at the very end,
   // after `leaseRenewal.stop()` has had its last chance to latch it) and returned after the
@@ -265,13 +283,13 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
       const objectStoreLogger = createLogger({phase: 'object-store-artifacts'})
       try {
         const adapter = createS3Adapter(storeConfig, objectStoreLogger)
-        const logPath = getOpenCodeLogPath()
-        const artifactResult = sandboxOutputUntrusted
-          ? {uploaded: 0, failed: 0}
-          : await syncArtifactsToStore(adapter, storeConfig, agentIdentity, repo, runId, logPath, objectStoreLogger)
-        if (sandboxOutputUntrusted) {
+        const artifactResult =
+          logPath === null
+            ? {uploaded: 0, failed: 0}
+            : await syncArtifactsToStore(adapter, storeConfig, agentIdentity, repo, runId, logPath, objectStoreLogger)
+        if (logPath === null) {
           objectStoreLogger.warning(
-            'Skipping the object-store artifact sync: the isolate-agent sandbox was not confirmed stopped and restored, so its log directory is not read',
+            'Skipping the object-store artifact sync: this isolate-agent run has no log snapshot from a confirmed sandbox take-back, so the shared log directory is not read',
           )
         }
         const snapshot = metrics.getMetrics()
@@ -425,10 +443,10 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
       declineReason == null && storePublishWithheld ? 'lease-not-acquired' : undefined,
     )
 
-    if (isOpenCodePromptArtifactEnabled() && !sandboxOutputUntrusted) {
+    if (isOpenCodePromptArtifactEnabled() && logPath !== null) {
       const artifactLogger = createLogger({phase: 'artifact-upload'})
       const artifactUploaded = await uploadLogArtifact({
-        logPath: getOpenCodeLogPath(),
+        logPath,
         runId: getGitHubRunId(),
         runAttempt: getGitHubRunAttempt(),
         invocationIdentity: getInvocationIdentity(),

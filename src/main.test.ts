@@ -15,6 +15,11 @@ import {DEFAULT_OPENCODE_VERSION, DEFAULT_SYSTEMATIC_VERSION} from './shared/con
 // The fake `opencode` binaries report this version. Setup runs on every invocation, so the bundle needs an install it can
 // find without a download: `seedHermeticSetup` plants one in the tool cache under the digest-bound name setup looks up.
 const MOCK_OPENCODE_VERSION = DEFAULT_OPENCODE_VERSION
+/** A V2 version one minor above the pin, so it never equals the pin whatever Renovate moves it to. */
+const NON_PIN_V2_VERSION = DEFAULT_OPENCODE_VERSION.replace(
+  /^(\d+)\.(\d+)\..*$/,
+  (_match, major: string, minor: string) => `${major}.${Number(minor) + 1}.0`,
+)
 
 // Isolated temp directories for test data and mock tools
 let testDataDir: string
@@ -284,15 +289,15 @@ it('rejects a V1 opencode-version at input parsing, naming the value and the way
 })
 
 it('never reaches a pre-installed non-pin V2 binary: the version is refused at parsing', async () => {
-  // #given an OpenCode 2.3.0 binary on PATH and a workflow that asks for exactly that version, which the Action would
+  // #given a non-pin V2 binary on PATH and a workflow that asks for exactly that version, which the Action would
   // otherwise reuse before setup could apply the pin policy
   const logFile = path.join(testDataDir, 'non-pin-binary-calls.log')
 
   const {stdout, stderr, code} = await runMain({
     'INPUT_GITHUB-TOKEN': 'ghp_test123',
     'INPUT_AUTH-JSON': '{"anthropic":{"type":"api","key":"sk-ant-test"}}',
-    'INPUT_OPENCODE-VERSION': '2.3.0',
-    MOCK_OPENCODE_VERSION: '2.3.0',
+    'INPUT_OPENCODE-VERSION': NON_PIN_V2_VERSION,
+    MOCK_OPENCODE_VERSION: NON_PIN_V2_VERSION,
     MOCK_OPENCODE_LOG: logFile,
     GITHUB_OUTPUT: '/dev/null',
     GITHUB_REPOSITORY: 'test/repo',
@@ -307,7 +312,7 @@ it('never reaches a pre-installed non-pin V2 binary: the version is refused at p
   expect(code).not.toBe(0)
   const output = `${stdout}\n${stderr}`
   expect(output).toContain("Input 'opencode-version'")
-  expect(output).toContain('"2.3.0"')
+  expect(output).toContain(`"${NON_PIN_V2_VERSION}"`)
   expect(output).toContain(DEFAULT_OPENCODE_VERSION)
   expect(output).toContain('only the recorded release')
   expect(existsSync(logFile)).toBe(false)

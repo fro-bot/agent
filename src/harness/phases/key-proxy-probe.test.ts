@@ -80,6 +80,27 @@ describe('probeKeyProxy', () => {
     expect(logger.warning).not.toHaveBeenCalled()
   })
 
+  it('logs one info line with the provider and the HTTP status when the probe passes, and nothing else', async () => {
+    // #given a proxy that answers 204 with a body that must never be logged
+    // #when probed
+    const {logger} = await probe(OPENAI, answer(204, BODY_CANARY))
+
+    // #then one info line carries the provider and the status only
+    expect(logger.info).toHaveBeenCalledTimes(1)
+    expect(logger.info).toHaveBeenCalledWith('Key proxy probe passed', {provider: 'openai', status: 204})
+    const logged = serializeLoggerCalls(logger)
+    expect(logged).not.toContain(BODY_CANARY)
+    expect(logged).not.toContain(PLACEHOLDER)
+  })
+
+  it('does not log a passed line when the probe warns or fails', async () => {
+    const warned = await probe(OPENAI, answer(403))
+    const failed = await probe(OPENAI, answer(401))
+
+    expect(warned.logger.info).not.toHaveBeenCalled()
+    expect(failed.logger.info).not.toHaveBeenCalled()
+  })
+
   it('sends the provider’s configured organization and project headers on a Bearer route', async () => {
     // #given a gateway that answers 403 unless the routing headers the forwarder sends for inference are present
     const plan: KeyProxyProviderPlan = {
