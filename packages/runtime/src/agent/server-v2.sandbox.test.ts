@@ -209,11 +209,13 @@ child.on('exit', code => process.exit(code ?? 0))
 /** The three fixed scripts of the view launch. They take every path as a positional argument. */
 const GATE_SCRIPT =
   'r=$1; s=$2; g=$3; n=$4; shift 4; ' +
-  'id=$("$r" /proc/self/ns/mnt) || exit 70; echo "$id" > "$g/ns" || exit 70; i=0; ' +
+  'id=$("$r" /proc/self/ns/mnt 2>>"$g/err") || exit 70; echo "$id" > "$g/ns" || exit 70; i=0; ' +
   'while :; do { read -r v < "$g/go"; } 2>/dev/null && [ "$v" = "$id" ] && break; ' +
-  'i=$((i+1)); [ "$i" -gt "$n" ] && exit 71; "$s" 0.1 || exit 72; done; exec "$@"'
-const BUILD_SCRIPT = '"$1" "$2" "$3" && shift 3 && exec "$@"'
-const ENTER_SCRIPT = '"$1" "$2" "$3" && cd / && "$4" -l "$5" && shift 5 && exec "$@"'
+  'i=$((i+1)); [ "$i" -gt "$n" ] && { echo "gate: no go-ahead within its bound" >> "$g/err"; exit 71; }; ' +
+  '"$s" 0.1 || exit 72; done; exec "$@"'
+const BUILD_SCRIPT = '"$1" "$2" "$3" 2>>"$4/err" && shift 4 && exec "$@"'
+const ENTER_SCRIPT =
+  'exec 3>>"$6/err" && "$1" "$2" "$3" 2>&3 && cd / && "$4" -l "$5" 2>&3 && exec 3>&- && shift 6 && exec "$@"'
 
 const VIEW: OpenCodeV2SandboxView = {
   unsharePath: '/usr/bin/unshare',
@@ -276,6 +278,7 @@ describe('buildSandboxLaunch with a read-only view', () => {
       '/opt/runner-cache/externals/node24/bin/node',
       '/home/runner/work/_actions/fro-bot/agent/v1/dist/sandbox-view.js',
       JSON.stringify(VIEW.policy),
+      '/home/runner/work/_temp/fro-bot-view-AbC123/g-XyZ789',
       '/usr/bin/sh',
       '-c',
       ENTER_SCRIPT,
@@ -285,6 +288,7 @@ describe('buildSandboxLaunch with a read-only view', () => {
       '/home/runner/work/_temp/view/root/mnt',
       '/usr/bin/umount',
       '/mnt',
+      '/home/runner/work/_temp/fro-bot-view-AbC123/g-XyZ789',
       '/usr/bin/setpriv',
       '--reuid=998',
       '--regid=997',
@@ -515,6 +519,69 @@ describe('the view launch chain, run for real with stand-in privileged tools', (
     expect(readFileSync(path.join(dir, 'arg'), 'utf8').trim()).toBe('serve')
   })
 
+  describe('the error file of the root steps', () => {
+    const errOf = (view: OpenCodeV2SandboxView) => readFileSync(path.join(view.gate.dir, 'err'), 'utf8')
+
+    it('receives the builder’s stderr, and the server never runs', () => {
+      // #given a builder that prints to stderr and fails
+      const made = counted(String.raw`process.stderr.write('builder says: mount: /x: denied\n'); process.exit(78)`, {})
+
+      // #when the chain runs
+      const result = runChain(made.spec, made.server, made.dir)
+
+      // #then the text is in the file, not on the launcher's stderr, and the server did not run
+      expect(result.status).toBe(78)
+      expect(errOf(made.view)).toContain('builder says: mount: /x: denied')
+      expect(result.stderr).not.toContain('builder says')
+      expect(serverRan(made.dir)).toBe(false)
+    })
+
+    it('receives the stderr of a failing pivot_root, and the server never runs', () => {
+      // #given a pivot_root that fails with a message
+      const made = standIns('process.exit(0)', 'echo "pivot_root: failed to change root: Invalid argument" >&2; exit 1')
+      const server = script(made.dir, 'opencode', `echo ran > ${path.join(made.dir, 'server-ran')}`)
+
+      // #when the chain runs
+      const result = runChain(made.spec, server, made.dir)
+
+      // #then
+      expect(result.status).toBe(1)
+      expect(errOf(made.view)).toContain('pivot_root: failed to change root: Invalid argument')
+      expect(serverRan(made.dir)).toBe(false)
+    })
+
+    it('receives the gate’s own line when it gives up', () => {
+      // #given no go-ahead
+      const made = counted('process.exit(0)', {go: null, ticks: 2})
+
+      // #when the chain runs
+      runChain(made.spec, made.server, made.dir)
+
+      // #then
+      expect(errOf(made.view)).toContain('gate: no go-ahead within its bound')
+    })
+
+    it('does not receive what the server writes, and the server does not inherit the file', () => {
+      // #given a server that writes to stderr and tries to write to descriptor 3
+      const made = standIns('process.exit(0)')
+      const server = script(
+        made.dir,
+        'opencode',
+        `echo server-noise >&2\nif ( echo leak >&3 ) 2>/dev/null; then echo open > ${path.join(made.dir, 'fd3')}; else echo closed > ${path.join(made.dir, 'fd3')}; fi`,
+      )
+
+      // #when the chain runs
+      const result = runChain(made.spec, server, made.dir)
+
+      // #then the server's stderr stayed with the launcher, and descriptor 3 was closed before the exec
+      expect(result.status).toBe(0)
+      expect(result.stderr).toContain('server-noise')
+      expect(existsSync(path.join(made.view.gate.dir, 'err')) ? errOf(made.view) : '').not.toContain('server-noise')
+      expect(existsSync(path.join(made.view.gate.dir, 'err')) ? errOf(made.view) : '').not.toContain('leak')
+      expect(readFileSync(path.join(made.dir, 'fd3'), 'utf8').trim()).toBe('closed')
+    })
+  })
+
   describe('the gate', () => {
     it('records the id of its own namespace before anything else runs, and lets the chain continue on a matching go-ahead', () => {
       // #given a go-ahead that names the id the gate will report
@@ -626,14 +693,22 @@ describe('startOpenCodeV2Server with a read-only view', () => {
     for (const dir of dirs.splice(0)) rmSync(dir, {recursive: true, force: true})
   })
 
-  it('reports the spawned launch pid and names the failed stage when the view cannot be built', async () => {
-    // #given a launcher that prints the builder's failure line and exits 78
+  it('reports the spawned launch pid and carries what the root steps wrote when the view cannot be built', async () => {
+    // #given a launcher whose root steps left their failure line in the gate's error file, while the launcher's own stdout and
+    // stderr carry something the message must not repeat
     const dir = mkdtempSync(path.join(os.tmpdir(), 'view-fail-'))
     dirs.push(dir)
+    const gateDir = path.join(dir, 'gate')
+    mkdirSync(gateDir)
+    writeFileSync(
+      path.join(gateDir, 'err'),
+      'noise\n{"view":"failed","stage":"seal","op":"mount -n -o remount,bind,ro /x","detail":"exited non-zero: mount: /x: denied"}\n',
+    )
     const sudoPath = path.join(dir, 'sudo')
-    writeFileSync(sudoPath, `#!/bin/sh\necho '{"view":"failed","stage":"seal"}'\nexit 78\n`)
+    writeFileSync(sudoPath, `#!/bin/sh\necho 'from-the-agent-stdout'\necho 'from-the-agent-stderr' >&2\nexit 78\n`)
     chmodSync(sudoPath, 0o755)
     const pids: number[] = []
+    const view = {...VIEW, gate: {...VIEW.gate, dir: gateDir}}
 
     // #when started
     const result = await startOpenCodeV2Server(
@@ -642,18 +717,56 @@ describe('startOpenCodeV2Server with a read-only view', () => {
         directory: dir,
         expectedPluginIds: [],
         timeouts: TIMEOUTS,
-        sandbox: launchSpec({sudoPath, view: VIEW}),
+        sandbox: launchSpec({sudoPath, view}),
         onSpawn: pid => pids.push(pid),
       },
       {debug: () => undefined, info: () => undefined, warning: () => undefined, error: () => undefined},
     )
 
-    // #then the start failed with the stage, and the pid was reported before anything else could go wrong
+    // #then the start failed with the root steps' text on one line, and the pid was reported first
     expect(result.success).toBe(false)
     expect(!result.success && result.error.kind).toBe('exited-early')
-    expect(!result.success && result.error.message).toContain('stage seal')
+    const message = result.success ? '' : result.error.message
+    expect(message).toContain('(code 78); root steps before the server: noise {"view":"failed","stage":"seal"')
+    expect(message).toContain('exited non-zero: mount: /x: denied')
+    expect(message).not.toContain('from-the-agent')
+    expect(message).not.toContain('\n')
     expect(!result.success && result.error.exitCode).toBe(78)
     expect(pids).toHaveLength(1)
     expect(pids[0]).toBeGreaterThan(0)
+  })
+
+  it('keeps the message to a fixed tail of one line, and says nothing when the error file is absent', async () => {
+    // #given a failing launcher, once with a long multi-line error file and once with none
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'view-fail-'))
+    dirs.push(dir)
+    const gateDir = path.join(dir, 'gate')
+    mkdirSync(gateDir)
+    writeFileSync(path.join(gateDir, 'err'), `${'a'.repeat(1000)}\nlast line\n`)
+    const sudoPath = path.join(dir, 'sudo')
+    writeFileSync(sudoPath, '#!/bin/sh\nexit 78\n')
+    chmodSync(sudoPath, 0o755)
+    const start = async (viewDir: string) =>
+      startOpenCodeV2Server(
+        {
+          binaryPath: '/unused',
+          directory: dir,
+          expectedPluginIds: [],
+          timeouts: TIMEOUTS,
+          sandbox: launchSpec({sudoPath, view: {...VIEW, gate: {...VIEW.gate, dir: viewDir}}}),
+        },
+        {debug: () => undefined, info: () => undefined, warning: () => undefined, error: () => undefined},
+      )
+
+    // #when started
+    const long = await start(gateDir)
+    const none = await start(path.join(dir, 'missing'))
+
+    // #then the long one is cut to the tail, the absent one has no root-step text
+    const longMessage = long.success ? '' : long.error.message
+    expect(longMessage).toContain('root steps before the server: ...')
+    expect(longMessage.endsWith('last line')).toBe(true)
+    expect(longMessage.length).toBeLessThan(500)
+    expect(!none.success && none.error.message).not.toContain('root steps')
   })
 })

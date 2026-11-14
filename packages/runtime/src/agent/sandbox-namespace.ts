@@ -24,6 +24,25 @@ export type SandboxNamespaceTools = Pick<SandboxIdentityTools, 'pgrep' | 'pkill'
 /** The files of a gate directory. The gate script and the runner side agree on these names. */
 export const GATE_NS_FILE = 'ns'
 export const GATE_GO_FILE = 'go'
+/** The stderr of the root steps of the chain (gate, builder, `pivot_root`, `umount`), appended by them as root. */
+export const GATE_ERR_FILE = 'err'
+
+/** Longest root-chain tail a message carries. */
+export const ROOT_CHAIN_TAIL_CHARS = 400
+
+/**
+ * The last {@link ROOT_CHAIN_TAIL_CHARS} characters of the root steps' stderr as one printable line. The file holds only
+ * what root steps before the uid drop wrote (the gate's fixed lines, the builder's one failure line and the stderr of
+ * `pivot_root` and `umount`): the server and its tools run after the drop and never write there.
+ */
+export function rootChainTail(text: string | null): string {
+  if (text === null) return ''
+  const line = text
+    .replaceAll(/[^\x20-\x7E]+/g, ' ')
+    .replaceAll(/ {2,}/g, ' ')
+    .trim()
+  return line.length > ROOT_CHAIN_TAIL_CHARS ? `...${line.slice(-ROOT_CHAIN_TAIL_CHARS)}` : line
+}
 
 export interface LaunchNamespace {
   /** The inode number of the launch's mount namespace. */

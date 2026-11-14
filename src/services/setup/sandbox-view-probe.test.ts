@@ -54,6 +54,7 @@ function createDeps(overrides: Partial<SandboxViewProbeDeps> = {}) {
     }),
     admit: vi.fn(async (): Promise<LaunchAdmission> => ADMITTED),
     stopLaunch: vi.fn(async () => 'stopped' as const),
+    readRootErr: vi.fn(async () => null),
     isAlive: () => false,
     logger: createMockLogger(),
     ...overrides,
@@ -111,20 +112,72 @@ describe('probeSandboxView', () => {
     expect(deps.removeFixture).toHaveBeenCalled()
   })
 
-  it('names the builder stage when the view could not be built', async () => {
-    // #given the builder's failure line
-    const {deps} = createDeps({
-      launch: vi.fn<SandboxViewProbeDeps['launch']>(async (_command, _args, options) => {
-        options.onSpawn(500)
-        return {pid: 500, exitCode: 78, timedOut: false, stdout: '{"view":"failed","stage":"verify"}\n'}
-      }),
+  const exiting = (exitCode: number, stderr = ''): SandboxViewProbeDeps['launch'] =>
+    vi.fn<SandboxViewProbeDeps['launch']>(async (_command, _args, options) => {
+      options.onSpawn(500)
+      return {pid: 500, exitCode, timedOut: false, stdout: '', stderr}
     })
+
+  it('names the builder stage, the failed operation and the tool’s error when the view could not be built', async () => {
+    // #given the builder's failure line in the gate's error file
+    const line =
+      '{"view":"failed","stage":"seal","op":"mount -n -o remount,bind,ro /x","detail":"exited non-zero: mount: /x: denied"}'
+    const {deps} = createDeps({launch: exiting(78), readRootErr: vi.fn(async () => `${line}\n`)})
 
     // #when probed
     const result = await probeSandboxView(INPUT, deps)
 
-    // #then the stage is in the message
-    expect(!result.ok && result.message).toContain('stage verify')
+    // #then the message names the stage and carries the line, on one line
+    const message = result.ok ? '' : result.message
+    expect(message).toContain('could not be built (stage seal)')
+    expect(message).toContain(`[root steps: ${line}]`)
+    expect(message).not.toContain('\n')
+  })
+
+  it('carries the launcher’s stderr when the root steps wrote nothing, for an exit that is none of the probe’s own', async () => {
+    // #given sudo refusing, and no error file
+    const {deps} = createDeps({launch: exiting(1, 'sudo: a password is required\n')})
+
+    // #when probed
+    const result = await probeSandboxView(INPUT, deps)
+
+    // #then the exit and sudo's text are in the message
+    expect(!result.ok && result.message).toBe(
+      'the read-only view probe failed (exit 1) [launcher stderr: sudo: a password is required]',
+    )
+  })
+
+  it('carries both, each as one line cut to a fixed tail', async () => {
+    // #given long, multi-line output from both
+    const long = `${'a'.repeat(600)}\nlast words\n\tend`
+    const {deps} = createDeps({launch: exiting(1, long), readRootErr: vi.fn(async () => long)})
+
+    // #when probed
+    const result = await probeSandboxView(INPUT, deps)
+
+    // #then each part is cut to 400 characters plus the ellipsis, and the message has no line break
+    const message = result.ok ? '' : result.message
+    const parts = [...message.matchAll(/(?:root steps|launcher stderr): (\.\.\.[^;\]]*)/g)].map(match => match[1] ?? '')
+    expect(parts).toHaveLength(2)
+    for (const part of parts) {
+      expect(part.length).toBe(403)
+      expect(part.endsWith('last words end')).toBe(true)
+    }
+    expect(message).not.toMatch(/[\n\t]/)
+  })
+
+  it('adds the evidence to a failed check of the probe too, and not to a pass', async () => {
+    // #given exit 10 with root-step text, and a pass with root-step text
+    const failing = createDeps({launch: exiting(10), readRootErr: vi.fn(async () => 'gate: something')})
+    const passing = createDeps({readRootErr: vi.fn(async () => 'gate: something')})
+
+    // #when probed
+    const failed = await probeSandboxView(INPUT, failing.deps)
+    const passed = await probeSandboxView(INPUT, passing.deps)
+
+    // #then
+    expect(!failed.ok && failed.message).toContain('not refused [root steps: gate: something]')
+    expect(passed).toEqual({ok: true})
   })
 
   it('fails when the probe cannot be started', async () => {

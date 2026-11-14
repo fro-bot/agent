@@ -18,8 +18,10 @@ import {
   admitLaunch,
   buildSandboxViewChain,
   buildSetprivDropArgs,
+  GATE_ERR_FILE,
   GATE_GO_FILE,
   GATE_NS_FILE,
+  rootChainTail,
   stopLaunch,
 } from '@fro-bot/runtime'
 import {toErrorMessage} from '../../shared/errors.js'
@@ -63,6 +65,8 @@ export interface ProbeLaunchResult {
   readonly exitCode: number | null
   readonly timedOut: boolean
   readonly stdout: string
+  /** The launcher's own stderr (`sudo`, the root steps and the probe's fixed scripts), bounded. */
+  readonly stderr?: string
 }
 
 export interface SandboxViewProbeDeps {
@@ -78,6 +82,8 @@ export interface SandboxViewProbeDeps {
   readonly admit: (pid: number, gateDir: string) => Promise<LaunchAdmission>
   /** Stops and confirms everything of the launch, by its namespace or, with no id captured, by its gate directory. */
   readonly stopLaunch: (gateDir: string, admission: LaunchAdmission) => Promise<NamespaceStopOutcome>
+  /** What the root steps of the chain appended to the gate's error file; null when there is none. */
+  readonly readRootErr: (gateDir: string) => Promise<string | null>
   readonly isAlive: (pid: number) => boolean
   readonly logger: Logger
 }
@@ -100,9 +106,9 @@ const ROOT_SCRIPT =
 const NOBODY_SCRIPT =
   'true > "$1" || exit 12; while read -r key value rest; do [ "$key" = "Uid:" ] && [ "$value" != "$2" ] && exit 13; done < /proc/self/status; exit 0'
 
-function describeFailure(result: ProbeLaunchResult): string {
+function describeFailure(result: ProbeLaunchResult, rootSteps: string): string {
   if (result.timedOut) return 'the read-only view probe timed out'
-  const stage = /"view":"failed","stage":"([a-z]{1,16})"/.exec(result.stdout)?.[1]
+  const stage = /"view":\s*"failed",\s*"stage":\s*"([a-z]{1,16})"/.exec(rootSteps)?.[1]
   switch (result.exitCode) {
     case 10:
       return 'the read-only view probe found a write outside the declared roots that was not refused'
@@ -122,6 +128,15 @@ function describeFailure(result: ProbeLaunchResult): string {
         ? `the read-only view probe failed (exit ${result.exitCode ?? 'none'})`
         : `the read-only view could not be built (stage ${stage})`
   }
+}
+
+/** A message with what the root steps and the launcher printed, each as one bounded line. */
+function withEvidence(message: string, rootSteps: string, launcherStderr: string): string {
+  const parts = [
+    rootSteps === '' ? '' : `root steps: ${rootSteps}`,
+    launcherStderr === '' ? '' : `launcher stderr: ${launcherStderr}`,
+  ].filter(part => part !== '')
+  return parts.length === 0 ? message : `${message} [${parts.join('; ')}]`
 }
 
 export async function probeSandboxView(
@@ -187,15 +202,19 @@ export async function probeSandboxView(
       },
     })
     if (launched.pid === null) return fail('the read-only view probe could not be started')
+    const rootSteps = rootChainTail(await deps.readRootErr(fixture.gate).catch(() => null))
+    const launcherStderr = rootChainTail(launched.stderr ?? '')
 
     // The probe's own launch is stopped and confirmed the way the teardown confirms a launch, pass or fail, and a launcher
     // that has exited is not the confirmation: with no id captured, the gate's processes are killed and counted.
     const stopped = await confirmStopped(launched.pid, fixture.gate, await admission, deps, options.settleMs)
     if (!stopped) {
       removable = false
-      return fail('the read-only view probe could not be confirmed stopped')
+      return fail(withEvidence('the read-only view probe could not be confirmed stopped', rootSteps, launcherStderr))
     }
-    return launched.exitCode === 0 && !launched.timedOut ? {ok: true} : fail(describeFailure(launched))
+    return launched.exitCode === 0 && !launched.timedOut
+      ? {ok: true}
+      : fail(withEvidence(describeFailure(launched, rootSteps), rootSteps, launcherStderr))
   } finally {
     // Nothing is deleted while a member of the probe's namespace may still be running.
     if (removable) {
@@ -264,6 +283,7 @@ async function launchWithDeadline(
 ): Promise<ProbeLaunchResult> {
   return new Promise(resolve => {
     let stdout = ''
+    let stderr = ''
     let timedOut = false
     let settled = false
     let timer: ReturnType<typeof setTimeout> | undefined
@@ -276,26 +296,30 @@ async function launchWithDeadline(
     let child: ReturnType<typeof spawn>
     try {
       child = spawn(command, [...args], {
-        stdio: ['ignore', 'pipe', 'ignore'],
+        stdio: ['ignore', 'pipe', 'pipe'],
         detached: true,
         cwd: '/',
         env: {PATH: '/usr/sbin:/usr/bin:/sbin:/bin', LC_ALL: 'C'},
       })
     } catch {
-      settle({pid: null, exitCode: null, timedOut: false, stdout: ''})
+      settle({pid: null, exitCode: null, timedOut: false, stdout: '', stderr: ''})
       return
     }
     const pid = child.pid
     if (pid === undefined) {
-      child.once('error', () => settle({pid: null, exitCode: null, timedOut: false, stdout: ''}))
+      child.once('error', () => settle({pid: null, exitCode: null, timedOut: false, stdout: '', stderr: ''}))
       return
     }
     options.onSpawn(pid)
     child.stdout?.on('data', (chunk: Buffer) => {
       if (stdout.length < 4096) stdout += chunk.toString('utf8')
     })
-    child.once('error', () => settle({pid, exitCode: null, timedOut, stdout}))
-    child.once('exit', code => settle({pid, exitCode: code, timedOut, stdout}))
+    child.stderr?.on('data', (chunk: Buffer) => {
+      // The end is what matters (tools print their error last): keep the tail, bounded.
+      stderr = (stderr + chunk.toString('utf8')).slice(-4096)
+    })
+    child.once('error', () => settle({pid, exitCode: null, timedOut, stdout, stderr}))
+    child.once('exit', code => settle({pid, exitCode: code, timedOut, stdout, stderr}))
     timer = setTimeout(() => {
       timedOut = true
       try {
@@ -305,7 +329,7 @@ async function launchWithDeadline(
         // Not permitted, or already gone.
       }
       // The exit may never arrive for a root process: do not wait for it.
-      setTimeout(() => settle({pid, exitCode: null, timedOut: true, stdout}), 2000).unref()
+      setTimeout(() => settle({pid, exitCode: null, timedOut: true, stdout, stderr}), 2000).unref()
     }, options.timeoutMs)
   })
 }
@@ -369,12 +393,15 @@ export function createViewProbe(options: {
         // Plain directories and files only. The new root was a mount point in a namespace that is gone, so it is empty.
         await fs.rm(fixture.allowed, {recursive: true, force: true})
         await fs.rm(fixture.sealed, {recursive: true, force: true})
-        for (const name of [GATE_NS_FILE, GATE_GO_FILE]) await fs.rm(path.join(fixture.gate, name), {force: true})
+        for (const name of [GATE_NS_FILE, GATE_GO_FILE, GATE_ERR_FILE]) {
+          await fs.rm(path.join(fixture.gate, name), {force: true})
+        }
         await fs.rmdir(fixture.gate)
         await fs.rmdir(fixture.newRoot)
         await fs.rmdir(fixture.dir)
       },
       launch: launchWithDeadline,
+      readRootErr: async gateDir => fs.readFile(path.join(gateDir, GATE_ERR_FILE), 'utf8').catch(() => null),
       admit: async (pid, gateDir) => admitLaunch(pid, gateDir, gateDeps, {isClosed: () => false}),
       stopLaunch: async (gateDir, admission) =>
         stopLaunch({gateDir, admission}, namespaceTools, identityDeps, gateDeps),

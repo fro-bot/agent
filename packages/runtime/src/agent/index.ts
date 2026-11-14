@@ -280,10 +280,13 @@ export type {
 } from './sandbox-identity.js'
 export {
   admitLaunch,
+  GATE_ERR_FILE,
   GATE_GO_FILE,
   GATE_NS_FILE,
   parseNamespaceId,
   readGateNamespace,
+  ROOT_CHAIN_TAIL_CHARS,
+  rootChainTail,
   selfExcludingPattern,
   stopGateProcesses,
   stopLaunch,

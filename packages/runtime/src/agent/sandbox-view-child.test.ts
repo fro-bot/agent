@@ -5,6 +5,15 @@ import {runSandboxViewChild, SANDBOX_VIEW_EXIT_FAILED, SANDBOX_VIEW_EXIT_INVALID
 
 const ROOT = '/run/view/root'
 
+/** The one line the builder reported, parsed. Fails the test when there is not exactly one, ending in a newline. */
+function reported(model: {readonly written: readonly string[]}): Record<string, unknown> {
+  expect(model.written).toHaveLength(1)
+  const line = model.written[0] ?? ''
+  expect(line.endsWith('\n')).toBe(true)
+  expect(line.slice(0, -1)).not.toContain('\n')
+  return JSON.parse(line) as Record<string, unknown>
+}
+
 const POLICY: SandboxViewPolicy = {
   newRoot: ROOT,
   putOld: '/mnt',
@@ -27,6 +36,8 @@ interface ModelOptions {
   readonly policyText?: string | undefined
   /** An argv that makes the tool exit non-zero. */
   readonly failOn?: (argv: readonly string[]) => boolean
+  /** What a failing tool prints. */
+  readonly stderr?: (argv: readonly string[]) => string
   /** An argv that never finishes within its deadline. */
   readonly hangOn?: (argv: readonly string[]) => boolean
   /** A remount of this path that silently does nothing, as `ro=recursive` does for submounts. */
@@ -101,16 +112,18 @@ function createModel(options: ModelOptions = {}): Model {
       ran.push([...argv])
       if (options.hangOn?.(argv) === true) {
         expect(timeoutMs).toBeGreaterThan(0)
-        return 'timeout'
+        return {status: 'timeout' as const, stderr: ''}
       }
-      return apply(argv) ? 'ok' : 'failed'
+      return apply(argv)
+        ? {status: 'ok' as const, stderr: ''}
+        : {status: 'failed' as const, stderr: options.stderr?.(argv) ?? 'mount: failed'}
     },
     mkdir: async directory => {
       made.push(directory)
     },
     realpath: async target => options.symlinks?.[target] ?? target,
     isEmptyDirectory: async target => options.notEmpty?.includes(target) !== true,
-    stdout: {
+    report: {
       write: chunk => {
         written.push(String(chunk))
       },
@@ -164,7 +177,7 @@ describe('runSandboxViewChild', () => {
       // #then nothing ran and the exit is the invalid-policy code with the fixed line
       expect(code).toBe(SANDBOX_VIEW_EXIT_INVALID_POLICY)
       expect(model.ran).toEqual([])
-      expect(model.written).toEqual(['{"view":"failed","stage":"policy"}\n'])
+      expect(reported(model)).toMatchObject({view: 'failed', stage: 'policy'})
     }
   })
 
@@ -222,7 +235,73 @@ describe('runSandboxViewChild', () => {
     expect(model.ran.some(argv => argv.includes('--bind'))).toBe(false)
     expect(model.ran.filter(argv => argv[3] === 'remount,bind,ro')).toHaveLength(2)
     // #and the line names a stage and nothing else
-    expect(model.written).toEqual(['{"view":"failed","stage":"seal"}\n'])
+    expect(reported(model)).toMatchObject({view: 'failed', stage: 'seal'})
+  })
+
+  it('names the failed operation and carries the tool’s error text, on one bounded line', async () => {
+    // #given a remount that fails with a multi-line, over-long error
+    const noise = `${'x'.repeat(500)}\nmount: ${ROOT}/dev: permission denied.\n\tdmesg may have more information\u0000\n`
+    const model = createModel({
+      failOn: argv => argv.at(-1) === `${ROOT}/dev` && argv[3] === 'remount,bind,ro',
+      stderr: () => noise,
+    })
+
+    // #when the builder runs
+    const code = await runSandboxViewChild(model.io)
+
+    // #then the line names the stage, the operation by tool name and arguments, and the end of the error text
+    expect(code).toBe(SANDBOX_VIEW_EXIT_FAILED)
+    const line = reported(model)
+    expect(line.stage).toBe('seal')
+    expect(line.op).toBe(`mount -n -o remount,bind,ro ${ROOT}/dev`)
+    const detail = String(line.detail)
+    expect(detail.startsWith('...')).toBe(true)
+    expect(detail.endsWith('dmesg may have more information')).toBe(true)
+    expect(detail).toContain(`mount: ${ROOT}/dev: permission denied.`)
+    expect(detail.length).toBeLessThanOrEqual(243)
+
+    expect(/[^\x20-\x7E]/.test(detail)).toBe(false)
+  })
+
+  it('says why a policy was refused', async () => {
+    // #given a writable root with a mount beneath it
+    const hostMounts = [
+      ...hostTable(),
+      {id: 8, parentId: 1, mountPoint: '/home/runner/work/repo/repo/dist', options: ['rw'], fsType: 'tmpfs'},
+    ]
+    const model = createModel({hostMounts})
+
+    // #when the builder runs
+    await runSandboxViewChild(model.io)
+
+    // #then the reason is in the line
+    const line = reported(model)
+    expect(line.stage).toBe('policy')
+    expect(String(line.detail)).toContain('has a mount beneath it: /home/runner/work/repo/repo/dist')
+  })
+
+  it('says why verification failed', async () => {
+    // #given a remount that silently does nothing
+    const model = createModel({ignoreRemountOf: `${ROOT}/dev`})
+
+    // #when the builder runs
+    await runSandboxViewChild(model.io)
+
+    // #then the verification's own reason is in the line
+    const line = reported(model)
+    expect(line.stage).toBe('verify')
+    expect(String(line.detail).length).toBeGreaterThan(0)
+  })
+
+  it('says a tool timed out', async () => {
+    // #given the tmpfs mount hangs
+    const model = createModel({hangOn: argv => argv.includes('tmpfs')})
+
+    // #when the builder runs
+    await runSandboxViewChild(model.io)
+
+    // #then
+    expect(String(reported(model).detail)).toMatch(/^timed out/)
   })
 
   it('treats an operation that exceeds its deadline as a failure', async () => {
@@ -234,7 +313,7 @@ describe('runSandboxViewChild', () => {
 
     // #then it stops without binding any root
     expect(code).toBe(SANDBOX_VIEW_EXIT_FAILED)
-    expect(model.written).toEqual(['{"view":"failed","stage":"temp"}\n'])
+    expect(reported(model)).toMatchObject({view: 'failed', stage: 'temp'})
     expect(model.ran.some(argv => argv.includes('--bind'))).toBe(false)
   })
 
@@ -269,7 +348,7 @@ describe('runSandboxViewChild', () => {
 
     // #then every operation succeeded and the verification still refused the view
     expect(code).toBe(SANDBOX_VIEW_EXIT_FAILED)
-    expect(model.written).toEqual(['{"view":"failed","stage":"verify"}\n'])
+    expect(reported(model)).toMatchObject({view: 'failed', stage: 'verify'})
   })
 
   it('fails when the put-old directory is not empty', async () => {
@@ -281,7 +360,7 @@ describe('runSandboxViewChild', () => {
 
     // #then it is refused before the verification
     expect(code).toBe(SANDBOX_VIEW_EXIT_FAILED)
-    expect(model.written).toEqual(['{"view":"failed","stage":"enter"}\n'])
+    expect(reported(model)).toMatchObject({view: 'failed', stage: 'enter'})
   })
 
   it('creates the mount point of a root under a private temp directory', async () => {
@@ -308,8 +387,13 @@ describe('runSandboxViewChild', () => {
     }
 
     // #when the builder runs
-    // #then it is a failed bind with the fixed line
+    // #then it is a failed bind that carries the error's message
     expect(await runSandboxViewChild(io)).toBe(SANDBOX_VIEW_EXIT_FAILED)
-    expect(model.written).toEqual(['{"view":"failed","stage":"bind"}\n'])
+    expect(reported(model)).toMatchObject({
+      view: 'failed',
+      stage: 'bind',
+      op: `mount -n -o rbind / ${ROOT}`,
+      detail: 'spawn failed',
+    })
   })
 })

@@ -33,6 +33,7 @@ import {
   createAttachmentDirExclusive,
   createSandboxAccount,
   deleteSandboxAccount,
+  GATE_ERR_FILE,
   GATE_GO_FILE,
   GATE_NS_FILE,
   parseMountInfo,
@@ -269,7 +270,7 @@ const defaultDeps: SandboxLifecycleDeps = {
       dir,
       // The gate's own files, by name. The id file belongs to root: the runner removes it as the owner of the directory.
       remove: async () => {
-        for (const name of [GATE_NS_FILE, GATE_GO_FILE]) await fs.rm(path.join(dir, name), {force: true})
+        for (const name of [GATE_NS_FILE, GATE_GO_FILE, GATE_ERR_FILE]) await fs.rm(path.join(dir, name), {force: true})
         await fs.rmdir(dir)
       },
     }

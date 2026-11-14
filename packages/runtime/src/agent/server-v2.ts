@@ -5,6 +5,7 @@ import type {SandboxViewPolicy} from './sandbox-view.js'
 import {Buffer} from 'node:buffer'
 import {spawn} from 'node:child_process'
 import {randomBytes} from 'node:crypto'
+import {readFileSync} from 'node:fs'
 import net from 'node:net'
 import process from 'node:process'
 import {sleep} from '../shared/async.js'
@@ -12,7 +13,7 @@ import {toErrorMessage} from '../shared/errors.js'
 import {err, ok} from '../shared/types.js'
 import {filterAgentEnv} from './filter-env.js'
 import {buildSetprivDropArgs} from './sandbox-identity.js'
-import {GATE_GO_FILE, GATE_NS_FILE} from './sandbox-namespace.js'
+import {GATE_ERR_FILE, GATE_GO_FILE, GATE_NS_FILE, rootChainTail} from './sandbox-namespace.js'
 
 /**
  * Spawn, authenticate to, gate and shut down a stock OpenCode V2 server (`serve --stdio`).
@@ -445,18 +446,24 @@ const SANDBOX_ENV_NAME = /^[A-Z_]\w*$/i
  * The first step inside the new mount namespace, before anything is built. It writes the id of its own mount namespace to
  * `$g/ns`, then waits for `$g/go` to hold that same id, which the runner writes only after it has read and validated the
  * id. It gives up after `$n` ticks of 0.1 s with exit 71 having run nothing; exit 70 when it cannot record the id, 72 when
- * it cannot wait. Arguments: readlink, sleep, gate directory, ticks, then the rest of the chain.
+ * it cannot wait. Arguments: readlink, sleep, gate directory, ticks, then the rest of the chain. What the root steps print
+ * to stderr is appended to `$g/err`, which the runner reads when the launch fails: this file never holds the agent's output.
  */
 const VIEW_GATE_SCRIPT =
   'r=$1; s=$2; g=$3; n=$4; shift 4; ' +
-  `id=$("$r" /proc/self/ns/mnt) || exit 70; echo "$id" > "$g/${GATE_NS_FILE}" || exit 70; i=0; ` +
+  `id=$("$r" /proc/self/ns/mnt 2>>"$g/${GATE_ERR_FILE}") || exit 70; echo "$id" > "$g/${GATE_NS_FILE}" || exit 70; i=0; ` +
   `while :; do { read -r v < "$g/${GATE_GO_FILE}"; } 2>/dev/null && [ "$v" = "$id" ] && break; ` +
-  'i=$((i+1)); [ "$i" -gt "$n" ] && exit 71; "$s" 0.1 || exit 72; done; exec "$@"'
+  `i=$((i+1)); [ "$i" -gt "$n" ] && { echo "gate: no go-ahead within its bound" >> "$g/${GATE_ERR_FILE}"; exit 71; }; ` +
+  '"$s" 0.1 || exit 72; done; exec "$@"'
 
-/** Runs the builder, then (only if it exited 0) replaces the shell with the rest of the chain. */
-const VIEW_BUILD_SCRIPT = '"$1" "$2" "$3" && shift 3 && exec "$@"'
-/** Moves the old root onto put-old, makes the new root `/`, unmounts the old root lazily, then execs the rest. */
-const VIEW_ENTER_SCRIPT = '"$1" "$2" "$3" && cd / && "$4" -l "$5" && shift 5 && exec "$@"'
+/** Runs the builder (stderr to the gate's error file), then (only if it exited 0) replaces the shell with the rest. */
+const VIEW_BUILD_SCRIPT = `"$1" "$2" "$3" 2>>"$4/${GATE_ERR_FILE}" && shift 4 && exec "$@"`
+/**
+ * Moves the old root onto put-old, makes the new root `/`, unmounts the old root lazily, then execs the rest. The error
+ * file is opened first, because the gate directory is not reachable once the root has moved, and closed before the exec so
+ * the server does not inherit it.
+ */
+const VIEW_ENTER_SCRIPT = `exec 3>>"$6/${GATE_ERR_FILE}" && "$1" "$2" "$3" 2>&3 && cd / && "$4" -l "$5" 2>&3 && exec 3>&- && shift 6 && exec "$@"`
 
 /**
  * Pure: the argv and environment of a sandboxed launch. Exported for tests that pin the exact command.
@@ -536,6 +543,7 @@ export function buildSandboxViewChain(view: OpenCodeV2SandboxView, command: read
     view.nodePath,
     view.builderPath,
     JSON.stringify(view.policy),
+    view.gate.dir,
     view.shPath,
     '-c',
     VIEW_ENTER_SCRIPT,
@@ -545,8 +553,19 @@ export function buildSandboxViewChain(view: OpenCodeV2SandboxView, command: read
     `${view.policy.newRoot}${view.policy.putOld}`,
     view.umountPath,
     view.policy.putOld,
+    view.gate.dir,
     ...command,
   ]
+}
+
+/** The tail of the root steps' stderr for a view launch, as one line; empty without a view or without output. */
+export function rootChainFailure(view: OpenCodeV2SandboxView | undefined): string {
+  if (view === undefined) return ''
+  try {
+    return rootChainTail(readFileSync(`${view.gate.dir}/${GATE_ERR_FILE}`, 'utf8'))
+  } catch {
+    return ''
+  }
 }
 
 export async function startOpenCodeV2Server(
@@ -670,12 +689,6 @@ export async function startOpenCodeV2Server(
     startError('aborted', 'OpenCode V2 server start was cancelled by the caller')
 
   // --- The listening line ---------------------------------------------------------------------------------
-  // The view builder's one failure line, `{"view":"failed","stage":"<name>"}`: a fixed stage name and nothing else.
-  let viewFailureStage: string | undefined
-  const stdoutClosed = new Promise<void>(resolve => {
-    if (child.stdout === null) resolve()
-    else child.stdout.once('close', () => resolve())
-  })
   const listening = new Promise<string>(resolve => {
     let buffered = ''
     let found = false
@@ -688,13 +701,6 @@ export async function startOpenCodeV2Server(
         const line = buffered.slice(0, newline)
         buffered = buffered.slice(newline + 1)
         const parsed = parseJson(line)
-        if (
-          isRecord(parsed) &&
-          parsed.view === 'failed' &&
-          typeof parsed.stage === 'string' &&
-          /^[a-z]{1,16}$/.test(parsed.stage)
-        )
-          viewFailureStage = parsed.stage
         if (isRecord(parsed) && typeof parsed.url === 'string') {
           found = true
           resolve(parsed.url)
@@ -734,12 +740,9 @@ export async function startOpenCodeV2Server(
     if (first.tag === 'spawn-error') return await fail(first.error)
     if (first.tag === 'abort') return await fail(aborted())
     if (first.tag === 'exit') {
-      // The exit event can precede the last stdout chunk: give the builder's failure line a moment to arrive.
-      if (options.sandbox?.view !== undefined) await settlesWithin(stdoutClosed, 250)
-      const detail =
-        viewFailureStage === undefined
-          ? ''
-          : `; the read-only view could not be built (stage ${viewFailureStage}) and the server was not started`
+      // What the root steps of a view launch wrote to stderr before the drop, from the gate's error file (never the server's).
+      const chain = rootChainFailure(options.sandbox?.view)
+      const detail = chain === '' ? '' : `; root steps before the server: ${chain}`
       return await fail(
         startError(
           'exited-early',
