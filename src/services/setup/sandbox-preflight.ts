@@ -200,8 +200,16 @@ const MANIFEST_NAMES = ['action.yaml', 'action.yml'] as const
  * component from the work directory down to `dist/` is a real directory, with the manifest and the entry scripts regular
  * files. `_actions` is a reserved subtree that handoff refuses to grant (see `sandbox-handoff.ts`).
  *
- * `GITHUB_ACTION_REPOSITORY` must be set, as provenance only: it says the runner thinks this is a downloaded action, and
- * decides nothing without the walk.
+ * The install root comes from the running bundle (`process.argv[1]`, which always names it), never from
+ * `GITHUB_ACTION_PATH`: inside a composite action that variable is the composite's own directory (in the workspace for
+ * a local wrapper, and different in the main and post stages), so a published install called through a composite would be
+ * refused for the wrapper's location. A composite wrapping `fro-bot/agent@<ref>` is supported.
+ *
+ * `GITHUB_ACTION_REPOSITORY` and `GITHUB_ACTION_REF` are the running action's own values (the runner sets them from the
+ * action's reference, and clears them for a local `uses: ./`). They are provenance only: they must match the
+ * `<owner>/<repo>` (case-insensitively) and the `<ref...>` the walk found, and decide nothing without the walk. The ref
+ * comparison is reliable because the runner builds the directory from the same `Name` and `Ref` strings it reports, joining
+ * a ref containing `/` as nested directories.
  */
 async function checkActionLocation(deps: SandboxPreflightDeps): Promise<SandboxPreflightResult | null> {
   const advice =
@@ -220,26 +228,33 @@ async function checkActionLocation(deps: SandboxPreflightDeps): Promise<SandboxP
     return refuse('GITHUB_ACTION_REPOSITORY is not set, so this does not look like a downloaded action')
   }
 
-  const reported = deps.env.GITHUB_ACTION_PATH
-  const reportedRoot = reported !== undefined && reported.length > 0 ? path.resolve(deps.cwd, reported) : null
-  const scriptPath =
-    deps.invokedAs !== null && deps.invokedAs.length > 0 ? path.resolve(deps.cwd, deps.invokedAs) : null
-  if (reportedRoot === null && scriptPath === null) {
-    return refuse('it could not be determined how the Action was started (no GITHUB_ACTION_PATH and no script path)')
+  if (deps.invokedAs === null || deps.invokedAs.length === 0) {
+    return refuse('it could not be determined how the Action was started (no script path)')
   }
   if (deps.bundleDir === null) {
     return refuse('the location of the running bundle could not be determined')
   }
 
-  // The install root: the runner-reported path, else the directory above the bundle directory the script was started from.
-  const installRoot = reportedRoot ?? path.dirname(path.dirname(scriptPath as string))
-  if (scriptPath !== null && path.dirname(scriptPath) !== path.join(installRoot, 'dist')) {
+  // The install root: the directory above the `dist/` the script was started from.
+  const scriptPath = path.resolve(deps.cwd, deps.invokedAs)
+  const installRoot = path.dirname(path.dirname(scriptPath))
+  if (path.dirname(scriptPath) !== path.join(installRoot, 'dist')) {
     return refuse(`the script ${scriptPath} is not ${path.join(installRoot, 'dist')}/<file>`)
   }
 
   const parts = isWithin(actionsRoot, installRoot) ? path.relative(actionsRoot, installRoot).split(path.sep) : []
   if (parts.length < 3 || parts.includes('') || parts.includes('..')) {
     return refuse(`the Action is started from ${installRoot}, which is not ${actionsRoot}/<owner>/<repo>/<ref>`)
+  }
+
+  const walkedRepository = `${parts[0]}/${parts[1]}`
+  if (repository.toLowerCase() !== walkedRepository.toLowerCase()) {
+    return refuse(`GITHUB_ACTION_REPOSITORY is ${repository}, but the install is ${walkedRepository}`)
+  }
+  const walkedRef = parts.slice(2).join('/')
+  const ref = deps.env.GITHUB_ACTION_REF
+  if (ref !== walkedRef) {
+    return refuse(`GITHUB_ACTION_REF is ${ref ?? 'unset'}, but the install is ${walkedRef}`)
   }
 
   // Walk every component from the work directory through dist/ with lstat: each must be a real directory.
