@@ -2452,16 +2452,25 @@ describe.skipIf(!gated)('isolate-agent runs bun and pnpm from their install root
   const responseDir = path.join(scratch, 'response')
   const keyDir = path.join(scratch, 'keys')
   const env = hostedEnv(workspace, xdgRoot)
+  // The directories the two binaries sit in (what `command -v` resolves to on the runner's PATH).
+  const binaryDirs = {bun: path.dirname(toolFacts.bun ?? ''), pnpm: path.dirname(toolFacts.pnpm ?? '')}
   const canary = path.join(runnerHome, `.fro-bot-it-canary-${tag}`)
   const canaryDir = path.join(runnerHome, `.fro-bot-it-canary-dir-${tag}`)
   // A link INSIDE a granted root that names a runner-private file: the grant must not follow it.
   const link = path.join(toolRoots.bun, `fro-bot-it-link-${tag}`)
   const marker = path.join(scratch, 'marker')
+  const aclBefore = new Map<string, string[]>()
+  const sharedAclTargets = (): string[] => [runnerHome, path.dirname(runnerTemp), runnerTemp, path.dirname(workspace)]
 
   let result: IsolatedRunResult | undefined
   let sandboxUid = -1
   let controls = new Map<string, Row[]>()
-  const facts = {changedInRoots: [] as string[], aclAfter: [] as string[], leftovers: [] as string[]}
+  const facts = {
+    changedInRoots: [] as string[],
+    aclAfter: [] as string[],
+    aclChanged: [] as string[],
+    leftovers: [] as string[],
+  }
 
   const fixtureDir = (name: string): string => path.join(workspace, 'fixtures', name)
   const installProbe = (id: string, directory: string, command: string, expectDirectory: string): Probe => ({
@@ -2496,24 +2505,29 @@ describe.skipIf(!gated)('isolate-agent runs bun and pnpm from their install root
       'left-pad',
     ),
     {
-      // Where each tool put its cache. Not asserted beyond "install worked": the cache falls back into the checkout when the
-      // default location is not writable.
+      // Where each tool put its cache: both belong in the agent's own home, and neither in the checkout.
       id: 'tool_cache_places',
       category: 'info',
       cmd:
-        `places=""; for d in "$HOME/.bun" "$HOME/.cache" "$HOME/.local/share/pnpm" ${q(fixtureDir('bun-registry'))}/node_modules/.cache ` +
-        `${q(fixtureDir('pnpm-registry'))}/.pnpm-store; do [ -e "$d" ] && places="$places $d"; done; R tool_cache_places INFO "$places"`,
+        `places=""; for d in "$HOME/.pnpm-store" "$HOME/.bun/install/cache" ` +
+        `${q(fixtureDir('bun-registry'))}/node_modules/.cache ${q(fixtureDir('pnpm-registry'))}/.pnpm-store; ` +
+        `do [ -e "$d" ] && places="$places $d"; done; R tool_cache_places INFO "$places"`,
     },
     // The roots stay read-only (create, append, rename, unlink next to the tool), and so does the binary itself.
     ...(['bun', 'pnpm'] as const).map(name =>
       writeMatrixProbe(`tool_ro_${name}`, toolRoots[name], tag, os.userInfo().uid),
     ),
+    // The directories that hold the binaries too: create, append, rename and unlink next to `bun` and `pnpm` themselves.
+    ...(['bun', 'pnpm'] as const).map(name =>
+      writeMatrixProbe(`tool_ro_${name}_bin`, binaryDirs[name], tag, os.userInfo().uid),
+    ),
     {
+      // pnpm's file, not bun's: the runner's own control cannot open the running bun (this suite runs under it) for writing.
       id: 'tool_binary_write',
       category: 'blocked',
       control: true,
       cmd:
-        `b=$(command -v bun); if ( : >> "$b" ) 2>/dev/null; then R tool_binary_write OPEN "opened the binary for writing"; ` +
+        `b=$(command -v pnpm); if ( : >> "$b" ) 2>/dev/null; then R tool_binary_write OPEN "opened the binary for writing"; ` +
         `else R tool_binary_write BLOCKED "refused"; fi`,
     },
     // What the grant must not reach: a file and a directory beside the roots, and what a link inside a root names.
@@ -2568,7 +2582,7 @@ describe.skipIf(!gated)('isolate-agent runs bun and pnpm from their install root
     fs.mkdirSync(canaryDir, {mode: 0o755})
     fs.writeFileSync(path.join(canaryDir, 'secret'), 'canary', {mode: 0o644})
     fs.symlinkSync(canary, link)
-    for (const root of [toolRoots.bun, toolRoots.pnpm]) {
+    for (const root of [toolRoots.bun, toolRoots.pnpm, binaryDirs.bun, binaryDirs.pnpm]) {
       for (const file of matrixSentinels(root, tag)) {
         fs.writeFileSync(file, 'sentinel')
         fs.chmodSync(file, 0o666)
@@ -2576,6 +2590,10 @@ describe.skipIf(!gated)('isolate-agent runs bun and pnpm from their install root
     }
 
     controls = runControls(steps(), workspace, process.env)
+    // What is on the shared directories before this suite's run. An earlier suite in the same job may have left entries for
+    // the account's uid (the commondir suite ends unsafe on purpose and keeps its grants), so the run is judged by what it
+    // changes, not by what the directories already held.
+    for (const target of sharedAclTargets()) aclBefore.set(target, aclLines(target, false))
     fs.writeFileSync(marker, 'm')
     // The marker is older than everything the run does, newer than everything this setup did.
     await new Promise(resolve => setTimeout(resolve, 1100))
@@ -2604,6 +2622,7 @@ describe.skipIf(!gated)('isolate-agent runs bun and pnpm from their install root
       )
       facts.changedInRoots.push(...changed.stdout.split('\n').filter(line => line.length > 0))
     }
+    // Paths this suite alone touches must carry no entry for the account at all.
     const uidEntry = new RegExp(`^(default:)?user:(${sandboxUid}|fro-bot-sandbox):`)
     for (const target of [toolRoots.bun, toolRoots.pnpm]) {
       facts.aclAfter.push(
@@ -2612,21 +2631,22 @@ describe.skipIf(!gated)('isolate-agent runs bun and pnpm from their install root
           .map(line => `${target}: ${line}`),
       )
     }
-    for (const target of [
-      runnerHome,
-      canary,
-      canaryDir,
-      path.dirname(runnerTemp),
-      runnerTemp,
-      path.dirname(workspace),
-    ]) {
+    for (const target of [canary, canaryDir]) {
       facts.aclAfter.push(
         ...aclLines(target, false)
           .filter(line => uidEntry.test(line))
           .map(line => `${target}: ${line}`),
       )
     }
-    for (const root of [toolRoots.bun, toolRoots.pnpm]) {
+    // Shared directories must hold what they held before the run.
+    for (const [target, before] of aclBefore) {
+      const after = aclLines(target, false)
+      facts.aclChanged.push(
+        ...after.filter(line => !before.includes(line)).map(line => `${target}: gained ${line}`),
+        ...before.filter(line => !after.includes(line)).map(line => `${target}: lost ${line}`),
+      )
+    }
+    for (const root of [toolRoots.bun, toolRoots.pnpm, binaryDirs.bun, binaryDirs.pnpm]) {
       for (const file of matrixSentinels(root, tag).filter(
         entry => entry.endsWith('-sbx') || entry.endsWith('-sbx-unlink'),
       )) {
@@ -2637,7 +2657,7 @@ describe.skipIf(!gated)('isolate-agent runs bun and pnpm from their install root
   }, 900_000)
 
   afterAll(() => {
-    for (const root of [toolRoots.bun, toolRoots.pnpm]) {
+    for (const root of [toolRoots.bun, toolRoots.pnpm, binaryDirs.bun, binaryDirs.pnpm]) {
       for (const name of fs.existsSync(root) ? fs.readdirSync(root) : []) {
         if (name.startsWith(`${VIEW_IT_PREFIX}-`)) fs.rmSync(path.join(root, name), {recursive: true, force: true})
       }
@@ -2654,6 +2674,8 @@ describe.skipIf(!gated)('isolate-agent runs bun and pnpm from their install root
     expect(uncontrolledRows(controls)).toEqual([])
     expect(controlCoversMatrix(controls.get('tool_ro_bun'))).toBe(true)
     expect(controlCoversMatrix(controls.get('tool_ro_pnpm'))).toBe(true)
+    expect(controlCoversMatrix(controls.get('tool_ro_bun_bin'))).toBe(true)
+    expect(controlCoversMatrix(controls.get('tool_ro_pnpm_bin'))).toBe(true)
   })
 
   it('runs the runner’s bun, with the version and the file the runner reports', () => {
@@ -2682,7 +2704,7 @@ describe.skipIf(!gated)('isolate-agent runs bun and pnpm from their install root
   it('keeps the install roots read-only: create, append, rename and unlink are refused, and so is opening the binary', () => {
     // #given the write matrix on each root and an append-open of the bun binary
     // #then nothing worked
-    for (const id of ['tool_ro_bun', 'tool_ro_pnpm', 'tool_binary_write']) {
+    for (const id of ['tool_ro_bun', 'tool_ro_pnpm', 'tool_ro_bun_bin', 'tool_ro_pnpm_bin', 'tool_binary_write']) {
       expect(failuresFor(result?.rows ?? new Map(), id, 'BLOCKED')).toEqual([])
     }
     // #and the sentinels the runner placed in the roots are untouched
@@ -2699,17 +2721,23 @@ describe.skipIf(!gated)('isolate-agent runs bun and pnpm from their install root
     }
   })
 
-  it('left no ACL entry for the agent’s uid on the roots, the home, the canaries or the work directory', () => {
+  it('left no ACL entry for the agent’s uid on the roots or canaries, and the shared directories as it found them', () => {
     // #given the runner reads the ACLs after take-back
-    // #then the uid was captured, and no entry for it remains
+    // #then the uid was captured, nothing remains on what this suite owns, and the home, the work directory and RUNNER_TEMP
+    // hold exactly the entries they held before the run
     expect(sandboxUid).toBeGreaterThan(0)
     expect(facts.aclAfter).toEqual([])
+    expect(facts.aclChanged).toEqual([])
     expect(result?.released).toMatchObject({stop: 'stopped', restore: 'restored'})
   })
 
-  it('writes where the install left its caches into the log, for the next reader', () => {
-    // #given the info row
-    // #then it exists (the places are not asserted: they depend on the tool's fallback)
-    expect(result?.rows.get('tool_cache_places')?.length).toBe(1)
+  it('keeps both tools’ caches in the agent’s own home and out of the checkout', () => {
+    // #given where the registry installs left their caches
+    const places = result?.rows.get('tool_cache_places')?.[0]?.evidence ?? ''
+
+    // #then pnpm's store and bun's cache are under the account's home, and nothing is in the checkout (it could be committed)
+    expect(places).toMatch(/\/\.pnpm-store/)
+    expect(places).toMatch(/\/\.bun\/install\/cache/)
+    expect(places).not.toContain('/fixtures/')
   })
 })
