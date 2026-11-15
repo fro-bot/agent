@@ -569,6 +569,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       } catch {
         admission = {kind: 'refused', host: null, reason: 'no-id'}
       }
+      const stopStarted = Date.now()
       const outcome = await deps.stopLaunch(
         {gateDir: launched.gateDir, admission},
         namespaceTools,
@@ -579,6 +580,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
         problem ??= 'a launch could not be confirmed stopped: its namespace or its gate still had processes'
         continue
       }
+      logger.info('Sandbox launch namespace stopped', {confirmed: true, elapsedMs: Date.now() - stopStarted})
       // The launcher is a process of the launch too (the runner cannot signal it): it exits once its child has.
       if (!(await launcherGone(launched.pid, LAUNCHER_EXIT_BOUND_MS))) {
         await run([tools.pkill, '-KILL', '-g', String(launched.pid)])

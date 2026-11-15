@@ -89,6 +89,40 @@ describe('probeSandboxView', () => {
     expect(deps.removeFixture).toHaveBeenCalledWith(FIXTURE)
   })
 
+  it('logs once at info, with the elapsed time only, when the probe passes', async () => {
+    // #given a probe that passes
+    const {deps} = createDeps()
+
+    // #when probed
+    const result = await probeSandboxView(INPUT, deps)
+
+    // #then one info line says so, with no paths or env values
+    expect(result).toEqual({ok: true})
+    const info = vi.mocked(deps.logger.info).mock.calls
+    expect(info).toEqual([['Read-only view probe passed', {elapsedMs: expect.any(Number) as number}]])
+  })
+
+  it('does not log a pass when a check fails or the launch is not confirmed stopped', async () => {
+    // #given a failing check, and a pass whose launch could not be confirmed stopped
+    const failing = createDeps({
+      launch: vi.fn<SandboxViewProbeDeps['launch']>(async (_command, _args, options) => {
+        options.onSpawn(500)
+        return {pid: 500, exitCode: 10, timedOut: false, stdout: ''}
+      }),
+    })
+    const unconfirmed = createDeps({stopLaunch: vi.fn(async () => 'unconfirmed' as const)})
+
+    // #when probed
+    const failed = await probeSandboxView(INPUT, failing.deps)
+    const notStopped = await probeSandboxView(INPUT, unconfirmed.deps, {settleMs: 10})
+
+    // #then both fail and neither logs the pass line
+    expect(failed.ok).toBe(false)
+    expect(notStopped.ok).toBe(false)
+    expect(failing.deps.logger.info).not.toHaveBeenCalled()
+    expect(unconfirmed.deps.logger.info).not.toHaveBeenCalled()
+  })
+
   it.each([
     [10, /not refused/],
     [11, /declared root/],

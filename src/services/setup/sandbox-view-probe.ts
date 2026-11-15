@@ -147,6 +147,7 @@ export async function probeSandboxView(
   options: {readonly settleMs?: number} = {},
 ): Promise<ViewProbeResult> {
   const fail = (message: string): ViewProbeResult => ({ok: false, message})
+  const started = Date.now()
   let fixture: ProbeFixture
   try {
     fixture = await deps.makeFixture()
@@ -217,9 +218,12 @@ export async function probeSandboxView(
       removable = false
       return fail(withEvidence('the read-only view probe could not be confirmed stopped', rootSteps, launcherStderr))
     }
-    return launched.exitCode === 0 && !launched.timedOut
-      ? {ok: true}
-      : fail(withEvidence(describeFailure(launched, stage), rootSteps, launcherStderr))
+    if (launched.exitCode !== 0 || launched.timedOut) {
+      return fail(withEvidence(describeFailure(launched, stage), rootSteps, launcherStderr))
+    }
+    // Only the elapsed time: the fixture's paths are under the runner's temp directory.
+    deps.logger.info('Read-only view probe passed', {elapsedMs: Date.now() - started})
+    return {ok: true}
   } finally {
     // Nothing is deleted while a member of the probe's namespace may still be running.
     if (removable) {
