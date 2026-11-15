@@ -155,6 +155,12 @@ jobs:
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: false
+      # pnpm under the runner home (~/setup-pnpm), next to the Bun the setup action installs (~/.bun): the suite checks that
+      # the isolated agent can run both. The version is explicit because package.json names Bun as the package manager.
+      - name: Setup pnpm
+        uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6.1.1
+        with:
+          version: 10
       # The pinned stock binary, verified against opencode-v2-pin.json BEFORE anything from the archive runs. It is
       # installed where the sandbox user can execute it (the Action's own install lives in the world-readable tool cache).
       - name: Fetch and verify the pinned OpenCode V2 binary
