@@ -543,7 +543,7 @@ Divergences from the plan, with the reason:
 
 ### Delivery 3: bun and pnpm
 
-- [ ] **Unit 9: Grant the install roots of bun and pnpm**
+- [x] **Unit 9: Grant the install roots of bun and pnpm**
 
 **Goal:** `bun` and `pnpm` run for the agent, and nothing else under the runner home becomes readable.
 
@@ -584,6 +584,15 @@ Divergences from the plan, with the reason:
 
 **Verification:**
 - A caller workflow that installs `bun` or `pnpm` the usual way needs no change beyond `isolate-agent: true`.
+
+### As built (Delivery 3)
+
+- The fixed list and the rule live in `src/services/setup/sandbox-tool-roots.ts` (a new module, so the lifecycle edit stays small). `resolveToolRoots` grants `~/.bun` and `~/setup-pnpm`, resolved against the runner home the lifecycle already uses, when the root passes `lstat` as a directory (not a symlink) owned by the runner, `realpath` equals the path, and a directory of the agent's mirrored `PATH` lies inside it. A root that is or contains the runner home, or overlaps `RUNNER_TEMP`, the actions directory, the checkout or a writable root, is refused. Each skip carries a reason and is logged with the grants in one `Sandbox tool roots` line.
+- The grants are plain `readable` roots, so the reserved-subtree check, root verification, lock planning and take-back already cover them. The handoff gained one check for every read grant (`broadReadGrantProblem`): a readable root that is or contains the runner home, `RUNNER_TEMP`, the checkout or a handed-over directory is refused at handoff and take-back.
+- The view's bind list is unchanged: both roots lie under the read-only rbind of `/`, so the lifecycle keeps them out of `policy.readOnly` rather than binding them again.
+- Symlinks: the grant is `setfacl -R -P` and `find -P`, which never follow a link, so a link inside a root that points outside it receives nothing and cannot widen the grant; what the agent can do through it is decided by the target's own mode and ACL (the home's other entries are denied). A root that holds such a link is therefore still granted. A hard link is different: an ACL belongs to the inode, so a hard link inside a root to a file outside it would carry the grant. Nothing in a supported install makes one; the docs say everything inside a granted root is readable.
+- Measured off-runner, in an Ubuntu 24.04 container as an unprivileged user with unwritable XDG directories: `pnpm install` falls back to `<project>/.pnpm-store`, and `bun install` to `<project>/node_modules/.cache`, so neither writes a cache under the agent's home. The suite records where the caches landed instead of asserting a location.
+- Suite 11 (real runner) and the `pnpm/action-setup` step of the `sandbox-integration` job (`v6.1.1`, `version: 10`; Bun comes from the repo's own setup action, which uses the same `oven-sh/setup-bun` that Unit 1 measured). A gated run without bun or pnpm fails in `beforeAll`.
 
 ---
 
