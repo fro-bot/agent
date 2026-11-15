@@ -945,12 +945,18 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
         state: path.join(stateBase, 'opencode'),
       })
       await writeSandboxGitConfig(options.workspacePath, input.ghConfigDir !== null)
+      const launchPath = await reachablePath(agentPath)
 
       const view = await buildView(manifest, account, runnerTemp)
       if (!view.success) return await failAndRelease(view.error)
 
       const extraEnv: Record<string, string> = {
         ...(input.ghConfigDir === null ? {} : {GH_CONFIG_DIR: input.ghConfigDir}),
+        // The checkout is the runner's, so git needs it trusted. Set in the environment as well as `~/.gitconfig`, because
+        // tests commonly turn off the global and system config files and keep the environment.
+        GIT_CONFIG_COUNT: '1',
+        GIT_CONFIG_KEY_0: 'safe.directory',
+        GIT_CONFIG_VALUE_0: options.workspacePath,
         ...toolCacheEnv(installRoots.granted, runnerHome, account.home),
       }
       const spec: OpenCodeV2SandboxLaunch = {
@@ -958,7 +964,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
         setprivPath: tools.setpriv,
         envPath: tools.env,
         account,
-        path: agentPath,
+        path: launchPath,
         view: view.data,
         tmpdir: sandboxTmp,
         xdg: agentXdg,
@@ -1026,7 +1032,6 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     return err(`${message}${suffix}`)
   }
 
-  /** `command[0]` is an absolute tool path. */
   /**
    * The agent's own XDG roots, in its home, so every tool it runs can keep caches and state there. Each root's `opencode`
    * entry links to the handed-over runner directory, where the server's database, logs and config live and which
@@ -1049,6 +1054,32 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     return roots
   }
 
+  /**
+   * The `PATH` entries the account can search, in order. A directory it can't enter (one under the runner home that no
+   * grant covers) turns a missing command into "permission denied", so it is left out. Checked as the account, after the
+   * handoff's grants.
+   */
+  async function reachablePath(candidate: string): Promise<string> {
+    if (account === null) throw new Error('no sandbox account')
+    const dirs = candidate.split(path.delimiter)
+    const result = await run(
+      buildRunAsSandboxArgv(account, tools, [
+        tools.sh,
+        '-c',
+        String.raw`for d do if [ -d "$d" ] && [ -x "$d" ]; then printf "%s\n" "$d"; fi; done`,
+        'sh',
+        ...dirs,
+      ]),
+    )
+    if (result.exitCode !== 0) throw new Error(`checking the sandbox PATH failed (exit ${result.exitCode})`)
+    const reachable = new Set(result.stdout.split('\n').filter(line => line.length > 0))
+    const kept = dirs.filter(dir => reachable.has(dir))
+    const dropped = dirs.filter(dir => !reachable.has(dir))
+    if (dropped.length > 0) logger.info('Sandbox PATH left out directories the agent cannot enter', {dropped})
+    return kept.join(path.delimiter)
+  }
+
+  /** `command[0]` is an absolute tool path. */
   async function runAsSandbox(command: readonly string[]): Promise<void> {
     if (account === null) throw new Error('no sandbox account')
     const result = await run(buildRunAsSandboxArgv(account, tools, command))
