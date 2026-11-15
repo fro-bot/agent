@@ -938,6 +938,12 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
 
       const sandboxTmp = path.join(account.home, 'tmp')
       await runAsSandbox([tools.mkdir, '-m', '0700', sandboxTmp])
+      const agentXdg = await createAgentXdg(account.home, {
+        data: path.join(dataBase, 'opencode'),
+        config: path.join(configBase, 'opencode'),
+        cache: path.join(cacheBase, 'opencode'),
+        state: path.join(stateBase, 'opencode'),
+      })
       await writeSandboxGitConfig(options.workspacePath, input.ghConfigDir !== null)
 
       const view = await buildView(manifest, account, runnerTemp)
@@ -955,7 +961,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
         path: agentPath,
         view: view.data,
         tmpdir: sandboxTmp,
-        xdg: {data: dataBase, config: configBase, cache: cacheBase, state: stateBase},
+        xdg: agentXdg,
         ...(Object.keys(extraEnv).length === 0 ? {} : {extraEnv}),
       }
       launchSpec = spec
@@ -1021,6 +1027,28 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   }
 
   /** `command[0]` is an absolute tool path. */
+  /**
+   * The agent's own XDG roots, in its home, so every tool it runs can keep caches and state there. Each root's `opencode`
+   * entry links to the handed-over runner directory, where the server's database, logs and config live and which
+   * take-back and the cache save read directly. Created as the account in its new, empty home.
+   */
+  async function createAgentXdg(
+    home: string,
+    opencode: Readonly<Record<'data' | 'config' | 'cache' | 'state', string>>,
+  ): Promise<Readonly<Record<'data' | 'config' | 'cache' | 'state', string>>> {
+    const roots = {
+      data: path.join(home, '.local', 'share'),
+      config: path.join(home, '.config'),
+      cache: path.join(home, '.cache'),
+      state: path.join(home, '.local', 'state'),
+    } as const
+    await runAsSandbox([tools.mkdir, '-p', '-m', '0700', roots.data, roots.config, roots.cache, roots.state])
+    for (const kind of ['data', 'config', 'cache', 'state'] as const) {
+      await runAsSandbox([tools.ln, '-sT', opencode[kind], path.join(roots[kind], 'opencode')])
+    }
+    return roots
+  }
+
   async function runAsSandbox(command: readonly string[]): Promise<void> {
     if (account === null) throw new Error('no sandbox account')
     const result = await run(buildRunAsSandboxArgv(account, tools, command))

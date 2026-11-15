@@ -31,6 +31,8 @@ export const SANDBOX_TOOL_NAMES = [
   'chown',
   'chmod',
   'mkdir',
+  // The agent's own XDG roots link their `opencode` entries to the handed-over directories.
+  'ln',
   'env',
   'git',
   // The git credential helper of the provisioned `gh` token (provision mode), so the model's `git push` authenticates.
