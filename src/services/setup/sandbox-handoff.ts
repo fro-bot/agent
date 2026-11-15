@@ -194,6 +194,21 @@ function reservedSubtreeProblem(manifest: HandoffManifest): string | null {
   return null
 }
 
+/**
+ * A read grant is for a narrow input (the attachment directory, the admitted skills, a tool's install root), and it is
+ * recursive. One that is, or contains, the runner home, `RUNNER_TEMP`, the checkout or a handed-over directory would open
+ * runner-private files to the sandbox wholesale, so it is refused whatever put it in the manifest.
+ */
+function broadReadGrantProblem(manifest: HandoffManifest): string | null {
+  const protectedPaths = [manifest.runnerHome, manifest.runnerTemp, manifest.workspace, ...manifest.handedOver]
+  for (const root of manifest.readable) {
+    const covered = protectedPaths.find(protectedPath => isWithin(root, protectedPath))
+    if (covered !== undefined)
+      return `the read grant ${root} is or contains ${covered}, which must never be read-granted whole`
+  }
+  return null
+}
+
 function everyRoot(manifest: HandoffManifest): string[] {
   return [manifest.workspace, ...manifest.handedOver, ...manifest.readable]
 }
@@ -210,6 +225,8 @@ export async function verifyRoots(
   phase: 'handoff' | 'take-back',
 ): Promise<string | null> {
   const {runnerUid, sandboxUid} = manifest.ids
+  const broad = broadReadGrantProblem(manifest)
+  if (broad !== null) return broad
   const reserved = reservedSubtreeProblem(manifest)
   if (reserved !== null) return reserved
   const ancestors = new Set<string>()

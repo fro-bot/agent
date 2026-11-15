@@ -26,7 +26,7 @@ const BASE_ACL = '# file: x\nuser::rwx\ngroup::r-x\nother::r-x\n'
 
 interface Fixture {
   readonly root: string
-  readonly manifest: HandoffManifest
+  manifest: HandoffManifest
   readonly calls: string[][]
   readonly deps: HandoffDeps
   readonly failWhen: {predicate: ((argv: readonly string[]) => boolean) | null}
@@ -992,6 +992,129 @@ describe('sandbox take-back', () => {
 
     // #then
     expect(outcome.status === 'unsafe' && outcome.reason).toContain('created during the run')
+  })
+})
+
+describe('install roots as read grants (bun and pnpm)', () => {
+  let fx: Fixture
+  let bun: string
+  let pnpm: string
+
+  beforeEach(() => {
+    fx = buildFixture()
+    const home = fx.manifest.runnerHome
+    bun = path.join(home, '.bun')
+    pnpm = path.join(home, 'setup-pnpm')
+    fs.mkdirSync(path.join(bun, 'bin'), {recursive: true})
+    fs.writeFileSync(path.join(bun, 'bin', 'bun'), 'bun', {mode: 0o755})
+    fs.symlinkSync('bun', path.join(bun, 'bin', 'bunx'))
+    fs.mkdirSync(path.join(pnpm, 'node_modules', '.bin'), {recursive: true})
+    // A link out of the root to a runner-private directory, and a hardlink-free control file beside the roots.
+    fs.symlinkSync(path.join(home, '.docker'), path.join(pnpm, 'to-docker'))
+    fs.writeFileSync(path.join(home, '.canary'), 'secret', {mode: 0o644})
+    fx.manifest = {...fx.manifest, readable: [...fx.manifest.readable, bun, pnpm]}
+  })
+  afterEach(() => {
+    fs.rmSync(fx.root, {recursive: true, force: true})
+  })
+
+  const lines = (): string[] => mutating(fx.calls).map(call => call.join(' '))
+
+  it('grants read and execute, never write, recursively and as a default entry, without following links', async () => {
+    // #when handed off
+    const result = await handOff(fx.manifest, fx.deps)
+
+    // #then each root gets rX through a physical walk, and a default entry for files written later
+    expect(result.success).toBe(true)
+    for (const root of [bun, pnpm]) {
+      expect(lines()).toContain(`${TOOLS.setfacl} -R -P -m u:${SANDBOX_UID}:rX ${root}`)
+      expect(lines()).toContain(
+        `${TOOLS.find} -P ${root} -xdev -type d -exec ${TOOLS.setfacl} -P -d -m u:${SANDBOX_UID}:rX {} +`,
+      )
+    }
+    // #and nothing the sandbox is given on those roots includes write, and no walk follows a link
+    const onRoots = lines().filter(line => line.includes(bun) || line.includes(pnpm))
+    expect(onRoots.some(line => /u:\d+:[r-]w/.test(line))).toBe(false)
+    expect(onRoots.some(line => / -[a-zA-Z]*[LH]\b/.test(line))).toBe(false)
+    expect(onRoots.some(line => line.includes(' -L ') || line.includes(' -H '))).toBe(false)
+  })
+
+  it('opens the way to the roots with traverse-only on the home, and keeps every other home entry denied', async () => {
+    // #given the home holds the roots, a canary file and runner-private directories
+    const home = fx.manifest.runnerHome
+    const result = await handOff(fx.manifest, fx.deps)
+
+    // #then the home is traversable
+    expect(result.success).toBe(true)
+    expect(lines()).toContain(`${TOOLS.setfacl} -P -m u:${SANDBOX_UID}:--x ${home}`)
+    // #and its other children stay denied: the canary beside the roots, the docker config, the shell profile
+    for (const name of ['.canary', '.docker', '.bashrc', '.config/canary']) {
+      expect(lines()).toContain(`${TOOLS.setfacl} -P -m u:${SANDBOX_UID}:--- ${home}/${name}`)
+    }
+    // #and the roots and their contents are never denied, and neither is the link inside the root
+    for (const name of ['.bun', 'setup-pnpm', '.bun/bin/bun', 'setup-pnpm/to-docker']) {
+      expect(lines()).not.toContain(`${TOOLS.setfacl} -P -m u:${SANDBOX_UID}:--- ${home}/${name}`)
+    }
+  })
+
+  it('plans no grant for what a link inside a root points at: the target keeps its own deny entry', async () => {
+    // #given a link from inside the pnpm root to ~/.docker
+    const plan = await planLocks(fx.manifest)
+
+    // #then the target is denied on its own (the link is skipped, the directory it names is not), and the link itself is not
+    expect(plan.deny).toContain(path.join(fx.manifest.runnerHome, '.docker'))
+    expect(plan.deny).not.toContain(path.join(pnpm, 'to-docker'))
+    expect(plan.traverse).toContain(fx.manifest.runnerHome)
+  })
+
+  it('takes the grants back entry by entry, access and default, and leaves no entry for the sandbox on the roots or the home', async () => {
+    // #given a completed handoff
+    const handed = await handOff(fx.manifest, fx.deps)
+    if (!handed.success) throw new Error(handed.error)
+    fx.calls.length = 0
+
+    // #when taken back
+    const outcome = await takeBack(fx.manifest, handed.data, fx.deps)
+
+    // #then
+    expect(outcome.status).toBe('restored')
+    for (const root of [bun, pnpm]) {
+      expect(lines()).toContain(`${TOOLS.setfacl} -R -P -n -x u:${SANDBOX_UID} ${root}`)
+      expect(lines()).toContain(
+        `${TOOLS.find} -P ${root} -xdev -type d -exec ${TOOLS.setfacl} -P -d -n -x u:${SANDBOX_UID} {} +`,
+      )
+    }
+    // #and the home's traverse entry is reverted by restoring the ACL recorded before the run
+    expect(lines().some(line => line.includes(fx.manifest.runnerHome) && /--set-file=|-b /.test(line))).toBe(true)
+  })
+
+  describe('refuses a grant that is broader than a tool install root', () => {
+    it.each([
+      ['the runner home itself', (m: HandoffManifest) => m.runnerHome],
+      ['an ancestor of the runner home', (m: HandoffManifest) => path.dirname(m.runnerHome)],
+      ['RUNNER_TEMP', (m: HandoffManifest) => m.runnerTemp],
+      ['the directory that holds RUNNER_TEMP', (m: HandoffManifest) => path.dirname(m.runnerTemp)],
+      ['the checkout', (m: HandoffManifest) => m.workspace],
+      ['a directory that contains the checkout', (m: HandoffManifest) => path.dirname(m.workspace)],
+      ['a handed-over directory', (m: HandoffManifest) => m.handedOver[0] ?? ''],
+    ])('%s', async (_label, pick) => {
+      // #given a readable root that is or contains something that must never be read-granted wholesale
+      const broad = {...fx.manifest, readable: [...fx.manifest.readable, pick(fx.manifest)]}
+
+      // #when verified and handed off
+      const problem = await verifyRoots(broad, fx.deps, 'handoff')
+      const result = await handOff(broad, fx.deps)
+
+      // #then it is refused by name, before anything is changed
+      expect(problem).toContain('read grant')
+      expect(!result.success && result.error).toContain('read grant')
+      expect(mutating(fx.calls)).toEqual([])
+    })
+
+    it('but allows the attachment and skill directories that sit inside RUNNER_TEMP, and the install roots', async () => {
+      // #then the fixture's own readable root and the install roots pass
+      expect(await verifyRoots(fx.manifest, fx.deps, 'handoff')).toBeNull()
+    })
   })
 })
 

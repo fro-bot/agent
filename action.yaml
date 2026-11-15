@@ -115,7 +115,7 @@ inputs:
       wrote stays untrusted for later steps. The agent sees a read-only view of the filesystem,
       with writes allowed only to the checkout, its response, session and gh config directories, its own home and a
       private temp directory. Its PATH is the runner's, so tools from earlier setup steps in the tool cache work;
-      tools under the runner's home (bun, pnpm) are not reachable yet. See the
+      bun and pnpm work too, from their install roots (~/.bun, ~/setup-pnpm), which it can read and run but not change. See the
       README for the full list of what is and is not blocked.
     required: false
     default: 'false'
