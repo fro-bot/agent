@@ -1139,6 +1139,44 @@ describe('createSandboxLifecycle', () => {
       expect(result.view?.policy.readOnly).not.toContain(PNPM)
     })
 
+    it('points the tools’ caches at the agent’s own home, only for the tools whose root was granted', async () => {
+      // #given both roots granted, and then only bun
+      const both = await prepared([BUN, PNPM])
+      const onlyBun = await prepared([BUN])
+      const none = await prepared([])
+
+      // #then the launch environment carries the cache locations under the account's home
+      expect(both.result.extraEnv).toEqual({
+        BUN_INSTALL_CACHE_DIR: '/home/fro-bot-sandbox/.bun/install/cache',
+        npm_config_store_dir: '/home/fro-bot-sandbox/.pnpm-store',
+        npm_config_cache_dir: '/home/fro-bot-sandbox/.cache/pnpm',
+        npm_config_state_dir: '/home/fro-bot-sandbox/.local/state/pnpm',
+      })
+      expect(onlyBun.result.extraEnv).toEqual({BUN_INSTALL_CACHE_DIR: '/home/fro-bot-sandbox/.bun/install/cache'})
+      // #and nothing is added when no tool root was granted
+      expect(none.result.extraEnv).toBeUndefined()
+    })
+
+    it('keeps the gh config directory next to the cache locations', async () => {
+      // #given a provisioned gh config and a granted pnpm root
+      const harness = createHarness()
+      harness.mocks.resolveToolRoots.mockResolvedValue({granted: [PNPM], skipped: []})
+      const lifecycle = create(harness, {
+        env: {HOME: '/home/runner', RUNNER_TEMP: temp},
+        runnerPath: undefined,
+        signals: fakeHost(),
+      })
+
+      // #when prepared
+      const result = await lifecycle.prepare({keyFilePaths: [], ghConfigDir: `${temp}/gh-config-abc`, repoSkills: null})
+
+      // #then both are in the launch environment
+      expect(result.success && result.data.extraEnv).toMatchObject({
+        GH_CONFIG_DIR: `${temp}/gh-config-abc`,
+        npm_config_store_dir: '/home/fro-bot-sandbox/.pnpm-store',
+      })
+    })
+
     it('says which roots were granted and which were skipped, and why', async () => {
       // #given one granted and one refused root
       const harness = createHarness()

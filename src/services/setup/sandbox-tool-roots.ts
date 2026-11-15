@@ -122,3 +122,34 @@ export async function resolveToolRoots(input: ToolRootInput, deps: ToolRootDeps 
   }
   return {granted, skipped}
 }
+
+/**
+ * Where the granted tools keep their caches: the agent's own home, set in the agent's environment.
+ *
+ * The runner's XDG data, cache and state directories are read-only for the agent apart from the `opencode` subdirectory
+ * of each, and the agent's `XDG_*` variables point at them. `pnpm` derives its store, metadata cache and state from those
+ * and does not fall back when it cannot create them (its `mkdir` fails and the install stops), so its three locations are
+ * named outright. `bun` falls back into the checkout (`node_modules/.cache`), where a cache could end up in the agent's
+ * commit, so its cache directory is named too. Only a granted tool gets its variables: `npm` warns about `npm_config_*`
+ * names it does not know.
+ */
+export function toolCacheEnv(
+  granted: readonly string[],
+  runnerHome: string,
+  agentHome: string,
+): Record<string, string> {
+  const has = (tool: string): boolean => {
+    const entry = SANDBOX_TOOL_ROOTS.find(root => root.tool === tool)
+    return entry !== undefined && granted.includes(path.join(runnerHome, entry.directory))
+  }
+  return {
+    ...(has('bun') ? {BUN_INSTALL_CACHE_DIR: path.join(agentHome, '.bun', 'install', 'cache')} : {}),
+    ...(has('pnpm')
+      ? {
+          npm_config_store_dir: path.join(agentHome, '.pnpm-store'),
+          npm_config_cache_dir: path.join(agentHome, '.cache', 'pnpm'),
+          npm_config_state_dir: path.join(agentHome, '.local', 'state', 'pnpm'),
+        }
+      : {}),
+  }
+}

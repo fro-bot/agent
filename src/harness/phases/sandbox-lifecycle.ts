@@ -44,7 +44,12 @@ import {
 import {createExecAdapter, holdSignalOwnership} from '../../services/setup/adapters.js'
 import {handOff, takeBack} from '../../services/setup/sandbox-handoff.js'
 import {ACTIONS_DIR_NAME} from '../../services/setup/sandbox-preflight.js'
-import {resolveToolRoots, type ToolRootInput, type ToolRootResult} from '../../services/setup/sandbox-tool-roots.js'
+import {
+  resolveToolRoots,
+  toolCacheEnv,
+  type ToolRootInput,
+  type ToolRootResult,
+} from '../../services/setup/sandbox-tool-roots.js'
 import {buildSandboxPath} from '../../services/setup/sandbox-toolchain-path.js'
 import {isProcessAlive} from '../../services/setup/sandbox-view-probe.js'
 import {toErrorMessage} from '../../shared/errors.js'
@@ -938,6 +943,10 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       const view = await buildView(manifest, account, runnerTemp)
       if (!view.success) return await failAndRelease(view.error)
 
+      const extraEnv: Record<string, string> = {
+        ...(input.ghConfigDir === null ? {} : {GH_CONFIG_DIR: input.ghConfigDir}),
+        ...toolCacheEnv(installRoots.granted, runnerHome, account.home),
+      }
       const spec: OpenCodeV2SandboxLaunch = {
         sudoPath: tools.sudo,
         setprivPath: tools.setpriv,
@@ -947,7 +956,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
         view: view.data,
         tmpdir: sandboxTmp,
         xdg: {data: dataBase, config: configBase, cache: cacheBase, state: stateBase},
-        ...(input.ghConfigDir === null ? {} : {extraEnv: {GH_CONFIG_DIR: input.ghConfigDir}}),
+        ...(Object.keys(extraEnv).length === 0 ? {} : {extraEnv}),
       }
       launchSpec = spec
       return ok(spec)
