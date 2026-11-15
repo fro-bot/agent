@@ -29,6 +29,7 @@ const TOOLS = Object.fromEntries(
     'chown',
     'chmod',
     'mkdir',
+    'ln',
     'env',
     'git',
     'gh',
@@ -236,15 +237,40 @@ describe('createSandboxLifecycle', () => {
       repoSkills: null,
     })
 
-    // #then the launch uses the runner-resolved XDG paths, and the manifest hands over the four opencode dirs plus the run dirs
+    // #then the launch uses the agent's own XDG roots, and the manifest hands over the four runner-resolved opencode dirs plus
+    // the run dirs
     expect(prepared.success).toBe(true)
     if (!prepared.success) throw new Error('unreachable')
     expect(prepared.data.xdg).toEqual({
-      data: '/custom/data',
-      config: '/home/runner/.config',
-      cache: '/home/runner/.cache',
-      state: '/home/runner/.local/state',
+      data: '/home/fro-bot-sandbox/.local/share',
+      config: '/home/fro-bot-sandbox/.config',
+      cache: '/home/fro-bot-sandbox/.cache',
+      state: '/home/fro-bot-sandbox/.local/state',
     })
+    // #and, as the account, the roots are made and each `opencode` entry links to its handed-over directory
+    const asSandbox = harness.sudoCalls.filter(call => call.includes('--reuid=998'))
+    const mkdir = asSandbox.find(
+      call => call.includes('/usr/bin/mkdir') && call.includes('/home/fro-bot-sandbox/.cache'),
+    )
+    expect(mkdir?.slice(mkdir.indexOf('/usr/bin/mkdir'))).toEqual([
+      '/usr/bin/mkdir',
+      '-p',
+      '-m',
+      '0700',
+      '/home/fro-bot-sandbox/.local/share',
+      '/home/fro-bot-sandbox/.config',
+      '/home/fro-bot-sandbox/.cache',
+      '/home/fro-bot-sandbox/.local/state',
+    ])
+    const links = asSandbox
+      .filter(call => call.includes('/usr/bin/ln'))
+      .map(call => call.slice(call.indexOf('/usr/bin/ln')))
+    expect(links).toEqual([
+      ['/usr/bin/ln', '-sT', '/custom/data/opencode', '/home/fro-bot-sandbox/.local/share/opencode'],
+      ['/usr/bin/ln', '-sT', '/home/runner/.config/opencode', '/home/fro-bot-sandbox/.config/opencode'],
+      ['/usr/bin/ln', '-sT', '/home/runner/.cache/opencode', '/home/fro-bot-sandbox/.cache/opencode'],
+      ['/usr/bin/ln', '-sT', '/home/runner/.local/state/opencode', '/home/fro-bot-sandbox/.local/state/opencode'],
+    ])
     expect(prepared.data.account).toEqual(ACCOUNT)
     expect(prepared.data.extraEnv).toMatchObject({GH_CONFIG_DIR: `${temp}/gh-config-abc`})
     expect(prepared.data.tmpdir).toBe('/home/fro-bot-sandbox/tmp')
@@ -1139,36 +1165,20 @@ describe('createSandboxLifecycle', () => {
       expect(result.view?.policy.readOnly).not.toContain(PNPM)
     })
 
-    it('points the tools’ caches at the agent’s own home: uv and pip always, bun and pnpm when granted', async () => {
-      // #given both roots granted, and then only bun
+    it('names bun’s cache in the agent’s own home when its root is granted, and nothing else', async () => {
+      // #given both roots granted, only bun, and none
       const both = await prepared([BUN, PNPM])
-      const onlyBun = await prepared([BUN])
+      const onlyPnpm = await prepared([PNPM])
       const none = await prepared([])
-      const always = {
-        UV_CACHE_DIR: '/home/fro-bot-sandbox/.cache/uv',
-        UV_PYTHON_INSTALL_DIR: '/home/fro-bot-sandbox/.local/share/uv/python',
-        UV_TOOL_DIR: '/home/fro-bot-sandbox/.local/share/uv/tools',
-        PIP_CACHE_DIR: '/home/fro-bot-sandbox/.cache/pip',
-      }
 
-      // #then the launch environment carries the cache locations under the account's home
-      expect(both.result.extraEnv).toEqual({
-        ...always,
-        BUN_INSTALL_CACHE_DIR: '/home/fro-bot-sandbox/.bun/install/cache',
-        npm_config_store_dir: '/home/fro-bot-sandbox/.pnpm-store',
-        npm_config_cache_dir: '/home/fro-bot-sandbox/.cache/pnpm',
-        npm_config_state_dir: '/home/fro-bot-sandbox/.local/state/pnpm',
-      })
-      expect(onlyBun.result.extraEnv).toEqual({
-        ...always,
-        BUN_INSTALL_CACHE_DIR: '/home/fro-bot-sandbox/.bun/install/cache',
-      })
-      // #and only uv and pip when no tool root was granted
-      expect(none.result.extraEnv).toEqual(always)
+      // #then only bun's cache is named; pnpm and the rest follow the agent's own XDG roots
+      expect(both.result.extraEnv).toEqual({BUN_INSTALL_CACHE_DIR: '/home/fro-bot-sandbox/.bun/install/cache'})
+      expect(onlyPnpm.result.extraEnv).toBeUndefined()
+      expect(none.result.extraEnv).toBeUndefined()
     })
 
-    it('keeps the gh config directory next to the cache locations', async () => {
-      // #given a provisioned gh config and a granted pnpm root
+    it('keeps the gh config directory in the launch environment', async () => {
+      // #given a provisioned gh config and a granted pnpm root (which adds nothing)
       const harness = createHarness()
       harness.mocks.resolveToolRoots.mockResolvedValue({granted: [PNPM], skipped: []})
       const lifecycle = create(harness, {
@@ -1181,10 +1191,7 @@ describe('createSandboxLifecycle', () => {
       const result = await lifecycle.prepare({keyFilePaths: [], ghConfigDir: `${temp}/gh-config-abc`, repoSkills: null})
 
       // #then both are in the launch environment
-      expect(result.success && result.data.extraEnv).toMatchObject({
-        GH_CONFIG_DIR: `${temp}/gh-config-abc`,
-        npm_config_store_dir: '/home/fro-bot-sandbox/.pnpm-store',
-      })
+      expect(result.success && result.data.extraEnv).toEqual({GH_CONFIG_DIR: `${temp}/gh-config-abc`})
     })
 
     it('says which roots were granted and which were skipped, and why', async () => {
