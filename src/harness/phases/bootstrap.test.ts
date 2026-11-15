@@ -631,6 +631,50 @@ describe('runBootstrap isolate-agent preflight', () => {
     expect(mocks.saveState).toHaveBeenCalledWith('sandboxState', 'pending')
   })
 
+  it('hands the lifecycle the PATH from before setup ran, even though setup prepends the opencode directory', async () => {
+    // #given a runner PATH, and a setup that prepends a directory to it, as `core.addPath` does
+    const before = '/opt/hostedtoolcache/node/24/x64/bin:/usr/local/bin:/usr/bin:/bin'
+    vi.stubEnv('PATH', before)
+    mocks.ensureOpenCodeAvailable.mockImplementation(async () => {
+      process.env.PATH = `/opt/hostedtoolcache/opencode/fresh:${process.env.PATH ?? ''}`
+      return {path: '/opt/hostedtoolcache/opencode/fresh', version: '1.0.0', didSetup: true}
+    })
+    const lifecycle = {prepare: vi.fn(), release: vi.fn(), launch: vi.fn()}
+    mocks.createSandboxLifecycle.mockReturnValue(lifecycle)
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: true})})
+    mocks.runSandboxPreflight.mockResolvedValue({ok: true, tools})
+    vi.stubEnv('GITHUB_WORKSPACE', path.join(runnerTempDir, 'repo'))
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when bootstrap runs
+    await runBootstrap(createMockLogger())
+
+    // #then setup did change the live PATH, and the lifecycle was given the one from before
+    expect(process.env.PATH).toBe(`/opt/hostedtoolcache/opencode/fresh:${before}`)
+    const options = mocks.createSandboxLifecycle.mock.calls[0]?.[0] as {runnerPath: string | undefined}
+    expect(options.runnerPath).toBe(before)
+  })
+
+  it('hands the lifecycle an undefined PATH when the runner had none, not the one setup made', async () => {
+    // #given no PATH, and a setup that creates one
+    vi.stubEnv('PATH', undefined)
+    mocks.ensureOpenCodeAvailable.mockImplementation(async () => {
+      process.env.PATH = '/opt/hostedtoolcache/opencode/fresh'
+      return {path: '/opt/hostedtoolcache/opencode/fresh', version: '1.0.0', didSetup: true}
+    })
+    mocks.createSandboxLifecycle.mockReturnValue({prepare: vi.fn(), release: vi.fn(), launch: vi.fn()})
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: true})})
+    mocks.runSandboxPreflight.mockResolvedValue({ok: true, tools})
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when bootstrap runs
+    await runBootstrap(createMockLogger())
+
+    // #then
+    const options = mocks.createSandboxLifecycle.mock.calls[0]?.[0] as {runnerPath: string | undefined}
+    expect(options.runnerPath).toBeUndefined()
+  })
+
   it('marks the run isolated from the input, before any sandbox exists, so a sandbox that never starts still counts', async () => {
     // #given isolation on; no lifecycle method is ever called here (createAccount may refuse later, in prepare)
     mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: true})})

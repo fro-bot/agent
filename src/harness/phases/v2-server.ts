@@ -475,7 +475,11 @@ export async function startActionOpenCodeV2(
   // With a sandbox the spawn goes through `sandbox.launch`, which records the attempt before port allocation begins and is
   // refused once the teardown has begun. `release` waits for the attempt to settle (and aborts it) before it verifies the
   // sandbox uid is empty, so a signal can no longer slip between this check and the privileged launch.
-  const spawnOptions = (extra: {readonly sandbox?: OpenCodeV2SandboxLaunch; readonly signal?: AbortSignal}) => ({
+  const spawnOptions = (extra: {
+    readonly sandbox?: OpenCodeV2SandboxLaunch
+    readonly signal?: AbortSignal
+    readonly onSpawn?: (pid: number) => void
+  }) => ({
     binaryPath: options.binaryPath,
     directory: options.workspacePath,
     expectedPluginIds: [SYSTEMATIC_V2_PLUGIN_ID, FRO_BOT_PLUGIN_ID],
@@ -483,6 +487,7 @@ export async function startActionOpenCodeV2(
     env: childEnv,
     ...(extra.sandbox === undefined ? {} : {sandbox: extra.sandbox}),
     ...(extra.signal === undefined ? {} : {signal: extra.signal}),
+    ...(extra.onSpawn === undefined ? {} : {onSpawn: extra.onSpawn}),
     ...(options.maskSecret === undefined ? {} : {maskSecret: options.maskSecret}),
     ...deps.startOptions,
   })
@@ -497,6 +502,7 @@ export async function startActionOpenCodeV2(
           spawnOptions({
             sandbox: context.spec,
             signal: runSignal === undefined ? context.signal : AbortSignal.any([runSignal, context.signal]),
+            onSpawn: context.noteSpawn,
           }),
           logger,
         )

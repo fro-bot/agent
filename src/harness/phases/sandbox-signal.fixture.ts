@@ -39,12 +39,21 @@ const tools = Object.fromEntries(
     'mkdir',
     'env',
     'git',
+    'unshare',
+    'mount',
+    'umount',
+    'pivot_root',
+    'sh',
+    'lsns',
+    'readlink',
+    'sleep',
   ].map(name => [name, `/usr/bin/${name}`]),
 ) as never
 
 const lifecycle = createSandboxLifecycle({
   tools,
   env: {HOME: '/tmp', RUNNER_TEMP: process.env.SIGNAL_FIXTURE_TEMP ?? '/tmp'},
+  runnerPath: undefined,
   runnerHome: '/tmp',
   workspacePath: '/tmp/ws',
   responseDir: null,
@@ -73,6 +82,12 @@ const lifecycle = createSandboxLifecycle({
       return 'deleted'
     },
     readText: async () => null,
+    createViewRoot: async () => ({
+      newRoot: '/tmp/fixture-view/root',
+      gateRoot: '/tmp/fixture-view/gates',
+      remove: async () => undefined,
+    }),
+    readMountInfo: async () => '',
     ids: () => ({uid: process.getuid?.() ?? 1, gid: process.getgid?.() ?? 1}),
   },
 })

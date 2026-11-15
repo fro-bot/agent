@@ -9,7 +9,9 @@ import type {OpenCodeV2ServerHandle} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
 import type {SandboxLifecycle} from './sandbox-lifecycle.js'
 import {Buffer} from 'node:buffer'
+import * as fs from 'node:fs'
 import http from 'node:http'
+import path from 'node:path'
 import {DatabaseSync} from 'node:sqlite'
 import {startOpenCodeV2Server} from '@fro-bot/runtime'
 
@@ -220,6 +222,7 @@ export async function startScriptedSession(options: ScriptedSessionOptions): Pro
         env: options.env,
         sandbox: context.spec,
         signal: context.signal,
+        onSpawn: context.noteSpawn,
         config: {
           share: 'disabled',
           model: 'fake/fixture-model',
@@ -265,4 +268,124 @@ export async function startScriptedSession(options: ScriptedSessionOptions): Pro
   const deadline = Date.now() + (options.turnTimeoutMs ?? 240_000)
   while (!provider.state.done && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 500))
   return handle
+}
+
+// --- The read-only view suite ------------------------------------------------------------------------------------------
+
+/** Every file a view probe creates starts with this, so a sweep after the run finds what a failed run left behind. */
+export const VIEW_IT_PREFIX = 'fro-bot-it'
+
+/** The operations of one write-matrix row. A control must manage all four, or its blocked twin proves less than it claims. */
+export const MATRIX_OPS = ['create', 'append', 'rename', 'unlink'] as const
+
+export interface MatrixDirectoryInput {
+  /** The runner's `PATH`. */
+  readonly pathEnv: string | undefined
+  /** `RUNNER_TOOL_CACHE`, or the hosted default. */
+  readonly toolCache: string
+  /** Further shared directories: `/opt`, `/usr/share`. */
+  readonly extra: readonly string[]
+}
+
+export interface MatrixDirectoryDeps {
+  readonly isDirectory: (target: string) => boolean
+  /** True when the runner itself may create files there. */
+  readonly isWritable: (target: string) => boolean
+  readonly subdirectories: (target: string) => readonly string[]
+}
+
+/**
+ * The shared directories the matrix covers: every absolute `PATH` entry, the extra directories, the tool cache and its first
+ * subdirectory, in that order and without duplicates. Only those the runner can write are returned. A directory the runner
+ * cannot write is not part of the threat, and a runner-side control could not show that a block means anything there.
+ */
+export function matrixDirectories(input: MatrixDirectoryInput, deps: MatrixDirectoryDeps): readonly string[] {
+  const candidates = [
+    ...(input.pathEnv ?? '').split(':').filter(entry => entry.startsWith('/')),
+    ...input.extra,
+    input.toolCache,
+  ]
+  const firstSubdirectory = deps
+    .subdirectories(input.toolCache)
+    .map(name => `${input.toolCache}/${name}`)
+    .find(candidate => deps.isDirectory(candidate) && deps.isWritable(candidate))
+  if (firstSubdirectory !== undefined) candidates.push(firstSubdirectory)
+  const seen = new Set<string>()
+  const directories: string[] = []
+  for (const candidate of candidates) {
+    const normalized = candidate.length > 1 ? candidate.replace(/\/+$/, '') : candidate
+    if (seen.has(normalized)) continue
+    seen.add(normalized)
+    if (deps.isDirectory(normalized) && deps.isWritable(normalized)) directories.push(normalized)
+  }
+  return directories
+}
+
+/**
+ * The disposable files the runner places in a matrix directory before the launch: for each actor (`ctl` is the runner's
+ * control, `sbx` is the sandbox) one to append to and rename, and one to unlink. Both are mode 0666, so only the mount, not the
+ * permission bits, can refuse the sandbox. The actor never shares a file with the other, so the control cannot use up the
+ * sandbox's.
+ */
+export function matrixSentinels(dir: string, tag: string): readonly string[] {
+  return (['ctl', 'sbx'] as const).flatMap(who => [
+    `${dir}/${VIEW_IT_PREFIX}-${tag}-${who}`,
+    `${dir}/${VIEW_IT_PREFIX}-${tag}-${who}-unlink`,
+  ])
+}
+
+/**
+ * One write-matrix row: create, append, rename and unlink in `dir`. It prints `OPEN` listing every operation that worked,
+ * or `BLOCKED` when none did. The actor is told by uid, so the runner's control and the sandbox use different sentinels.
+ */
+export function writeMatrixProbe(id: string, dir: string, tag: string, runnerUid: number): Probe {
+  return {
+    id,
+    category: 'blocked',
+    control: true,
+    cmd:
+      `b=${q(dir)}/${VIEW_IT_PREFIX}-${tag}; ` +
+      `if [ "$(id -u)" = ${runnerUid} ]; then who=ctl; else who=sbx; fi; s="$b-$who"; u="$b-$who-unlink"; got=""; ` +
+      `( : > "$b-new-$who" ) 2>/dev/null && { got="$got create"; rm -f "$b-new-$who"; }; ` +
+      `( echo x >> "$s" ) 2>/dev/null && got="$got append"; ` +
+      `if mv "$s" "$s.moved" 2>/dev/null; then got="$got rename"; mv "$s.moved" "$s"; fi; ` +
+      `if rm "$u" 2>/dev/null; then got="$got unlink"; fi; ` +
+      `if [ -z "$got" ]; then R ${id} BLOCKED "no write operation succeeded"; else R ${id} OPEN "succeeded:$got"; fi`,
+  }
+}
+
+/** True when a control row names all four matrix operations. */
+export function controlCoversMatrix(rows: readonly Row[] | undefined): boolean {
+  return (rows ?? []).some(row => row.status === 'OPEN' && MATRIX_OPS.every(op => row.evidence.includes(op)))
+}
+
+/** A `works` row: the actor can create and remove a file in `dirExpr` (a shell word, already quoted or an expansion). */
+export const writeWorksProbe = (id: string, dirExpr: string): Probe => ({
+  id,
+  category: 'works',
+  cmd:
+    `d=${dirExpr}; t="$d/.${VIEW_IT_PREFIX}-w-$$"; ` +
+    `if ( : > "$t" ) 2>/dev/null; then rm -f "$t"; R ${id} WORKS "wrote $d"; else R ${id} FAILED "no write to $d"; fi`,
+})
+
+/**
+ * Copies `entry` of a bundle directory, and every file it imports (relative `./x.js`, static or dynamic, transitively), into
+ * `target`: the stand-in published install a root process runs the view builder from. A missing import throws here, naming
+ * the file, rather than failing later as a bare exit code of a process the test cannot see into. Returns the copied names.
+ */
+export function copyBundleWithImports(sourceDir: string, targetDir: string, entry: string): readonly string[] {
+  const copied = new Set<string>()
+  const pending = [entry]
+  for (let name = pending.pop(); name !== undefined; name = pending.pop()) {
+    if (copied.has(name)) continue
+    const from = path.join(sourceDir, name)
+    if (!fs.existsSync(from)) throw new Error(`${name} is imported by the bundle but is not in ${sourceDir}`)
+    fs.copyFileSync(from, path.join(targetDir, name))
+    copied.add(name)
+    const text = fs.readFileSync(from, 'utf8')
+    for (const match of text.matchAll(/(?:from|import)\s*(?:\(\s*)?["']\.\/([^"'/]+\.js)["']/g)) {
+      if (match[1] !== undefined) pending.push(match[1])
+    }
+  }
+  return [...copied]
 }
