@@ -1,0 +1,1 @@
+import e from"node:path";function t(t,n){let r=e.relative(t,n);return r===``?!0:r===`..`||r.startsWith(`..${e.sep}`)?!1:!e.isAbsolute(r)}export{t};
