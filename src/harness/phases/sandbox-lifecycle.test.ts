@@ -1239,6 +1239,7 @@ describe('createSandboxLifecycle', () => {
         {pkill: '/usr/bin/pkill', pgrep: '/usr/bin/pgrep', lsns: '/usr/bin/lsns'},
         expect.anything(),
         expect.anything(),
+        {onRoute: expect.any(Function) as unknown},
       )
       const order = [
         harness.mocks.stopLaunch.mock.invocationCallOrder[0] ?? 0,
@@ -1284,6 +1285,68 @@ describe('createSandboxLifecycle', () => {
       // #then the dead launcher was no reason to skip it
       expect(restored).toMatchObject({stop: 'stopped', restore: 'restored'})
       expect(harness.mocks.stopLaunch).toHaveBeenCalledTimes(1)
+    })
+
+    it.each([
+      ['an id was captured', admittedLaunch, 'namespace'],
+      ['no id was captured', refusedLaunch, 'gate'],
+    ] as const)(
+      'logs once that the launch is confirmed empty when %s, by the route it took',
+      async (_label, admission, via) => {
+        // #given a launch whose stop confirms it empty
+        const logger = createMockLogger()
+        const {harness, lifecycle} = await preparedWith(undefined, {logger})
+        harness.mocks.admit.mockImplementation(admission)
+        await lifecycle.launch(spawnLauncher())
+
+        // #when released
+        await lifecycle.release()
+
+        // #then one info line carries the confirmation, the route and the elapsed time, and nothing else
+        const lines = vi
+          .mocked(logger.info)
+          .mock.calls.filter(([message]) => message === 'Sandbox launch namespace stopped')
+        expect(lines).toEqual([
+          ['Sandbox launch namespace stopped', {confirmed: true, via, elapsedMs: expect.any(Number) as number}],
+        ])
+      },
+    )
+
+    it('reports the route the stop took, not the admission, when the id was read late', async () => {
+      // #given a refused admission whose id the stop read from the gate at teardown
+      const logger = createMockLogger()
+      const {harness, lifecycle} = await preparedWith(undefined, {logger})
+      harness.mocks.admit.mockImplementation(refusedLaunch)
+      harness.mocks.stopLaunch.mockImplementation(async (_launch, _tools, _deps, _gate, options) => {
+        options?.onRoute?.('namespace')
+        return 'stopped'
+      })
+      await lifecycle.launch(spawnLauncher())
+
+      // #when released
+      await lifecycle.release()
+
+      // #then
+      expect(logger.info).toHaveBeenCalledWith('Sandbox launch namespace stopped', {
+        confirmed: true,
+        via: 'namespace',
+        elapsedMs: expect.any(Number) as number,
+      })
+    })
+
+    it('does not log a confirmation when the stop cannot confirm the launch empty', async () => {
+      // #given a stop that cannot confirm
+      const logger = createMockLogger()
+      const {harness, lifecycle} = await preparedWith(undefined, {logger})
+      harness.mocks.stopLaunch.mockResolvedValue('unconfirmed')
+      await lifecycle.launch(spawnLauncher())
+
+      // #when released
+      const released = await lifecycle.release()
+
+      // #then the run is unsafe and the confirmation line was not logged
+      expect(released).toMatchObject({stop: 'unconfirmed', restore: 'unsafe'})
+      expect(logger.info).not.toHaveBeenCalledWith('Sandbox launch namespace stopped', expect.anything())
     })
 
     it.each([

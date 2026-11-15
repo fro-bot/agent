@@ -1,6 +1,6 @@
 import type {PrivilegedRun, SandboxIdentityDeps} from './sandbox-identity.js'
 import type {GateDeps, LaunchAdmission, SandboxNamespaceTools} from './sandbox-namespace.js'
-import {describe, expect, it} from 'vitest'
+import {describe, expect, it, vi} from 'vitest'
 import {
   admitLaunch,
   GATE_GO_FILE,
@@ -735,5 +735,55 @@ describe('stopLaunch: what teardown does for each state of a launch', () => {
     // #then
     expect(outcome).toBe('stopped')
     expect(model.procs.map(proc => proc.pid)).toEqual([1, 102])
+  })
+})
+
+describe('stopLaunch: how a launch is stopped is reported before the stop runs', () => {
+  const refused: LaunchAdmission = {kind: 'refused', host: String(HOST), reason: 'no-id'}
+  const noFiles = createFiles({}).deps
+
+  it('reports `namespace` for an admitted launch', async () => {
+    // #given a launch whose id was captured at admission
+    const model = createModel(runningTree())
+    const onRoute = vi.fn()
+
+    // #when stopped
+    await stopLaunch(
+      {gateDir: GATE_DIR, admission: {kind: 'admitted', namespace: NAMESPACE}},
+      TOOLS,
+      model.deps,
+      noFiles,
+      {
+        onRoute,
+      },
+    )
+
+    // #then the namespace route was taken
+    expect(onRoute).toHaveBeenCalledExactlyOnceWith('namespace')
+  })
+
+  it('reports `namespace` for a refused admission whose id the gate file gives at teardown', async () => {
+    // #given an id that arrived after the admission gave up
+    const model = createModel(gateTree())
+    const files = createFiles({initial: {[NS_FILE]: `mnt:[${VIEW}]\n`}})
+    const onRoute = vi.fn()
+
+    // #when stopped
+    await stopLaunch({gateDir: GATE_DIR, admission: refused}, TOOLS, model.deps, files.deps, {onRoute})
+
+    // #then the late read counts as a namespace stop
+    expect(onRoute).toHaveBeenCalledExactlyOnceWith('namespace')
+  })
+
+  it('reports `gate` when no id was captured', async () => {
+    // #given a launch that never reported an id
+    const model = createModel(gateTree())
+    const onRoute = vi.fn()
+
+    // #when stopped
+    await stopLaunch({gateDir: GATE_DIR, admission: refused}, TOOLS, model.deps, noFiles, {onRoute})
+
+    // #then the gate directory kill was used
+    expect(onRoute).toHaveBeenCalledExactlyOnceWith('gate')
   })
 })
