@@ -294,7 +294,7 @@ describe('inspections that feed an absence assertion', () => {
 
     it('bounds the stderr tail it reports', () => {
       // #given a very long, multi-line stderr
-      const run = returning(done({status: 1, stderr: `${'e'.repeat(500)}\nlast words\n`}))
+      const run = returning(done({status: 3, stderr: `${'e'.repeat(500)}\nlast words\n`}))
 
       // #then the message carries the end of it on one line, cut to a fixed length
       let message = ''
