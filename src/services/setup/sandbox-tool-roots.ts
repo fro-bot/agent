@@ -124,14 +124,12 @@ export async function resolveToolRoots(input: ToolRootInput, deps: ToolRootDeps 
 }
 
 /**
- * Where the granted tools keep their caches: the agent's own home, set in the agent's environment.
+ * Where the agent's tools keep their caches: the agent's own home, set in the agent's environment.
  *
- * The runner's XDG data, cache and state directories are read-only for the agent apart from the `opencode` subdirectory
- * of each, and the agent's `XDG_*` variables point at them. `pnpm` derives its store, metadata cache and state from those
- * and does not fall back when it cannot create them (its `mkdir` fails and the install stops), so its three locations are
- * named outright. `bun` falls back into the checkout (`node_modules/.cache`), where a cache could end up in the agent's
- * commit, so its cache directory is named too. Only a granted tool gets its variables: `npm` warns about `npm_config_*`
- * names it does not know.
+ * The agent's `XDG_*` variables point at the runner's directories, which are read-only for the agent apart from the
+ * `opencode` subdirectory of each. `pnpm` and `uv` fail there, and `bun` falls back into the checkout, so their locations
+ * are named outright. `uv` and `pip` run from the world-readable tool cache, so theirs are always set; pnpm's and bun's
+ * only when their root is granted, since `npm` warns about `npm_config_*` names it does not know.
  */
 export function toolCacheEnv(
   granted: readonly string[],
@@ -143,6 +141,10 @@ export function toolCacheEnv(
     return entry !== undefined && granted.includes(path.join(runnerHome, entry.directory))
   }
   return {
+    UV_CACHE_DIR: path.join(agentHome, '.cache', 'uv'),
+    UV_PYTHON_INSTALL_DIR: path.join(agentHome, '.local', 'share', 'uv', 'python'),
+    UV_TOOL_DIR: path.join(agentHome, '.local', 'share', 'uv', 'tools'),
+    PIP_CACHE_DIR: path.join(agentHome, '.cache', 'pip'),
     ...(has('bun') ? {BUN_INSTALL_CACHE_DIR: path.join(agentHome, '.bun', 'install', 'cache')} : {}),
     ...(has('pnpm')
       ? {
