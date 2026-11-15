@@ -70,17 +70,24 @@ import {startKeyProxyProcess, type KeyProxyProcess} from './key-proxy-process.js
 import {snapshotLogDirectory} from './log-snapshot.js'
 import {createSandboxLifecycle} from './sandbox-lifecycle.js'
 import {
+  aclLines,
+  aclText,
+  changedFilesSince,
   controlCoversMatrix,
   copyBundleWithImports,
   describeReconstruction,
   failuresFor,
+  findPaths,
   matrixDirectories,
   matrixSentinels,
+  mountNamespaceIds,
   parseRows,
+  pgrepOutput,
   PRELUDE,
   q,
   readProbe,
   readSessionIds,
+  runnerFirstLine,
   safeEnvPath,
   safeEnvToken,
   startScriptedProvider,
@@ -544,7 +551,7 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
     // --- Stop, verify, take back ------------------------------------------------------------------------------
     await handle.shutdown()
     released = await lifecycle.release()
-    straysAfterRelease = spawnSync('pgrep', ['-f', 'sleep 777'], {encoding: 'utf8'}).stdout.trim()
+    straysAfterRelease = pgrepOutput(['-f', 'sleep 777'])
   }, 600_000)
 
   afterAll(async () => {
@@ -628,12 +635,11 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
     expect(fs.readFileSync(path.join(workspace, 'm-0700', 'inner', 'f'), 'utf8').trim()).toBe('x')
     // #and nothing under the roots still belongs to the sandbox
     // (the root-owned file the setup made on purpose is not the sandbox's)
-    const leftover = spawnSync(
-      'find',
+    const leftover = findPaths(
       [workspace, responseDir, '-xdev', '!', '-user', String(runnerUid), '!', '-name', 'pre-acl-root'],
-      {encoding: 'utf8'},
+      'looking for files the sandbox still owns',
     )
-    expect(leftover.stdout.trim()).toBe('')
+    expect(leftover).toEqual([])
     // #and the symlink is still a symlink, and the sentinel it pointed at was never touched
     expect(fs.lstatSync(path.join(workspace, 'm-link')).isSymbolicLink()).toBe(true)
     expect(fs.readFileSync(sentinel, 'utf8')).toBe('sentinel-content')
@@ -653,29 +659,29 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
 
   it("removes only this run's ACL entries: a pre-existing named ACL survives and no default entry of this run remains", () => {
     // #given ACLs that existed before the run, and the handoff's own access and default entries
-    const read = (target: string): string => spawnSync('getfacl', ['-p', target], {encoding: 'utf8'}).stdout
+    const read = (target: string): string => aclText(['-p', target])
     // #then the pre-existing named access entries and the pre-existing default entry are intact
     expect(read(path.join(workspace, 'pre-acl'))).toContain('user:nobody:r-x')
     expect(read(path.join(workspace, 'pre-acl-dir'))).toContain('user:nobody:r-x')
     expect(read(path.join(workspace, 'pre-acl-dir'))).toContain('default:user:nobody:r-x')
     // #and nothing of this run is left: no entry for the (deleted, so numeric) sandbox uid, anywhere
-    const tree = spawnSync('getfacl', ['-R', '-p', workspace, responseDir], {encoding: 'utf8'}).stdout
+    const tree = aclText(['-R', '-p', workspace, responseDir])
     expect(tree).not.toMatch(/^(default:)?user:\d+:/m)
     // #and the runner has no entry in the handed-over directory beyond the ones it had before (none)
     const me = os.userInfo().username
-    const handed = spawnSync('getfacl', ['-R', '-p', responseDir], {encoding: 'utf8'}).stdout
+    const handed = aclText(['-R', '-p', responseDir])
     expect(handed).not.toMatch(new RegExp(`^(default:)?user:${me}:`, 'm'))
   })
 
   it('leaves the runner grants that existed before the run alone, and gives model-created checkout files none of their own', () => {
     // #given a runner entry on a root-owned file and a runner default entry on a runner-owned directory, both from before
     const me = os.userInfo().username
-    const read = (target: string): string => spawnSync('getfacl', ['-p', target], {encoding: 'utf8'}).stdout
+    const read = (target: string): string => aclText(['-p', target])
     // #then both survived take-back exactly (the mask-preserving removal touched neither)
     expect(read(path.join(workspace, 'pre-acl-root'))).toContain(`user:${me}:r--`)
     expect(read(path.join(workspace, 'pre-acl-runner-default'))).toContain(`default:user:${me}:r-x`)
     // #and the only checkout paths that name the runner are those two: nothing this run created inherited an entry
-    const tree = spawnSync('getfacl', ['-R', '-p', workspace], {encoding: 'utf8'}).stdout
+    const tree = aclText(['-R', '-p', workspace])
     const named = tree
       .split('\n\n')
       .filter(block => new RegExp(`^(default:)?user:${me}:`, 'm').test(block))
@@ -718,7 +724,7 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
     const passwd = fs.readFileSync('/etc/passwd', 'utf8')
     // #then the account is gone and no ACL names it on the paths we touched
     expect(passwd).not.toContain('fro-bot-sandbox')
-    const acl = spawnSync('getfacl', ['-R', '-p', workspace], {encoding: 'utf8'}).stdout
+    const acl = aclText(['-R', '-p', workspace])
     expect(acl).not.toContain('user:fro-bot-sandbox')
     expect(acl).not.toMatch(/^user:\d+:/m)
   })
@@ -941,7 +947,7 @@ describe.skipIf(!gated)('isolate-agent with a provisioned gh config and an admit
     const hosts = path.join(ghConfigDir, 'hosts.yml')
     expect(fs.readFileSync(hosts, 'utf8')).toContain(ghDummyToken)
     expect(fs.statSync(hosts).uid).toBe(runnerUid)
-    const acl = spawnSync('getfacl', ['-R', '-p', ghConfigDir, stagingRoot], {encoding: 'utf8'}).stdout
+    const acl = aclText(['-R', '-p', ghConfigDir, stagingRoot])
     expect(acl).not.toMatch(/^user:\d+:/m)
   })
 })
@@ -1763,12 +1769,7 @@ function hostMountSet(): string[] {
 
 /** The mount namespaces on the machine, as root sees them: a namespace with no process in it is not listed. */
 function mountNamespaces(): string[] {
-  const listed = spawnSync('sudo', ['-n', 'lsns', '-t', 'mnt', '-n', '-o', 'NS'], {encoding: 'utf8'})
-  return listed.stdout
-    .split('\n')
-    .map(line => line.trim())
-    .filter(line => line.length > 0)
-    .toSorted()
+  return mountNamespaceIds()
 }
 
 /** Removes what a view probe may have left in the shared directories. The runner may remove any of it: they are mode 777. */
@@ -1787,7 +1788,7 @@ function sweepViewFiles(): void {
 }
 
 function strayProcesses(pattern: string): string {
-  return spawnSync('pgrep', ['-d,', '-f', pattern], {encoding: 'utf8'}).stdout.trim()
+  return pgrepOutput(['-d,', '-f', pattern])
 }
 
 describe.skipIf(!gated)('isolate-agent read-only view: the write boundary on a hosted runner', () => {
@@ -2296,8 +2297,7 @@ function runnerTool(name: string): string | null {
 
 /** The first line of what the runner's own `command` prints: what the agent's shell must report too. */
 function runnerReports(command: string): string {
-  const result = spawnSync('sh', ['-c', command], {encoding: 'utf8'})
-  return result.stdout.split('\n')[0]?.trim() ?? ''
+  return runnerFirstLine(command)
 }
 
 const pathTools = gated ? {node: runnerTool('node'), uv: runnerTool('uv')} : {node: null, uv: null}
@@ -2434,12 +2434,6 @@ function toolProblems(): string[] {
       problems.push(`${name} resolves to ${found}, not under ${toolRoots[name]}`)
   }
   return problems
-}
-
-/** Every `getfacl` line of `target`, access and default, as the runner reads them (a deleted account leaves its uid). */
-function aclLines(target: string, recursive: boolean): string[] {
-  const result = spawnSync('getfacl', ['-p', '-c', ...(recursive ? ['-R'] : []), target], {encoding: 'utf8'})
-  return result.stdout.split('\n').filter(line => line.length > 0)
 }
 
 describe.skipIf(!gated)('isolate-agent runs bun and pnpm from their install roots', () => {
@@ -2613,14 +2607,7 @@ describe.skipIf(!gated)('isolate-agent runs bun and pnpm from their install root
 
     // What the runner finds afterwards: anything new or changed in the roots, and any entry left for the agent's uid.
     for (const root of [toolRoots.bun, toolRoots.pnpm]) {
-      const changed = spawnSync(
-        'find',
-        [root, '-type', 'f', '-newer', marker, '-not', '-name', `${VIEW_IT_PREFIX}-*`, '-not', '-path', '*/install/*'],
-        {
-          encoding: 'utf8',
-        },
-      )
-      facts.changedInRoots.push(...changed.stdout.split('\n').filter(line => line.length > 0))
+      facts.changedInRoots.push(...changedFilesSince(root, marker, VIEW_IT_PREFIX))
     }
     // Paths this suite alone touches must carry no entry for the account at all.
     const uidEntry = new RegExp(`^(default:)?user:(${sandboxUid}|fro-bot-sandbox):`)
