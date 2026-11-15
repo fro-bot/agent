@@ -1,8 +1,10 @@
 ---
 type: subsystem
-last-updated: "2026-11-08"
-updated-by: "f7c20f94"
+last-updated: "2026-11-15"
+updated-by: "962b70bc"
 sources:
+  - src/harness/phases/sandbox-lifecycle.ts
+  - packages/runtime/src/agent/sandbox-namespace.ts
   - packages/runtime/src/agent/drain-progress-v2.ts
   - packages/runtime/src/agent/ownership-ledger.ts
   - packages/runtime/src/agent/ledger-reconcile.ts
@@ -31,14 +33,14 @@ sources:
   - src/services/setup/ci-config-v2.ts
   - packages/runtime/src/agent/permission-rules-v2.ts
   - docs/solutions/integration-issues/permission-ask-dropped-by-ownership-filter-2026-09-19.md
-summary: "How ownership accounting and generation-specific release gates contain background subagents, shells, and follow-up turns"
+summary: "How ownership accounting, V2 directory release, and isolated-process teardown contain background work"
 ---
 
 # Background Subagents and Ownership
 
 A root session becoming idle does not mean its run has finished. Background subagents can still write the checkout, a shell can remain alive, and completion notices can queue another parent turn. Releasing the repository lock or saving session state at the first idle event would race those writers.
 
-Fro Bot therefore separates **ownership accounting** from **release evidence**. The Action and gateway share an ownership ledger, but each OpenCode generation has its own completion protocol. [[Architecture Overview]] explains generation selection; [[Execution Lifecycle]] places the release checks in the Action pipeline.
+Fro Bot therefore separates **ownership accounting** from **release evidence**. The Action and gateway share an ownership ledger and now both execute OpenCode V2, with directory quietness as an additional release requirement. [[Architecture Overview]] explains the V2-only boundary; [[Execution Lifecycle]] places the release checks in the Action pipeline.
 
 ## Ownership accounting
 
@@ -80,7 +82,9 @@ Successful execution keeps its event observer alive through release. A notice-tr
 
 Finally, the server is shut down and its exit confirmed. An unconfirmed directory or process exit declines persistence. A lost prompt acknowledgment also declines persistence and endorsement, even if a later stop finds a quiet directory: the harness cannot account for what the accepted prompt may have done.
 
-Overflow recovery uses the same generation-specific backend as the original execution. V2 refuses to archive and restart when stopping the old session's work cannot be confirmed, preventing a replacement session from racing the old writer.
+An isolated Action adds process-level confirmation after this OpenCode-level release. `src/harness/phases/sandbox-lifecycle.ts` stops the recorded mount namespace as root, confirms it is empty even if the launcher already exited, then kills and checks every process of the sandbox uid before restoring files to the runner. This catches processes outside OpenCode's session and shell accounting. The provider-key proxy is stopped after take-back; uncertain teardown blocks response-file reads, pushes, and session saving rather than treating a drained ledger as sufficient.
+
+Overflow recovery uses the same V2 backend and server as the original execution. It refuses to archive and restart when stopping the old session's work cannot be confirmed, preventing a replacement session from racing the old writer.
 
 The Action emits one `Run release verdict` line from `src/features/agent/drain-v2.ts` before pre-shutdown work. It records the drain outcome, whether stopping was needed, directory quietness, observation count and passing quiet streak, successful shell deletions and actual session interruptions, unresolved ownership count, and any decline reason. These are bounded counts and states, not model-controlled shell commands. Quietness still needs a separately confirmed server shutdown before persistence is safe.
 

@@ -1,7 +1,7 @@
 ---
 type: convention
-last-updated: "2026-11-08"
-updated-by: "f7c20f94"
+last-updated: "2026-11-15"
+updated-by: "962b70bc"
 sources:
   - packages/runtime/src/session/generation.ts
   - packages/runtime/src/agent/event-v2.ts
@@ -18,7 +18,8 @@ sources:
   - src/shared/cache-save-result.ts
   - src/services/cache/checkpoint.ts
   - scripts/module-taxonomy.test.ts
-  - scripts/harness-tag-derivation.test.ts
+  - src/features/delegated/trusted-git.ts
+  - packages/runtime/src/shared/safe-read.ts
   - packages/runtime/src/shared/logger.ts
   - packages/runtime/src/shared/errors.ts
   - packages/runtime/src/coordination/entity-ref.ts
@@ -132,7 +133,7 @@ This pattern means the setup, cache, and execution modules can be tested without
 
 All interface properties use `readonly`. This is enforced project-wide and prevents accidental mutation of shared state. Combined with the functional style (no classes, no mutable instance state), this makes data flow through the system predictable.
 
-The rule carries one named exception, and naming it explicitly is the point — a silent exception invites a second one. Per-invocation mutable trackers threaded through the SSE event loop (the activity tracker and its root-freshness tracker in `src/features/agent/streaming.ts`) hold mutable fields, because a functional update would allocate a fresh object on every token delta. The exception is bounded by scope rather than convention: these objects live for one invocation, never escape the event loop, and are never shared across runs. Anything outside that scope stays `readonly`.
+The rule carries one named exception, and naming it explicitly is the point — a silent exception invites a second one. Per-invocation mutable trackers threaded through the V2 SSE event loop (`ActivityTrackerV2` in `src/features/agent/streaming-v2.ts`) hold mutable fields, because a functional update would allocate a fresh object on every token delta. The exception is bounded by scope rather than convention: these objects live for one invocation and are not shared across runs.
 
 ## Veto, Not Certificate
 
@@ -166,9 +167,9 @@ One directory sits outside this convention. `deploy/scripts/` is plain Node ESM 
 
 ### Drift Guards
 
-A second, less common pattern appears where one fact is necessarily produced in more than one place — for example the harness release-tag shape, which is derived independently by the release workflow, the npm version builder, and the setup module (see [[Setup and Configuration]]). Rather than accept that these will silently diverge, the suite carries **drift guards**: tests that read the repository's own source text and fail by name when one producer is changed without the others.
+A second, less common pattern appears where one fact is necessarily produced in more than one place. The suite carries **drift guards**: tests that read the repository's own source text and fail by name when one producer changes without the others. `scripts/vitest-config-wiring.test.ts`, for example, checks package test entry points and the workspace image against the shared test configuration.
 
-The guards exist because the obvious alternative failed in practice. A mirrored copy of the harness-version predicate, added under a comment claiming it matched production, kept passing after production changed — it was asserting against its own copy, not the module. That is the failure mode drift guards are built to prevent, and it is why they are written to fail in a specific, nameable direction rather than to merely pattern-match a line. Their known limitations (for instance, the shared comment-stripper does not parse regex literals) are documented at the guard, and are chosen so that a parse failure produces a _weaker_ guard rather than a false pass on missing code.
+These tests guard the actual producers rather than a mirrored predicate that could agree only with itself. The historical harness release-tag guard disappeared with the V1 release workflows; it is no longer an active setup invariant.
 
 ## Documented Solutions
 
@@ -187,7 +188,9 @@ The project uses conventional commits: `type(scope): description`. Types include
 
 ## Boundary-Preserving Patterns
 
-Generation-neutral contracts have explicit homes rather than remaining exports of a legacy implementation. `execution-deadline.ts` and `attempt-outcome.ts` hold the Action's shared timing and result vocabulary; `run-core-shared.ts` holds the gateway's shared stream and error contracts. V1 modules consume these alongside V2, so retaining a rollback backend does not make it the architectural owner of the current path. [[Architecture Overview]] describes the generation selector.
+Execution contracts have explicit homes rather than remaining exports of a legacy implementation. `execution-deadline.ts` and `attempt-outcome.ts` hold the Action's timing and result vocabulary; `run-core-shared.ts` holds the gateway's stream and error contracts. Both orchestrators now execute V2 only. The older generation survives in history-import compatibility and published rollback artifacts, not a selectable live backend. See [[Architecture Overview]].
+
+Post-agent reads preserve the same separation between data and authority. `src/features/delegated/trusted-git.ts` runs bounded git commands with a replaced environment, hooks and fsmonitor disabled, and a fixed system path. `packages/runtime/src/shared/safe-read.ts` opens regular files without following a final symlink and verifies the opened handle before streaming it. These helpers reduce the chance that inspecting model-written output executes it or uploads a different file.
 
 The conventions above preserve a few recurring boundaries: typed normalization separates external webhook payloads from business logic, injected loggers keep credential redaction on the output path, and non-force ref updates avoid replacing another writer's work. Type suppressions and hidden global context would weaken the evidence these boundaries provide, which explains their absence from the project's normal implementation style.
 
