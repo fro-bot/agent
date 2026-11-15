@@ -37,6 +37,7 @@ const tools = Object.fromEntries(
     'chown',
     'chmod',
     'mkdir',
+    'ln',
     'env',
     'git',
     'unshare',
