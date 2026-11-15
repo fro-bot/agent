@@ -21,6 +21,7 @@ import {
   GATE_ERR_FILE,
   GATE_GO_FILE,
   GATE_NS_FILE,
+  rootChainReport,
   rootChainTail,
   stopLaunch,
 } from '@fro-bot/runtime'
@@ -91,6 +92,8 @@ export interface SandboxViewProbeDeps {
 /** A probe takes a few hundred milliseconds on the hosted images. */
 export const VIEW_PROBE_TIMEOUT_MS = 15_000
 const SETTLE_MS = 3000
+/** How long, after the launcher exits, its stderr may still arrive. */
+const STDERR_DRAIN_MS = 500
 /** Ticks of 0.1 s the gate waits for the go-ahead: it normally gets it within milliseconds. */
 const PROBE_GATE_TICKS = 100
 const SETTLE_POLL_MS = 50
@@ -106,9 +109,8 @@ const ROOT_SCRIPT =
 const NOBODY_SCRIPT =
   'true > "$1" || exit 12; while read -r key value rest; do [ "$key" = "Uid:" ] && [ "$value" != "$2" ] && exit 13; done < /proc/self/status; exit 0'
 
-function describeFailure(result: ProbeLaunchResult, rootSteps: string): string {
+function describeFailure(result: ProbeLaunchResult, stage: string | null): string {
   if (result.timedOut) return 'the read-only view probe timed out'
-  const stage = /"view":\s*"failed",\s*"stage":\s*"([a-z]{1,16})"/.exec(rootSteps)?.[1]
   switch (result.exitCode) {
     case 10:
       return 'the read-only view probe found a write outside the declared roots that was not refused'
@@ -124,7 +126,7 @@ function describeFailure(result: ProbeLaunchResult, rootSteps: string): string {
       return 'the read-only view probe could not pass its launch gate'
     case null:
     default:
-      return stage === undefined
+      return stage === null
         ? `the read-only view probe failed (exit ${result.exitCode ?? 'none'})`
         : `the read-only view could not be built (stage ${stage})`
   }
@@ -202,7 +204,10 @@ export async function probeSandboxView(
       },
     })
     if (launched.pid === null) return fail('the read-only view probe could not be started')
-    const rootSteps = rootChainTail(await deps.readRootErr(fixture.gate).catch(() => null))
+    // The stage is read from the whole report; only the displayed evidence is cut.
+    const rootText = await deps.readRootErr(fixture.gate).catch(() => null)
+    const {stage} = rootChainReport(rootText)
+    const rootSteps = rootChainTail(rootText)
     const launcherStderr = rootChainTail(launched.stderr ?? '')
 
     // The probe's own launch is stopped and confirmed the way the teardown confirms a launch, pass or fail, and a launcher
@@ -214,7 +219,7 @@ export async function probeSandboxView(
     }
     return launched.exitCode === 0 && !launched.timedOut
       ? {ok: true}
-      : fail(withEvidence(describeFailure(launched, rootSteps), rootSteps, launcherStderr))
+      : fail(withEvidence(describeFailure(launched, stage), rootSteps, launcherStderr))
   } finally {
     // Nothing is deleted while a member of the probe's namespace may still be running.
     if (removable) {
@@ -276,7 +281,7 @@ function createPrivilegedRunFromExec(exec: ExecAdapter, sudo: string): Privilege
 }
 
 /** Runs the command detached with its stdout captured, bounded in time and size. A timeout tries to kill its group. */
-async function launchWithDeadline(
+export async function launchWithDeadline(
   command: string,
   args: readonly string[],
   options: {readonly timeoutMs: number; readonly onSpawn: (pid: number) => void},
@@ -319,7 +324,16 @@ async function launchWithDeadline(
       stderr = (stderr + chunk.toString('utf8')).slice(-4096)
     })
     child.once('error', () => settle({pid, exitCode: null, timedOut, stdout, stderr}))
-    child.once('exit', code => settle({pid, exitCode: code, timedOut, stdout, stderr}))
+    // `exit` can precede the last stderr bytes, and an early `sudo` or `unshare` failure is exactly what is wanted. `close`
+    // comes once every stream has ended. A descendant that keeps the pipe open (an orphaned root process) must not hold the
+    // result back, so after `exit` the drain has its own short bound.
+    child.once('close', code => settle({pid, exitCode: code, timedOut, stdout, stderr}))
+    child.once('exit', code => {
+      // The launcher is gone: the execution deadline no longer applies. A timeout recorded before this stays recorded; a
+      // descendant holding the pipe through the deadline must not turn an on-time exit into one.
+      if (timer !== undefined) clearTimeout(timer)
+      setTimeout(() => settle({pid, exitCode: code, timedOut, stdout, stderr}), STDERR_DRAIN_MS).unref()
+    })
     timer = setTimeout(() => {
       timedOut = true
       try {

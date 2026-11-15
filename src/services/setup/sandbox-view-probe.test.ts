@@ -166,6 +166,26 @@ describe('probeSandboxView', () => {
     expect(message).not.toMatch(/[\n\t]/)
   })
 
+  it('keeps the stage when the builder’s report is longer than the displayed tail', async () => {
+    // #given the longest report the builder prints, after earlier root-step output
+    const report = JSON.stringify({
+      view: 'failed',
+      stage: 'seal',
+      op: `mount ${'x'.repeat(150)}`,
+      detail: `exited non-zero: ${'e'.repeat(220)}`,
+    })
+    const {deps} = createDeps({launch: exiting(78), readRootErr: vi.fn(async () => `${'n'.repeat(300)}\n${report}\n`)})
+
+    // #when probed
+    const result = await probeSandboxView(INPUT, deps)
+
+    // #then the stage is in the message, and the displayed evidence is still the bounded tail
+    const message = result.ok ? '' : result.message
+    expect(message).toContain('could not be built (stage seal)')
+    expect(message).toMatch(/\[root steps: \.\.\.[^\]]{400}\]/)
+    expect(message).not.toContain('"stage":"seal"')
+  })
+
   it('adds the evidence to a failed check of the probe too, and not to a pass', async () => {
     // #given exit 10 with root-step text, and a pass with root-step text
     const failing = createDeps({launch: exiting(10), readRootErr: vi.fn(async () => 'gate: something')})

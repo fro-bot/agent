@@ -9,7 +9,7 @@
  * tool shell as the sandbox user. Each "blocked" probe has a positive control: the same command run as the runner must
  * succeed (be OPEN), otherwise a BLOCKED result proves nothing.
  *
- * Nine suites run one after another (the sandbox account name is fixed, so two never overlap):
+ * Ten suites run one after another (the sandbox account name is fixed, so two never overlap):
  *   1. the boundary: blocked and works rows, identity, quiescence, take-back;
  *   2. a provisioned `gh` config and an admitted repo skill;
  *   3. the persistence round trip (restore, isolated run, checkpoint and save, restore, isolated run);
@@ -20,7 +20,9 @@
  *   7. a server torn down mid-run leaves no namespace member and no private mount;
  *   8. a second isolated run in the same job finds nothing of the first outside the places it may write;
  *   9. a launcher killed while the chain waits at its gate: nothing past the gate ran, and the teardown is not `restored`
- *      unless it confirmed the orphaned root process gone.
+ *      unless it confirmed the orphaned root process gone;
+ *  10. the agent's PATH is the runner's: `node` and `uv` from the tool cache (put on PATH by `setup-node` and `setup-uv`)
+ *      run in the agent's shell and report what they report to the runner.
  *
  * Every suite runs through the read-only view, as the Action does: the launch has no other form.
  *
@@ -212,6 +214,7 @@ async function runIsolated(options: IsolatedRunOptions): Promise<IsolatedRunResu
   const lifecycle = createSandboxLifecycle({
     tools: options.tools,
     env: options.env,
+    runnerPath: options.env.PATH,
     runnerHome,
     workspacePath: options.workspace,
     responseDir: options.responseDir,
@@ -511,6 +514,7 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
     lifecycle = createSandboxLifecycle({
       tools,
       env,
+      runnerPath: env.PATH,
       runnerHome,
       workspacePath: workspace,
       responseDir,
@@ -1600,6 +1604,7 @@ describe.skipIf(!gated)('isolate-agent key proxy through a real model shell', ()
     lifecycle = createSandboxLifecycle({
       tools,
       env,
+      runnerPath: env.PATH,
       runnerHome,
       workspacePath: workspace,
       responseDir,
@@ -2062,6 +2067,7 @@ describe.skipIf(!gated)('isolate-agent read-only view: a server torn down while 
     lifecycle = createSandboxLifecycle({
       tools,
       env,
+      runnerPath: env.PATH,
       runnerHome,
       workspacePath: workspace,
       responseDir,
@@ -2200,6 +2206,7 @@ describe.skipIf(!gated)('isolate-agent read-only view: a launcher killed while t
     lifecycle = createSandboxLifecycle({
       tools,
       env,
+      runnerPath: env.PATH,
       runnerHome,
       workspacePath: workspace,
       responseDir,
@@ -2270,5 +2277,131 @@ describe.skipIf(!gated)('isolate-agent read-only view: a launcher killed while t
     expect(released).toMatchObject({stop: 'stopped', restore: 'restored'})
     expect(processesAfter).toBe('')
     expect(newNamespaces).toEqual([])
+  })
+})
+
+// --- 10. The agent's PATH ----------------------------------------------------------------------------------------------
+
+/** Where `name` resolves for the runner, or null. The runner's PATH is what the agent's is built from. */
+function runnerTool(name: string): string | null {
+  const found = spawnSync('sh', ['-c', `command -v ${name}`], {encoding: 'utf8'})
+  const resolved = found.stdout.trim()
+  return found.status === 0 && resolved.startsWith('/') ? resolved : null
+}
+
+/** The first line of what the runner's own `command` prints: what the agent's shell must report too. */
+function runnerReports(command: string): string {
+  const result = spawnSync('sh', ['-c', command], {encoding: 'utf8'})
+  return result.stdout.split('\n')[0]?.trim() ?? ''
+}
+
+const pathTools = gated ? {node: runnerTool('node'), uv: runnerTool('uv')} : {node: null, uv: null}
+/** The tools the CI job provisions (`setup-node`, `setup-uv`) that are not on the runner's PATH. Empty off a runner. */
+const missingPathTools = Object.entries(pathTools)
+  .filter(([, found]) => found === null)
+  .map(([name]) => name)
+
+describe.skipIf(!gated)("isolate-agent PATH mirrors the runner's", () => {
+  const logger = createLogger({phase: 'sandbox-integration-path'})
+  const scratch = path.join(runnerTemp, `sandbox-it-path-${process.pid}`)
+  // Its own XDG roots: the commondir suite above ends `unsafe` and leaves the default ones owned by the sandbox uid.
+  const xdgRoot = path.join(runnerTemp, `sandbox-it-path-xdg-${process.pid}`)
+  const workspace = path.join(scratch, 'ws')
+  const responseDir = path.join(scratch, 'response')
+  const keyDir = path.join(scratch, 'keys')
+  const env = hostedEnv(workspace, xdgRoot)
+
+  let result: IsolatedRunResult | undefined
+  const expected = {
+    nodePath: pathTools.node ?? '',
+    nodeVersion: gated ? runnerReports('node -v') : '',
+    uvPath: pathTools.uv ?? '',
+    uvVersion: gated ? runnerReports('uv --version') : '',
+  }
+
+  const steps: Probe[] = [
+    {
+      id: 'path_node',
+      category: 'works',
+      cmd: 'v=$(node -v 2>&1 | head -1); p=$(command -v node); [ -n "$v" ] && R path_node WORKS "$v $p" || R path_node FAILED "node did not run"',
+    },
+    {
+      id: 'path_uv',
+      category: 'works',
+      cmd: 'v=$(uv --version 2>&1 | head -1); p=$(command -v uv); [ -n "$p" ] && R path_uv WORKS "$v $p" || R path_uv FAILED "uv not found"',
+    },
+    {
+      // The system tools still resolve through the appended system directories.
+      id: 'path_system',
+      category: 'works',
+      cmd: 'p=$(command -v git); case "$p" in /*) R path_system WORKS "$p";; *) R path_system FAILED "git not found";; esac',
+    },
+    {
+      id: 'path_value',
+      category: 'info',
+      cmd: 'R path_value INFO "$PATH"',
+    },
+  ]
+
+  beforeAll(async () => {
+    const tools = await preflightTools(logger)
+    fs.mkdirSync(responseDir, {recursive: true})
+    const keyFile = writeKeyFile(keyDir)
+    initWorkspace(workspace)
+    result = await runIsolated({tools, env, workspace, responseDir, keyFile, steps, logger})
+  }, 600_000)
+
+  afterAll(() => {
+    fs.rmSync(scratch, {recursive: true, force: true})
+    fs.rmSync(xdgRoot, {recursive: true, force: true})
+  }, 120_000)
+
+  it('starts from a runner that has the tools this suite checks', () => {
+    // #given the gated run is on, so the job is expected to have run `setup-node` and `setup-uv`
+    // #then a missing tool is a failure of the job's setup, not a reason to skip the checks below
+    expect(missingPathTools).toEqual([])
+  })
+
+  it('runs the runner’s node, the version and the file the runner reports', () => {
+    // #given the agent's shell ran `node -v` and `command -v node`
+    // #then both match what the runner resolves and reports
+    expect(failuresFor(result?.rows ?? new Map(), 'path_node', 'WORKS')).toEqual([])
+    expect(result?.rows.get('path_node')?.[0]?.evidence).toBe(`${expected.nodeVersion} ${expected.nodePath}`)
+  })
+
+  it('runs the runner’s uv, the version and the file the runner reports', () => {
+    // #given the agent's shell ran `uv --version` and `command -v uv`
+    // #then both match what the runner resolves and reports
+    expect(failuresFor(result?.rows ?? new Map(), 'path_uv', 'WORKS')).toEqual([])
+    expect(result?.rows.get('path_uv')?.[0]?.evidence).toBe(`${expected.uvVersion} ${expected.uvPath}`)
+  })
+
+  it('still resolves the system tools', () => {
+    // #given `git` looked up in the agent's shell
+    // #then it is found
+    expect(failuresFor(result?.rows ?? new Map(), 'path_system', 'WORKS')).toEqual([])
+  })
+
+  it('has the runner’s tool directories in order, then the system directories', () => {
+    // #given the agent's PATH, as its shell reports it
+    const agentPath = (result?.rows.get('path_value')?.[0]?.evidence ?? '').split(':')
+
+    // #then the directory of the runner's node comes before the directory of its uv or after, as on the runner, and every
+    // system directory is present
+    const runnerEntries = (process.env.PATH ?? '').split(':')
+    const nodeDir = path.dirname(expected.nodePath)
+    const uvDir = path.dirname(expected.uvPath)
+    expect(agentPath).toContain(nodeDir)
+    expect(agentPath).toContain(uvDir)
+    expect(Math.sign(agentPath.indexOf(nodeDir) - agentPath.indexOf(uvDir))).toBe(
+      Math.sign(runnerEntries.indexOf(nodeDir) - runnerEntries.indexOf(uvDir)),
+    )
+    for (const directory of ['/usr/local/bin', '/usr/bin', '/bin']) expect(agentPath).toContain(directory)
+  })
+
+  it('restored the run', () => {
+    // #given the release of the run
+    // #then it was stopped and taken back
+    expect(result?.released).toMatchObject({stop: 'stopped', restore: 'restored'})
   })
 })

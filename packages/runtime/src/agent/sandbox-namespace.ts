@@ -31,6 +31,29 @@ export const GATE_ERR_FILE = 'err'
 export const ROOT_CHAIN_TAIL_CHARS = 400
 
 /**
+ * What the builder's report in the root steps' stderr says, read from the WHOLE text: the displayed tail is cut from the
+ * front and can lose the stage. The last line that is a failure report with a plain-word stage wins; anything else is
+ * ignored.
+ */
+export function rootChainReport(text: string | null): {readonly stage: string | null} {
+  if (text === null) return {stage: null}
+  const lines = text.split('\n')
+  for (let index = lines.length - 1; index >= 0; index--) {
+    const line = lines[index]?.trim() ?? ''
+    if (!line.startsWith('{')) continue
+    try {
+      const parsed = JSON.parse(line) as {view?: unknown; stage?: unknown}
+      if (parsed.view === 'failed' && typeof parsed.stage === 'string' && /^[a-z]{1,16}$/.test(parsed.stage)) {
+        return {stage: parsed.stage}
+      }
+    } catch {
+      // Not a report.
+    }
+  }
+  return {stage: null}
+}
+
+/**
  * The last {@link ROOT_CHAIN_TAIL_CHARS} characters of the root steps' stderr as one printable line. The file holds only
  * what root steps before the uid drop wrote (the gate's fixed lines, the builder's one failure line and the stderr of
  * `pivot_root` and `umount`): the server and its tools run after the drop and never write there.

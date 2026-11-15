@@ -65,6 +65,8 @@ export interface BootstrapPhaseResult {
 }
 
 export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPhaseResult | null> {
+  // The isolated agent's `PATH` is built from this, read before setup's `core.addPath` prepends the OpenCode directory.
+  const runnerPath = process.env.PATH
   const inputsResult = parseActionInputs()
 
   if (!inputsResult.success) {
@@ -165,17 +167,22 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
     responseFilePathCandidates: responseFile?.responseFilePathCandidates ?? null,
     trustedHeadSha: inputs.trustedHeadSha,
     sandboxTools,
-    sandbox: createRunSandbox(sandboxTools, responseFile?.responseFilePath ?? null),
+    sandbox: createRunSandbox(sandboxTools, responseFile?.responseFilePath ?? null, runnerPath),
   }
 }
 
 /** The lifecycle for an isolated run, or null. Every state change is written for the post hook. */
-function createRunSandbox(tools: SandboxToolPaths | null, responseFilePath: string | null): SandboxLifecycle | null {
+function createRunSandbox(
+  tools: SandboxToolPaths | null,
+  responseFilePath: string | null,
+  runnerPath: string | undefined,
+): SandboxLifecycle | null {
   if (tools === null) return null
   const runnerTemp = process.env.RUNNER_TEMP?.trim() ?? ''
   return createSandboxLifecycle({
     tools,
     env: process.env,
+    runnerPath,
     workspacePath: getGitHubWorkspace(),
     responseDir: responseFilePath === null ? null : path.dirname(responseFilePath),
     attachmentDir:

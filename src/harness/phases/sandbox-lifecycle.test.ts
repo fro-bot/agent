@@ -58,6 +58,7 @@ interface Harness {
     readonly admit: Mock<SandboxLifecycleDeps['admit']>
     readonly stopLaunch: Mock<SandboxLifecycleDeps['stopLaunch']>
     readonly isProcessAlive: Mock<SandboxLifecycleDeps['isProcessAlive']>
+    readonly isDirectory: Mock<SandboxLifecycleDeps['isDirectory']>
   }
   /** What `remove` of the view root was called with, in order. */
   readonly viewRootRemovals: string[]
@@ -109,6 +110,7 @@ function createHarness(): Harness {
     })),
     stopLaunch: vi.fn(async () => 'stopped' as const),
     isProcessAlive: vi.fn(() => false),
+    isDirectory: vi.fn((directory: string) => !directory.includes('missing')),
   }
   const sudoCalls: string[][] = []
   const exec: ExecAdapter = {
@@ -205,6 +207,7 @@ describe('createSandboxLifecycle', () => {
     const lifecycle = createSandboxLifecycle({
       tools: TOOLS,
       env: {HOME: '/home/runner', RUNNER_TEMP: temp, XDG_DATA_HOME: '/custom/data'},
+      runnerPath: undefined,
       runnerHome: '/home/runner',
       workspacePath: '/home/runner/work/r/r',
       responseDir: `${temp}/fro-bot-response/1-1`,
@@ -1007,6 +1010,63 @@ describe('createSandboxLifecycle', () => {
       // #then the account was removed and the state says so
       expect(prepared.success).toBe(false)
       expect(states).toEqual(['pending', 'restored'])
+    })
+  })
+
+  describe('the agent’s PATH', () => {
+    const prepareInput = {keyFilePaths: [], ghConfigDir: null, repoSkills: null}
+    // `temp` is made per test, so the base environment is too.
+    const baseEnv = (): NodeJS.ProcessEnv => ({HOME: '/home/runner', RUNNER_TEMP: temp, XDG_DATA_HOME: '/custom/data'})
+
+    async function pathFor(env: NodeJS.ProcessEnv) {
+      const harness = createHarness()
+      const lifecycle = create(harness, {env, runnerPath: env.PATH, signals: fakeHost()})
+      const prepared = await lifecycle.prepare(prepareInput)
+      if (!prepared.success) throw new Error(prepared.error)
+      return prepared.data.path
+    }
+
+    it('is the runner’s PATH, existing entries only, once each, with the missing system directories last', async () => {
+      // #given a runner PATH with a tool-cache entry, a missing entry and a duplicate
+      const agentPath = await pathFor({
+        ...baseEnv(),
+        PATH: '/opt/hostedtoolcache/node/24/x64/bin:/opt/missing/bin:/usr/bin:/opt/hostedtoolcache/node/24/x64/bin',
+      })
+
+      // #then
+      expect(agentPath).toBe('/opt/hostedtoolcache/node/24/x64/bin:/usr/bin:/usr/local/bin:/bin')
+    })
+
+    it('is the fixed system PATH when the runner has none', async () => {
+      // #given no PATH in the Action's environment
+      // #then
+      expect(await pathFor(baseEnv())).toBe('/usr/local/bin:/usr/bin:/bin')
+    })
+
+    it('is the value it was given, whatever the environment holds when the sandbox is prepared', async () => {
+      // #given a runner PATH handed in, and a live environment whose PATH has since changed (setup prepends to it)
+      const harness = createHarness()
+      const env: NodeJS.ProcessEnv = {...baseEnv(), PATH: '/opt/hostedtoolcache/opencode/fresh:/opt/early/bin'}
+      const lifecycle = create(harness, {env, runnerPath: '/opt/early/bin', signals: fakeHost()})
+
+      // #when prepared
+      const prepared = await lifecycle.prepare(prepareInput)
+
+      // #then the handed-in value is the one used, and the environment's is not read
+      expect(prepared.success && prepared.data.path).toBe('/opt/early/bin:/usr/local/bin:/usr/bin:/bin')
+    })
+
+    it('is the system PATH alone when it was given nothing, even if the environment now holds one', async () => {
+      // #given no runner PATH handed in
+      const harness = createHarness()
+      const env: NodeJS.ProcessEnv = {...baseEnv(), PATH: '/opt/hostedtoolcache/opencode/fresh'}
+      const lifecycle = create(harness, {env, runnerPath: undefined, signals: fakeHost()})
+
+      // #when prepared
+      const prepared = await lifecycle.prepare(prepareInput)
+
+      // #then
+      expect(prepared.success && prepared.data.path).toBe('/usr/local/bin:/usr/bin:/bin')
     })
   })
 
