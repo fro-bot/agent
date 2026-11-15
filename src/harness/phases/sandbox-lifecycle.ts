@@ -44,6 +44,7 @@ import {
 import {createExecAdapter, holdSignalOwnership} from '../../services/setup/adapters.js'
 import {handOff, takeBack} from '../../services/setup/sandbox-handoff.js'
 import {ACTIONS_DIR_NAME} from '../../services/setup/sandbox-preflight.js'
+import {resolveToolRoots, type ToolRootInput, type ToolRootResult} from '../../services/setup/sandbox-tool-roots.js'
 import {buildSandboxPath} from '../../services/setup/sandbox-toolchain-path.js'
 import {isProcessAlive} from '../../services/setup/sandbox-view-probe.js'
 import {toErrorMessage} from '../../shared/errors.js'
@@ -240,6 +241,8 @@ export interface SandboxLifecycleDeps {
   readonly isProcessAlive: (pid: number) => boolean
   /** True when the path is an existing directory (following links), for the agent's `PATH`. */
   readonly isDirectory: (directory: string) => boolean
+  /** Which of the supported tool install roots (bun, pnpm) the sandbox may read. */
+  readonly resolveToolRoots: (input: ToolRootInput) => Promise<ToolRootResult>
 }
 
 const defaultDeps: SandboxLifecycleDeps = {
@@ -291,6 +294,7 @@ const defaultDeps: SandboxLifecycleDeps = {
   stopLaunch,
   isProcessAlive,
   isDirectory: directory => fsSync.statSync(directory, {throwIfNoEntry: false})?.isDirectory() === true,
+  resolveToolRoots: async input => resolveToolRoots(input),
 }
 
 /** Where the view's old root is moved before it is unmounted. An empty directory on every supported image. */
@@ -420,6 +424,8 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
 
   let account: SandboxAccount | null = null
   let manifest: HandoffManifest | null = null
+  // The granted tool install roots of this run, kept out of the view's own bind list.
+  let toolRoots: ReadonlySet<string> = new Set()
   let journal: HandoffJournal | null = null
   let released: Promise<SandboxReleaseResult> | undefined
   // The in-flight `prepare`. Teardown waits for it, so a signal can never read a half-built state (no account yet, or no
@@ -889,6 +895,22 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       }
       if (input.repoSkills?.admittedDir != null) readable.add(input.repoSkills.admittedDir)
 
+      // Install roots of bun and pnpm under the runner home: read and execute for the sandbox, so the tools on its `PATH`
+      // resolve. Decided from the same `PATH` the agent gets.
+      const agentPath = buildSandboxPath(runnerPath, deps.isDirectory)
+      const installRoots = await deps.resolveToolRoots({
+        runnerHome,
+        runnerUid: ids.uid,
+        agentPath,
+        runnerTemp,
+        actionsDir: path.join(path.dirname(path.resolve(runnerTemp)), ACTIONS_DIR_NAME),
+        workspace: options.workspacePath,
+        writableRoots: [...handedOver, account.home],
+      })
+      logger.info('Sandbox tool roots', {granted: installRoots.granted, skipped: installRoots.skipped})
+      toolRoots = new Set(installRoots.granted)
+      for (const root of installRoots.granted) readable.add(root)
+
       manifest = {
         ids: {runnerUid: ids.uid, runnerGid: ids.gid, sandboxUid: account.uid, sandboxGid: account.gid},
         runnerHome,
@@ -921,7 +943,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
         setprivPath: tools.setpriv,
         envPath: tools.env,
         account,
-        path: buildSandboxPath(runnerPath, deps.isDirectory),
+        path: agentPath,
         view: view.data,
         tmpdir: sandboxTmp,
         xdg: {data: dataBase, config: configBase, cache: cacheBase, state: stateBase},
@@ -955,7 +977,9 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       putOld: VIEW_PUT_OLD,
       tools: {mount: tools.mount, umount: tools.umount},
       writable: [...new Set([handed.workspace, ...handed.handedOver, sandboxAccount.home])],
-      readOnly: [...new Set([...handed.readable, ...handed.traverseOnly])],
+      // The tool install roots are left out: everything under `/` is already read-only in the view, and the grant only
+      // adds permission to read and execute, so binding them again would add nothing but a way to refuse a launch.
+      readOnly: [...new Set([...handed.readable, ...handed.traverseOnly])].filter(root => !toolRoots.has(root)),
       runnerHome,
       actionsDir: path.join(path.dirname(path.resolve(runnerTemp)), ACTIONS_DIR_NAME),
     }
