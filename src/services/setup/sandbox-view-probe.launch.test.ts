@@ -1,5 +1,5 @@
 import {execFileSync} from 'node:child_process'
-import {mkdtempSync, readFileSync, rmSync} from 'node:fs'
+import {existsSync, mkdtempSync, readFileSync, rmSync} from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import {afterEach, describe, expect, it} from 'vitest'
@@ -28,11 +28,16 @@ async function waitUntilGone(pid: number): Promise<void> {
 
 describe('launchWithDeadline, with real child processes', () => {
   // The detached descendant outlives the launcher on purpose, so it is killed here whatever the test did, and its absence
-  // is asserted: a failed test must not leave a `sleep` behind.
+  // is asserted: a failed test must not leave a `sleep` behind. The pid file is registered before the launch, so a test
+  // that fails or times out before reading it still has its descendant found here.
   let descendantPid: number | null = null
+  let descendantPidFile: string | null = null
   const scratchDirs: string[] = []
   afterEach(async () => {
-    const pid = descendantPid
+    const file = descendantPidFile
+    descendantPidFile = null
+    const fromFile = file !== null && existsSync(file) ? Number(readFileSync(file, 'utf8')) : Number.NaN
+    const pid = descendantPid ?? (Number.isInteger(fromFile) && fromFile > 0 ? fromFile : null)
     descendantPid = null
     if (pid !== null) {
       try {
@@ -131,6 +136,7 @@ describe('launchWithDeadline, with real child processes', () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), 'launch-detached-'))
     scratchDirs.push(dir)
     const pidFile = path.join(dir, 'descendant.pid')
+    descendantPidFile = pidFile
     const spawnDetached = [
       "const {spawn} = require('node:child_process')",
       "const child = spawn('sleep', ['30'], {detached: true, stdio: ['ignore', 'ignore', 'inherit']})",
