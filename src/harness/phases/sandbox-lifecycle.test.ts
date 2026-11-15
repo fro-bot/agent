@@ -246,7 +246,7 @@ describe('createSandboxLifecycle', () => {
       state: '/home/runner/.local/state',
     })
     expect(prepared.data.account).toEqual(ACCOUNT)
-    expect(prepared.data.extraEnv).toEqual({GH_CONFIG_DIR: `${temp}/gh-config-abc`})
+    expect(prepared.data.extraEnv).toMatchObject({GH_CONFIG_DIR: `${temp}/gh-config-abc`})
     expect(prepared.data.tmpdir).toBe('/home/fro-bot-sandbox/tmp')
     const manifest = harness.mocks.handOff.mock.calls[0]?.[0] as unknown as {
       handedOver: string[]
@@ -1139,22 +1139,32 @@ describe('createSandboxLifecycle', () => {
       expect(result.view?.policy.readOnly).not.toContain(PNPM)
     })
 
-    it('points the tools’ caches at the agent’s own home, only for the tools whose root was granted', async () => {
+    it('points the tools’ caches at the agent’s own home: uv and pip always, bun and pnpm when granted', async () => {
       // #given both roots granted, and then only bun
       const both = await prepared([BUN, PNPM])
       const onlyBun = await prepared([BUN])
       const none = await prepared([])
+      const always = {
+        UV_CACHE_DIR: '/home/fro-bot-sandbox/.cache/uv',
+        UV_PYTHON_INSTALL_DIR: '/home/fro-bot-sandbox/.local/share/uv/python',
+        UV_TOOL_DIR: '/home/fro-bot-sandbox/.local/share/uv/tools',
+        PIP_CACHE_DIR: '/home/fro-bot-sandbox/.cache/pip',
+      }
 
       // #then the launch environment carries the cache locations under the account's home
       expect(both.result.extraEnv).toEqual({
+        ...always,
         BUN_INSTALL_CACHE_DIR: '/home/fro-bot-sandbox/.bun/install/cache',
         npm_config_store_dir: '/home/fro-bot-sandbox/.pnpm-store',
         npm_config_cache_dir: '/home/fro-bot-sandbox/.cache/pnpm',
         npm_config_state_dir: '/home/fro-bot-sandbox/.local/state/pnpm',
       })
-      expect(onlyBun.result.extraEnv).toEqual({BUN_INSTALL_CACHE_DIR: '/home/fro-bot-sandbox/.bun/install/cache'})
-      // #and nothing is added when no tool root was granted
-      expect(none.result.extraEnv).toBeUndefined()
+      expect(onlyBun.result.extraEnv).toEqual({
+        ...always,
+        BUN_INSTALL_CACHE_DIR: '/home/fro-bot-sandbox/.bun/install/cache',
+      })
+      // #and only uv and pip when no tool root was granted
+      expect(none.result.extraEnv).toEqual(always)
     })
 
     it('keeps the gh config directory next to the cache locations', async () => {

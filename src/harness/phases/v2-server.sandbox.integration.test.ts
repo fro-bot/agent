@@ -2499,11 +2499,21 @@ describe.skipIf(!gated)('isolate-agent runs bun and pnpm from their install root
       'left-pad',
     ),
     {
-      // Where each tool put its cache: both belong in the agent's own home, and neither in the checkout.
+      // uv from the tool cache: a project venv in the checkout, one tiny registry package, and an import through it.
+      id: 'tool_uv_install',
+      category: 'works',
+      cmd:
+        `cd ${q(fixtureDir('uv-project'))} && o=$( { uv venv .venv && uv pip install --python .venv/bin/python six && ` +
+        `.venv/bin/python -c 'import six'; } 2>&1); rc=$?; ` +
+        `if [ $rc -eq 0 ]; then R tool_uv_install WORKS "installed"; ` +
+        `else R tool_uv_install FAILED "rc=$rc [$(printf %s "$o" | tail -c 300 | ev)]"; fi`,
+    },
+    {
+      // Where each tool put its cache: all belong in the agent's own home, and none in the checkout.
       id: 'tool_cache_places',
       category: 'info',
       cmd:
-        `places=""; for d in "$HOME/.pnpm-store" "$HOME/.bun/install/cache" ` +
+        `places=""; for d in "$HOME/.pnpm-store" "$HOME/.bun/install/cache" "$HOME/.cache/uv" ` +
         `${q(fixtureDir('bun-registry'))}/node_modules/.cache ${q(fixtureDir('pnpm-registry'))}/.pnpm-store; ` +
         `do [ -e "$d" ] && places="$places $d"; done; R tool_cache_places INFO "$places"`,
     },
@@ -2569,6 +2579,7 @@ describe.skipIf(!gated)('isolate-agent runs bun and pnpm from their install root
       if (withRegistry) dependencies['left-pad'] = '1.3.0'
       fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({name, version: '1.0.0', dependencies}))
     }
+    fs.mkdirSync(fixtureDir('uv-project'), {recursive: true})
     // The checkout is committed state: the fixtures are untracked files in it, which the handoff does not mind.
 
     // Canaries beside the roots (readable by anyone if nothing denied them), a link inside a root, and sentinels in the roots.
@@ -2679,14 +2690,17 @@ describe.skipIf(!gated)('isolate-agent runs bun and pnpm from their install root
     expect(result?.rows.get('tool_pnpm')?.[0]?.evidence).toBe(`${toolFacts.pnpmVersion} ${toolFacts.pnpm}`)
   })
 
-  it.each(['tool_bun_install', 'tool_bun_install_registry', 'tool_pnpm_install', 'tool_pnpm_install_registry'])(
-    'installs: %s succeeds in the checkout as the agent',
-    id => {
-      // #given an install of a tiny project in the checkout
-      // #then it succeeded and put its package in node_modules
-      expect(failuresFor(result?.rows ?? new Map(), id, 'WORKS')).toEqual([])
-    },
-  )
+  it.each([
+    'tool_bun_install',
+    'tool_bun_install_registry',
+    'tool_pnpm_install',
+    'tool_pnpm_install_registry',
+    'tool_uv_install',
+  ])('installs: %s succeeds in the checkout as the agent', id => {
+    // #given an install of a tiny project in the checkout
+    // #then it succeeded and put its package in node_modules
+    expect(failuresFor(result?.rows ?? new Map(), id, 'WORKS')).toEqual([])
+  })
 
   it('keeps the install roots read-only: create, append, rename and unlink are refused, and so is opening the binary', () => {
     // #given the write matrix on each root and an append-open of the bun binary
@@ -2718,13 +2732,15 @@ describe.skipIf(!gated)('isolate-agent runs bun and pnpm from their install root
     expect(result?.released).toMatchObject({stop: 'stopped', restore: 'restored'})
   })
 
-  it('keeps both tools’ caches in the agent’s own home and out of the checkout', () => {
+  it('keeps the tools’ caches in the agent’s own home and out of the checkout', () => {
     // #given where the registry installs left their caches
     const places = result?.rows.get('tool_cache_places')?.[0]?.evidence ?? ''
 
-    // #then pnpm's store and bun's cache are under the account's home, and nothing is in the checkout (it could be committed)
+    // #then pnpm's store and bun's and uv's caches are under the account's home, and nothing is in the checkout (it could be
+    // committed)
     expect(places).toMatch(/\/\.pnpm-store/)
     expect(places).toMatch(/\/\.bun\/install\/cache/)
+    expect(places).toMatch(/\/\.cache\/uv/)
     expect(places).not.toContain('/fixtures/')
   })
 })

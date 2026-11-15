@@ -205,6 +205,21 @@ describe('toolCacheEnv', () => {
   const agentHome = '/home/fro-bot-sandbox'
   const bun = `${runnerHome}/.bun`
   const pnpm = `${runnerHome}/setup-pnpm`
+  const ALWAYS = {
+    UV_CACHE_DIR: `${agentHome}/.cache/uv`,
+    UV_PYTHON_INSTALL_DIR: `${agentHome}/.local/share/uv/python`,
+    UV_TOOL_DIR: `${agentHome}/.local/share/uv/tools`,
+    PIP_CACHE_DIR: `${agentHome}/.cache/pip`,
+  }
+
+  it('always points uv’s and pip’s caches, managed Pythons and tools at the agent’s own home', () => {
+    // #given no root granted (uv and pip run from the tool cache, not the runner home)
+    const env = toolCacheEnv([], runnerHome, agentHome)
+
+    // #then uv and pip get their locations, all under the agent's home
+    expect(env).toEqual(ALWAYS)
+    for (const value of Object.values(env)) expect(value.startsWith(`${agentHome}/`)).toBe(true)
+  })
 
   it('points pnpm’s store, cache and state at the agent’s own home when the pnpm root is granted', () => {
     // #given only pnpm granted
@@ -212,6 +227,7 @@ describe('toolCacheEnv', () => {
 
     // #then pnpm gets its three locations under the agent's home, and bun nothing
     expect(env).toEqual({
+      ...ALWAYS,
       npm_config_store_dir: `${agentHome}/.pnpm-store`,
       npm_config_cache_dir: `${agentHome}/.cache/pnpm`,
       npm_config_state_dir: `${agentHome}/.local/state/pnpm`,
@@ -222,25 +238,29 @@ describe('toolCacheEnv', () => {
     // #given only bun granted
     // #then
     expect(toolCacheEnv([bun], runnerHome, agentHome)).toEqual({
+      ...ALWAYS,
       BUN_INSTALL_CACHE_DIR: `${agentHome}/.bun/install/cache`,
     })
   })
 
-  it('sets both for both, and nothing when no root is granted (so npm sees no unknown config)', () => {
+  it('sets both for both, and no npm or bun names when no root is granted (so npm sees no unknown config)', () => {
     // #given
     // #then
-    expect(Object.keys(toolCacheEnv([bun, pnpm], runnerHome, agentHome)).toSorted()).toEqual([
-      'BUN_INSTALL_CACHE_DIR',
-      'npm_config_cache_dir',
-      'npm_config_state_dir',
-      'npm_config_store_dir',
-    ])
-    expect(toolCacheEnv([], runnerHome, agentHome)).toEqual({})
+    expect(Object.keys(toolCacheEnv([bun, pnpm], runnerHome, agentHome)).toSorted()).toEqual(
+      [
+        ...Object.keys(ALWAYS),
+        'BUN_INSTALL_CACHE_DIR',
+        'npm_config_cache_dir',
+        'npm_config_state_dir',
+        'npm_config_store_dir',
+      ].toSorted(),
+    )
+    expect(toolCacheEnv([], runnerHome, agentHome)).toEqual(ALWAYS)
   })
 
   it('ignores a granted path that is not one of the supported roots', () => {
     // #given a path that merely looks similar
     // #then
-    expect(toolCacheEnv([`${runnerHome}/.bun-other`, '/opt/pnpm'], runnerHome, agentHome)).toEqual({})
+    expect(toolCacheEnv([`${runnerHome}/.bun-other`, '/opt/pnpm'], runnerHome, agentHome)).toEqual(ALWAYS)
   })
 })
