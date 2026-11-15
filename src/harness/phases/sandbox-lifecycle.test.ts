@@ -45,6 +45,12 @@ const TOOLS = Object.fromEntries(
 ) as unknown as SandboxToolPaths
 
 const ACCOUNT = {name: 'fro-bot-sandbox', uid: 998, gid: 997, home: '/home/fro-bot-sandbox'}
+// The checkout every test's lifecycle is given, trusted for git through the environment.
+const TRUSTED_CHECKOUT_ENV = {
+  GIT_CONFIG_COUNT: '1',
+  GIT_CONFIG_KEY_0: 'safe.directory',
+  GIT_CONFIG_VALUE_0: '/home/runner/work/r/r',
+}
 
 interface Harness {
   readonly deps: SandboxLifecycleDeps
@@ -122,6 +128,12 @@ function createHarness(): Harness {
     getExecOutput: vi.fn(async (command: string, args: string[] = []) => {
       sudoCalls.push([command, ...args])
       const isGitGlobal = args[0] === 'config' && args[1] === '--global'
+      // The account's PATH check prints the directories it can enter: here, every one not named `unreachable`.
+      const script = args.findIndex(arg => arg.startsWith('for d do'))
+      if (script !== -1) {
+        const reachable = args.slice(script + 2).filter(dir => !dir.includes('unreachable'))
+        return {exitCode: 0, stdout: reachable.map(dir => `${dir}\n`).join(''), stderr: ''}
+      }
       return {exitCode: 0, stdout: isGitGlobal ? `${args[3]}-value\n` : '', stderr: ''}
     }),
   }
@@ -1055,6 +1067,52 @@ describe('createSandboxLifecycle', () => {
       return prepared.data.path
     }
 
+    it('leaves out directories the account cannot enter, and says which', async () => {
+      // #given a runner PATH with a directory the account can't enter (the fake check reports it as unreachable)
+      const harness = createHarness()
+      const logger = createMockLogger()
+      const lifecycle = create(harness, {
+        logger,
+        env: baseEnv(),
+        runnerPath: '/opt/hostedtoolcache/node/24/x64/bin:/home/runner/.cargo/unreachable/bin:/usr/bin',
+        signals: fakeHost(),
+      })
+
+      // #when prepared
+      const prepared = await lifecycle.prepare(prepareInput)
+
+      // #then it is gone from the launch PATH, checked as the account, and named in the log
+      expect(prepared.success && prepared.data.path).toBe(
+        '/opt/hostedtoolcache/node/24/x64/bin:/usr/bin:/usr/local/bin:/bin',
+      )
+      const check = harness.sudoCalls.find(call => call.some(arg => arg.startsWith('for d do')))
+      expect(check).toContain('--reuid=998')
+      expect(check).toContain('/home/runner/.cargo/unreachable/bin')
+      expect(logger.info).toHaveBeenCalledWith('Sandbox PATH left out directories the agent cannot enter', {
+        dropped: ['/home/runner/.cargo/unreachable/bin'],
+      })
+    })
+
+    it('fails the launch when the account’s PATH check fails', async () => {
+      // #given the check exits non-zero
+      const harness = createHarness()
+      const mocked = vi.mocked(harness.exec.getExecOutput)
+      const original = mocked.getMockImplementation()
+      mocked.mockImplementation(async (command: string, args: string[] = []) =>
+        args.some(arg => arg.startsWith('for d do'))
+          ? {exitCode: 1, stdout: '', stderr: ''}
+          : (original?.(command, args) ?? {exitCode: 0, stdout: '', stderr: ''}),
+      )
+      const lifecycle = create(harness, {env: baseEnv(), runnerPath: '/usr/bin', signals: fakeHost()})
+
+      // #when prepared
+      const prepared = await lifecycle.prepare(prepareInput)
+
+      // #then nothing launches
+      expect(prepared.success).toBe(false)
+      expect(prepared.success ? '' : prepared.error).toMatch(/checking the sandbox PATH failed/)
+    })
+
     it('is the runner’s PATH, existing entries only, once each, with the missing system directories last', async () => {
       // #given a runner PATH with a tool-cache entry, a missing entry and a duplicate
       const agentPath = await pathFor({
@@ -1172,9 +1230,12 @@ describe('createSandboxLifecycle', () => {
       const none = await prepared([])
 
       // #then only bun's cache is named; pnpm and the rest follow the agent's own XDG roots
-      expect(both.result.extraEnv).toEqual({BUN_INSTALL_CACHE_DIR: '/home/fro-bot-sandbox/.bun/install/cache'})
-      expect(onlyPnpm.result.extraEnv).toBeUndefined()
-      expect(none.result.extraEnv).toBeUndefined()
+      expect(both.result.extraEnv).toEqual({
+        ...TRUSTED_CHECKOUT_ENV,
+        BUN_INSTALL_CACHE_DIR: '/home/fro-bot-sandbox/.bun/install/cache',
+      })
+      expect(onlyPnpm.result.extraEnv).toEqual(TRUSTED_CHECKOUT_ENV)
+      expect(none.result.extraEnv).toEqual(TRUSTED_CHECKOUT_ENV)
     })
 
     it('keeps the gh config directory in the launch environment', async () => {
@@ -1191,7 +1252,10 @@ describe('createSandboxLifecycle', () => {
       const result = await lifecycle.prepare({keyFilePaths: [], ghConfigDir: `${temp}/gh-config-abc`, repoSkills: null})
 
       // #then both are in the launch environment
-      expect(result.success && result.data.extraEnv).toEqual({GH_CONFIG_DIR: `${temp}/gh-config-abc`})
+      expect(result.success && result.data.extraEnv).toEqual({
+        ...TRUSTED_CHECKOUT_ENV,
+        GH_CONFIG_DIR: `${temp}/gh-config-abc`,
+      })
     })
 
     it('says which roots were granted and which were skipped, and why', async () => {

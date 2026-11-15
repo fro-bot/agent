@@ -2511,6 +2511,23 @@ describe.skipIf(!gated)('isolate-agent runs bun and pnpm from their install root
         `else R tool_uv_install FAILED "rc=$rc [$(printf %s "$o" | tail -c 300 | ev)]"; fi`,
     },
     {
+      // A missing command is "not found", not "permission denied": the agent's PATH holds no directory it can't enter
+      // (the runner image puts `~/.cargo/bin` and `~/.dotnet/tools` on the runner's).
+      id: 'path_missing_command',
+      category: 'works',
+      cmd:
+        `code=$(node -e "require('child_process').spawn('fro-bot-no-such-command').on('error', e => console.log(e.code))") && ` +
+        `[ "$code" = ENOENT ] && R path_missing_command WORKS "$code" || R path_missing_command FAILED "spawn reported $code"`,
+    },
+    {
+      // Git trusts the runner-owned checkout even with the global and system config files turned off, as test suites do.
+      id: 'git_safe_directory_env',
+      category: 'works',
+      cmd:
+        `out=$(GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null HOME=$(mktemp -d) git -C ${q(workspace)} rev-parse --is-inside-work-tree 2>&1) && ` +
+        `R git_safe_directory_env WORKS "$out" || R git_safe_directory_env FAILED "$out"`,
+    },
+    {
       // Any tool that follows XDG: its cache and data land in the agent's own XDG roots, in its home.
       id: 'tool_xdg_other',
       category: 'works',
@@ -2744,6 +2761,13 @@ describe.skipIf(!gated)('isolate-agent runs bun and pnpm from their install root
     expect(facts.aclAfter).toEqual([])
     expect(facts.aclChanged).toEqual([])
     expect(result?.released).toMatchObject({stop: 'stopped', restore: 'restored'})
+  })
+
+  it('reports a missing command as not found and lets git use the runner’s checkout with its config files off', () => {
+    // #given the agent spawned a command that doesn't exist and ran git with no global or system config
+    // #then the spawn failed with ENOENT, not EACCES, and git still trusted the checkout
+    expect(failuresFor(result?.rows ?? new Map(), 'path_missing_command', 'WORKS')).toEqual([])
+    expect(failuresFor(result?.rows ?? new Map(), 'git_safe_directory_env', 'WORKS')).toEqual([])
   })
 
   it('gives any tool that follows XDG the agent’s own XDG roots, not the runner’s', () => {
