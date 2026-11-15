@@ -205,62 +205,23 @@ describe('toolCacheEnv', () => {
   const agentHome = '/home/fro-bot-sandbox'
   const bun = `${runnerHome}/.bun`
   const pnpm = `${runnerHome}/setup-pnpm`
-  const ALWAYS = {
-    UV_CACHE_DIR: `${agentHome}/.cache/uv`,
-    UV_PYTHON_INSTALL_DIR: `${agentHome}/.local/share/uv/python`,
-    UV_TOOL_DIR: `${agentHome}/.local/share/uv/tools`,
-    PIP_CACHE_DIR: `${agentHome}/.cache/pip`,
-  }
 
-  it('always points uv’s and pip’s caches, managed Pythons and tools at the agent’s own home', () => {
-    // #given no root granted (uv and pip run from the tool cache, not the runner home)
-    const env = toolCacheEnv([], runnerHome, agentHome)
-
-    // #then uv and pip get their locations, all under the agent's home
-    expect(env).toEqual(ALWAYS)
-    for (const value of Object.values(env)) expect(value.startsWith(`${agentHome}/`)).toBe(true)
-  })
-
-  it('points pnpm’s store, cache and state at the agent’s own home when the pnpm root is granted', () => {
-    // #given only pnpm granted
-    const env = toolCacheEnv([pnpm], runnerHome, agentHome)
-
-    // #then pnpm gets its three locations under the agent's home, and bun nothing
-    expect(env).toEqual({
-      ...ALWAYS,
-      npm_config_store_dir: `${agentHome}/.pnpm-store`,
-      npm_config_cache_dir: `${agentHome}/.cache/pnpm`,
-      npm_config_state_dir: `${agentHome}/.local/state/pnpm`,
-    })
-  })
-
-  it('points bun’s install cache at the agent’s own home when the bun root is granted', () => {
-    // #given only bun granted
-    // #then
+  it('points bun\u2019s install cache at the agent\u2019s own home when the bun root is granted', () => {
+    // #given bun granted, alone or with pnpm
+    // #then only bun's cache is named: everything that follows XDG uses the agent's own XDG roots
     expect(toolCacheEnv([bun], runnerHome, agentHome)).toEqual({
-      ...ALWAYS,
+      BUN_INSTALL_CACHE_DIR: `${agentHome}/.bun/install/cache`,
+    })
+    expect(toolCacheEnv([bun, pnpm], runnerHome, agentHome)).toEqual({
       BUN_INSTALL_CACHE_DIR: `${agentHome}/.bun/install/cache`,
     })
   })
 
-  it('sets both for both, and no npm or bun names when no root is granted (so npm sees no unknown config)', () => {
+  it('names nothing without bun\u2019s root, or for a path that only looks like it', () => {
     // #given
     // #then
-    expect(Object.keys(toolCacheEnv([bun, pnpm], runnerHome, agentHome)).toSorted()).toEqual(
-      [
-        ...Object.keys(ALWAYS),
-        'BUN_INSTALL_CACHE_DIR',
-        'npm_config_cache_dir',
-        'npm_config_state_dir',
-        'npm_config_store_dir',
-      ].toSorted(),
-    )
-    expect(toolCacheEnv([], runnerHome, agentHome)).toEqual(ALWAYS)
-  })
-
-  it('ignores a granted path that is not one of the supported roots', () => {
-    // #given a path that merely looks similar
-    // #then
-    expect(toolCacheEnv([`${runnerHome}/.bun-other`, '/opt/pnpm'], runnerHome, agentHome)).toEqual(ALWAYS)
+    expect(toolCacheEnv([], runnerHome, agentHome)).toEqual({})
+    expect(toolCacheEnv([pnpm], runnerHome, agentHome)).toEqual({})
+    expect(toolCacheEnv([`${runnerHome}/.bun-other`], runnerHome, agentHome)).toEqual({})
   })
 })

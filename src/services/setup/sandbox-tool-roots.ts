@@ -124,34 +124,17 @@ export async function resolveToolRoots(input: ToolRootInput, deps: ToolRootDeps 
 }
 
 /**
- * Where the agent's tools keep their caches: the agent's own home, set in the agent's environment.
- *
- * The agent's `XDG_*` variables point at the runner's directories, which are read-only for the agent apart from the
- * `opencode` subdirectory of each. `pnpm` and `uv` fail there, and `bun` falls back into the checkout, so their locations
- * are named outright. `uv` and `pip` run from the world-readable tool cache, so theirs are always set; pnpm's and bun's
- * only when their root is granted, since `npm` warns about `npm_config_*` names it does not know.
+ * bun's install cache in the agent's own home: it follows `BUN_INSTALL`, not XDG, and otherwise falls back into the
+ * checkout (`node_modules/.cache`), where it could end up in the agent's commit. Set only when bun's root is granted.
+ * Tools that follow XDG keep their caches in the agent's own XDG roots and need nothing here.
  */
 export function toolCacheEnv(
   granted: readonly string[],
   runnerHome: string,
   agentHome: string,
 ): Record<string, string> {
-  const has = (tool: string): boolean => {
-    const entry = SANDBOX_TOOL_ROOTS.find(root => root.tool === tool)
-    return entry !== undefined && granted.includes(path.join(runnerHome, entry.directory))
-  }
-  return {
-    UV_CACHE_DIR: path.join(agentHome, '.cache', 'uv'),
-    UV_PYTHON_INSTALL_DIR: path.join(agentHome, '.local', 'share', 'uv', 'python'),
-    UV_TOOL_DIR: path.join(agentHome, '.local', 'share', 'uv', 'tools'),
-    PIP_CACHE_DIR: path.join(agentHome, '.cache', 'pip'),
-    ...(has('bun') ? {BUN_INSTALL_CACHE_DIR: path.join(agentHome, '.bun', 'install', 'cache')} : {}),
-    ...(has('pnpm')
-      ? {
-          npm_config_store_dir: path.join(agentHome, '.pnpm-store'),
-          npm_config_cache_dir: path.join(agentHome, '.cache', 'pnpm'),
-          npm_config_state_dir: path.join(agentHome, '.local', 'state', 'pnpm'),
-        }
-      : {}),
-  }
+  const bun = SANDBOX_TOOL_ROOTS.find(root => root.tool === 'bun')
+  return bun !== undefined && granted.includes(path.join(runnerHome, bun.directory))
+    ? {BUN_INSTALL_CACHE_DIR: path.join(agentHome, '.bun', 'install', 'cache')}
+    : {}
 }

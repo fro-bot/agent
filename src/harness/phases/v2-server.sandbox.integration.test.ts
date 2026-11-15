@@ -1598,8 +1598,9 @@ describe.skipIf(!gated)('isolate-agent key proxy through a real model shell', ()
           `[ "$(printf %s "$KEY" | grep -caF -- "$KEY")" = 1 ] || { R real_key_absent FAILED "content detector control"; exit 0; }; ` +
           `procs=$( { ${String.raw`tr '\0' '\n'`} < /proc/$PPID/environ; ${String.raw`tr '\0' '\n'`} < /proc/self/environ; ` +
           `cat /proc/${proxy?.pid}/cmdline /proc/${proxy?.pid}/environ; } 2>/dev/null | grep -caF -- "$KEY" ); ` +
-          // An unset root is skipped: an empty operand would make some grep builds scan the current directory.
-          `set --; for d in "$HOME" "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME" ${q(responseDir)} ${q(workspace)}; do [ -n "$d" ] && set -- "$@" "$d"; done; files=$(leaks "$@"); ` +
+          // An unset root is skipped: an empty operand would make some grep builds scan the current directory. The `opencode`
+          // entries of the agent's XDG roots are links, which `grep -r` follows only when named, so each is named too.
+          `set --; for d in "$HOME" "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME" "$XDG_DATA_HOME/opencode" "$XDG_CONFIG_HOME/opencode" "$XDG_CACHE_HOME/opencode" "$XDG_STATE_HOME/opencode" ${q(responseDir)} ${q(workspace)}; do [ -n "$d" ] && set -- "$@" "$d"; done; files=$(leaks "$@"); ` +
           `[ "$procs" = 0 ] && [ "$files" = 0 ] && R real_key_absent BLOCKED "no copy of the key in env, proxy argv or readable files" || R real_key_absent OPEN "process_copies=$procs files=$files"`,
       },
     ]
@@ -2464,6 +2465,7 @@ describe.skipIf(!gated)('isolate-agent runs bun and pnpm from their install root
     aclAfter: [] as string[],
     aclChanged: [] as string[],
     leftovers: [] as string[],
+    otherToolInRunnerXdg: [] as string[],
   }
 
   const fixtureDir = (name: string): string => path.join(workspace, 'fixtures', name)
@@ -2509,11 +2511,21 @@ describe.skipIf(!gated)('isolate-agent runs bun and pnpm from their install root
         `else R tool_uv_install FAILED "rc=$rc [$(printf %s "$o" | tail -c 300 | ev)]"; fi`,
     },
     {
+      // Any tool that follows XDG: its cache and data land in the agent's own XDG roots, in its home.
+      id: 'tool_xdg_other',
+      category: 'works',
+      cmd:
+        `mkdir -p "$XDG_CACHE_HOME/othertool" "$XDG_DATA_HOME/othertool" && echo x > "$XDG_CACHE_HOME/othertool/x" && ` +
+        `echo x > "$XDG_DATA_HOME/othertool/x" && a=$(readlink -f "$XDG_CACHE_HOME/othertool/x") && ` +
+        `b=$(readlink -f "$XDG_DATA_HOME/othertool/x") && case "$a$b" in *"$HOME"/*"$HOME"/*) R tool_xdg_other WORKS "$a $b";; ` +
+        `*) R tool_xdg_other FAILED "outside the home: $a $b";; esac || R tool_xdg_other FAILED "write failed"`,
+    },
+    {
       // Where each tool put its cache: all belong in the agent's own home, and none in the checkout.
       id: 'tool_cache_places',
       category: 'info',
       cmd:
-        `places=""; for d in "$HOME/.pnpm-store" "$HOME/.bun/install/cache" "$HOME/.cache/uv" ` +
+        `places=""; for d in "$HOME/.local/share/pnpm/store" "$HOME/.bun/install/cache" "$HOME/.cache/uv" ` +
         `${q(fixtureDir('bun-registry'))}/node_modules/.cache ${q(fixtureDir('pnpm-registry'))}/.pnpm-store; ` +
         `do [ -e "$d" ] && places="$places $d"; done; R tool_cache_places INFO "$places"`,
     },
@@ -2620,6 +2632,8 @@ describe.skipIf(!gated)('isolate-agent runs bun and pnpm from their install root
     for (const root of [toolRoots.bun, toolRoots.pnpm]) {
       facts.changedInRoots.push(...changedFilesSince(root, marker, VIEW_IT_PREFIX))
     }
+    // Nothing a tool wrote to its XDG directories reached the runner's own XDG roots.
+    facts.otherToolInRunnerXdg.push(...findPaths([xdgRoot, '-name', 'othertool'], 'the runner XDG roots'))
     // Paths this suite alone touches must carry no entry for the account at all.
     const uidEntry = new RegExp(`^(default:)?user:(${sandboxUid}|fro-bot-sandbox):`)
     for (const target of [toolRoots.bun, toolRoots.pnpm]) {
@@ -2732,13 +2746,20 @@ describe.skipIf(!gated)('isolate-agent runs bun and pnpm from their install root
     expect(result?.released).toMatchObject({stop: 'stopped', restore: 'restored'})
   })
 
+  it('gives any tool that follows XDG the agent’s own XDG roots, not the runner’s', () => {
+    // #given a tool wrote to $XDG_CACHE_HOME and $XDG_DATA_HOME as the agent
+    // #then both writes resolved into the account's home, and the runner's XDG roots hold nothing of it
+    expect(failuresFor(result?.rows ?? new Map(), 'tool_xdg_other', 'WORKS')).toEqual([])
+    expect(facts.otherToolInRunnerXdg).toEqual([])
+  })
+
   it('keeps the tools’ caches in the agent’s own home and out of the checkout', () => {
     // #given where the registry installs left their caches
     const places = result?.rows.get('tool_cache_places')?.[0]?.evidence ?? ''
 
     // #then pnpm's store and bun's and uv's caches are under the account's home, and nothing is in the checkout (it could be
     // committed)
-    expect(places).toMatch(/\/\.pnpm-store/)
+    expect(places).toMatch(/\/\.local\/share\/pnpm\/store/)
     expect(places).toMatch(/\/\.bun\/install\/cache/)
     expect(places).toMatch(/\/\.cache\/uv/)
     expect(places).not.toContain('/fixtures/')
