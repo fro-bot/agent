@@ -3,21 +3,12 @@ import * as path from 'node:path'
 import {isWithin} from '@fro-bot/runtime'
 
 /**
- * Install roots of tools that live under the runner home, which the sandbox cannot otherwise enter (`isolate-agent`).
+ * Install roots under the runner home that the isolated agent may read and execute: `setup-bun` installs to `~/.bun` and
+ * `pnpm/action-setup` to `~/setup-pnpm`. A root is granted only when it is a plain runner-owned directory reached without a
+ * symlink and a directory of the agent's `PATH` lies inside it.
  *
- * `setup-bun` installs to `~/.bun` and `pnpm/action-setup` to `~/setup-pnpm`, and both put a directory inside that root on
- * `PATH`. The agent's `PATH` already names those directories, but the home is default-deny, so the tools do not resolve. A
- * root on this fixed list is granted read and execute (never write) when it is really there and really a tool install: it
- * exists, is a plain runner-owned directory reached without a symlink, and a directory of the agent's `PATH` lies inside it.
- *
- * What the grant is, and is not:
- * - It is `rX` on the root's inodes, applied with a physical walk (`setfacl -P`, `find -P`): it never follows a symlink, so
- *   a link inside a root that points outside it receives nothing. What the agent can do through such a link is decided by
- *   the target's own mode and ACL, and the handoff already denies every other entry of the home. A link therefore cannot
- *   widen the grant, and a root that holds one is still granted.
- * - It reaches every inode of the root, including a hard link to a file outside it (an ACL belongs to the inode). Nothing
- *   in a supported install makes one, and everything inside a granted root is readable by the agent: the docs say so.
- * - It is never write access. The read-only view already keeps the root read-only for the agent.
+ * The grant is `rX` applied with a physical walk, so a symlink inside a root receives nothing and its target keeps its own
+ * permissions. A hard link would carry the grant (ACLs belong to inodes); supported installs make none.
  */
 
 /** The supported tools and where their setup actions install them, relative to the runner home. */
