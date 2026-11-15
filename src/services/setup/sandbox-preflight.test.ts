@@ -39,7 +39,7 @@ const HOSTED_ENV: NodeJS.ProcessEnv = {
   GITHUB_WORKSPACE: '/home/runner/work/repo/repo',
   RUNNER_TEMP: '/home/runner/work/_temp',
   GITHUB_ACTION_REPOSITORY: 'fro-bot/agent',
-  GITHUB_ACTION_PATH: '/home/runner/work/_actions/fro-bot/agent/v1',
+  GITHUB_ACTION_REF: 'v1',
 }
 const WORK = '/home/runner/work'
 const PUBLISHED_ROOT = '/home/runner/work/_actions/fro-bot/agent/v1'
@@ -243,9 +243,16 @@ describe('runSandboxPreflight', () => {
 
   describe('published installs only', () => {
     const WORKSPACE = '/home/runner/work/repo/repo'
+    /** The runner's provenance for an install at `<work>/_actions/<owner>/<repo>/<ref...>`; local roots keep the default. */
+    const provenanceFor = (root: string, work = WORK): NodeJS.ProcessEnv => {
+      const parts = path.relative(`${work}/_actions`, root).split('/')
+      return parts.length >= 3 && !parts.includes('..')
+        ? {GITHUB_ACTION_REPOSITORY: `${parts[0]}/${parts[1]}`, GITHUB_ACTION_REF: parts.slice(2).join('/')}
+        : {}
+    }
     const withInstall = (root: string, extra: Partial<Parameters<typeof createDeps>[0]> = {}) =>
       createDeps({
-        env: {...HOSTED_ENV, GITHUB_ACTION_PATH: root},
+        env: {...HOSTED_ENV, ...provenanceFor(root)},
         bundleDir: `${root}/dist`,
         invokedAs: `${root}/dist/main.js`,
         entries: publishedEntries(root),
@@ -265,7 +272,7 @@ describe('runSandboxPreflight', () => {
       const work = '/srv/gha/work'
       const root = `${work}/_actions/fro-bot/agent/v1`
       const {deps} = withInstall(root, {
-        env: {...HOSTED_ENV, RUNNER_TEMP: `${work}/_temp`, GITHUB_ACTION_PATH: root},
+        env: {...HOSTED_ENV, RUNNER_TEMP: `${work}/_temp`, ...provenanceFor(root, work)},
         entries: publishedEntries(root, work),
       })
 
@@ -432,32 +439,89 @@ describe('runSandboxPreflight', () => {
       await expectRefused(deps, getExecOutput, /bundle/)
     })
 
-    it('refuses when GITHUB_ACTION_PATH and the script path disagree', async () => {
-      // #given two published installs, one reported and the other started
-      const other = `${WORK}/_actions/fro-bot/agent/v2`
-      const {deps, getExecOutput} = withInstall(PUBLISHED_ROOT, {invokedAs: `${other}/dist/main.js`})
-
-      // #when / #then
-      await expectRefused(deps, getExecOutput)
-    })
-
-    it('derives the install from the script path when GITHUB_ACTION_PATH is unset', async () => {
-      // #given only argv[1]
-      const {deps} = withInstall(PUBLISHED_ROOT, {env: {...HOSTED_ENV, GITHUB_ACTION_PATH: undefined}})
+    it('passes when GITHUB_ACTION_PATH is unset (a direct call of a published action)', async () => {
+      // #given the runner's top-level action: no GITHUB_ACTION_PATH, the install derived from argv[1]
+      const {deps} = withInstall(PUBLISHED_ROOT)
+      expect(deps.env.GITHUB_ACTION_PATH).toBeUndefined()
 
       // #when / #then
       expect((await runSandboxPreflight(deps)).ok).toBe(true)
     })
 
-    it('fails closed when neither GITHUB_ACTION_PATH nor a script path says how the Action was started', async () => {
-      // #given a perfectly good canonical bundle, but no lexical invocation
+    it.each([
+      ['a local wrapper in the workspace', `${WORKSPACE}/.github/actions/fro-bot-agent`],
+      ['a wrapper in another stage of a two-deep composite', `${WORKSPACE}/.github/actions/outer`],
+    ])('passes a published install called through %s, whatever GITHUB_ACTION_PATH says', async (_label, wrapper) => {
+      // #given the composite's own directory in GITHUB_ACTION_PATH, and the published bundle running from _actions
+      const {deps} = withInstall(PUBLISHED_ROOT, {env: {...HOSTED_ENV, GITHUB_ACTION_PATH: wrapper}})
+
+      // #when / #then the install is the running bundle, not the wrapper
+      expect((await runSandboxPreflight(deps)).ok).toBe(true)
+    })
+
+    it('refuses a bundle outside _actions even when it is called through a composite', async () => {
+      // #given a composite wrapper whose bundle is in the checkout
+      const root = `${WORKSPACE}/.github/actions/fro-bot-agent`
+      const {deps, getExecOutput} = withInstall(root, {env: {...HOSTED_ENV, GITHUB_ACTION_PATH: root}})
+
+      // #when / #then
+      await expectRefused(deps, getExecOutput, /not .*_actions\/<owner>\/<repo>\/<ref>/)
+    })
+
+    it('compares the repository case-insensitively', async () => {
+      // #given the workflow wrote the repository in another case than the directory
+      const {deps} = withInstall(PUBLISHED_ROOT, {env: {...HOSTED_ENV, GITHUB_ACTION_REPOSITORY: 'Fro-Bot/Agent'}})
+
+      // #when / #then
+      expect((await runSandboxPreflight(deps)).ok).toBe(true)
+    })
+
+    it('refuses a repository that is not the one the bundle was installed from', async () => {
+      // #given the runner names another repository than the install path
       const {deps, getExecOutput} = withInstall(PUBLISHED_ROOT, {
-        env: {...HOSTED_ENV, GITHUB_ACTION_PATH: undefined},
-        invokedAs: null,
+        env: {...HOSTED_ENV, GITHUB_ACTION_REPOSITORY: 'someone/else'},
       })
 
       // #when / #then
+      await expectRefused(deps, getExecOutput, /GITHUB_ACTION_REPOSITORY is someone\/else/)
+    })
+
+    it.each([
+      ['v2', 'a different ref'],
+      ['', 'an empty ref'],
+      [undefined, 'an unset ref'],
+      ['agent/v1', 'a ref that only shares a tail'],
+    ])('refuses GITHUB_ACTION_REF %s (%s)', async (ref, _label) => {
+      // #given the install is at .../v1 but the runner reports another ref
+      const {deps, getExecOutput} = withInstall(PUBLISHED_ROOT, {env: {...HOSTED_ENV, GITHUB_ACTION_REF: ref}})
+
+      // #when / #then
+      await expectRefused(deps, getExecOutput, /GITHUB_ACTION_REF/)
+    })
+
+    it('refuses a ref that is only a prefix of the nested ref directory', async () => {
+      // #given a ref with a slash, reported as its first segment only
+      const root = `${WORK}/_actions/fro-bot/agent/feature/x`
+      const {deps, getExecOutput} = withInstall(root, {env: {...HOSTED_ENV, GITHUB_ACTION_REF: 'feature'}})
+
+      // #when / #then
+      await expectRefused(deps, getExecOutput, /GITHUB_ACTION_REF is feature/)
+    })
+
+    it('fails closed when the script path is unknown', async () => {
+      // #given a perfectly good canonical bundle, but no lexical invocation
+      const {deps, getExecOutput} = withInstall(PUBLISHED_ROOT, {invokedAs: null})
+
+      // #when / #then
       await expectRefused(deps, getExecOutput, /how the Action was started/)
+    })
+
+    it('refuses a script that is not directly in a dist directory', async () => {
+      // #given a script one level too deep
+      const {deps, getExecOutput} = withInstall(PUBLISHED_ROOT, {invokedAs: `${PUBLISHED_ROOT}/dist/sub/main.js`})
+
+      // #when / #then
+      await expectRefused(deps, getExecOutput, /is not .*\/dist\/<file>/)
     })
 
     it('fails closed without RUNNER_TEMP, since the work directory cannot be derived', async () => {

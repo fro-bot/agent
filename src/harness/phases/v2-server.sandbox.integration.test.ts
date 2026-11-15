@@ -296,7 +296,7 @@ async function preflightTools(logger: Logger): Promise<SandboxToolPaths> {
   const base = createSandboxPreflightDeps(createExecAdapter(), logger)
   const preflight = await runSandboxPreflight({
     ...base,
-    env: {...base.env, GITHUB_ACTION_PATH: fakeActionRoot, GITHUB_ACTION_REPOSITORY: 'fro-bot-sandbox-it/agent'},
+    env: {...base.env, GITHUB_ACTION_REPOSITORY: 'fro-bot-sandbox-it/agent', GITHUB_ACTION_REF: 'refs/v1'},
     bundleDir: path.join(fakeActionRoot, 'dist'),
     invokedAs: path.join(fakeActionRoot, 'dist', 'main.js'),
     // The real probe, pointed at the stand-in install's builder: the preflight is part of what this suite proves.
