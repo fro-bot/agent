@@ -1,9 +1,51 @@
-import {describe, expect, it} from 'vitest'
+import {execFileSync} from 'node:child_process'
+import {mkdtempSync, readFileSync, rmSync} from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import {afterEach, describe, expect, it} from 'vitest'
 import {launchWithDeadline} from './sandbox-view-probe.js'
 
 const SH = '/bin/sh'
 
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** The process group of a live process, read back from `ps` (the same flags work on Linux and macOS). */
+function processGroupOf(pid: number): number {
+  return Number(execFileSync('ps', ['-o', 'pgid=', '-p', String(pid)], {encoding: 'utf8'}).trim())
+}
+
+async function waitUntilGone(pid: number): Promise<void> {
+  const deadline = Date.now() + 3000
+  while (isAlive(pid) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50))
+}
+
 describe('launchWithDeadline, with real child processes', () => {
+  // The detached descendant outlives the launcher on purpose, so it is killed here whatever the test did, and its absence
+  // is asserted: a failed test must not leave a `sleep` behind.
+  let descendantPid: number | null = null
+  const scratchDirs: string[] = []
+  afterEach(async () => {
+    const pid = descendantPid
+    descendantPid = null
+    if (pid !== null) {
+      try {
+        process.kill(pid, 'SIGKILL')
+      } catch {
+        // Already gone.
+      }
+      await waitUntilGone(pid)
+    }
+    for (const dir of scratchDirs.splice(0)) rmSync(dir, {recursive: true, force: true})
+    if (pid !== null && isAlive(pid)) throw new Error(`The detached descendant ${pid} is still running after cleanup`)
+  })
+
   it('captures stderr written right before exit', async () => {
     // #given a child that prints to stderr and exits at once
     const result = await launchWithDeadline(SH, ['-c', 'echo "sudo: early failure" >&2; exit 3'], {
@@ -83,16 +125,44 @@ describe('launchWithDeadline, with real child processes', () => {
   })
 
   it('keeps a timeout recorded before the exit when a descendant outside the killed group still holds stderr', async () => {
-    // #given a launcher that outlives a short deadline, and a descendant in its own process group (job control) that the
-    // group kill does not reach, so `close` does not come and the result is settled from `exit`
-    const result = await launchWithDeadline(SH, ['-c', 'set -m; (sleep 2) & exec sleep 30'], {
-      timeoutMs: 300,
-      onSpawn: () => undefined,
-    })
+    // #given a launcher that outlives a 1.5 s deadline, and a descendant that is really detached: node spawns `sleep` with
+    // `detached: true` (its own session and process group, portable to macOS, which has no `setsid`), stderr inherited, and
+    // records its pid. The launcher's group kill cannot reach it, so `close` never comes and the result is settled from `exit`.
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'launch-detached-'))
+    scratchDirs.push(dir)
+    const pidFile = path.join(dir, 'descendant.pid')
+    const spawnDetached = [
+      "const {spawn} = require('node:child_process')",
+      "const child = spawn('sleep', ['30'], {detached: true, stdio: ['ignore', 'ignore', 'inherit']})",
+      "require('node:fs').writeFileSync(process.argv[1], String(child.pid))",
+      'child.unref()',
+    ].join(';')
+    // #when run
+    const started = Date.now()
+    const result = await launchWithDeadline(
+      SH,
+      ['-c', '"$1" -e "$2" "$3"; exec sleep 30', 'sh', process.execPath, spawnDetached, pidFile],
+      {timeoutMs: 1500, onSpawn: () => undefined},
+    )
+    const elapsed = Date.now() - started
+    descendantPid = Number(readFileSync(pidFile, 'utf8'))
 
-    // #then it is still a timeout
+    // #then the fixture did what it says: the descendant exists, is alive, and is in another process group than the
+    // launcher (a detached child leads its own session, so its group is its own pid)
+    expect(Number.isInteger(descendantPid) && descendantPid > 0).toBe(true)
+    expect(isAlive(descendantPid)).toBe(true)
+    const descendantGroup = processGroupOf(descendantPid)
+    expect(result.pid).not.toBeNull()
+    expect(descendantGroup).not.toBe(result.pid)
+    expect(descendantGroup).toBe(descendantPid)
+
+    // #and the timeout recorded before the exit survived the drain window
     expect(result.timedOut).toBe(true)
     expect(result.exitCode).toBeNull()
+
+    // #and the result did not wait for the descendant: deadline, plus the drain bound, plus slack, well under the 2 s
+    // fallback that applies when no exit arrives
+    expect(elapsed).toBeLessThan(1500 + 500 + 700)
   })
 
   it('reports a launcher that cannot be started with no pid', async () => {
