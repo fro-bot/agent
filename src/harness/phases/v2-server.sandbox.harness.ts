@@ -9,6 +9,7 @@ import type {OpenCodeV2ServerHandle} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
 import type {SandboxLifecycle} from './sandbox-lifecycle.js'
 import {Buffer} from 'node:buffer'
+import {spawnSync} from 'node:child_process'
 import * as fs from 'node:fs'
 import http from 'node:http'
 import path from 'node:path'
@@ -388,4 +389,126 @@ export function copyBundleWithImports(sourceDir: string, targetDir: string, entr
     }
   }
   return [...copied]
+}
+
+// --- Inspections: read what the sandbox left, and fail loudly when the reading itself fails -------------------------------
+
+/** What an inspection command did. A runner that cannot report all of it is not an inspection. */
+export interface InspectionResult {
+  readonly status: number | null
+  readonly signal: string | null
+  readonly stdout: string
+  readonly stderr: string
+  /** Set when the process could not be started, timed out or overflowed its buffer. */
+  readonly error?: Error | undefined
+}
+
+export type InspectionRunner = (command: string, args: readonly string[]) => InspectionResult
+
+/** The real runner. The buffer is large on purpose: a recursive `getfacl` of an install root is hundreds of kilobytes. */
+export const runInspection: InspectionRunner = (command, args) => {
+  const result = spawnSync(command, [...args], {encoding: 'utf8', maxBuffer: 64 * 1024 * 1024})
+  return {
+    status: result.status,
+    signal: result.signal,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    error: result.error,
+  }
+}
+
+/** The end of a command's stderr as one short line, so a failure names its cause without flooding the log. */
+function stderrTail(stderr: string): string {
+  const line = stderr.replaceAll(/\s+/g, ' ').trim()
+  return line.length > 200 ? `...${line.slice(-200)}` : line
+}
+
+/**
+ * Runs an inspection and returns its stdout, but only when it completed: no spawn error, not killed by a signal, and an exit
+ * status in `okStatuses`. An absence assertion (no ACL entry, no changed file, no stray process) must never be satisfied by
+ * the output of a command that failed, so anything else throws, naming `description` and a bounded stderr tail.
+ */
+export function inspectOutput(
+  command: string,
+  args: readonly string[],
+  description: string,
+  run: InspectionRunner = runInspection,
+  okStatuses: readonly number[] = [0],
+): string {
+  const result = run(command, args)
+  const tail = stderrTail(result.stderr ?? '')
+  const detail = tail.length === 0 ? '' : `; stderr: ${tail}`
+  if (result.error !== undefined) {
+    throw new Error(`${description}: ${command} could not complete (${result.error.message})${detail}`)
+  }
+  if (result.signal !== null) throw new Error(`${description}: ${command} was killed by ${result.signal}${detail}`)
+  if (result.status === null || !okStatuses.includes(result.status)) {
+    throw new Error(
+      `${description}: ${command} exited ${result.status === null ? 'without a status' : result.status}${detail}`,
+    )
+  }
+  return result.stdout ?? ''
+}
+
+const nonEmptyLines = (text: string): string[] => text.split('\n').filter(line => line.length > 0)
+
+/** Every `getfacl` line of `target`, access and default, as the runner reads them. Throws when `getfacl` fails. */
+export function aclLines(target: string, recursive: boolean, run?: InspectionRunner): string[] {
+  const args = ['-p', '-c', ...(recursive ? ['-R'] : []), target]
+  return nonEmptyLines(inspectOutput('getfacl', args, `reading the ACL of ${target}`, run))
+}
+
+/** `getfacl` output for the given arguments (paths and flags), whole. Throws when `getfacl` fails. */
+export function aclText(args: readonly string[], run?: InspectionRunner): string {
+  const targets = args.filter(arg => !arg.startsWith('-')).join(' ')
+  return inspectOutput('getfacl', args, `reading the ACL of ${targets}`, run)
+}
+
+/** Regular files under `root` modified after `marker`, minus names starting with `ignoredPrefix` and anything under an `install` directory (bun's own cache). */
+export function changedFilesSince(
+  root: string,
+  marker: string,
+  ignoredPrefix: string,
+  run?: InspectionRunner,
+): string[] {
+  const args = [
+    root,
+    '-type',
+    'f',
+    '-newer',
+    marker,
+    '-not',
+    '-name',
+    `${ignoredPrefix}-*`,
+    '-not',
+    '-path',
+    '*/install/*',
+  ]
+  return nonEmptyLines(inspectOutput('find', args, `scanning ${root} for changed files`, run))
+}
+
+/** The paths `find` prints for `args` (a complete argument list). Throws when `find` fails, even with partial output. */
+export function findPaths(args: readonly string[], description: string, run?: InspectionRunner): string[] {
+  return nonEmptyLines(inspectOutput('find', args, description, run))
+}
+
+/** What `pgrep` prints for `args`. Exit 1 means "no match" and is a real answer; any other status is a failure. */
+export function pgrepOutput(args: readonly string[], run?: InspectionRunner): string {
+  return inspectOutput('pgrep', args, `looking for processes (${args.join(' ')})`, run, [0, 1]).trim()
+}
+
+/** The mount namespaces on the machine as root sees them. A failed `lsns` is not an empty machine. */
+export function mountNamespaceIds(run?: InspectionRunner): string[] {
+  const text = inspectOutput('sudo', ['-n', 'lsns', '-t', 'mnt', '-n', '-o', 'NS'], 'listing mount namespaces', run)
+  return nonEmptyLines(
+    text
+      .split('\n')
+      .map(line => line.trim())
+      .join('\n'),
+  ).toSorted()
+}
+
+/** The first line of what the runner's own shell command prints. Throws when the command fails. */
+export function runnerFirstLine(command: string, run?: InspectionRunner): string {
+  return inspectOutput('sh', ['-c', command], `running ${command}`, run).split('\n')[0]?.trim() ?? ''
 }

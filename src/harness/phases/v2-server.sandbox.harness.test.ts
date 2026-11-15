@@ -5,14 +5,25 @@ import path from 'node:path'
 import {fileURLToPath} from 'node:url'
 import {afterEach, describe, expect, it} from 'vitest'
 import {
+  aclLines,
+  aclText,
+  changedFilesSince,
   controlCoversMatrix,
   copyBundleWithImports,
+  findPaths,
+  inspectOutput,
   matrixDirectories,
   matrixSentinels,
+  mountNamespaceIds,
   parseRows,
+  pgrepOutput,
   PRELUDE,
+  runInspection,
+  runnerFirstLine,
   writeMatrixProbe,
   writeWorksProbe,
+  type InspectionResult,
+  type InspectionRunner,
 } from './v2-server.sandbox.harness.js'
 
 const noFs = {isDirectory: () => true, isWritable: () => true, subdirectories: () => [] as string[]}
@@ -217,5 +228,196 @@ describe('copyBundleWithImports', () => {
         expect(fs.existsSync(path.join(target, match[1] ?? ''))).toBe(true)
       }
     }
+  })
+})
+
+describe('inspections that feed an absence assertion', () => {
+  const done = (overrides: Partial<InspectionResult> = {}): InspectionResult => ({
+    status: 0,
+    signal: null,
+    stdout: '',
+    stderr: '',
+    ...overrides,
+  })
+  const returning =
+    (result: InspectionResult): InspectionRunner =>
+    () =>
+      result
+
+  // The two the review named, and the same shape for every helper that returns output.
+  const callers: readonly (readonly [string, (run: InspectionRunner) => unknown, string])[] = [
+    ['aclLines', run => aclLines('/home/runner/.bun', true, run), '/home/runner/.bun'],
+    ['aclText', run => aclText(['-R', '-p', '/work/ws', '/work/response'], run), '/work/ws /work/response'],
+    [
+      'changedFilesSince',
+      run => changedFilesSince('/home/runner/setup-pnpm', '/tmp/marker', 'fro-bot-it', run),
+      '/home/runner/setup-pnpm',
+    ],
+    [
+      'findPaths',
+      run => findPaths(['/work/ws', '-xdev'], 'looking for files the sandbox still owns', run),
+      'files the sandbox still owns',
+    ],
+    ['mountNamespaceIds', run => mountNamespaceIds(run), 'mount namespaces'],
+    ['runnerFirstLine', run => runnerFirstLine('cd /tmp && bun --version', run), 'bun --version'],
+    ['pgrepOutput', run => pgrepOutput(['-f', 'sleep 777'], run), 'sleep 777'],
+  ]
+
+  describe.each(callers)('%s', (_name, call, named) => {
+    it('throws, naming the target, when the command exits non-zero (a half-read listing is not evidence)', () => {
+      // #given a failure with partial output that would read as "nothing found"
+      const run = returning(done({status: 2, stdout: '', stderr: 'getfacl: /x: Permission denied\nsecond line'}))
+
+      // #then
+      expect(() => call(run)).toThrow(named)
+      expect(() => call(run)).toThrow('exited 2')
+      // #and the stderr tail is on one line
+      expect(() => call(run)).toThrow('stderr: getfacl: /x: Permission denied second line')
+    })
+
+    it('throws when the command could not be started', () => {
+      // #given a spawn error (command not found, timeout, buffer overflow)
+      const run = returning(done({status: null, error: new Error('spawn getfacl ENOENT')}))
+
+      // #then
+      expect(() => call(run)).toThrow('could not complete (spawn getfacl ENOENT)')
+      expect(() => call(run)).toThrow(named)
+    })
+
+    it('throws when the command was killed by a signal', () => {
+      // #given a process killed before it finished
+      const run = returning(done({status: null, signal: 'SIGTERM'}))
+
+      // #then
+      expect(() => call(run)).toThrow('killed by SIGTERM')
+    })
+
+    it('bounds the stderr tail it reports', () => {
+      // #given a very long, multi-line stderr
+      const run = returning(done({status: 3, stderr: `${'e'.repeat(500)}\nlast words\n`}))
+
+      // #then the message carries the end of it on one line, cut to a fixed length
+      let message = ''
+      try {
+        call(run)
+      } catch (error) {
+        message = (error as Error).message
+      }
+      expect(message).toContain('stderr: ...')
+      expect(message).toContain('last words')
+      expect(message).not.toContain('\n')
+      expect(message.length).toBeLessThan(600)
+    })
+
+    it('throws when the exit status is missing', () => {
+      // #given neither a status nor a signal nor an error
+      // #then it is not a completed inspection
+      expect(() => call(returning(done({status: null})))).toThrow('without a status')
+    })
+  })
+
+  describe('on success', () => {
+    it('returns the parsed lines of getfacl, without empty ones, and passes the real arguments', () => {
+      // #given a runner that records its call
+      const calls: (readonly string[])[] = []
+      const run: InspectionRunner = (command, args) => {
+        calls.push([command, ...args])
+        return done({stdout: 'user::rwx\nuser:999:--x\n\ngroup::r-x\n'})
+      }
+
+      // #when
+      const lines = aclLines('/home/runner', false, run)
+      const recursive = aclLines('/home/runner/.bun', true, run)
+
+      // #then
+      expect(lines).toEqual(['user::rwx', 'user:999:--x', 'group::r-x'])
+      expect(recursive).toHaveLength(3)
+      expect(calls).toEqual([
+        ['getfacl', '-p', '-c', '/home/runner'],
+        ['getfacl', '-p', '-c', '-R', '/home/runner/.bun'],
+      ])
+    })
+
+    it('returns the changed files from find, skipping the ignored prefix and bun’s own cache by argument', () => {
+      // #given
+      const calls: (readonly string[])[] = []
+      const run: InspectionRunner = (command, args) => {
+        calls.push([command, ...args])
+        return done({stdout: '/home/runner/.bun/bin/bun\n'})
+      }
+
+      // #then
+      expect(changedFilesSince('/home/runner/.bun', '/tmp/marker', 'fro-bot-it', run)).toEqual([
+        '/home/runner/.bun/bin/bun',
+      ])
+      expect(calls[0]).toEqual([
+        'find',
+        '/home/runner/.bun',
+        '-type',
+        'f',
+        '-newer',
+        '/tmp/marker',
+        '-not',
+        '-name',
+        'fro-bot-it-*',
+        '-not',
+        '-path',
+        '*/install/*',
+      ])
+    })
+
+    it('returns an empty list for a command that completed and found nothing', () => {
+      // #then success with no output is a real "nothing"
+      expect(changedFilesSince('/x', '/m', 'p', returning(done()))).toEqual([])
+      expect(aclLines('/x', false, returning(done()))).toEqual([])
+    })
+
+    it('treats pgrep exit 1 as no match, and anything above it as a failure', () => {
+      // #then
+      expect(pgrepOutput(['-f', 'x'], returning(done({status: 1})))).toBe('')
+      expect(pgrepOutput(['-f', 'x'], returning(done({stdout: '41,42\n'})))).toBe('41,42')
+      expect(() => pgrepOutput(['-f', 'x'], returning(done({status: 2, stderr: 'pgrep: invalid'})))).toThrow('exited 2')
+    })
+
+    it('returns the sorted namespace ids from lsns, trimmed', () => {
+      // #then
+      expect(mountNamespaceIds(returning(done({stdout: '  4026532500\n4026531841\n\n'})))).toEqual([
+        '4026531841',
+        '4026532500',
+      ])
+    })
+
+    it('returns the first line of the runner’s own command', () => {
+      // #then
+      expect(runnerFirstLine('x', returning(done({stdout: '1.4.4\nextra\n'})))).toBe('1.4.4')
+    })
+  })
+
+  describe('the real runner', () => {
+    it('reports a command that exits non-zero, and one that does not exist', () => {
+      // #given real child processes
+      const failed = runInspection('sh', ['-c', 'echo partial; echo oops >&2; exit 3'])
+      const missing = runInspection('/nonexistent/inspector', [])
+
+      // #then the status and stderr arrive, and a missing command carries an error
+      expect(failed).toMatchObject({status: 3, signal: null})
+      expect(failed.stdout).toContain('partial')
+      expect(failed.stderr).toContain('oops')
+      expect(missing.error).toBeDefined()
+      // #and through the helper both throw
+      expect(() => inspectOutput('sh', ['-c', 'echo partial; exit 3'], 'real failing command')).toThrow('exited 3')
+      expect(() => inspectOutput('/nonexistent/inspector', [], 'real missing command')).toThrow('could not complete')
+    })
+
+    it('reports a process killed by a signal', () => {
+      // #given a shell that kills itself
+      // #then
+      expect(() => inspectOutput('sh', ['-c', 'kill -KILL $$'], 'real killed command')).toThrow('killed by SIGKILL')
+    })
+
+    it('returns the output of a command that succeeds', () => {
+      // #then
+      expect(inspectOutput('sh', ['-c', 'echo fine'], 'real command')).toBe('fine\n')
+    })
   })
 })

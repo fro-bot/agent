@@ -9,7 +9,7 @@
  * tool shell as the sandbox user. Each "blocked" probe has a positive control: the same command run as the runner must
  * succeed (be OPEN), otherwise a BLOCKED result proves nothing.
  *
- * Ten suites run one after another (the sandbox account name is fixed, so two never overlap):
+ * Eleven suites run one after another (the sandbox account name is fixed, so two never overlap):
  *   1. the boundary: blocked and works rows, identity, quiescence, take-back;
  *   2. a provisioned `gh` config and an admitted repo skill;
  *   3. the persistence round trip (restore, isolated run, checkpoint and save, restore, isolated run);
@@ -22,7 +22,9 @@
  *   9. a launcher killed while the chain waits at its gate: nothing past the gate ran, and the teardown is not `restored`
  *      unless it confirmed the orphaned root process gone;
  *  10. the agent's PATH is the runner's: `node` and `uv` from the tool cache (put on PATH by `setup-node` and `setup-uv`)
- *      run in the agent's shell and report what they report to the runner.
+ *      run in the agent's shell and report what they report to the runner;
+ *  11. `bun` and `pnpm` run for the agent from their install roots under the runner home, installs work, nothing else in the
+ *      home becomes readable, the roots stay read-only, and take-back leaves no ACL entry for the agent's uid.
  *
  * Every suite runs through the read-only view, as the Action does: the launch has no other form.
  *
@@ -68,17 +70,24 @@ import {startKeyProxyProcess, type KeyProxyProcess} from './key-proxy-process.js
 import {snapshotLogDirectory} from './log-snapshot.js'
 import {createSandboxLifecycle} from './sandbox-lifecycle.js'
 import {
+  aclLines,
+  aclText,
+  changedFilesSince,
   controlCoversMatrix,
   copyBundleWithImports,
   describeReconstruction,
   failuresFor,
+  findPaths,
   matrixDirectories,
   matrixSentinels,
+  mountNamespaceIds,
   parseRows,
+  pgrepOutput,
   PRELUDE,
   q,
   readProbe,
   readSessionIds,
+  runnerFirstLine,
   safeEnvPath,
   safeEnvToken,
   startScriptedProvider,
@@ -201,6 +210,8 @@ interface IsolatedRunOptions {
   readonly repoSkills?: {readonly stagingRoot: string; readonly admittedDir: string | null}
   /** Called with the lifecycle as soon as it exists, so a suite's `afterAll` can release it if the run throws. */
   readonly onLifecycle?: (lifecycle: SandboxLifecycle) => void
+  /** Called with the launch the lifecycle prepared (the account's uid is the one the handoff named). */
+  readonly onPrepared?: (launch: {readonly account: {readonly uid: number}}) => void
 }
 
 interface IsolatedRunResult {
@@ -229,6 +240,7 @@ async function runIsolated(options: IsolatedRunOptions): Promise<IsolatedRunResu
       repoSkills: options.repoSkills ?? null,
     })
     if (!prepared.success) throw new Error(prepared.error)
+    options.onPrepared?.(prepared.data)
     const handle = await startScriptedSession({
       binary: BINARY ?? '',
       workspace: options.workspace,
@@ -539,7 +551,7 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
     // --- Stop, verify, take back ------------------------------------------------------------------------------
     await handle.shutdown()
     released = await lifecycle.release()
-    straysAfterRelease = spawnSync('pgrep', ['-f', 'sleep 777'], {encoding: 'utf8'}).stdout.trim()
+    straysAfterRelease = pgrepOutput(['-f', 'sleep 777'])
   }, 600_000)
 
   afterAll(async () => {
@@ -623,12 +635,11 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
     expect(fs.readFileSync(path.join(workspace, 'm-0700', 'inner', 'f'), 'utf8').trim()).toBe('x')
     // #and nothing under the roots still belongs to the sandbox
     // (the root-owned file the setup made on purpose is not the sandbox's)
-    const leftover = spawnSync(
-      'find',
+    const leftover = findPaths(
       [workspace, responseDir, '-xdev', '!', '-user', String(runnerUid), '!', '-name', 'pre-acl-root'],
-      {encoding: 'utf8'},
+      'looking for files the sandbox still owns',
     )
-    expect(leftover.stdout.trim()).toBe('')
+    expect(leftover).toEqual([])
     // #and the symlink is still a symlink, and the sentinel it pointed at was never touched
     expect(fs.lstatSync(path.join(workspace, 'm-link')).isSymbolicLink()).toBe(true)
     expect(fs.readFileSync(sentinel, 'utf8')).toBe('sentinel-content')
@@ -648,29 +659,29 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
 
   it("removes only this run's ACL entries: a pre-existing named ACL survives and no default entry of this run remains", () => {
     // #given ACLs that existed before the run, and the handoff's own access and default entries
-    const read = (target: string): string => spawnSync('getfacl', ['-p', target], {encoding: 'utf8'}).stdout
+    const read = (target: string): string => aclText(['-p', target])
     // #then the pre-existing named access entries and the pre-existing default entry are intact
     expect(read(path.join(workspace, 'pre-acl'))).toContain('user:nobody:r-x')
     expect(read(path.join(workspace, 'pre-acl-dir'))).toContain('user:nobody:r-x')
     expect(read(path.join(workspace, 'pre-acl-dir'))).toContain('default:user:nobody:r-x')
     // #and nothing of this run is left: no entry for the (deleted, so numeric) sandbox uid, anywhere
-    const tree = spawnSync('getfacl', ['-R', '-p', workspace, responseDir], {encoding: 'utf8'}).stdout
+    const tree = aclText(['-R', '-p', workspace, responseDir])
     expect(tree).not.toMatch(/^(default:)?user:\d+:/m)
     // #and the runner has no entry in the handed-over directory beyond the ones it had before (none)
     const me = os.userInfo().username
-    const handed = spawnSync('getfacl', ['-R', '-p', responseDir], {encoding: 'utf8'}).stdout
+    const handed = aclText(['-R', '-p', responseDir])
     expect(handed).not.toMatch(new RegExp(`^(default:)?user:${me}:`, 'm'))
   })
 
   it('leaves the runner grants that existed before the run alone, and gives model-created checkout files none of their own', () => {
     // #given a runner entry on a root-owned file and a runner default entry on a runner-owned directory, both from before
     const me = os.userInfo().username
-    const read = (target: string): string => spawnSync('getfacl', ['-p', target], {encoding: 'utf8'}).stdout
+    const read = (target: string): string => aclText(['-p', target])
     // #then both survived take-back exactly (the mask-preserving removal touched neither)
     expect(read(path.join(workspace, 'pre-acl-root'))).toContain(`user:${me}:r--`)
     expect(read(path.join(workspace, 'pre-acl-runner-default'))).toContain(`default:user:${me}:r-x`)
     // #and the only checkout paths that name the runner are those two: nothing this run created inherited an entry
-    const tree = spawnSync('getfacl', ['-R', '-p', workspace], {encoding: 'utf8'}).stdout
+    const tree = aclText(['-R', '-p', workspace])
     const named = tree
       .split('\n\n')
       .filter(block => new RegExp(`^(default:)?user:${me}:`, 'm').test(block))
@@ -713,7 +724,7 @@ describe.skipIf(!gated)('isolate-agent against the real stock binary on a hosted
     const passwd = fs.readFileSync('/etc/passwd', 'utf8')
     // #then the account is gone and no ACL names it on the paths we touched
     expect(passwd).not.toContain('fro-bot-sandbox')
-    const acl = spawnSync('getfacl', ['-R', '-p', workspace], {encoding: 'utf8'}).stdout
+    const acl = aclText(['-R', '-p', workspace])
     expect(acl).not.toContain('user:fro-bot-sandbox')
     expect(acl).not.toMatch(/^user:\d+:/m)
   })
@@ -936,7 +947,7 @@ describe.skipIf(!gated)('isolate-agent with a provisioned gh config and an admit
     const hosts = path.join(ghConfigDir, 'hosts.yml')
     expect(fs.readFileSync(hosts, 'utf8')).toContain(ghDummyToken)
     expect(fs.statSync(hosts).uid).toBe(runnerUid)
-    const acl = spawnSync('getfacl', ['-R', '-p', ghConfigDir, stagingRoot], {encoding: 'utf8'}).stdout
+    const acl = aclText(['-R', '-p', ghConfigDir, stagingRoot])
     expect(acl).not.toMatch(/^user:\d+:/m)
   })
 })
@@ -1758,12 +1769,7 @@ function hostMountSet(): string[] {
 
 /** The mount namespaces on the machine, as root sees them: a namespace with no process in it is not listed. */
 function mountNamespaces(): string[] {
-  const listed = spawnSync('sudo', ['-n', 'lsns', '-t', 'mnt', '-n', '-o', 'NS'], {encoding: 'utf8'})
-  return listed.stdout
-    .split('\n')
-    .map(line => line.trim())
-    .filter(line => line.length > 0)
-    .toSorted()
+  return mountNamespaceIds()
 }
 
 /** Removes what a view probe may have left in the shared directories. The runner may remove any of it: they are mode 777. */
@@ -1782,7 +1788,7 @@ function sweepViewFiles(): void {
 }
 
 function strayProcesses(pattern: string): string {
-  return spawnSync('pgrep', ['-d,', '-f', pattern], {encoding: 'utf8'}).stdout.trim()
+  return pgrepOutput(['-d,', '-f', pattern])
 }
 
 describe.skipIf(!gated)('isolate-agent read-only view: the write boundary on a hosted runner', () => {
@@ -2291,8 +2297,7 @@ function runnerTool(name: string): string | null {
 
 /** The first line of what the runner's own `command` prints: what the agent's shell must report too. */
 function runnerReports(command: string): string {
-  const result = spawnSync('sh', ['-c', command], {encoding: 'utf8'})
-  return result.stdout.split('\n')[0]?.trim() ?? ''
+  return runnerFirstLine(command)
 }
 
 const pathTools = gated ? {node: runnerTool('node'), uv: runnerTool('uv')} : {node: null, uv: null}
@@ -2403,5 +2408,339 @@ describe.skipIf(!gated)("isolate-agent PATH mirrors the runner's", () => {
     // #given the release of the run
     // #then it was stopped and taken back
     expect(result?.released).toMatchObject({stop: 'stopped', restore: 'restored'})
+  })
+})
+
+// --- 11. bun and pnpm --------------------------------------------------------------------------------------------------
+
+const toolRoots = {bun: path.join(runnerHome, '.bun'), pnpm: path.join(runnerHome, 'setup-pnpm')}
+const toolFacts = gated
+  ? {
+      bun: runnerTool('bun'),
+      pnpm: runnerTool('pnpm'),
+      bunVersion: runnerReports('cd /tmp && bun --version'),
+      // Not from the checkout: its package.json names bun as the package manager, which pnpm complains about.
+      pnpmVersion: runnerReports('cd /tmp && pnpm --version'),
+    }
+  : {bun: null, pnpm: null, bunVersion: '', pnpmVersion: ''}
+
+/** Why this runner cannot run the suite. The CI job provisions both tools, so a gated run that lacks one must fail. */
+function toolProblems(): string[] {
+  const problems: string[] = []
+  for (const name of ['bun', 'pnpm'] as const) {
+    const found = toolFacts[name]
+    if (found === null) problems.push(`${name} is not on the runner's PATH`)
+    else if (!found.startsWith(`${toolRoots[name]}/`))
+      problems.push(`${name} resolves to ${found}, not under ${toolRoots[name]}`)
+  }
+  return problems
+}
+
+describe.skipIf(!gated)('isolate-agent runs bun and pnpm from their install roots', () => {
+  const logger = createLogger({phase: 'sandbox-integration-tools'})
+  const tag = String(process.pid)
+  const scratch = path.join(runnerTemp, `sandbox-it-tools-${process.pid}`)
+  // Its own XDG roots: the commondir suite above ends `unsafe` and leaves the default ones owned by the sandbox uid.
+  const xdgRoot = path.join(runnerTemp, `sandbox-it-tools-xdg-${process.pid}`)
+  const workspace = path.join(scratch, 'ws')
+  const responseDir = path.join(scratch, 'response')
+  const keyDir = path.join(scratch, 'keys')
+  const env = hostedEnv(workspace, xdgRoot)
+  // The directories the two binaries sit in (what `command -v` resolves to on the runner's PATH).
+  const binaryDirs = {bun: path.dirname(toolFacts.bun ?? ''), pnpm: path.dirname(toolFacts.pnpm ?? '')}
+  const canary = path.join(runnerHome, `.fro-bot-it-canary-${tag}`)
+  const canaryDir = path.join(runnerHome, `.fro-bot-it-canary-dir-${tag}`)
+  // A link INSIDE a granted root that names a runner-private file: the grant must not follow it.
+  const link = path.join(toolRoots.bun, `fro-bot-it-link-${tag}`)
+  const marker = path.join(scratch, 'marker')
+  const aclBefore = new Map<string, string[]>()
+  const sharedAclTargets = (): string[] => [runnerHome, path.dirname(runnerTemp), runnerTemp, path.dirname(workspace)]
+
+  let result: IsolatedRunResult | undefined
+  let sandboxUid = -1
+  let controls = new Map<string, Row[]>()
+  const facts = {
+    changedInRoots: [] as string[],
+    aclAfter: [] as string[],
+    aclChanged: [] as string[],
+    leftovers: [] as string[],
+  }
+
+  const fixtureDir = (name: string): string => path.join(workspace, 'fixtures', name)
+  const installProbe = (id: string, directory: string, command: string, expectDirectory: string): Probe => ({
+    id,
+    category: 'works',
+    cmd:
+      `cd ${q(directory)} && o=$(${command} 2>&1); rc=$?; ` +
+      `if [ $rc -eq 0 ] && [ -d ${q(`${directory}/node_modules/${expectDirectory}`)} ]; then R ${id} WORKS "installed"; ` +
+      `else R ${id} FAILED "rc=$rc [$(printf %s "$o" | tail -c 300 | ev)]"; fi`,
+  })
+
+  const steps = (): Probe[] => [
+    {
+      id: 'tool_bun',
+      category: 'works',
+      cmd: 'cd /tmp && v=$(bun --version 2>&1 | head -1); p=$(command -v bun); [ -n "$p" ] && R tool_bun WORKS "$v $p" || R tool_bun FAILED "bun not found"',
+    },
+    {
+      id: 'tool_pnpm',
+      category: 'works',
+      cmd: 'cd /tmp && v=$(pnpm --version 2>&1 | head -1); p=$(command -v pnpm); [ -n "$p" ] && R tool_pnpm WORKS "$v $p" || R tool_pnpm FAILED "pnpm not found"',
+    },
+    // Installs of a local package, offline, and of one tiny registry package (left-pad@1.3.0, the one the earlier hosted
+    // measurements installed): both tools must succeed with the account's own home and the checkout as their only writes.
+    installProbe('tool_bun_install', fixtureDir('bun-local'), 'bun install', 'local-pkg'),
+    installProbe('tool_bun_install_registry', fixtureDir('bun-registry'), 'bun install', 'left-pad'),
+    installProbe('tool_pnpm_install', fixtureDir('pnpm-local'), 'pnpm install --no-frozen-lockfile', 'local-pkg'),
+    installProbe(
+      'tool_pnpm_install_registry',
+      fixtureDir('pnpm-registry'),
+      'pnpm install --no-frozen-lockfile',
+      'left-pad',
+    ),
+    {
+      // uv from the tool cache: a project venv in the checkout, one tiny registry package, and an import through it.
+      id: 'tool_uv_install',
+      category: 'works',
+      cmd:
+        `cd ${q(fixtureDir('uv-project'))} && o=$( { uv venv .venv && uv pip install --python .venv/bin/python six && ` +
+        `.venv/bin/python -c 'import six'; } 2>&1); rc=$?; ` +
+        `if [ $rc -eq 0 ]; then R tool_uv_install WORKS "installed"; ` +
+        `else R tool_uv_install FAILED "rc=$rc [$(printf %s "$o" | tail -c 300 | ev)]"; fi`,
+    },
+    {
+      // Where each tool put its cache: all belong in the agent's own home, and none in the checkout.
+      id: 'tool_cache_places',
+      category: 'info',
+      cmd:
+        `places=""; for d in "$HOME/.pnpm-store" "$HOME/.bun/install/cache" "$HOME/.cache/uv" ` +
+        `${q(fixtureDir('bun-registry'))}/node_modules/.cache ${q(fixtureDir('pnpm-registry'))}/.pnpm-store; ` +
+        `do [ -e "$d" ] && places="$places $d"; done; R tool_cache_places INFO "$places"`,
+    },
+    // The roots stay read-only (create, append, rename, unlink next to the tool), and so does the binary itself.
+    ...(['bun', 'pnpm'] as const).map(name =>
+      writeMatrixProbe(`tool_ro_${name}`, toolRoots[name], tag, os.userInfo().uid),
+    ),
+    // The directories that hold the binaries too: create, append, rename and unlink next to `bun` and `pnpm` themselves.
+    ...(['bun', 'pnpm'] as const).map(name =>
+      writeMatrixProbe(`tool_ro_${name}_bin`, binaryDirs[name], tag, os.userInfo().uid),
+    ),
+    {
+      // pnpm's file, not bun's: the runner's own control cannot open the running bun (this suite runs under it) for writing.
+      id: 'tool_binary_write',
+      category: 'blocked',
+      control: true,
+      cmd:
+        `b=$(command -v pnpm); if ( : >> "$b" ) 2>/dev/null; then R tool_binary_write OPEN "opened the binary for writing"; ` +
+        `else R tool_binary_write BLOCKED "refused"; fi`,
+    },
+    // What the grant must not reach: a file and a directory beside the roots, and what a link inside a root names.
+    {id: 'tool_canary_file', category: 'blocked', control: true, cmd: readProbe('tool_canary_file', canary)},
+    {
+      id: 'tool_canary_dir',
+      category: 'blocked',
+      control: true,
+      cmd: readProbe('tool_canary_dir', path.join(canaryDir, 'secret')),
+    },
+    {id: 'tool_canary_link', category: 'blocked', control: true, cmd: readProbe('tool_canary_link', link)},
+    {
+      id: 'tool_home_listing',
+      category: 'blocked',
+      control: true,
+      // The home's own listing: the sandbox may traverse it, but not list it.
+      cmd: `if ls ${q(runnerHome)} >/dev/null 2>&1; then R tool_home_listing OPEN "listed"; else R tool_home_listing BLOCKED "refused"; fi`,
+    },
+  ]
+
+  beforeAll(async () => {
+    const problems = toolProblems()
+    if (problems.length > 0)
+      throw new Error(`The tools suite needs bun and pnpm set up before it runs: ${problems.join('; ')}`)
+    const tools = await preflightTools(logger)
+    fs.mkdirSync(responseDir, {recursive: true})
+    const keyFile = writeKeyFile(keyDir)
+    initWorkspace(workspace)
+
+    // Fixture projects in the checkout: two offline ones with a local package, two with one registry package.
+    for (const [name, withRegistry] of [
+      ['bun-local', false],
+      ['bun-registry', true],
+      ['pnpm-local', false],
+      ['pnpm-registry', true],
+    ] as const) {
+      const dir = fixtureDir(name)
+      fs.mkdirSync(path.join(dir, 'local-pkg'), {recursive: true})
+      fs.writeFileSync(
+        path.join(dir, 'local-pkg', 'package.json'),
+        '{"name":"local-pkg","version":"1.0.0","main":"index.js"}\n',
+      )
+      fs.writeFileSync(path.join(dir, 'local-pkg', 'index.js'), 'module.exports = 1\n')
+      const dependencies: Record<string, string> = {'local-pkg': 'file:./local-pkg'}
+      if (withRegistry) dependencies['left-pad'] = '1.3.0'
+      fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({name, version: '1.0.0', dependencies}))
+    }
+    fs.mkdirSync(fixtureDir('uv-project'), {recursive: true})
+    // The checkout is committed state: the fixtures are untracked files in it, which the handoff does not mind.
+
+    // Canaries beside the roots (readable by anyone if nothing denied them), a link inside a root, and sentinels in the roots.
+    fs.writeFileSync(canary, 'canary', {mode: 0o644})
+    fs.mkdirSync(canaryDir, {mode: 0o755})
+    fs.writeFileSync(path.join(canaryDir, 'secret'), 'canary', {mode: 0o644})
+    fs.symlinkSync(canary, link)
+    for (const root of [toolRoots.bun, toolRoots.pnpm, binaryDirs.bun, binaryDirs.pnpm]) {
+      for (const file of matrixSentinels(root, tag)) {
+        fs.writeFileSync(file, 'sentinel')
+        fs.chmodSync(file, 0o666)
+      }
+    }
+
+    controls = runControls(steps(), workspace, process.env)
+    // What is on the shared directories before this suite's run. An earlier suite in the same job may have left entries for
+    // the account's uid (the commondir suite ends unsafe on purpose and keeps its grants), so the run is judged by what it
+    // changes, not by what the directories already held.
+    for (const target of sharedAclTargets()) aclBefore.set(target, aclLines(target, false))
+    fs.writeFileSync(marker, 'm')
+    // The marker is older than everything the run does, newer than everything this setup did.
+    await new Promise(resolve => setTimeout(resolve, 1100))
+
+    result = await runIsolated({
+      tools,
+      env,
+      workspace,
+      responseDir,
+      keyFile,
+      steps: steps(),
+      logger,
+      onPrepared: launch => {
+        sandboxUid = launch.account.uid
+      },
+    })
+
+    // What the runner finds afterwards: anything new or changed in the roots, and any entry left for the agent's uid.
+    for (const root of [toolRoots.bun, toolRoots.pnpm]) {
+      facts.changedInRoots.push(...changedFilesSince(root, marker, VIEW_IT_PREFIX))
+    }
+    // Paths this suite alone touches must carry no entry for the account at all.
+    const uidEntry = new RegExp(`^(default:)?user:(${sandboxUid}|fro-bot-sandbox):`)
+    for (const target of [toolRoots.bun, toolRoots.pnpm]) {
+      facts.aclAfter.push(
+        ...aclLines(target, true)
+          .filter(line => uidEntry.test(line))
+          .map(line => `${target}: ${line}`),
+      )
+    }
+    for (const target of [canary, canaryDir]) {
+      facts.aclAfter.push(
+        ...aclLines(target, false)
+          .filter(line => uidEntry.test(line))
+          .map(line => `${target}: ${line}`),
+      )
+    }
+    // Shared directories must hold what they held before the run.
+    for (const [target, before] of aclBefore) {
+      const after = aclLines(target, false)
+      facts.aclChanged.push(
+        ...after.filter(line => !before.includes(line)).map(line => `${target}: gained ${line}`),
+        ...before.filter(line => !after.includes(line)).map(line => `${target}: lost ${line}`),
+      )
+    }
+    for (const root of [toolRoots.bun, toolRoots.pnpm, binaryDirs.bun, binaryDirs.pnpm]) {
+      for (const file of matrixSentinels(root, tag).filter(
+        entry => entry.endsWith('-sbx') || entry.endsWith('-sbx-unlink'),
+      )) {
+        const content = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '<missing>'
+        if (content !== 'sentinel') facts.leftovers.push(`${file}: ${content}`)
+      }
+    }
+  }, 900_000)
+
+  afterAll(() => {
+    for (const root of [toolRoots.bun, toolRoots.pnpm, binaryDirs.bun, binaryDirs.pnpm]) {
+      for (const name of fs.existsSync(root) ? fs.readdirSync(root) : []) {
+        if (name.startsWith(`${VIEW_IT_PREFIX}-`)) fs.rmSync(path.join(root, name), {recursive: true, force: true})
+      }
+    }
+    fs.rmSync(canary, {force: true})
+    fs.rmSync(canaryDir, {recursive: true, force: true})
+    fs.rmSync(scratch, {recursive: true, force: true})
+    fs.rmSync(xdgRoot, {recursive: true, force: true})
+  }, 120_000)
+
+  it('has a runner-side control for every blocked row', () => {
+    // #given the same commands run as the runner
+    // #then each managed to do what the sandbox is shown not to (a blocked row without a working control proves nothing)
+    expect(uncontrolledRows(controls)).toEqual([])
+    expect(controlCoversMatrix(controls.get('tool_ro_bun'))).toBe(true)
+    expect(controlCoversMatrix(controls.get('tool_ro_pnpm'))).toBe(true)
+    expect(controlCoversMatrix(controls.get('tool_ro_bun_bin'))).toBe(true)
+    expect(controlCoversMatrix(controls.get('tool_ro_pnpm_bin'))).toBe(true)
+  })
+
+  it('runs the runner’s bun, with the version and the file the runner reports', () => {
+    // #given `bun --version` and `command -v bun` in the agent's shell
+    // #then both match what the runner resolves and reports
+    expect(failuresFor(result?.rows ?? new Map(), 'tool_bun', 'WORKS')).toEqual([])
+    expect(result?.rows.get('tool_bun')?.[0]?.evidence).toBe(`${toolFacts.bunVersion} ${toolFacts.bun}`)
+  })
+
+  it('runs the runner’s pnpm, with the version and the file the runner reports', () => {
+    // #given the same for pnpm
+    // #then
+    expect(failuresFor(result?.rows ?? new Map(), 'tool_pnpm', 'WORKS')).toEqual([])
+    expect(result?.rows.get('tool_pnpm')?.[0]?.evidence).toBe(`${toolFacts.pnpmVersion} ${toolFacts.pnpm}`)
+  })
+
+  it.each([
+    'tool_bun_install',
+    'tool_bun_install_registry',
+    'tool_pnpm_install',
+    'tool_pnpm_install_registry',
+    'tool_uv_install',
+  ])('installs: %s succeeds in the checkout as the agent', id => {
+    // #given an install of a tiny project in the checkout
+    // #then it succeeded and put its package in node_modules
+    expect(failuresFor(result?.rows ?? new Map(), id, 'WORKS')).toEqual([])
+  })
+
+  it('keeps the install roots read-only: create, append, rename and unlink are refused, and so is opening the binary', () => {
+    // #given the write matrix on each root and an append-open of the bun binary
+    // #then nothing worked
+    for (const id of ['tool_ro_bun', 'tool_ro_pnpm', 'tool_ro_bun_bin', 'tool_ro_pnpm_bin', 'tool_binary_write']) {
+      expect(failuresFor(result?.rows ?? new Map(), id, 'BLOCKED')).toEqual([])
+    }
+    // #and the sentinels the runner placed in the roots are untouched
+    expect(facts.leftovers).toEqual([])
+    // #and nothing in either root is new or changed after the run began
+    expect(facts.changedInRoots).toEqual([])
+  })
+
+  it('leaves every other entry of the home unreadable: the canary file, the canary directory, a link inside a root, the listing', () => {
+    // #given the home was made traversable for the roots
+    // #then what lies beside the roots is still refused, and so is what a link inside a root names
+    for (const id of ['tool_canary_file', 'tool_canary_dir', 'tool_canary_link', 'tool_home_listing']) {
+      expect(failuresFor(result?.rows ?? new Map(), id, 'BLOCKED')).toEqual([])
+    }
+  })
+
+  it('left no ACL entry for the agent’s uid on the roots or canaries, and the shared directories as it found them', () => {
+    // #given the runner reads the ACLs after take-back
+    // #then the uid was captured, nothing remains on what this suite owns, and the home, the work directory and RUNNER_TEMP
+    // hold exactly the entries they held before the run
+    expect(sandboxUid).toBeGreaterThan(0)
+    expect(facts.aclAfter).toEqual([])
+    expect(facts.aclChanged).toEqual([])
+    expect(result?.released).toMatchObject({stop: 'stopped', restore: 'restored'})
+  })
+
+  it('keeps the tools’ caches in the agent’s own home and out of the checkout', () => {
+    // #given where the registry installs left their caches
+    const places = result?.rows.get('tool_cache_places')?.[0]?.evidence ?? ''
+
+    // #then pnpm's store and bun's and uv's caches are under the account's home, and nothing is in the checkout (it could be
+    // committed)
+    expect(places).toMatch(/\/\.pnpm-store/)
+    expect(places).toMatch(/\/\.bun\/install\/cache/)
+    expect(places).toMatch(/\/\.cache\/uv/)
+    expect(places).not.toContain('/fixtures/')
   })
 })

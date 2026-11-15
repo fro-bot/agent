@@ -1,5 +1,6 @@
 import type {LaunchAdmission} from '@fro-bot/runtime'
 import type {SandboxToolPaths} from '../../services/setup/sandbox-preflight.js'
+import type {ToolRootResult} from '../../services/setup/sandbox-tool-roots.js'
 import type {ExecAdapter, ExecOptions} from '../../services/setup/types.js'
 import type {SandboxLifecycleDeps, SandboxPrepareInput, SignalHost} from './sandbox-lifecycle.js'
 import {Buffer} from 'node:buffer'
@@ -59,6 +60,7 @@ interface Harness {
     readonly stopLaunch: Mock<SandboxLifecycleDeps['stopLaunch']>
     readonly isProcessAlive: Mock<SandboxLifecycleDeps['isProcessAlive']>
     readonly isDirectory: Mock<SandboxLifecycleDeps['isDirectory']>
+    readonly resolveToolRoots: Mock<SandboxLifecycleDeps['resolveToolRoots']>
   }
   /** What `remove` of the view root was called with, in order. */
   readonly viewRootRemovals: string[]
@@ -111,6 +113,7 @@ function createHarness(): Harness {
     stopLaunch: vi.fn(async () => 'stopped' as const),
     isProcessAlive: vi.fn(() => false),
     isDirectory: vi.fn((directory: string) => !directory.includes('missing')),
+    resolveToolRoots: vi.fn(async (): Promise<ToolRootResult> => ({granted: [], skipped: []})),
   }
   const sudoCalls: string[][] = []
   const exec: ExecAdapter = {
@@ -243,7 +246,7 @@ describe('createSandboxLifecycle', () => {
       state: '/home/runner/.local/state',
     })
     expect(prepared.data.account).toEqual(ACCOUNT)
-    expect(prepared.data.extraEnv).toEqual({GH_CONFIG_DIR: `${temp}/gh-config-abc`})
+    expect(prepared.data.extraEnv).toMatchObject({GH_CONFIG_DIR: `${temp}/gh-config-abc`})
     expect(prepared.data.tmpdir).toBe('/home/fro-bot-sandbox/tmp')
     const manifest = harness.mocks.handOff.mock.calls[0]?.[0] as unknown as {
       handedOver: string[]
@@ -1070,6 +1073,164 @@ describe('createSandboxLifecycle', () => {
     })
   })
 
+  describe('tool install roots (bun, pnpm)', () => {
+    const prepareInput = {keyFilePaths: [], ghConfigDir: null, repoSkills: null}
+    const BUN = '/home/runner/.bun'
+    const PNPM = '/home/runner/setup-pnpm'
+
+    async function prepared(granted: readonly string[], runnerPath = `${BUN}/bin:/usr/bin`) {
+      const harness = createHarness()
+      harness.mocks.resolveToolRoots.mockResolvedValue({granted, skipped: []})
+      const logger = createMockLogger()
+      const lifecycle = create(harness, {
+        env: {HOME: '/home/runner', RUNNER_TEMP: temp},
+        runnerPath,
+        logger,
+        signals: fakeHost(),
+      })
+      const result = await lifecycle.prepare(prepareInput)
+      if (!result.success) throw new Error(result.error)
+      const manifest = harness.mocks.handOff.mock.calls[0]?.[0] as unknown as {readable: string[]}
+      return {harness, result: result.data, manifest, logger}
+    }
+
+    it('asks for the roots with the agent’s own PATH and everything a root must stay apart from', async () => {
+      // #given a runner PATH with bun's directory in it
+      const {harness, result} = await prepared([BUN])
+
+      // #then the resolver saw the mirrored PATH the agent gets, the runner uid and the protected paths
+      const input = harness.mocks.resolveToolRoots.mock.calls[0]?.[0]
+      expect(input?.agentPath).toBe(result.path)
+      expect(input).toMatchObject({
+        runnerHome: '/home/runner',
+        runnerUid: 1001,
+        runnerTemp: temp,
+        actionsDir: `${path.dirname(temp)}/_actions`,
+        workspace: '/home/runner/work/r/r',
+      })
+      // #and the writable roots are the handed-over directories and the sandbox's home
+      expect(input?.writableRoots).toEqual(
+        expect.arrayContaining(['/home/runner/.local/share/opencode', '/home/fro-bot-sandbox']),
+      )
+    })
+
+    it('makes each granted root a readable root of the handoff, next to the attachment directory', async () => {
+      // #given both roots granted
+      const {manifest} = await prepared([BUN, PNPM])
+
+      // #then they join `readable`, so the handoff treats them like the other read grants
+      expect(manifest.readable).toEqual(expect.arrayContaining([BUN, PNPM]))
+    })
+
+    it('grants nothing when the resolver grants nothing', async () => {
+      // #given no tool installed
+      const {manifest} = await prepared([])
+
+      // #then the manifest holds only the run's own read grants
+      expect(manifest.readable.some(root => root === BUN || root === PNPM)).toBe(false)
+    })
+
+    it('leaves the roots out of the view’s read-only list: the view already holds them read-only', async () => {
+      // #given a granted root
+      const {result} = await prepared([BUN, PNPM])
+
+      // #then the view's own bind list is the same as without tool roots (no extra bind-back, no extra refusal path)
+      expect(result.view?.policy.readOnly).not.toContain(BUN)
+      expect(result.view?.policy.readOnly).not.toContain(PNPM)
+    })
+
+    it('points the tools’ caches at the agent’s own home: uv and pip always, bun and pnpm when granted', async () => {
+      // #given both roots granted, and then only bun
+      const both = await prepared([BUN, PNPM])
+      const onlyBun = await prepared([BUN])
+      const none = await prepared([])
+      const always = {
+        UV_CACHE_DIR: '/home/fro-bot-sandbox/.cache/uv',
+        UV_PYTHON_INSTALL_DIR: '/home/fro-bot-sandbox/.local/share/uv/python',
+        UV_TOOL_DIR: '/home/fro-bot-sandbox/.local/share/uv/tools',
+        PIP_CACHE_DIR: '/home/fro-bot-sandbox/.cache/pip',
+      }
+
+      // #then the launch environment carries the cache locations under the account's home
+      expect(both.result.extraEnv).toEqual({
+        ...always,
+        BUN_INSTALL_CACHE_DIR: '/home/fro-bot-sandbox/.bun/install/cache',
+        npm_config_store_dir: '/home/fro-bot-sandbox/.pnpm-store',
+        npm_config_cache_dir: '/home/fro-bot-sandbox/.cache/pnpm',
+        npm_config_state_dir: '/home/fro-bot-sandbox/.local/state/pnpm',
+      })
+      expect(onlyBun.result.extraEnv).toEqual({
+        ...always,
+        BUN_INSTALL_CACHE_DIR: '/home/fro-bot-sandbox/.bun/install/cache',
+      })
+      // #and only uv and pip when no tool root was granted
+      expect(none.result.extraEnv).toEqual(always)
+    })
+
+    it('keeps the gh config directory next to the cache locations', async () => {
+      // #given a provisioned gh config and a granted pnpm root
+      const harness = createHarness()
+      harness.mocks.resolveToolRoots.mockResolvedValue({granted: [PNPM], skipped: []})
+      const lifecycle = create(harness, {
+        env: {HOME: '/home/runner', RUNNER_TEMP: temp},
+        runnerPath: undefined,
+        signals: fakeHost(),
+      })
+
+      // #when prepared
+      const result = await lifecycle.prepare({keyFilePaths: [], ghConfigDir: `${temp}/gh-config-abc`, repoSkills: null})
+
+      // #then both are in the launch environment
+      expect(result.success && result.data.extraEnv).toMatchObject({
+        GH_CONFIG_DIR: `${temp}/gh-config-abc`,
+        npm_config_store_dir: '/home/fro-bot-sandbox/.pnpm-store',
+      })
+    })
+
+    it('says which roots were granted and which were skipped, and why', async () => {
+      // #given one granted and one refused root
+      const harness = createHarness()
+      harness.mocks.resolveToolRoots.mockResolvedValue({
+        granted: [BUN],
+        skipped: [{tool: 'pnpm', root: PNPM, reason: 'is a symlink'}],
+      })
+      const logger = createMockLogger()
+      const lifecycle = create(harness, {
+        env: {HOME: '/home/runner', RUNNER_TEMP: temp},
+        runnerPath: undefined,
+        logger,
+        signals: fakeHost(),
+      })
+
+      // #when prepared
+      await lifecycle.prepare(prepareInput)
+
+      // #then one line names both
+      expect(logger.info).toHaveBeenCalledWith('Sandbox tool roots', {
+        granted: [BUN],
+        skipped: [{tool: 'pnpm', root: PNPM, reason: 'is a symlink'}],
+      })
+    })
+
+    it('fails the preparation, and releases, when the resolver throws', async () => {
+      // #given a resolver that cannot finish
+      const harness = createHarness()
+      harness.mocks.resolveToolRoots.mockRejectedValue(new Error('EIO'))
+      const lifecycle = create(harness, {
+        env: {HOME: '/home/runner', RUNNER_TEMP: temp},
+        runnerPath: undefined,
+        signals: fakeHost(),
+      })
+
+      // #when prepared
+      const result = await lifecycle.prepare(prepareInput)
+
+      // #then no handoff happened, and the failure is explicit
+      expect(result.success).toBe(false)
+      expect(harness.mocks.handOff).not.toHaveBeenCalled()
+    })
+  })
+
   describe('the read-only view', () => {
     const prepareInput = {keyFilePaths: [], ghConfigDir: null, repoSkills: null}
     const quietReport = <T>(value: T) => ({value, unconfirmed: false})
@@ -1284,6 +1445,39 @@ describe('createSandboxLifecycle', () => {
       // #then the dead launcher was no reason to skip it
       expect(restored).toMatchObject({stop: 'stopped', restore: 'restored'})
       expect(harness.mocks.stopLaunch).toHaveBeenCalledTimes(1)
+    })
+
+    it('logs once that the launch is confirmed empty, with the elapsed time', async () => {
+      // #given a launch whose stop confirms it empty
+      const logger = createMockLogger()
+      const {lifecycle} = await preparedWith(undefined, {logger})
+      await lifecycle.launch(spawnLauncher())
+
+      // #when released
+      await lifecycle.release()
+
+      // #then one info line carries the confirmation and the elapsed time
+      const lines = vi
+        .mocked(logger.info)
+        .mock.calls.filter(([message]) => message === 'Sandbox launch namespace stopped')
+      expect(lines).toEqual([
+        ['Sandbox launch namespace stopped', {confirmed: true, elapsedMs: expect.any(Number) as number}],
+      ])
+    })
+
+    it('does not log a confirmation when the stop cannot confirm the launch empty', async () => {
+      // #given a stop that cannot confirm
+      const logger = createMockLogger()
+      const {harness, lifecycle} = await preparedWith(undefined, {logger})
+      harness.mocks.stopLaunch.mockResolvedValue('unconfirmed')
+      await lifecycle.launch(spawnLauncher())
+
+      // #when released
+      const released = await lifecycle.release()
+
+      // #then the run is unsafe and the confirmation line was not logged
+      expect(released).toMatchObject({stop: 'unconfirmed', restore: 'unsafe'})
+      expect(logger.info).not.toHaveBeenCalledWith('Sandbox launch namespace stopped', expect.anything())
     })
 
     it.each([

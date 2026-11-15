@@ -543,7 +543,7 @@ Divergences from the plan, with the reason:
 
 ### Delivery 3: bun and pnpm
 
-- [ ] **Unit 9: Grant the install roots of bun and pnpm**
+- [x] **Unit 9: Grant the install roots of bun and pnpm**
 
 **Goal:** `bun` and `pnpm` run for the agent, and nothing else under the runner home becomes readable.
 
@@ -584,6 +584,18 @@ Divergences from the plan, with the reason:
 
 **Verification:**
 - A caller workflow that installs `bun` or `pnpm` the usual way needs no change beyond `isolate-agent: true`.
+
+### As built (Delivery 3)
+
+- The fixed list and the rule live in `src/services/setup/sandbox-tool-roots.ts` (a new module, so the lifecycle edit stays small). `resolveToolRoots` grants `~/.bun` and `~/setup-pnpm`, resolved against the runner home the lifecycle already uses, when the root passes `lstat` as a directory (not a symlink) owned by the runner, `realpath` equals the path, and a directory of the agent's mirrored `PATH` lies inside it. A root that is or contains the runner home, or overlaps `RUNNER_TEMP`, the actions directory, the checkout or a writable root, is refused. Each skip carries a reason and is logged with the grants in one `Sandbox tool roots` line.
+- The grants are plain `readable` roots, so the reserved-subtree check, root verification, lock planning and take-back already cover them. The handoff gained one check for every read grant (`broadReadGrantProblem`): a readable root that is or contains the runner home, `RUNNER_TEMP`, the checkout or a handed-over directory is refused at handoff and take-back.
+- The view's bind list is unchanged: both roots lie under the read-only rbind of `/`, so the lifecycle keeps them out of `policy.readOnly` rather than binding them again.
+- Symlinks: the grant is `setfacl -R -P` and `find -P`, which never follow a link, so a link inside a root that points outside it receives nothing and cannot widen the grant; what the agent can do through it is decided by the target's own mode and ACL (the home's other entries are denied). A root that holds such a link is therefore still granted. A hard link is different: an ACL belongs to the inode, so a hard link inside a root to a file outside it would carry the grant. Nothing in a supported install makes one; the docs say everything inside a granted root is readable.
+- Caches (found on the first hosted run of suite 11, both images): `pnpm install` failed with `ENOENT ... mkdir '<XDG_DATA_HOME>/pnpm'` in `createNewStoreController`, because pnpm derives its store, metadata cache and state from the runner's read-only XDG directories and does not fall back (an unprivileged container with unwritable XDG directories had misled the earlier check: there pnpm fell back to `<project>/.pnpm-store`). `bun install` worked but wrote `node_modules/.cache` in the checkout. The lifecycle now adds `toolCacheEnv(granted, runnerHome, account.home)` to the launch's `extraEnv`: `npm_config_store_dir`, `npm_config_cache_dir`, `npm_config_state_dir` when the pnpm root is granted, `BUN_INSTALL_CACHE_DIR` when the bun root is. Only a granted tool gets its variables, because npm warns about unknown `npm_config_*` names. Suite 11 asserts both caches are under the account's home and not in the checkout.
+- `uv` and `pip` (follow-up): `toolCacheEnv` also always sets `UV_CACHE_DIR`, `UV_PYTHON_INSTALL_DIR`, `UV_TOOL_DIR` and `PIP_CACHE_DIR` under the account home, since `uv` keeps its cache under `XDG_CACHE_HOME` and its managed Pythons and tools under `XDG_DATA_HOME`. Suite 11 adds `uv venv` plus `uv pip install six` in the checkout and asserts `~/.cache/uv` holds the cache.
+- Suite 11 corrections from that run: the binary-write row uses pnpm's file (the runner cannot open the running bun for writing: text file busy), the binaries' directories get the write matrix, and the ACL check compares the shared directories with a snapshot taken before the run, because the commondir suite ends `unsafe` on purpose and leaves `user:<uid>:--x` on the home, the work directory and `RUNNER_TEMP` before the tools suite starts (the handoff records them as the original and restores them).
+
+- Suite 11 (real runner) and the `pnpm/action-setup` step of the `sandbox-integration` job (`v6.1.1`, `version: 10`; Bun comes from the repo's own setup action, which uses the same `oven-sh/setup-bun` that Unit 1 measured). A gated run without bun or pnpm fails in `beforeAll`.
 
 ---
 
