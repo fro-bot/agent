@@ -297,7 +297,6 @@ export type {
   GateDeps,
   LaunchAdmission,
   LaunchNamespace,
-  LaunchStopRoute,
   NamespaceStopOutcome,
   SandboxNamespaceTools,
 } from './sandbox-namespace.js'

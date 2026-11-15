@@ -2,7 +2,6 @@ import type {Result} from '@bfra.me/es/result'
 import type {
   GateDeps,
   LaunchAdmission,
-  LaunchStopRoute,
   OpenCodeV2SandboxLaunch,
   OpenCodeV2SandboxView,
   PrivilegedRun,
@@ -570,22 +569,18 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       } catch {
         admission = {kind: 'refused', host: null, reason: 'no-id'}
       }
-      // The route is the stop's to report: a refused admission whose id the gate file gives at teardown still stops the
-      // namespace. Until it reports, the admission is the best guess.
-      let via: LaunchStopRoute = admission.kind === 'refused' ? 'gate' : 'namespace'
       const stopStarted = Date.now()
       const outcome = await deps.stopLaunch(
         {gateDir: launched.gateDir, admission},
         namespaceTools,
         identityDeps(),
         deps.gateFiles,
-        {onRoute: route => (via = route)},
       )
       if (outcome !== 'stopped') {
         problem ??= 'a launch could not be confirmed stopped: its namespace or its gate still had processes'
         continue
       }
-      logger.info('Sandbox launch namespace stopped', {confirmed: true, via, elapsedMs: Date.now() - stopStarted})
+      logger.info('Sandbox launch namespace stopped', {confirmed: true, elapsedMs: Date.now() - stopStarted})
       // The launcher is a process of the launch too (the runner cannot signal it): it exits once its child has.
       if (!(await launcherGone(launched.pid, LAUNCHER_EXIT_BOUND_MS))) {
         await run([tools.pkill, '-KILL', '-g', String(launched.pid)])

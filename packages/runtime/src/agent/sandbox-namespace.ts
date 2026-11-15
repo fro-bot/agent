@@ -88,9 +88,6 @@ export type LaunchAdmission =
 
 export type NamespaceStopOutcome = 'stopped' | 'unconfirmed'
 
-/** How {@link stopLaunch} stops a launch: by its namespace (an id was captured) or by its gate directory (none was). */
-export type LaunchStopRoute = 'namespace' | 'gate'
-
 export interface GateDeps {
   /** Reads a text file; null when it is missing or unreadable. */
   readonly readText: (absolutePath: string) => Promise<string | null>
@@ -318,12 +315,7 @@ export async function stopLaunch(
   tools: SandboxNamespaceTools,
   deps: SandboxIdentityDeps,
   gate: Pick<GateDeps, 'readText'>,
-  options: {
-    readonly boundMs?: number
-    readonly pollMs?: number
-    /** Told which route the stop takes, before it runs: a late read of the gate's id makes it `namespace` for a refused admission. */
-    readonly onRoute?: (route: LaunchStopRoute) => void
-  } = {},
+  options: {readonly boundMs?: number; readonly pollMs?: number} = {},
 ): Promise<NamespaceStopOutcome> {
   const {admission} = launch
   let namespace = admission.kind === 'refused' ? null : admission.namespace
@@ -335,10 +327,6 @@ export async function stopLaunch(
       // Treated as no id: the gate directory kill below still applies.
     }
   }
-  if (namespace !== null) {
-    options.onRoute?.('namespace')
-    return stopLaunchNamespace(namespace, tools, deps, options)
-  }
-  options.onRoute?.('gate')
+  if (namespace !== null) return stopLaunchNamespace(namespace, tools, deps, options)
   return stopGateProcesses(launch.gateDir, tools, deps, options)
 }
