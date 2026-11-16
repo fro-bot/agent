@@ -253,6 +253,25 @@ describe('startOpenCodeV2Server', () => {
       expect(childEnv.OPENCODE_DISABLE_AUTOUPDATE).toBe('1')
     })
 
+    it('gives the server gh auth only through GH_CONFIG_DIR, never a GH_TOKEN (#2156)', async () => {
+      // #given the Action's own process env as provision mode leaves it: both set in-process by configureGhAuth
+      const created = fixture()
+      const env = {
+        PATH: process.env.PATH,
+        GH_TOKEN: 'ghs_should_not_pass',
+        GH_CONFIG_DIR: '/tmp/gh-config-abc123',
+      }
+
+      // #when started
+      const result = await start(created, {env})
+
+      // #then the child authenticates through the config dir; the raw token stays out of its environment
+      expect(result.success).toBe(true)
+      const childEnv = created.readRecord().env
+      expect(childEnv.GH_TOKEN).toBeUndefined()
+      expect(childEnv.GH_CONFIG_DIR).toBe('/tmp/gh-config-abc123')
+    })
+
     it('does not inherit an operator OPENCODE_CONFIG_CONTENT when no config is given', async () => {
       // #given
       const created = fixture()

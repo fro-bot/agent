@@ -183,10 +183,9 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
     const provisionChildCredential = inputs.credential === 'provision'
     const ghResult = await configureGhAuth(octokit, null, githubToken, logger, execAdapter, provisionChildCredential)
     if (provisionChildCredential) {
-      core.exportVariable('GH_TOKEN', githubToken)
-      if (process.env.GH_CONFIG_DIR != null && process.env.GH_CONFIG_DIR.length > 0) {
-        core.exportVariable('GH_CONFIG_DIR', process.env.GH_CONFIG_DIR)
-      }
+      // `configureGhAuth` already set process.env.GH_TOKEN and GH_CONFIG_DIR for this process, which is all the
+      // Action and the server it spawns need. Do NOT `core.exportVariable` them: that writes $GITHUB_ENV and hands
+      // the write token to every later step in the caller's job (#2156).
       logger.info('GitHub CLI configured')
     } else {
       logger.info('GitHub CLI credential withheld from child (affected trigger)')

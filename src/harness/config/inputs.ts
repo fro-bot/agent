@@ -136,8 +136,8 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     // Delete the raw input from env (same hyphen-key gotcha as auth-json below:
     // @actions/core maps `github-token` to `INPUT_GITHUB-TOKEN`) so the OpenCode
     // server child (spawned with `{ ...process.env }`) does not inherit this copy.
-    // Note: this removes the INPUT_* copy only; GH_TOKEN is still exported for the
-    // agent's own gh/git use — reducing that further is tracked as an infra change.
+    // Note: this removes the INPUT_* copy only; provision mode still sets GH_TOKEN in this process
+    // (never in $GITHUB_ENV) for the Action's own gh use.
     delete process.env['INPUT_GITHUB-TOKEN']
 
     const authJson = core.getInput('auth-json', {required: true}).trim()
