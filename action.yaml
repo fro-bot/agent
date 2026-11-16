@@ -119,6 +119,13 @@ inputs:
       README for the full list of what is and is not blocked.
     required: false
     default: 'false'
+  agent-state-home:
+    description: >-
+      With `isolate-agent: true`, an absolute directory inside the checkout (`GITHUB_WORKSPACE`) to use as the agent's
+      `XDG_STATE_HOME` instead of one in its private home. The Action creates it if missing, hands it to the agent for the
+      run and takes it back after, so a tool that keeps state there (a run record, a ledger) leaves it in the checkout. A
+      relative path, a path outside the checkout or a symlink fails the run. Ignored without `isolate-agent`.
+    required: false
   opencode-config:
     description: >-
       JSON object to merge into the OpenCode config (OPENCODE_CONFIG_CONTENT).

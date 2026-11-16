@@ -262,6 +262,10 @@ export async function verifyRoots(
     if (problem !== null) return problem
     const stats = await fs.lstat(ancestor)
     if (stats.uid !== runnerUid) continue
+    // The checkout, and the directories between it and a handed-over directory inside it (`agent-state-home`), carry the
+    // sandbox's write grant by design: the sandbox already owns what lies under the checkout. A swap there is still caught
+    // above (a link, or a directory the sandbox owns, is refused), so only an ancestor outside the checkout is read for a grant.
+    if (isWithin(manifest.workspace, ancestor)) continue
     const acl = await deps.run([deps.tools.getfacl, '-p', '-c', ancestor])
     if (acl.exitCode !== 0) return `could not read the ACL of ${ancestor}`
     if (grantsSandboxWrite(acl.stdout, sandboxUid)) return `ancestor ${ancestor} grants the sandbox write access`

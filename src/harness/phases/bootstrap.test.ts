@@ -94,6 +94,7 @@ function createActionInputs(overrides: Partial<ActionInputs> = {}): ActionInputs
     brokeredPushExtraPaths: [],
     repoSkills: false,
     isolateAgent: false,
+    agentStateHome: null,
     storeConfig: {
       enabled: false,
       bucket: '',

@@ -210,6 +210,8 @@ interface IsolatedRunOptions {
   readonly logger: Logger
   readonly ghConfigDir?: string
   readonly repoSkills?: {readonly stagingRoot: string; readonly admittedDir: string | null}
+  /** The `agent-state-home` input, resolved: an absolute directory inside `workspace`. */
+  readonly agentStateHome?: string
   /** Called with the lifecycle as soon as it exists, so a suite's `afterAll` can release it if the run throws. */
   readonly onLifecycle?: (lifecycle: SandboxLifecycle) => void
   /** Called with the launch the lifecycle prepared (the account's uid is the one the handoff named). */
@@ -231,6 +233,7 @@ async function runIsolated(options: IsolatedRunOptions): Promise<IsolatedRunResu
     runnerHome,
     workspacePath: options.workspace,
     responseDir: options.responseDir,
+    agentStateHome: options.agentStateHome ?? null,
     logger: options.logger,
     viewLauncher,
   })
@@ -2212,6 +2215,91 @@ describe.skipIf(!gated)('isolate-agent read-only view: a second isolated run in 
     // #then it saw no marker and no file of ours in the places the first run wrote
     expect(failuresFor(second?.rows ?? new Map(), 'run2_clean', 'WORKS')).toEqual([])
     expect(first?.rows.get('run1_markers')).toBeDefined()
+  })
+})
+
+describe.skipIf(!gated)('isolate-agent agent-state-home: a state directory and a clone inside the checkout', () => {
+  const logger = createLogger({phase: 'sandbox-integration-state-home'})
+  const scratch = path.join(runnerTemp, `sandbox-it-state-home-${process.pid}`)
+  const xdgRoot = path.join(runnerTemp, `sandbox-it-state-home-xdg-${process.pid}`)
+  const workspace = path.join(scratch, 'ws')
+  const stateHome = path.join(workspace, 'connect', 'state')
+  const nested = path.join(workspace, 'connect', 'checkouts', 'nested')
+  const responseDir = path.join(scratch, 'response')
+  const keyDir = path.join(scratch, 'keys')
+  const env = hostedEnv(workspace, xdgRoot)
+  const written = path.join(stateHome, 'systematic', 'connect', 'run.json')
+
+  let result: IsolatedRunResult | undefined
+
+  const steps = (): Probe[] => [
+    {
+      // What the connect helper does: its run record lives under `$XDG_STATE_HOME`, which must be the directory the runner named
+      // and must be the sandbox's to write (the helper refuses a state root another uid owns).
+      id: 'state_home_write',
+      category: 'works',
+      cmd:
+        `if [ "$XDG_STATE_HOME" = ${q(stateHome)} ] && mkdir -p "$XDG_STATE_HOME/systematic/connect" ` +
+        `&& echo recorded > "$XDG_STATE_HOME/systematic/connect/run.json" && [ -L "$XDG_STATE_HOME/opencode" ]; ` +
+        'then R state_home_write WORKS "wrote under XDG_STATE_HOME; opencode link kept"; ' +
+        'else R state_home_write FAILED "XDG_STATE_HOME=$XDG_STATE_HOME"; fi',
+    },
+    {
+      // A repository the runner cloned under the checkout is the runner's, not the sandbox uid's: git trusts it only through
+      // the `<checkout>/*` entry.
+      id: 'nested_git_status',
+      category: 'works',
+      cmd:
+        `if out=$(git -C ${q(nested)} status --porcelain 2>&1); then R nested_git_status WORKS "status ok"; ` +
+        'else R nested_git_status FAILED "$(printf %s "$out" | ev)"; fi',
+    },
+  ]
+
+  beforeAll(async () => {
+    const tools = await preflightTools(logger)
+    fs.mkdirSync(responseDir, {recursive: true})
+    const keyFile = writeKeyFile(keyDir)
+    initWorkspace(workspace)
+    // Cloned by the runner, as the connect workflow does, before the sandbox exists.
+    fs.mkdirSync(path.dirname(nested), {recursive: true})
+    git(workspace, 'clone', '-q', workspace, nested)
+    result = await runIsolated({
+      tools,
+      env,
+      workspace,
+      responseDir,
+      keyFile,
+      steps: steps(),
+      logger,
+      agentStateHome: stateHome,
+    })
+  }, 600_000)
+
+  afterAll(() => {
+    fs.rmSync(scratch, {recursive: true, force: true})
+    fs.rmSync(xdgRoot, {recursive: true, force: true})
+  }, 120_000)
+
+  it('gives the agent the named state home: it writes there and the file is in the checkout afterwards', () => {
+    // #given the agent wrote a file under its XDG_STATE_HOME
+    // #then the probe saw the variable and the link, and the runner finds the file where it named the directory
+    expect(failuresFor(result?.rows ?? new Map(), 'state_home_write', 'WORKS')).toEqual([])
+    expect(fs.readFileSync(written, 'utf8')).toBe('recorded\n')
+  })
+
+  it('hands the directory back to the runner, without the opencode link the lifecycle made in it', () => {
+    // #given the run was taken back
+    // #then the runner owns what the agent wrote, and nothing of ours is left in the directory
+    expect(result?.released).toMatchObject({stop: 'stopped', restore: 'restored'})
+    expect(fs.lstatSync(written).uid).toBe(process.getuid?.())
+    expect(fs.lstatSync(stateHome).uid).toBe(process.getuid?.())
+    expect(fs.existsSync(path.join(stateHome, 'opencode'))).toBe(false)
+  })
+
+  it('runs git in a repository the runner cloned under the checkout', () => {
+    // #given the probe ran `git -C <checkout>/connect/checkouts/nested status` as the sandbox uid
+    // #then it was trusted
+    expect(failuresFor(result?.rows ?? new Map(), 'nested_git_status', 'WORKS')).toEqual([])
   })
 })
 

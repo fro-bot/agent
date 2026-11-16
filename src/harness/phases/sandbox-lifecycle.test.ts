@@ -45,11 +45,14 @@ const TOOLS = Object.fromEntries(
 ) as unknown as SandboxToolPaths
 
 const ACCOUNT = {name: 'fro-bot-sandbox', uid: 998, gid: 997, home: '/home/fro-bot-sandbox'}
-// What every launch adds: the checkout trusted for git through the environment, and the agent's own runtime directory.
+// What every launch adds: the checkout and every repository under it trusted for git through the environment, and the
+// agent's own runtime directory.
 const TRUSTED_CHECKOUT_ENV = {
-  GIT_CONFIG_COUNT: '1',
+  GIT_CONFIG_COUNT: '2',
   GIT_CONFIG_KEY_0: 'safe.directory',
   GIT_CONFIG_VALUE_0: '/home/runner/work/r/r',
+  GIT_CONFIG_KEY_1: 'safe.directory',
+  GIT_CONFIG_VALUE_1: '/home/runner/work/r/r/*',
   XDG_RUNTIME_DIR: '/home/fro-bot-sandbox/.run',
 }
 
@@ -322,14 +325,16 @@ describe('createSandboxLifecycle', () => {
     // #when
     await lifecycle.prepare({keyFilePaths: [], ghConfigDir: null, repoSkills: null})
 
-    // #then every write goes through setpriv as the sandbox uid with the exact drop, and covers the three keys
+    // #then every write goes through setpriv as the sandbox uid with the exact drop, and covers the checkout, the
+    // repositories under it and the identity
     const gitWrites = harness.sudoCalls.filter(call => call.includes('--file'))
-    expect(gitWrites).toHaveLength(3)
+    expect(gitWrites).toHaveLength(4)
     for (const call of gitWrites) {
       expect(call.slice(0, 5)).toEqual(['/usr/bin/sudo', '-n', '--', '/usr/bin/setpriv', '--reuid=998'])
       expect(call).toContain('/home/fro-bot-sandbox/.gitconfig')
     }
-    expect(gitWrites.map(call => call.at(-2))).toEqual(['safe.directory', 'user.name', 'user.email'])
+    expect(gitWrites.map(call => call.at(-2))).toEqual(['safe.directory', 'safe.directory', 'user.name', 'user.email'])
+    expect(gitWrites.slice(0, 2).map(call => call.at(-1))).toEqual(['/home/runner/work/r/r', '/home/runner/work/r/r/*'])
     expect(
       harness.sudoCalls.some(call => call.includes('/usr/bin/mkdir') && call.includes('/home/fro-bot-sandbox/tmp')),
     ).toBe(true)
@@ -413,6 +418,188 @@ describe('createSandboxLifecycle', () => {
       expect(prepared.success).toBe(true)
       expect(helperWritesOf(harness)).toEqual([])
       expect(logger.warning).toHaveBeenCalled()
+    })
+  })
+
+  describe('agent-state-home', () => {
+    const WORKSPACE = '/home/runner/work/r/r'
+    const STATE_HOME = `${WORKSPACE}/connect/state`
+    const input = {keyFilePaths: [], ghConfigDir: null, repoSkills: null}
+    const asSandbox = (harness: Harness): string[][] => harness.sudoCalls.filter(call => call.includes('--reuid=998'))
+
+    async function withStateHome(
+      overrides: Partial<Parameters<typeof createSandboxLifecycle>[0]> = {},
+      stateHome: string | null = STATE_HOME,
+    ) {
+      const harness = createHarness()
+      const lifecycle = create(harness, {agentStateHome: stateHome, signals: fakeHost(), ...overrides})
+      const prepared = await lifecycle.prepare(input)
+      return {harness, lifecycle, prepared}
+    }
+
+    it('points the agent XDG_STATE_HOME at the directory, leaving the other roots in its home', async () => {
+      // #given a state home inside the checkout
+      const {prepared} = await withStateHome()
+
+      // #then only the state root moves
+      expect(prepared.success && prepared.data.xdg).toEqual({
+        data: '/home/fro-bot-sandbox/.local/share',
+        config: '/home/fro-bot-sandbox/.config',
+        cache: '/home/fro-bot-sandbox/.cache',
+        state: STATE_HOME,
+      })
+    })
+
+    it('hands the directory over like the other handed-over directories, so the sandbox owns it for the run', async () => {
+      // #given a state home inside the checkout
+      const {harness} = await withStateHome()
+
+      // #then it is in the manifest the handoff and the take-back both use
+      const manifest = harness.mocks.handOff.mock.calls[0]?.[0] as unknown as {handedOver: string[]; workspace: string}
+      expect(manifest.handedOver).toContain(STATE_HOME)
+      expect(manifest.workspace).toBe(WORKSPACE)
+    })
+
+    it('takes it back with the rest, from the same manifest', async () => {
+      // #given a prepared lifecycle with a state home
+      const {harness, lifecycle} = await withStateHome()
+
+      // #when released
+      await lifecycle.release()
+
+      // #then the take-back receives the manifest that names it
+      const handedManifest = harness.mocks.handOff.mock.calls[0]?.[0]
+      expect(harness.mocks.takeBack.mock.calls[0]?.[0]).toBe(handedManifest)
+      expect(harness.mocks.takeBack.mock.calls[0]?.[0].handedOver).toContain(STATE_HOME)
+    })
+
+    it('keeps the opencode state link, inside the new state home, so the agent still reaches the runner session storage', async () => {
+      // #given a state home and the runner's own opencode state directory elsewhere
+      const {harness} = await withStateHome()
+
+      // #then the link is made as the sandbox in the state home, and no link is made in its old state root
+      const links = asSandbox(harness)
+        .filter(call => call.includes('/usr/bin/ln'))
+        .map(call => call.slice(call.indexOf('/usr/bin/ln')))
+      expect(links).toContainEqual([
+        '/usr/bin/ln',
+        '-sfT',
+        '/home/runner/.local/state/opencode',
+        `${STATE_HOME}/opencode`,
+      ])
+      expect(links.some(link => link.at(-1) === '/home/fro-bot-sandbox/.local/state/opencode')).toBe(false)
+      // #and the other three roots keep their links
+      expect(links).toHaveLength(4)
+    })
+
+    it('makes no link when the runner opencode state directory already is the state home entry', async () => {
+      // #given the runner's XDG_STATE_HOME is the state home itself, so `<state home>/opencode` is the real directory
+      const {harness, prepared} = await withStateHome({
+        env: {HOME: '/home/runner', RUNNER_TEMP: temp, XDG_STATE_HOME: STATE_HOME},
+      })
+
+      // #then the real directory is handed over, and no link (a loop onto itself) is made
+      expect(prepared.success).toBe(true)
+      const manifest = harness.mocks.handOff.mock.calls[0]?.[0] as unknown as {handedOver: string[]}
+      expect(manifest.handedOver).toEqual(expect.arrayContaining([STATE_HOME, `${STATE_HOME}/opencode`]))
+      const links = asSandbox(harness).filter(call => call.includes('/usr/bin/ln'))
+      expect(links.some(call => call.at(-1) === `${STATE_HOME}/opencode`)).toBe(false)
+      expect(links).toHaveLength(3)
+    })
+
+    it('removes the link it made from the state home once the files are back, and only then', async () => {
+      // #given a state home and a link remover that records the order
+      const harness = createHarness()
+      const order: string[] = []
+      harness.mocks.takeBack.mockImplementation(async () => {
+        order.push('takeBack')
+        return {status: 'restored' as const}
+      })
+      const removeLink = vi.fn(async (target: string) => {
+        order.push(`remove ${target}`)
+      })
+      const lifecycle = create(harness, {
+        agentStateHome: STATE_HOME,
+        signals: fakeHost(),
+        deps: {...harness.deps, removeLink},
+      })
+      await lifecycle.prepare(input)
+
+      // #when released
+      await lifecycle.release()
+
+      // #then the workspace is left without our link
+      expect(order).toEqual(['takeBack', `remove ${STATE_HOME}/opencode`])
+    })
+
+    it('leaves the link alone when the take-back was unsafe', async () => {
+      // #given an unsafe take-back
+      const harness = createHarness()
+      harness.mocks.takeBack.mockResolvedValue({status: 'unsafe', reason: 'ancestor /x is a symlink'})
+      const removeLink = vi.fn(async () => {})
+      const lifecycle = create(harness, {
+        agentStateHome: STATE_HOME,
+        signals: fakeHost(),
+        deps: {...harness.deps, removeLink},
+      })
+      await lifecycle.prepare(input)
+
+      // #when released
+      await lifecycle.release()
+
+      // #then nothing in the untrusted tree is touched
+      expect(removeLink).not.toHaveBeenCalled()
+    })
+
+    it('removes no link when there is no state home', async () => {
+      // #given a run without one
+      const harness = createHarness()
+      const removeLink = vi.fn(async () => {})
+      const lifecycle = create(harness, {signals: fakeHost(), deps: {...harness.deps, removeLink}})
+      await lifecycle.prepare(input)
+
+      // #when released
+      await lifecycle.release()
+
+      // #then
+      expect(removeLink).not.toHaveBeenCalled()
+    })
+
+    it('keeps the directory out of the view policy, because the checkout mount already covers it', async () => {
+      // #given a state home inside the checkout
+      const {prepared} = await withStateHome({
+        viewLauncher: {nodePath: '/opt/runner/node', builderPath: '/work/_actions/o/r/v1/dist/sandbox-view.js'},
+      })
+
+      // #then the checkout is the one writable root that holds it
+      const writable = prepared.success ? (prepared.data.view?.policy.writable ?? []) : []
+      expect(writable).toContain(WORKSPACE)
+      expect(writable).not.toContain(STATE_HOME)
+    })
+
+    it.each([
+      ['outside the checkout', '/home/runner/work/other/state'],
+      ['a sibling sharing the checkout prefix', `${WORKSPACE}-evil/state`],
+      ['the checkout itself', WORKSPACE],
+      ['relative', 'connect/state'],
+    ])('refuses a state home that is %s before it creates the account', async (_label, stateHome) => {
+      // #given a value the resolver would never have returned
+      const {harness, prepared} = await withStateHome({}, stateHome)
+
+      // #then nothing was created or handed over
+      expect(!prepared.success && prepared.error).toContain('agent-state-home')
+      expect(harness.mocks.createAccount).not.toHaveBeenCalled()
+      expect(harness.mocks.handOff).not.toHaveBeenCalled()
+    })
+
+    it('changes nothing without a state home: the old state root and the single opencode link stay', async () => {
+      // #given a run without one
+      const {prepared, harness} = await withStateHome({}, null)
+
+      // #then the state root is in the agent's home, as before
+      expect(prepared.success && prepared.data.xdg.state).toBe('/home/fro-bot-sandbox/.local/state')
+      const manifest = harness.mocks.handOff.mock.calls[0]?.[0] as unknown as {handedOver: string[]}
+      expect(manifest.handedOver).not.toContain(STATE_HOME)
     })
   })
 
@@ -1155,6 +1342,7 @@ describe('createSandboxLifecycle', () => {
       expect(prepared.success && prepared.data.extraEnv).toEqual({
         ...TRUSTED_CHECKOUT_ENV,
         GIT_CONFIG_VALUE_0: '/tmp/checkout',
+        GIT_CONFIG_VALUE_1: '/tmp/checkout/*',
         PLAYWRIGHT_BROWSERS_PATH: '/opt/browsers',
         MISE_DATA_DIR: '/tmp/checkout/.mise',
       })
