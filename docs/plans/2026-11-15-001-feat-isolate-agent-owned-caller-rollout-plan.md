@@ -44,7 +44,7 @@ v0.144.1 removes the blockers recorded in the origin's dependencies:
 
 ### Deferred to Separate Tasks
 
-- **Blocked callers (5).** Each uses a tool installed under the runner home that the agent can't reach:
+- **Blocked callers (5), since done (see As Built).** Each uses a tool installed under the runner home that the agent can't reach:
   - Playwright browsers in `~/.cache/ms-playwright`: marcusrbrown/gpt, and marcusrbrown/marcusrbrown.github.io `fro-bot-scheduled` and `live-audit-discovery`;
   - uv-managed Python: marcusrbrown/poly;
   - mise: marcusrbrown/containers.
@@ -139,7 +139,7 @@ flowchart TD
 
 ## Implementation Units
 
-- [ ] **Unit 1: Re-confirm the caller list**
+- [x] **Unit 1: Re-confirm the caller list**
 
 **Goal:** Wave 1 starts from a complete, current list.
 
@@ -159,7 +159,7 @@ flowchart TD
 **Verification:**
 - Every owned job has one verdict: ready, ready after edits, push group (P-A, P-B or P-C), gated, or blocked.
 
-- [ ] **Unit 2: Wave 1, callers that don't push from the model**
+- [x] **Unit 2: Wave 1, callers that don't push from the model**
 
 **Goal:** Turn isolation on for the 20 jobs that don't push from the model: 2 ready, 17 needing edits, and the formerly gated survey-repo. With the 11 push-group jobs in Units 3–7 and the 5 deferred, that accounts for all 36.
 
@@ -208,7 +208,7 @@ The fro-bot/.github jobs (`fro-bot` and `observe` in `fro-bot.yaml`, plus `draft
 **Verification:**
 - Each merged repo's next run of each trigger type completes isolated.
 
-- [ ] **Unit 3: Push proof P-A (persisted checkout token): fro-bot/.github remediate**
+- [x] **Unit 3: Push proof P-A (persisted checkout token): fro-bot/.github remediate**
 
 **Goal:** Show that a job which relied on the persisted checkout token pushes through the `gh` helper alone (AE2).
 
@@ -228,7 +228,7 @@ The fro-bot/.github jobs (`fro-bot` and `observe` in `fro-bot.yaml`, plus `draft
 **Verification:**
 - The remediate PR exists and the run is green. Only then does the opt-in PR merge.
 
-- [ ] **Unit 4: Push proof P-B (extraheader step): metacogs**
+- [x] **Unit 4: Push proof P-B (extraheader step): metacogs**
 
 **Goal:** Show that removing the extraheader step leaves a working push.
 
@@ -249,7 +249,7 @@ The fro-bot/.github jobs (`fro-bot` and `observe` in `fro-bot.yaml`, plus `draft
 **Verification:**
 - The PR exists and the run is green before metacogs' opt-in merges.
 
-- [ ] **Unit 5: Push proof P-C (no credential step): vbs**
+- [x] **Unit 5: Push proof P-C (no credential step): vbs**
 
 **Goal:** Show that a job with persist false and no credential step pushes through the `gh` helper. This also resolves the open question about vbs's history. marcusrbrown/yield-farmer is in this group: its scheduled prompt pushes fixes to existing PR branches.
 
@@ -269,7 +269,7 @@ The fro-bot/.github jobs (`fro-bot` and `observe` in `fro-bot.yaml`, plus `draft
 **Verification:**
 - The PR exists. If the push fails, stop P-C and report back before any of its group opts in.
 
-- [ ] **Unit 6: Push-group waves**
+- [x] **Unit 6: Push-group waves**
 
 **Goal:** Opt in the remaining `branch-pr` workflows after their pattern's proof.
 
@@ -295,7 +295,7 @@ The fro-bot/.github jobs (`fro-bot` and `observe` in `fro-bot.yaml`, plus `draft
 **Verification:**
 - Each workflow's next scheduled `branch-pr` run completes isolated.
 
-- [ ] **Unit 7: Systematic composite**
+- [x] **Unit 7: Systematic composite**
 
 **Goal:** Let marcusrbrown/systematic opt in through its wrapper action.
 
@@ -317,6 +317,37 @@ The fro-bot/.github jobs (`fro-bot` and `observe` in `fro-bot.yaml`, plus `draft
 
 **Verification:**
 - The dispatch PR exists and the run is green.
+
+## As Built
+
+All 24 planned opt-in PRs merged on 2026-11-15, and the 5 deferred jobs followed on 2026-11-16. The plan's "no fro-bot/agent code changes" didn't hold. The rollout needed four Action fixes:
+
+- **v0.144.2 (#2222).** The agent's PATH drops entries the account can't enter. Before this, a missing command under `~/.cargo/bin` reported EACCES, not ENOENT. The launch env also trusts the checkout through `GIT_CONFIG_*` `safe.directory`, because tests that set `GIT_CONFIG_NOSYSTEM=1` lose `/etc/gitconfig`'s `safe.directory=*`.
+- **v0.144.3 (#2225).** The preflight finds the published install from the running bundle (`process.argv[1]`), not `GITHUB_ACTION_PATH`, which names the composite's own directory when a composite wraps the Action. This unblocked Systematic.
+- **v0.144.4 (#2232).** The agent gets its own `XDG_RUNTIME_DIR` (`~/.run`), which fixed agent-browser's socket. `PLAYWRIGHT_BROWSERS_PATH`, `UV_PYTHON_INSTALL_DIR` and `MISE_DATA_DIR` pass through as resolved paths when the agent can enter them and the view still shows them. This unblocked the 5 deferred jobs.
+- **Five `OPENCODE_AUTH_JSON` secrets.** Five secrets (renovate-config, marcusrbrown, opencode-copilot-delegate, sparkle, bfra-me/.github), and later poly's, carried an unused `opencode` provider that the key proxy can't route. Removing it from each secret fixed the config-stage refusal.
+
+Push proofs:
+- The first dispatches pushed nothing, so seeded proofs re-ran on v0.144.2. They made an empty commit and ran a plain `git push` with no credential setup.
+- **P-C passed:** vbs, run 43698088014, draft PR vbs#827.
+- **P-A passed:** fro-bot/.github remediate, run 43698123070, draft PR fro-bot/.github#4252.
+- **P-B (metacogs) didn't push.** A non-empty prompt clears `output-mode`, so the model treated the run as comment-only. Its gitconfig did carry the `gh` helper, and with the extraheader step gone metacogs is in the same state as vbs. P-C stands for it.
+
+Deferred jobs:
+- **Playwright** (gpt, both github.io jobs): browsers install into `$RUNNER_TOOL_CACHE/ms-playwright`.
+- **poly:** installs uv's Pythons into `$RUNNER_TOOL_CACHE/uv-python`.
+- **containers:** installs mise into `$RUNNER_TOOL_CACHE/mise`.
+- **agent-browser** works under isolation. The live-audit prompt itself still points HOME at a path too long for a socket, with or without isolation (marcusrbrown.github.io#514).
+
+Other repo fixes:
+- dashboard#841, fro-bot/.github#4253, containers#865 and Systematic#1420 each needed a workflow test updated.
+- fro-bot/.github's knowledge-MCP call log moved out of `RUNNER_TEMP`.
+- yield-farmer needed `output-mode: branch-pr` restored for the v0.43 to v0.144 jump.
+- github.io, marcusrbrown.com and tokentoilet first needed their pre-existing red checks fixed (github.io#507, .com#611, tokentoilet#1687).
+
+Still open:
+- The first real post-merge push runs: infra `fro-bot-storage`, bfra-me/works autoheal, yield-farmer's schedule, github.io `fro-bot-scheduled`, and fro-bot/.github's comment path.
+- marcusrbrown/systematic `connect.yaml` stays unisolated. It would pass the preflight, but the Action overrides the workflow's `XDG_STATE_HOME`, so the run record lands in the agent's home, and its nested clones aren't trusted for git. It needs its own design.
 
 ## System-Wide Impact
 
