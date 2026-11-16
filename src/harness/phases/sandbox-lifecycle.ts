@@ -1033,7 +1033,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
         ...(input.ghConfigDir === null ? {} : {GH_CONFIG_DIR: input.ghConfigDir}),
         // The checkout is the runner's, so git needs it trusted. Set in the environment as well as `~/.gitconfig`, because
         // tests commonly turn off the global and system config files and keep the environment.
-        // `<checkout>/*` trusts every repository under it (git 2.46 or later; older git ignores the entry), for the clones a
+        // `<checkout>/*` trusts every repository under it (git 2.45.3 or later; older git ignores the entry), for the clones a
         // runner step made there: they are the runner's, and only the checkout itself was trusted before.
         GIT_CONFIG_COUNT: '2',
         GIT_CONFIG_KEY_0: 'safe.directory',
@@ -1207,7 +1207,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   }
 
   /**
-   * `safe.directory` for the checkout (owned by the runner) and every repository under it (git 2.46 or later; older git
+   * `safe.directory` for the checkout (owned by the runner) and every repository under it (git 2.45.3 or later; older git
    * ignores the second entry), and the identity setup configured for the runner. In provision
    * mode (the sandbox holds a `gh` config), also a credential helper so the model's `git push` authenticates.
    */

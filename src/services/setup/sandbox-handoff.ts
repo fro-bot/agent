@@ -209,8 +209,23 @@ function broadReadGrantProblem(manifest: HandoffManifest): string | null {
   return null
 }
 
+/**
+ * The handed-over directories that lie inside no other handed-over directory. A nested one (the runner's `<state>/opencode`
+ * inside an `agent-state-home` that is the same `<state>`) is covered by its outer root's walk: `find -P <outer> -xdev -user
+ * <uid>` chowns it and everything under it, the runner ACL (`find -type d`) and its removal (`setfacl -R`) recurse, and
+ * take-back's chown and leftover check do too. Left as a root of its own, it would make its parent an *ancestor* in
+ * `verifyRoots`, which at take-back is already the sandbox's and is refused as foreign. The outer root keeps every
+ * ancestor check; a nested root has none of its own because nothing lies between it and the outer root but the outer
+ * root's own content.
+ */
+function outermostHandedOver(manifest: HandoffManifest): string[] {
+  return [...new Set(manifest.handedOver)].filter(
+    dir => !manifest.handedOver.some(other => other !== dir && isWithin(other, dir)),
+  )
+}
+
 function everyRoot(manifest: HandoffManifest): string[] {
-  return [manifest.workspace, ...manifest.handedOver, ...manifest.readable]
+  return [manifest.workspace, ...outermostHandedOver(manifest), ...manifest.readable]
 }
 
 /**
@@ -416,8 +431,9 @@ export async function handOff(
     )
 
     // 4. Handed-over directories: created as the runner, then chowned. The runner keeps an ACL entry so it can still
-    // write into them during the run (the prompt artifact goes to the log dir).
-    for (const dir of manifest.handedOver) {
+    // write into them during the run (the prompt artifact goes to the log dir). Outermost roots only: a nested one is
+    // covered by its outer root's recursive walk (see `outermostHandedOver`).
+    for (const dir of outermostHandedOver(manifest)) {
       journal.chowned.push(dir)
       await must(
         run,
