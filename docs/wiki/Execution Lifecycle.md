@@ -1,8 +1,12 @@
 ---
 type: architecture
-last-updated: "2026-11-08"
-updated-by: "f7c20f94"
+last-updated: "2026-11-15"
+updated-by: "962b70bc"
 sources:
+  - src/harness/phases/sandbox-lifecycle.ts
+  - src/harness/phases/repo-skills.ts
+  - src/harness/phases/log-snapshot.ts
+  - src/features/delegated/trusted-git.ts
   - src/features/agent/execution-deadline.ts
   - src/features/reviews/reviewed-head.ts
   - src/harness/phases/brokered-push-plan.ts
@@ -111,6 +115,8 @@ Parses action inputs (`parseActionInputs`), validates credentials, and ensures t
 
 Bootstrap also resolves the run's **response-delivery decision** — a two-axis object (`resolveResponseDelivery()` in `packages/runtime/src/agent/response-delivery.ts`) that decides both _how_ the agent's answer reaches GitHub and _whether the agent is given a GitHub credential at all_. Comment and review triggers (`issue_comment`, `pull_request`, `issues`) resolve to `file-convention` delivery with the credential **withheld**; `schedule` and `workflow_dispatch` resolve to `model-gh` delivery with the credential **provisioned**, because those flows legitimately create branches, commits, and PRs on their own. The decision is computed once here from the raw event name, threaded through setup so the credential is (or is not) provisioned, and re-asserted against the routing classification so a mismatch fails loudly rather than silently mis-provisioning. See [[Setup and Configuration]] for how the credential is withheld and [[Prompt Architecture]] for how the delivery mode reshapes the response protocol the agent is told to follow.
 
+With `isolate-agent`, bootstrap first checks the hosted Linux runner, published-install provenance, required privileged tools, and absence of persisted checkout credentials. Unsupported installs fail before setup rather than silently running without isolation. After routing, optional repository skills are staged from a freshly fetched default branch; this is separate from credential provisioning and never trusts skills from the checked-out PR or dispatch branch.
+
 ## 2. Routing
 
 This is where the incoming GitHub webhook event gets classified and the run decides what to do.
@@ -150,7 +156,7 @@ Posts visual feedback so the user knows the agent received their request. For co
 
 Restores the OpenCode storage directory from S3 backup first when configured, then falls back to GitHub Actions cache. The cache key is scoped by repository, branch, and OS to prevent cross-branch contamination. After restore, the module checks for corruption (unreadable directory, version mismatch) and falls back to clean state if needed. Credentials (`auth.json`) that may have leaked into cache from a prior run are deleted as a security measure.
 
-This phase also starts the OpenCode V2 server (`src/harness/phases/v2-server.ts`): prepare owner-only provider-key files, remove stale `auth.json`, ensure both required plugins are installed, assemble the ordered permission rules, clear held execution claims from restored state, then spawn and verify plugins, effective permissions, and provider authentication. Finally it waits for the V1 history-import endpoint to report completed. A failed gate shuts the server down and disables the main-step cache save.
+This phase also starts the OpenCode V2 server (`src/harness/phases/v2-server.ts`): prepare owner-only provider-key files on ordinary runs, or the runner-owned key proxy on isolated runs; remove stale `auth.json`; ensure both required plugins are installed; assemble the ordered permission rules; clear held execution claims from restored state; then spawn and verify plugins, effective permissions, and provider authentication. Finally it waits for the V1 history-import endpoint to report completed. A failed gate shuts the server down and disables the main-step cache save.
 
 ## 7. Session Prep
 
@@ -177,6 +183,12 @@ The V2 consumer rejects permission requests and cancels forms in CI. Native even
 The observer remains open until the directory decision. Later root turns are merged into success/failure, artifacts, and usage before Finalize. Pruning runs after that observation ends, while the server is still available. Shutdown then confirms the child process exited. Thus V2 has already shut down before review reconciliation and response delivery, and Cleanup handles persistence rather than repeating that lifecycle.
 
 An exceptional exit before this phase still runs a stop-and-release attempt from `run.ts`'s outer `finally`. An unconfirmed stop or server exit declines saving; an expired successful-run drain remains incomplete even if cancellation subsequently confirms quiet, because work was cut short. A failed overflow stop also prevents starting a replacement session in the same checkout.
+
+### Isolated process take-back
+
+Directory quietness and server exit are not enough for an isolated run. Before runner-side response reads, brokered pushes, or persistence, `sandbox-lifecycle.ts` confirms the recorded launch namespace is empty, stops all processes of the sandbox account, takes back the granted files, and restores the checkout's pre-agent git configuration and execution-sensitive metadata. The provider-key proxy stops last. An unconfirmed stop or unsafe restoration blocks publication and saving; a proxy that crashed before teardown also fails the run. The same lifecycle runs on exceptional exits.
+
+After confirmed take-back, `log-snapshot.ts` copies the log directory to a runner-owned invocation-specific snapshot. Cleanup and the post hook publish that copy, never a shared directory a later isolated step can write. [[Session Persistence]] describes the copy bounds and refusal behavior.
 
 ## 10. Review Reconciliation
 
@@ -206,11 +218,13 @@ Finalize also hosts an optional **brokered push** step for the file-convention p
 
 The step is a fail-closed state machine where every stage re-derives trust from event-time facts rather than the model's output. An **early gate** (`brokered-push-gate.ts`) admits only `issue_comment` events on a same-repo pull request from an `OWNER`, `MEMBER`, or `COLLABORATOR`, and only when a **trusted head SHA** was captured before execution (see [[Setup and Configuration]] for the `trusted-head-sha` input that anchors this). A **live permission re-check** then confirms the triggering actor still has `write` or `admin` on the repository, failing closed on any lookup error so a transient outage suppresses the push rather than allowing it. **Reconstruction** (`reconstruct-changes.ts`) diffs the workspace against that trusted SHA — never local `HEAD`, branches, or remotes — enumerates untracked files, and reads each changed file through an `O_NOFOLLOW` handle to close a symlink swap race. A **path allowlist** (`brokered-push-validation.ts`) restricts delivery to `src/`, package `src/`, `docs/`, and a short set of top-level docs (`README.md`, `ARCHITECTURE.md`, `STRUCTURE.md`), capped at 100 files, so config, scripts, and CI files can never be pushed. A final **pre-write gate** re-resolves the live PR immediately before the Git Data API write, rejecting the push if the PR closed, the base or head repository changed, the head branch was renamed, or the head SHA moved.
 
-The whole step runs under a 120-second wall-clock ceiling enforced by a `Promise.race`. The `AbortSignal` cancels the Octokit calls promptly, but the reconstruction `git` subprocess cannot observe an abort signal, so the race is the hard bound for a stalled subprocess; the abandoned promise never leaks because the process exits once `run()` resolves. Delivery is deliberately **non-atomic**: the commit lands before the response comment is posted, and a timeout firing after `updateRef` already succeeded reports failure for a commit that may exist. This self-heals — a re-run reconstructs the now-updated branch to _nothing-to-deliver_ rather than double-pushing. On success, Finalize appends a "Brokered push delivered" footer (branch, changed paths, commit SHA) to the delivered comment; on failure it fails the run with a generic error and posts no push.
+The whole step runs under a 120-second wall-clock ceiling enforced by a `Promise.race`. Octokit calls receive an abort signal, while each reconstruction git call has a separate 60-second bound that kills its process group. `trusted-git.ts` replaces the environment and disables hooks, fsmonitor, external diffs, and text conversion in the relevant callers. Isolated reconstruction also refuses populated index gitlinks and avoids entering submodules, whose own configuration was not restored by take-back.
+
+Delivery is deliberately **non-atomic**: the commit lands before the response comment is posted, and a timeout firing after `updateRef` already succeeded reports failure for a commit that may exist. This self-heals — a re-run reconstructs the now-updated branch to _nothing-to-deliver_ rather than double-pushing. On success, Finalize appends a "Brokered push delivered" footer (branch, changed paths, commit SHA) to the delivered comment; on failure it fails the run with a generic error and posts no push.
 
 ## 12. Cleanup (Always)
 
-Runs in a `finally` block regardless of success or failure. Completes the acknowledgment state machine (replaces 👀 with 🎉 on success or 😕 on failure, removes the `agent: working` label). Cleans up file attachments. Prunes old sessions. Shuts down the OpenCode server. Shutdown does not itself checkpoint SQLite — it sends the child's kill signal and then waits, bounded and best-effort, for the child to stop answering, so the checkpoint that follows is not racing a writer that is still alive but idle. Merging the write-ahead log into the main database file is `checkpointDatabase`'s job, called inside `saveCache`. If the S3 object store is enabled, uploads run artifacts and metadata to the store (see [[Session Persistence]]), and `saveCache` writes session state to S3 before the Actions cache. Saves the cache, then optionally uploads a prompt log artifact for observability.
+Runs in a `finally` block regardless of success or failure. Cleans up acknowledgment state and file attachments, then persists eligible state and uploads diagnostics. Session pruning and server shutdown normally happened during release; an exceptional path attempts release before cleanup. Shutdown confirms process exit rather than merely observing an idle HTTP endpoint. Merging the SQLite write-ahead log is `checkpointDatabase`'s job inside `saveCache`. If S3 is enabled, cleanup uploads eligible run artifacts and metadata, and `saveCache` writes session state to S3 before the Actions cache. An isolated invocation reads logs only from its confirmed take-back snapshot; runner-generated metadata is independent of that log-read gate.
 
 The save is not unconditional. Cleanup first applies a **persistence safety gate** that can decline it outright, checking three independently sufficient reasons in a fixed order and reporting only the first match: unresolved background-subagent ownership, an OpenCode server shutdown that never confirmed the writer had quiesced, or a coordination lease whose continuity could not be verified. Declining yields the `ownership-declined` outcome rather than a failed save — the difference matters downstream, because a declined save must not be retried by a process holding less evidence than the one that declined it. See [[Background Subagents and Ownership]] for the gate and [[Session Persistence]] for the outcome contract.
 
@@ -316,14 +330,17 @@ main.ts
         │     acquire per-repo Action lock (`action.json`) when S3 is enabled; fail closed on lock error
         │
         ├─→ acknowledge phase
-        │     acknowledgeReceipt (reaction + comment stub)
+        │     acknowledgeReceipt (reaction + working label)
+        │
+        ├─→ optional repository-skills staging
+        │     trusted event → fresh default-branch fetch → bounded skill admission
         │
         ├─→ cache-restore phase
         │     restore from S3 first → fall back to Actions cache when needed
         │     → repair the restored SQLite database before the server opens it:
         │       checkpoint its WAL, or clean-slate it if SQLite reports it structurally corrupt
-        │     → bootstrapOpenCodeServer probes instance-scoped readiness (session.list) before
-        │       reporting the server bootstrapped, not just listening
+        │     → startActionOpenCodeV2: plugin activation, effective-rule and credential gates
+        │     → bounded V1 history-import wait before any prompt
         │
         ├─→ session-prep phase
         │     processAttachments → buildAgentPrompt (packages/runtime)
@@ -334,25 +351,20 @@ main.ts
         │     (onPermissionAsked auto-denies any permission.asked event immediately —
         │      there is no interactive approval path in CI, so an unanswered ask must
         │      never be left to block the run until the execution deadline)
-     (the `question` tool is never offered: bootstrapOpenCodeServer pins
-      OPENCODE_CLIENT=fro-bot-action and clears OPENCODE_ENABLE_QUESTION_TOOL, so
-      upstream does not register it — nobody can answer in CI and a pending
-      question has no server-side timeout; see "OpenCode Question Tool Disabled")
-        │     (processEventStream observes owned descendants via a per-invocation
-        │      OwnershipLedger: a completed `task` tool call carrying
-        │      metadata.background === true adopts the child session id, after which
-        │      its deltas/tools/permission-asks route like the root's, its token
-        │      totals sum into the run's reported usage, and its session.error marks
-        │      the entry unknown rather than ending the run's own turn)
+        │     question is denied by the effective V2 permission rules;
+        │       any form that still arrives is cancelled
+        │     native dispatch events account for child sessions and shell jobs;
+        │       owned child failures do not automatically fail the root
         │
         ├─→ drain phase
-        │     runDrain: owned background work settles before anything below
-        │       publishes, persists, or releases — reconciles once immediately, then
-        │       polls until the ledger drains or the run's deadline
-        │       (computeDrainDeadlineMs: total timeout minus a 30s teardown reserve
-        │       minus time execution already spent) expires, at which point every
-        │       unsettled entry is session.abort-ed (no-op when execution never ran,
-        │       e.g. SKIP_AGENT_EXECUTION=true)
+        │     runReleaseV2: observe late turns and wait for directory stability
+        │       → on failure or expiry, stop shells and sessions and confirm quiet
+        │       → prune while the server is available, then confirm process exit
+        │
+        ├─→ isolated take-back (when enabled)
+        │     confirm namespace and uid stopped → restore files and git metadata
+        │       → stop key proxy → snapshot this invocation's logs
+        │     unsafe restoration blocks publication and persistence
         │
         ├─→ review-reconciliation phase
         │     reconcile formal review state after agent execution
@@ -364,7 +376,7 @@ main.ts
         │       comment-only from trusted routing context)
         │
         └─→ cleanup phase
-              prune sessions → shutdown server → sync artifacts and metadata
+              attachment/acknowledgment cleanup → sync eligible logs and metadata
               → saveCache — declined outright (`ownership-declined`) if the ownership
                 ledger, server shutdown quiescence, or the coordination lease cannot
                 confirm no writer remains live; otherwise checkpoints the WAL before

@@ -1,8 +1,9 @@
 ---
 type: subsystem
-last-updated: "2026-11-08"
-updated-by: "f7c20f94"
+last-updated: "2026-11-15"
+updated-by: "962b70bc"
 sources:
+  - packages/gateway/src/execute/format-part.ts
   - packages/gateway/src/execute/permission-detail-v2.ts
   - packages/gateway/src/execute/run-core-v2.ts
   - packages/gateway/src/execute/drain-completion-v2.ts
@@ -245,7 +246,7 @@ Operators observe and settle approvals two ways. The SSE stream carries **approv
 
 **Discord-started runs are decidable from the dashboard.** A Discord run registers its approvals under its thread id (what the Discord button verifies), but a dashboard operator only holds the run id, so every registry entry also carries the `runId` of the run that raised it, for both surfaces. The listing route reads `describePendingForRun(runId)`, and the decision route passes `runId` to `handleDecision`: a web operator's decision is accepted only when the request's stored `runId` equals the URL's `runId`, and a mismatch answers exactly like an unknown request (`unavailable`), so a valid run in one repo cannot settle or probe another run's request. Nothing else loosens: the operator allowlist, the repo-access predicate, the single-winner claim, and the reject-only refusal still apply, and a Discord click is still verified against the thread. A Discord run's approvals fan out the same open and settle frames to the run's SSE subscribers (`createWebApprovalOnRegistered`, the announce half of the web transport, attached by the Discord transport right after it registers), and the settle frame no longer depends on the Discord card having posted. A dashboard decision settles the Discord card as `Approved by <login> (dashboard)`, and a Discord click racing a dashboard decision settles once through the claim gate. `always` stays run-local either way.
 
-**Always is scoped to this run.** The gateway translates an operator's `always` decision to `once` upstream on both generations. OpenCode would otherwise store that grant beyond the run: V1 in directory memory, V2 in project-scoped database rows. Instead, `approvals/run-grants.ts` retains the ask's save patterns in a per-run set once the reply or its authoritative echo confirms approval. Later asks from the root or an owned descendant are auto-answered once only when the action and every resource match; partial matches still ask, and a configured deny still wins before the gateway sees a request.
+**Always is scoped to this run.** The V2 gateway translates an operator's `always` decision to `once` upstream. OpenCode would otherwise store that grant beyond the run in project-scoped database rows. Instead, `approvals/run-grants.ts` retains the ask's save patterns in a per-run set once the reply or its authoritative echo confirms approval. Later asks from the root or an owned descendant are auto-answered once only when the action and every resource match; partial matches still ask, and a configured deny still wins before the gateway sees a request.
 
 A newly confirmed grant can also settle already-open matching asks through the registry's single-winner claim gate, closing their cards normally. An ambiguous auto-reply waits up to five seconds for its echo before returning the ask to an operator. Teardown drops all grants before stopping the run, including failure, cancel, timeout, and quarantine; another run on the same workspace inherits none of them. This scope is the same on Discord and web.
 
@@ -266,6 +267,8 @@ The web question transport (`web/operator/web-question.ts`) follows the same **r
 **Untrusted text.** Every question header, text, option label and description, and every answer is untrusted plain text. The gateway carries these strings verbatim apart from length bounding and control-character stripping, never pre-renders them as HTML or Markdown, and never logs them or puts them in audit events or push payloads. Clients must display them as inert text.
 
 **Discord.** For a Discord-launched run, the same request also appears in the run's thread. A single-question request that fits Discord's component limits renders natively with buttons or a select, Skip, and a text-answer modal when a custom answer is allowed. Any other shape posts a short notice saying a question is waiting and can be answered on this operator surface, and carries no question text. The request stays answerable here either way, and a Discord delivery failure never settles it.
+
+Question content is not repeated in the generic tool-output stream. `packages/gateway/src/execute/format-part.ts` suppresses the `question` tool's summary line on both success and error, leaving the dedicated question card and settlement rendering responsible for that interaction. This avoids a second raw-input rendering without hiding the actual request from its operator surface.
 
 ## Cancelling a Run
 
