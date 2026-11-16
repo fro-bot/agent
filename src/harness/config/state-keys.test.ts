@@ -37,6 +37,7 @@ describe('state-keys', () => {
     })
 
     it('contains object store config state keys', () => {
+      expect(STATE_KEYS.GH_CONFIG_DIR).toBe('ghConfigDir')
       expect(STATE_KEYS.S3_ENABLED).toBe('storeConfig.enabled')
       expect(STATE_KEYS.S3_BUCKET).toBe('storeConfig.bucket')
       expect(STATE_KEYS.S3_REGION).toBe('storeConfig.region')
@@ -49,7 +50,7 @@ describe('state-keys', () => {
     })
 
     it('has correct number of keys', () => {
-      expect(Object.keys(STATE_KEYS)).toHaveLength(20)
+      expect(Object.keys(STATE_KEYS)).toHaveLength(21)
     })
 
     it('values are string type compatible', () => {

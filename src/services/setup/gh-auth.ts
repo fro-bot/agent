@@ -2,12 +2,12 @@ import type {Octokit} from '../github/types.js'
 import type {ExecAdapter, GhAuthResult, Logger} from './types.js'
 import {Buffer} from 'node:buffer'
 import {chmod, mkdtemp} from 'node:fs/promises'
-import {tmpdir} from 'node:os'
 import {join} from 'node:path'
 import process from 'node:process'
 import {toErrorMessage} from '../../shared/errors.js'
 import {getUserByUsername} from '../github/api.js'
 import {getBotLogin as getAuthenticatedUser} from '../github/client.js'
+import {GH_CONFIG_DIR_PREFIX, ghConfigBaseDir} from './gh-config-dir.js'
 
 const GH_LOGIN_TIMEOUT_MS = 30_000
 
@@ -75,9 +75,7 @@ export async function configureGhAuth(
     // setup — the harness already has GH_TOKEN set above; only the model's child `gh` usage
     // is affected.
     try {
-      const baseTmp =
-        process.env.RUNNER_TEMP != null && process.env.RUNNER_TEMP.length > 0 ? process.env.RUNNER_TEMP : tmpdir()
-      const ghConfigDir = await mkdtemp(join(baseTmp, 'gh-config-'))
+      const ghConfigDir = await mkdtemp(join(ghConfigBaseDir(), GH_CONFIG_DIR_PREFIX))
       await chmod(ghConfigDir, 0o700)
 
       // `gh auth login --with-token` refuses to persist credentials when GH_TOKEN/GITHUB_TOKEN
@@ -120,8 +118,8 @@ export async function configureGhAuth(
       // expand) but does NOT close *deliberate* exfiltration — that's the deferred credential
       // broker's job. Tight perms (0700/0600) bound cross-user/cross-process reach only.
       //
-      // No explicit cleanup: ghConfigDir lives under the ephemeral runner temp dir, wiped at
-      // job end.
+      // The directory outlives setup on purpose (the server and the model's `gh` read it) and is removed at the end of
+      // the run by the harness (`releaseRunGhConfig`), so a later step in the caller's job cannot read the token from it.
     } catch (error) {
       logger.warning('Failed to configure off-environment gh auth; child gh CLI will be unauthenticated', {
         error: toErrorMessage(error),

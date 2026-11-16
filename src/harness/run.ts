@@ -13,7 +13,7 @@ import type {TriggerContext} from '../features/triggers/types.js'
 import type {DeduplicationEntity} from '../services/cache/dedup.js'
 import type {Octokit} from '../services/github/types.js'
 import type {InvocationOutcome, InvocationVerificationFacts} from './outcome.js'
-import type {SandboxLifecycle} from './phases/sandbox-lifecycle.js'
+import type {SandboxLifecycle, SandboxReleaseResult} from './phases/sandbox-lifecycle.js'
 import process from 'node:process'
 import * as core from '@actions/core'
 import {applyTerminalReaction} from '../features/agent/index.js'
@@ -43,6 +43,7 @@ import {
   type ExecutePhaseResult,
 } from './phases/execute.js'
 import {runFinalizeWithResult} from './phases/finalize.js'
+import {releaseRunGhConfig, trackRunGhConfigDir} from './phases/gh-config.js'
 import {snapshotLogDirectory} from './phases/log-snapshot.js'
 import {mergeObservedTurn, recordObservedTurn} from './phases/observed-turn-v2.js'
 import {releaseOptionsFromExecution, runReleaseV2} from './phases/release-v2.js'
@@ -64,6 +65,12 @@ export async function run(): Promise<number> {
   // an unparseable value) returns before any lifecycle exists, and cleanup must still treat the run as isolated.
   const isolationRequested = isIsolationRequested(core.getInput('isolate-agent'))
 
+  // What `GH_CONFIG_DIR` held before this run's setup could change it: an earlier step's directory, which is not ours to remove.
+  const ambientGhConfigDir = process.env.GH_CONFIG_DIR
+  // The `gh` config directory this run's setup created (provision mode), or null. Removed in the `finally` block once
+  // nothing uses it, so a later step in the caller's job cannot read the token from its `hosts.yml` (#2156).
+  let ghConfigDir: string | null = null
+
   let reactionCtx: ReactionContext | null = null
   let exitCode = 0
   let githubClient: Octokit | null = null
@@ -83,6 +90,13 @@ export async function run(): Promise<number> {
   // The lifecycle itself records the `unsafe` state for the post hook on every release that is not a confirmed restore.
   const markSandboxUntrusted = (): void => {
     sandboxOutputUntrusted = true
+  }
+  // True once a sandbox release left files the sandbox user may still own (`unsafe`, or a release that threw). Narrower than
+  // `sandboxOutputUntrusted`: a sandbox that never started (`not-needed`) handed nothing over, so the `gh` config directory
+  // is still the runner's own and is removed.
+  let sandboxRestoreUnsafe = false
+  const recordSandboxRelease = (outcome: SandboxReleaseResult): void => {
+    if (outcome.restore === 'unsafe') sandboxRestoreUnsafe = true
   }
   // The runner-owned copy of the OpenCode logs this invocation took at its own confirmed sandbox take-back, or null. The
   // shared log directory is re-handed to every later isolated step's sandbox, so an isolated run publishes only this.
@@ -207,6 +221,9 @@ export async function run(): Promise<number> {
 
     requestedOutputModeState = resolveRequestedOutputModeState()
     const bootstrap = await runBootstrap(bootstrapLogger)
+    // Setup has run, whether or not bootstrap went on to succeed. Recorded now so the post hook can remove the directory if
+    // this step is killed before the `finally` block gets to it.
+    ghConfigDir = trackRunGhConfigDir(ambientGhConfigDir)
     if (bootstrap == null) {
       deliveryOutcome = 'failed'
       setUnavailableActionOutputs(Date.now() - startTime)
@@ -355,6 +372,7 @@ export async function run(): Promise<number> {
     if (sandboxLifecycle !== null) {
       const sandboxOutcome = await sandboxLifecycle.release()
       sandboxSettled = true
+      recordSandboxRelease(sandboxOutcome)
       if (sandboxOutcome.restore !== 'restored') {
         markSandboxUntrusted()
         skipSessionPersistence = true
@@ -527,6 +545,7 @@ export async function run(): Promise<number> {
     if (sandboxLifecycle !== null && !sandboxSettled) {
       try {
         const sandboxOutcome = await sandboxLifecycle.release()
+        recordSandboxRelease(sandboxOutcome)
         if (sandboxOutcome.restore === 'restored') {
           await snapshotSandboxLogs()
           if (sandboxOutcome.proxy === 'crashed') {
@@ -542,6 +561,7 @@ export async function run(): Promise<number> {
         }
       } catch (sandboxError) {
         markSandboxUntrusted()
+        sandboxRestoreUnsafe = true
         skipSessionPersistence = true
         persistenceDeclineReason ??= `the isolate-agent sandbox could not be released (${toErrorMessage(sandboxError)}), so no session state is saved`
         core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
@@ -574,6 +594,10 @@ export async function run(): Promise<number> {
     }).finally(async () => {
       // runCleanup shuts the V2 server down; only then is the staging root, which the server reads, safe to remove.
       await removeRepoSkillsStaging(repoSkillsStagingRoot)
+      // The same holds for the `gh` config directory: the server and the sandbox read it, and what runs after this point
+      // uses the Action's Octokit client, never `gh`. A bootstrap that threw after setup never recorded it above.
+      ghConfigDir ??= trackRunGhConfigDir(ambientGhConfigDir)
+      await releaseRunGhConfig({dir: ghConfigDir, sandboxTrusted: !sandboxRestoreUnsafe, logger: bootstrapLogger})
     })
 
     // FINAL assessment: the single call to this pure function, made only now that
