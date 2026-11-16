@@ -1,11 +1,13 @@
 import type {ExecAdapter, Logger} from './types.js'
 import {Buffer} from 'node:buffer'
 import * as fs from 'node:fs/promises'
-import {join} from 'node:path'
+import {tmpdir} from 'node:os'
+import {delimiter, join} from 'node:path'
 
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {createMockOctokit} from '../github/test-helpers.js'
+import {createExecAdapter} from './adapters.js'
 import {configureGhAuth, configureGitIdentity, getBotLogin, getBotUserId} from './gh-auth.js'
 
 vi.mock('node:fs/promises', async () => {
@@ -256,6 +258,87 @@ describe('gh-auth', () => {
       // call rather than unset, so an ambient GH_CONFIG_DIR in the environment does not
       // make this test brittle.
       expect(process.env.GH_CONFIG_DIR).toBe(originalEnv.GH_CONFIG_DIR)
+    })
+
+    // Regression for #2164: `@actions/exec` writes `input` with `stdin.end(input)` and attaches no stdin 'error'
+    // listener, so a `gh` that exits without reading stdin turned EPIPE into an unhandled 'error' event that killed
+    // the whole Action. A real token is tiny and only hits EPIPE intermittently on Linux (never on macOS); a token
+    // larger than the pipe buffer (64 KiB) leaves unread data in the pipe when the child exits on every platform, so
+    // the write deterministically fails with EPIPE.
+    it.skipIf(process.platform === 'win32')(
+      'takes the gh auth login failed warning path, without crashing, when gh exits without reading stdin',
+      async () => {
+        // #given a real `gh` that exits non-zero immediately, never reading stdin, and a token far past the pipe buffer
+        const stubDir = await fs.mkdtemp(join(tmpdir(), 'gh-stub-'))
+        const stubPath = join(stubDir, 'gh')
+        await fs.writeFile(stubPath, '#!/bin/sh\nexit 1\n')
+        await fs.chmod(stubPath, 0o755)
+        process.env.PATH = `${stubDir}${delimiter}${process.env.PATH ?? ''}`
+        delete process.env.GH_CONFIG_DIR
+        const mockOctokit = createMockOctokit()
+        const token = 'x'.repeat(1024 * 1024)
+
+        try {
+          // #when
+          const result = await configureGhAuth(mockOctokit, token, 'default', mockLogger, createExecAdapter())
+
+          // #then the failure is a warning, not an unhandled 'error' event
+          expect(result.authenticated).toBe(true)
+          expect(mockLogger.warning).toHaveBeenCalledWith(
+            expect.stringContaining('gh auth login failed'),
+            expect.objectContaining({exitCode: 1}),
+          )
+          expect(process.env.GH_CONFIG_DIR).toBeUndefined()
+        } finally {
+          await fs.rm(stubDir, {recursive: true, force: true})
+        }
+      },
+    )
+
+    it('runs gh auth login through execWithTimeout, with the token on stdin and never in argv', async () => {
+      // #given
+      const mockOctokit = createMockOctokit()
+      const execWithTimeout = vi.fn().mockResolvedValue(0)
+      const getExecOutput = vi.fn()
+      const mockExec = createMockExecAdapter({execWithTimeout, getExecOutput})
+      const token = 'super-secret-token-seam'
+
+      // #when
+      await configureGhAuth(mockOctokit, token, 'default', mockLogger, mockExec)
+
+      // #then
+      expect(getExecOutput).not.toHaveBeenCalled()
+      expect(execWithTimeout).toHaveBeenCalledWith(
+        'gh',
+        ['auth', 'login', '--with-token'],
+        expect.any(Number),
+        expect.objectContaining({input: Buffer.from(token, 'utf8')}),
+      )
+      const call = execWithTimeout.mock.calls[0] as unknown[]
+      expect((call[1] as string[]).some(arg => arg.includes(token))).toBe(false)
+      expect(JSON.stringify(vi.mocked(mockLogger.info).mock.calls)).not.toContain(token)
+      if (process.env.GH_CONFIG_DIR != null) {
+        await fs.rm(process.env.GH_CONFIG_DIR, {recursive: true, force: true})
+      }
+    })
+
+    it('warns and leaves GH_CONFIG_DIR unchanged when gh auth login times out', async () => {
+      // #given
+      const mockOctokit = createMockOctokit()
+      const execWithTimeout = vi.fn().mockResolvedValue('timed-out')
+      const mockExec = createMockExecAdapter({execWithTimeout})
+      delete process.env.GH_CONFIG_DIR
+
+      // #when
+      const result = await configureGhAuth(mockOctokit, 'app-token', 'default', mockLogger, mockExec)
+
+      // #then
+      expect(result.authenticated).toBe(true)
+      expect(mockLogger.warning).toHaveBeenCalledWith(
+        expect.stringContaining('gh auth login failed'),
+        expect.objectContaining({exitCode: 'timed-out'}),
+      )
+      expect(process.env.GH_CONFIG_DIR).toBeUndefined()
     })
 
     it('sets process.env.GH_CONFIG_DIR to the temp dir only when gh auth login succeeds', async () => {
