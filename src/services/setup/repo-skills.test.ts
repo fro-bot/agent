@@ -1216,6 +1216,55 @@ describe('repo-skills', () => {
       expect(fs.readdirSync(staging)).toEqual([])
     })
 
+    it.each([
+      ['a repository named .github', 'fro-bot/.github'],
+      ['a repository that starts with a hyphen', 'fro-bot/-x'],
+      ['a repository with a dotted tail', 'fro-bot/a..b'],
+    ])('reads the default branch of %s', async (_label, repository) => {
+      // #given a base repository whose name needs the leading-dot (or hyphen) segment to be accepted
+      setUpRepos()
+      const [owner, name] = repository.split('/') as [string, string]
+      fs.mkdirSync(path.join(server, owner), {recursive: true})
+      fs.cpSync(origin, path.join(server, owner, `${name}.git`), {recursive: true})
+
+      // #when staging it
+      const sourceDir = (await stageDir({repository})) as string
+
+      // #then the remote URL is read as a path, never an option, and main's skills are extracted
+      expect(listFiles(sourceDir)).toEqual(['probe/SKILL.md', 'probe/references/r.md'])
+    })
+
+    it.each([
+      ['a dot repository', 'fro-bot/.'],
+      ['a dot-dot repository', 'fro-bot/..'],
+      ['a dot owner', './agent'],
+      ['a dot-dot owner', '../agent'],
+      ['an owner that starts with a dot', '.owner/agent'],
+      ['an owner that starts with a hyphen', '-x/agent'],
+      ['an extra slash', 'fro-bot/agent/extra'],
+      ['a leading slash', '/fro-bot/agent'],
+      ['no slash', 'agent'],
+      ['an empty owner', '/agent'],
+      ['an empty repository', 'fro-bot/'],
+      ['a space', 'fro-bot/a gent'],
+      ['a colon', 'fro-bot/a:gent'],
+      ['an at sign', 'fro-bot@evil/agent'],
+      ['a newline', 'fro-bot/agent\n'],
+      ['a backslash', String.raw`fro-bot\agent`],
+    ])('refuses %s before git runs', async (_label, repository) => {
+      // #given an exec adapter that records every command
+      setUpBareDirectories()
+      const execWithTimeout = vi.fn(async () => 0)
+      const exec: ExecAdapter = {...createExecAdapter(), execWithTimeout}
+
+      // #when staging a repository name that is not a plain owner/repo
+      const error = unwrapErr(await stage({exec, repository}))
+
+      // #then it is refused for its name, and git never ran
+      expect(error).toContain('not a plain owner/repo')
+      expect(execWithTimeout).not.toHaveBeenCalled()
+    })
+
     it('fails closed when reading the blobs times out', async () => {
       // #given an exec adapter whose cat-file step times out
       setUpRepos()

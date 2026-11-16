@@ -85,7 +85,13 @@ const SAFE_SKILL_ID = /^[A-Z0-9][\w.-]{0,63}$/i
 
 /** Git ref name characters the default branch may use. Anything else is refused before git runs. */
 const SAFE_BRANCH_NAME = /^\w[\w./-]{0,199}$/
-const SAFE_REPOSITORY = /^\w[\w.-]*\/\w[\w.-]*$/
+/**
+ * `owner/repo`, exactly one slash. The owner starts with a word character (GitHub owners never start with a dot or a
+ * hyphen). The repository is `[\w.-]+` minus `.` and `..`, so `fro-bot/.github` is accepted. The value only ever lands
+ * inside `${serverUrl}/${repository}.git`, after the scheme and host, so a leading `-` or `.` cannot be read as a git
+ * option, and with the dot-only names refused no segment can walk out of the owner/repo path.
+ */
+const SAFE_REPOSITORY = /^\w[\w.-]*\/(?!\.{1,2}$)[\w.-]+$/
 const SAFE_REF_KEY = /^[\w.-]+$/
 
 function isWildcardFree(directory: string): boolean {
