@@ -6,8 +6,9 @@
  * the CI config names through `skills.paths`:
  *
  * 1. `stageDefaultBranchSkills` fetches the default branch fresh from the base repository into a throwaway repository,
- *    lists `.agents/skills` in that exact commit, checks the listing against a size budget, and only then writes each
- *    listed blob to disk RAW (`git cat-file --batch`). Never `git archive`: it honours committed `.gitattributes`
+ *    lists `.agents/skills` in that exact commit, applies a size budget per skill (a skill too big on its own, or past the
+ *    running total, is dropped and warned about by id; the rest proceed), and only then writes each admitted skill's
+ *    blobs to disk RAW (`git cat-file --batch`). Never `git archive`: it honours committed `.gitattributes`
  *    (`export-subst`, `ident`, `eol`) and can turn a few KiB of stored blobs into megabytes past the budget. No ref, config or object in the checkout
  *    is read or changed, so an earlier workflow step cannot plant or age the revision, and the PR head or a dispatched
  *    branch is never a source.
@@ -48,14 +49,15 @@ export interface RepoSkillsLimits {
   /** Files copied across all admitted skills. */
   readonly maxFiles: number
   /**
-   * Entries (files, symlinks, submodules AND directories) in the default branch's `.agents/skills` tree, counted before
-   * anything is extracted and counting what admission would reject. Twice `maxFiles`: directories are entries here, and a
-   * tree at the file limit still has a directory per skill.
+   * Entries (files, symlinks AND directories) of one skill in the default branch's `.agents/skills` tree, and the same
+   * number as the limit on the running total across admitted skills; counted before anything is extracted and counting
+   * what admission would reject. Twice `maxFiles`: directories are entries here, and a tree at the file limit still has a
+   * directory per skill.
    */
   readonly maxSourceEntries: number
-  /** Bytes copied across all admitted skills, and the byte budget of the source tree (the same number). */
+  /** Bytes copied across all admitted skills, and the byte limit of one skill's source tree and of their total (the same number). */
   readonly maxBytes: number
-  /** Directory depth below a skill directory, for the source tree and for admission (OpenCode's scanner stops at 6). */
+  /** Directory depth below a skill directory, for each skill in the source tree and for admission (OpenCode's scanner stops at 6). */
   readonly maxDepth: number
   /** Bound on each git command. */
   readonly commandTimeoutMs: number
@@ -339,43 +341,84 @@ function symlinkedSkillIdsOf(entries: readonly TreeEntry[]): readonly string[] {
   return [...ids].toSorted()
 }
 
+/** Which limit a skill broke. The first three are the skill's own size; the last two are the running total. */
+export type SkillDropReason =
+  'over-total-bytes' | 'over-total-entries' | 'too-deep' | 'too-many-bytes' | 'too-many-entries'
+
+/** A skill left out of staging for its size: its id (log-safe), the limit it broke, and the count against that limit. */
+export interface DroppedSkill {
+  readonly id: string
+  readonly reason: SkillDropReason
+  /** The skill's own count, or for an `over-total-*` reason, what the running total would have become. */
+  readonly observed: number
+  readonly limit: number
+}
+
+export interface SelectedSkills {
+  /** The listed entries of the admitted skills only, grouped by skill id (sorted), in listing order within a skill. */
+  readonly entries: readonly TreeEntry[]
+  readonly dropped: readonly DroppedSkill[]
+}
+
 /**
- * Checks the default branch's skills tree against the budget before a byte of it is written. Every entry under
- * `.agents/skills` counts, rejected ones included (a symlink admission will refuse still costs a write), and the
- * blob sizes are summed. Fails on: too many entries, too many bytes, a path deeper than admission walks (a file may sit
- * `maxDepth` directories below its skill directory), or a submodule, which has no blob to write and that
- * admission could never tell from a real directory. Messages carry counts and limits, never a path.
+ * Applies the size budget to the default branch's skills tree, one skill at a time, before a byte of it is written. A
+ * skill is every entry below `.agents/skills/<id>/`. A skill that breaks a limit on its own (entries, bytes, or a path
+ * deeper than admission walks: a file may sit `maxDepth` directories below its skill directory) is dropped; the others
+ * are admitted in id order for as long as the running entry and byte totals stay within the same limits, and one that
+ * would push either over is dropped too (later, smaller skills may still fit). Every entry counts, rejected ones
+ * included (a symlink admission will refuse still costs a write), and a dropped skill costs the total nothing.
+ *
+ * What is NOT a size problem refuses the whole source: a submodule (no blob to write, and admission could never tell it
+ * from a real directory) or an unsafe path anywhere under the skills root, including inside a skill that would have been
+ * dropped. Messages and drops carry ids and counts, never a path.
  */
-export function checkSourceBudget(entries: readonly TreeEntry[], limits: RepoSkillsLimits): Result<void, string> {
+export function selectSkillsWithinBudget(
+  entries: readonly TreeEntry[],
+  limits: RepoSkillsLimits,
+): Result<SelectedSkills, string> {
   const root = `${SKILLS_GIT_PATH}/`
-  let count = 0
-  let bytes = 0
-  let deepest = 0
+  const bySkill = new Map<string, TreeEntry[]>()
   for (const entry of entries) {
     // `ls-tree` also prints the `.agents` and `.agents/skills` trees above the pathspec.
     if (!entry.path.startsWith(root)) continue
     if (entry.type === 'commit') return err('The default branch skills contain a submodule; repo skills are not loaded')
-    count += 1
-    bytes += entry.size ?? 0
+    const safe = safeRelativeSkillPath(entry.path)
+    if (!safe.success) return safe
+    const id = entry.path.slice(root.length).split('/')[0] as string
+    const group = bySkill.get(id)
+    if (group === undefined) bySkill.set(id, [entry])
+    else group.push(entry)
+  }
+
+  const admitted: TreeEntry[] = []
+  const dropped: DroppedSkill[] = []
+  let totalEntries = 0
+  let totalBytes = 0
+  for (const id of [...bySkill.keys()].toSorted((a, b) => (a < b ? -1 : 1))) {
+    const group = bySkill.get(id) as TreeEntry[]
+    const count = group.length
+    const bytes = group.reduce((sum, entry) => sum + (entry.size ?? 0), 0)
     // Components below the skill directory: `<id>/a/b/file` has two directories, `a` and `b`.
-    deepest = Math.max(deepest, entry.path.slice(root.length).split('/').length - 2)
-  }
-  if (count > limits.maxSourceEntries) {
-    return err(
-      `The default branch skills exceed the staging budget (${count} entries, limit ${limits.maxSourceEntries}); repo skills are not loaded`,
+    const deepest = group.reduce(
+      (deepestSoFar, entry) => Math.max(deepestSoFar, entry.path.slice(root.length).split('/').length - 2),
+      0,
     )
+    const drop = (reason: SkillDropReason, observed: number, limit: number): void => {
+      dropped.push({id: displayId(id), reason, observed, limit})
+    }
+    if (count > limits.maxSourceEntries) drop('too-many-entries', count, limits.maxSourceEntries)
+    else if (bytes > limits.maxBytes) drop('too-many-bytes', bytes, limits.maxBytes)
+    else if (deepest > limits.maxDepth) drop('too-deep', deepest, limits.maxDepth)
+    else if (totalEntries + count > limits.maxSourceEntries) {
+      drop('over-total-entries', totalEntries + count, limits.maxSourceEntries)
+    } else if (totalBytes + bytes > limits.maxBytes) drop('over-total-bytes', totalBytes + bytes, limits.maxBytes)
+    else {
+      totalEntries += count
+      totalBytes += bytes
+      admitted.push(...group)
+    }
   }
-  if (bytes > limits.maxBytes) {
-    return err(
-      `The default branch skills exceed the staging budget (${bytes} bytes, limit ${limits.maxBytes}); repo skills are not loaded`,
-    )
-  }
-  if (deepest > limits.maxDepth) {
-    return err(
-      `The default branch skills exceed the staging budget (${deepest} directories deep, limit ${limits.maxDepth}); repo skills are not loaded`,
-    )
-  }
-  return ok(undefined)
+  return ok({entries: admitted, dropped})
 }
 
 /**
@@ -531,9 +574,11 @@ type CommandOutcome =
  * checkout and never reads a ref that already exists there: the checkout's refs, config (`insteadOf`, hooks) and
  * shallow state are not trusted, and are not changed either.
  *
- * Returns the extracted skills directory, or null when the default branch has none. Before writing anything it lists the
- * subtree and refuses one over the entry, byte or depth budget (`checkSourceBudget`). Every git command is bounded by a
- * timeout; any failure is an error and the caller loads no repo skills.
+ * Returns the extracted skills directory, or null when the default branch has none (or none that fits). Before writing
+ * anything it lists the subtree and applies the size budget one skill at a time (`selectSkillsWithinBudget`): an
+ * oversized skill is dropped with a warning naming its id, and the rest are staged. A submodule, an unsafe path, an
+ * unreadable listing or anything the blob read finds inconsistent refuses the whole source. Every git command is bounded
+ * by a timeout; any failure is an error and the caller loads no repo skills.
  */
 export async function stageDefaultBranchSkills(
   options: StageDefaultBranchSkillsOptions,
@@ -654,26 +699,35 @@ export async function stageDefaultBranchSkills(
       logger.debug('The default branch has no .agents/skills', {defaultBranch})
       return ok(null)
     }
-    const withinBudget = checkSourceBudget(entries.data, limits)
-    if (!withinBudget.success) return withinBudget
 
     // Write the stored blobs, raw. `cat-file --batch` applies no attribute, filter, eol or ident processing, and the
-    // listing that passed the budget decides what is read: no path is walked by git here.
+    // listing decides what is read: no path is walked by git here. What is wrong with the whole tree (an unsupported
+    // mode or a missing size) refuses the source; what is merely too big is dropped, skill by skill, and the rest goes on.
     const extractRoot = path.join(stagingRoot, EXTRACT_DIRECTORY_NAME)
-    const underRoot = entries.data.filter(entry => entry.path.startsWith(`${SKILLS_GIT_PATH}/`))
-    for (const entry of underRoot) {
-      const safe = safeRelativeSkillPath(entry.path)
-      if (!safe.success) return safe
+    const listedUnderRoot = entries.data.filter(entry => entry.path.startsWith(`${SKILLS_GIT_PATH}/`))
+    if (
+      listedUnderRoot.some(
+        entry =>
+          entry.type === 'blob' && entry.mode !== '120000' && (!FILE_MODES.has(entry.mode) || entry.size === null),
+      )
+    ) {
+      return err('The default branch skills contain an entry with an unsupported mode; repo skills are not loaded')
+    }
+    const selected = selectSkillsWithinBudget(listedUnderRoot, limits)
+    if (!selected.success) return selected
+    for (const dropped of selected.data.dropped) {
+      logger.warning('Skipped a repository skill that does not fit the staging budget', {...dropped})
+    }
+    // Only the admitted skills are read, written and reported: a dropped skill is never on disk, so admission cannot meet
+    // it, and its symlinks cannot reject an id that was never staged.
+    const underRoot = selected.data.entries
+    if (underRoot.length === 0) {
+      logger.debug('No skill under .agents/skills fits the staging budget', {defaultBranch})
+      return ok(null)
     }
     // Symlinks (mode 120000) are counted by the budget above and reported below, but never read or written.
     const symlinkedSkillIds = symlinkedSkillIdsOf(underRoot)
     const blobs = underRoot.filter(entry => entry.type === 'blob' && entry.mode !== '120000')
-    if (
-      underRoot.some(entry => entry.type === 'blob' && entry.mode !== '120000' && !FILE_MODES.has(entry.mode)) ||
-      blobs.some(entry => entry.size === null)
-    ) {
-      return err('The default branch skills contain an entry with an unsupported mode; repo skills are not loaded')
-    }
     const expected = blobs.map(entry => ({oid: entry.oid, size: entry.size as number}))
     // Output is the bodies plus one short header and newline each: capped at the listed bytes and a header allowance.
     const catFileCap =
