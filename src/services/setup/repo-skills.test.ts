@@ -10,7 +10,6 @@ import {createMockLogger, serializeLoggerCalls, unwrapErr, unwrapOk} from '../..
 import {createExecAdapter} from './adapters.js'
 import {
   admitRepoSkills,
-  checkSourceBudget,
   createRepoSkillsStagingRoot,
   DEFAULT_REPO_SKILLS_LIMITS,
   parseCatFileBatch,
@@ -18,6 +17,7 @@ import {
   removeRepoSkillsStagingRoot,
   REPO_SKILLS_DIRECTORY_NAME,
   safeRelativeSkillPath,
+  selectSkillsWithinBudget,
   stageDefaultBranchSkills,
   type StagedSkills,
 } from './repo-skills.js'
@@ -444,7 +444,7 @@ describe('repo-skills', () => {
     })
   })
 
-  describe('checkSourceBudget', () => {
+  describe('selectSkillsWithinBudget', () => {
     const entry = (type: 'blob' | 'commit' | 'tree', file: string, size: number | null = 1, mode = '100644') => ({
       mode,
       type,
@@ -452,9 +452,17 @@ describe('repo-skills', () => {
       size,
       path: `.agents/skills/${file}`,
     })
+    /** A skill of `count` one-byte files, plus its directory entry: `count + 1` entries. */
+    const skill = (id: string, count: number, size = 1) => [
+      entry('tree', id, null, '040000'),
+      ...Array.from({length: count}, (_, i) => entry('blob', `${id}/f${i}.md`, size)),
+    ]
+    const idsOf = (entries: readonly {readonly path: string}[]): string[] => [
+      ...new Set(entries.map(item => item.path.split('/')[2] as string)),
+    ]
 
     it('ignores the ancestor trees that ls-tree prints above the skills root', () => {
-      // #given the .agents and .agents/skills entries and one file
+      // #given the .agents and .agents/skills entries and one skill of two entries
       const entries = [
         {mode: '040000', type: 'tree' as const, oid: OID, size: null, path: '.agents'},
         {mode: '040000', type: 'tree' as const, oid: OID, size: null, path: '.agents/skills'},
@@ -462,62 +470,133 @@ describe('repo-skills', () => {
         entry('blob', 'a/SKILL.md'),
       ]
 
-      // #when checking with room for exactly the two real entries
-      const verdict = checkSourceBudget(entries, {...DEFAULT_REPO_SKILLS_LIMITS, maxSourceEntries: 2})
+      // #when selecting with room for exactly the two real entries
+      const selected = unwrapOk(selectSkillsWithinBudget(entries, {...DEFAULT_REPO_SKILLS_LIMITS, maxSourceEntries: 2}))
 
-      // #then it fits
-      expect(verdict.success).toBe(true)
+      // #then the skill is kept, nothing is dropped, and the ancestors are not part of the result
+      expect(selected.dropped).toEqual([])
+      expect(selected.entries.map(item => item.path)).toEqual(['.agents/skills/a', '.agents/skills/a/SKILL.md'])
     })
 
-    it('counts every kind of entry, trees and symlinks included', () => {
-      // #given three trees and one symlink
+    it('keeps every skill, in id order, when all of them fit', () => {
+      // #given three small skills listed out of order
+      const entries = [...skill('c', 1), ...skill('a', 1), ...skill('b', 1)]
+
+      // #when selecting
+      const selected = unwrapOk(selectSkillsWithinBudget(entries, DEFAULT_REPO_SKILLS_LIMITS))
+
+      // #then nothing is dropped and the order is by id, not by listing order
+      expect(selected.dropped).toEqual([])
+      expect(idsOf(selected.entries)).toEqual(['a', 'b', 'c'])
+    })
+
+    it('drops a skill with too many entries by itself and keeps the others', () => {
+      // #given a skill of 4 entries (trees and symlinks count) and a small one, against a budget of 3
       const entries = [
-        entry('tree', 'a', null, '040000'),
-        entry('tree', 'a/b', null, '040000'),
-        entry('tree', 'a/b/c', null, '040000'),
-        entry('blob', 'a/b/c/link', 4, '120000'),
+        entry('tree', 'big', null, '040000'),
+        entry('tree', 'big/b', null, '040000'),
+        entry('tree', 'big/b/c', null, '040000'),
+        entry('blob', 'big/b/c/link', 4, '120000'),
+        ...skill('small', 1),
       ]
 
-      // #when the budget is three entries
-      const error = unwrapErr(checkSourceBudget(entries, {...DEFAULT_REPO_SKILLS_LIMITS, maxSourceEntries: 3}))
+      // #when selecting
+      const selected = unwrapOk(selectSkillsWithinBudget(entries, {...DEFAULT_REPO_SKILLS_LIMITS, maxSourceEntries: 3}))
 
-      // #then it is over, naming the count and not a path
-      expect(error).toContain('4 entries')
-      expect(error).not.toContain('link')
+      // #then the big one is dropped for its entry count, named by id, and the small one stays
+      expect(selected.dropped).toEqual([{id: 'big', reason: 'too-many-entries', observed: 4, limit: 3}])
+      expect(idsOf(selected.entries)).toEqual(['small'])
     })
 
-    it('sums blob sizes and is over by one byte', () => {
-      // #given two blobs one byte over the limit
+    it('drops a skill that is one byte over the byte limit by itself and keeps the others', () => {
+      // #given one skill 101 bytes over a 100 byte limit, and one exactly at it
       const limits = {...DEFAULT_REPO_SKILLS_LIMITS, maxBytes: 100}
-      const over = [entry('blob', 'a/SKILL.md', 60), entry('blob', 'a/big.md', 41)]
-      const at = [entry('blob', 'a/SKILL.md', 60), entry('blob', 'a/big.md', 40)]
+      const entries = [
+        entry('blob', 'over/SKILL.md', 60),
+        entry('blob', 'over/big.md', 41),
+        entry('blob', 'at/f.md', 100),
+      ]
 
-      // #when checking
-      // #then one byte over fails and exactly at the limit passes
-      expect(unwrapErr(checkSourceBudget(over, limits))).toContain('101 bytes')
-      expect(checkSourceBudget(at, limits).success).toBe(true)
+      // #when selecting
+      const selected = unwrapOk(selectSkillsWithinBudget(entries, limits))
+
+      // #then one byte over is dropped for its size and exactly at the limit is kept
+      expect(selected.dropped).toEqual([{id: 'over', reason: 'too-many-bytes', observed: 101, limit: 100}])
+      expect(idsOf(selected.entries)).toEqual(['at'])
     })
 
-    it('refuses a submodule anywhere under the skills root', () => {
-      // #given a gitlink inside a skill
-      const entries = [entry('commit', 'a/sub', null, '160000')]
+    it('drops a skill with a file one directory past maxDepth and keeps one exactly at it', () => {
+      // #given files six and seven directories below their skill directory
+      const entries = [entry('blob', 'ok/a/b/c/d/e/f/file.md'), entry('blob', 'deep/a/b/c/d/e/f/g/file.md')]
 
-      // #when checking
-      const error = unwrapErr(checkSourceBudget(entries, DEFAULT_REPO_SKILLS_LIMITS))
+      // #when selecting with the default depth of six
+      const selected = unwrapOk(selectSkillsWithinBudget(entries, DEFAULT_REPO_SKILLS_LIMITS))
 
-      // #then the whole source is refused
+      // #then six is kept and seven is dropped for its depth
+      expect(selected.dropped).toEqual([{id: 'deep', reason: 'too-deep', observed: 7, limit: 6}])
+      expect(idsOf(selected.entries)).toEqual(['ok'])
+    })
+
+    it('drops later-sorted skills that would push the running byte total over, and keeps those that still fit', () => {
+      // #given skills of 60, 60 and 30 bytes against a total of 100, listed backwards
+      const limits = {...DEFAULT_REPO_SKILLS_LIMITS, maxBytes: 100}
+      const entries = [entry('blob', 'c/f.md', 30), entry('blob', 'b/f.md', 60), entry('blob', 'a/f.md', 60)]
+
+      // #when selecting
+      const selected = unwrapOk(selectSkillsWithinBudget(entries, limits))
+
+      // #then `a` fills the budget first (sorted by id), `b` would push it to 120, and `c` still fits at 90
+      expect(selected.dropped).toEqual([{id: 'b', reason: 'over-total-bytes', observed: 120, limit: 100}])
+      expect(idsOf(selected.entries)).toEqual(['a', 'c'])
+    })
+
+    it('drops later-sorted skills that would push the running entry total over', () => {
+      // #given three skills of 3 entries each against a total of 7
+      const limits = {...DEFAULT_REPO_SKILLS_LIMITS, maxSourceEntries: 7}
+      const entries = [...skill('a', 2), ...skill('b', 2), ...skill('c', 2)]
+
+      // #when selecting
+      const selected = unwrapOk(selectSkillsWithinBudget(entries, limits))
+
+      // #then a and b (6 entries) are kept, and c would be 9
+      expect(selected.dropped).toEqual([{id: 'c', reason: 'over-total-entries', observed: 9, limit: 7}])
+      expect(idsOf(selected.entries)).toEqual(['a', 'b'])
+    })
+
+    it('does not let a dropped skill use up the total', () => {
+      // #given an oversized skill that sorts first, and a small one, against a total of 100 bytes
+      const limits = {...DEFAULT_REPO_SKILLS_LIMITS, maxBytes: 100}
+      const entries = [entry('blob', 'a/f.md', 500), entry('blob', 'b/f.md', 100)]
+
+      // #when selecting
+      const selected = unwrapOk(selectSkillsWithinBudget(entries, limits))
+
+      // #then only the oversized one is dropped, and the other still gets the whole budget
+      expect(selected.dropped.map(item => item.id)).toEqual(['a'])
+      expect(idsOf(selected.entries)).toEqual(['b'])
+    })
+
+    it('refuses the whole source for a submodule anywhere, even inside a skill that would be dropped', () => {
+      // #given a gitlink inside an oversized skill, next to a clean skill
+      const entries = [entry('blob', 'big/f.md', 1000), entry('commit', 'big/sub', null, '160000'), ...skill('ok', 1)]
+
+      // #when selecting with a budget that drops `big` anyway
+      const error = unwrapErr(selectSkillsWithinBudget(entries, {...DEFAULT_REPO_SKILLS_LIMITS, maxBytes: 100}))
+
+      // #then everything is refused
       expect(error).toContain('submodule')
     })
 
-    it('admits a file exactly maxDepth directories below its skill and refuses one deeper', () => {
-      // #given files six and seven directories below the skill directory
-      const atLimit = entry('blob', 'skill/a/b/c/d/e/f/file.md')
-      const tooDeep = entry('blob', 'skill/a/b/c/d/e/f/g/file.md')
+    it.each(['a/../b', 'a//b', 'a/./b'])('refuses the whole source for the unsafe path %s', file => {
+      // #given an unsafe path inside an oversized skill, next to a clean skill
+      const entries = [entry('blob', file, 1000), ...skill('ok', 1)]
 
-      // #when checking with the default depth of six
-      // #then six passes and seven fails
-      expect(checkSourceBudget([atLimit], DEFAULT_REPO_SKILLS_LIMITS).success).toBe(true)
-      expect(unwrapErr(checkSourceBudget([tooDeep], DEFAULT_REPO_SKILLS_LIMITS))).toContain('deep')
+      // #when selecting with a budget that would drop it anyway
+      const error = unwrapErr(selectSkillsWithinBudget(entries, {...DEFAULT_REPO_SKILLS_LIMITS, maxBytes: 100}))
+
+      // #then everything is refused, and the message names no path
+      expect(error).toContain('unsafe path')
+      expect(error).not.toContain(file)
     })
   })
 
@@ -1216,6 +1295,55 @@ describe('repo-skills', () => {
       expect(fs.readdirSync(staging)).toEqual([])
     })
 
+    it.each([
+      ['a repository named .github', 'fro-bot/.github'],
+      ['a repository that starts with a hyphen', 'fro-bot/-x'],
+      ['a repository with a dotted tail', 'fro-bot/a..b'],
+    ])('reads the default branch of %s', async (_label, repository) => {
+      // #given a base repository whose name needs the leading-dot (or hyphen) segment to be accepted
+      setUpRepos()
+      const [owner, name] = repository.split('/') as [string, string]
+      fs.mkdirSync(path.join(server, owner), {recursive: true})
+      fs.cpSync(origin, path.join(server, owner, `${name}.git`), {recursive: true})
+
+      // #when staging it
+      const sourceDir = (await stageDir({repository})) as string
+
+      // #then the remote URL is read as a path, never an option, and main's skills are extracted
+      expect(listFiles(sourceDir)).toEqual(['probe/SKILL.md', 'probe/references/r.md'])
+    })
+
+    it.each([
+      ['a dot repository', 'fro-bot/.'],
+      ['a dot-dot repository', 'fro-bot/..'],
+      ['a dot owner', './agent'],
+      ['a dot-dot owner', '../agent'],
+      ['an owner that starts with a dot', '.owner/agent'],
+      ['an owner that starts with a hyphen', '-x/agent'],
+      ['an extra slash', 'fro-bot/agent/extra'],
+      ['a leading slash', '/fro-bot/agent'],
+      ['no slash', 'agent'],
+      ['an empty owner', '/agent'],
+      ['an empty repository', 'fro-bot/'],
+      ['a space', 'fro-bot/a gent'],
+      ['a colon', 'fro-bot/a:gent'],
+      ['an at sign', 'fro-bot@evil/agent'],
+      ['a newline', 'fro-bot/agent\n'],
+      ['a backslash', String.raw`fro-bot\agent`],
+    ])('refuses %s before git runs', async (_label, repository) => {
+      // #given an exec adapter that records every command
+      setUpBareDirectories()
+      const execWithTimeout = vi.fn(async () => 0)
+      const exec: ExecAdapter = {...createExecAdapter(), execWithTimeout}
+
+      // #when staging a repository name that is not a plain owner/repo
+      const error = unwrapErr(await stage({exec, repository}))
+
+      // #then it is refused for its name, and git never ran
+      expect(error).toContain('not a plain owner/repo')
+      expect(execWithTimeout).not.toHaveBeenCalled()
+    })
+
     it('fails closed when reading the blobs times out', async () => {
       // #given an exec adapter whose cat-file step times out
       setUpRepos()
@@ -1360,64 +1488,226 @@ describe('repo-skills', () => {
         expect(fs.existsSync(path.join(staging, 'source-tree'))).toBe(false)
       }
 
-      it('rejects a tree with too many entries without reading or writing a blob', async () => {
-        // #given a listing one entry over the entry budget
+      /** A record with its own object id, so a test can tell which blobs were asked for. */
+      const blobAt = (oid: string, file: string, size: number, mode = '100644'): string =>
+        `${mode} blob ${oid} ${String(size).padStart(7)}\t.agents/skills/${file}\0`
+      const treeAt = (directory: string): string =>
+        `040000 tree ${'a'.repeat(40)}       -\t.agents/skills/${directory}\0`
+      const oidOf = (n: number): string => n.toString(16).padStart(40, '0')
+      const droppedWarnings = (logger: ReturnType<typeof createMockLogger>): unknown[][] =>
+        vi.mocked(logger.warning).mock.calls
+
+      it('drops a skill with too many entries instead of refusing the source, reading none of it', async () => {
+        // #given one skill one entry over the entry budget
         setUpBareDirectories()
         const {exec, commands} = fakeExec(
           Array.from({length: DEFAULT_REPO_SKILLS_LIMITS.maxSourceEntries + 1}, (_, i) => blob(`s/f${i}.md`)).join(''),
         )
+        const logger = createMockLogger()
 
         // #when staging
-        const error = unwrapErr(await stage({exec}))
+        const staged = unwrapOk(await stage({exec, logger}))
 
-        // #then it is refused for its size, and no blob was read
-        expect(error).toContain('budget')
-        expect(error).toContain('entries')
+        // #then nothing is left to load, one warning names the skill and the limit, and no blob was read
+        expect(staged).toBeNull()
+        expect(droppedWarnings(logger)).toHaveLength(1)
+        expect(droppedWarnings(logger)[0]?.[1]).toMatchObject({
+          id: 's',
+          reason: 'too-many-entries',
+          observed: DEFAULT_REPO_SKILLS_LIMITS.maxSourceEntries + 1,
+          limit: DEFAULT_REPO_SKILLS_LIMITS.maxSourceEntries,
+        })
         expectNothingMaterialized(commands)
       })
 
-      it('rejects a tree with too many bytes without reading or writing a blob', async () => {
+      it('drops a skill with too many bytes instead of refusing the source, reading none of it', async () => {
         // #given one blob a byte over the byte budget
         setUpBareDirectories()
         const {exec, commands} = fakeExec(blob('s/SKILL.md', DEFAULT_REPO_SKILLS_LIMITS.maxBytes + 1))
+        const logger = createMockLogger()
 
         // #when staging
-        const error = unwrapErr(await stage({exec}))
+        const staged = unwrapOk(await stage({exec, logger}))
 
-        // #then it is refused for its bytes, and nothing was materialized
-        expect(error).toContain('budget')
-        expect(error).toContain('bytes')
+        // #then it is dropped for its bytes and nothing was materialized
+        expect(staged).toBeNull()
+        expect(droppedWarnings(logger)[0]?.[1]).toMatchObject({id: 's', reason: 'too-many-bytes'})
         expectNothingMaterialized(commands)
       })
 
-      it('counts symlinks, which admission will reject, toward the budget', async () => {
+      it('counts symlinks, which admission will reject, toward the skill it is dropped for', async () => {
         // #given two files and two symlinks against a budget of three
         setUpBareDirectories()
         const {exec, commands} = fakeExec(
           blob('s/SKILL.md') + blob('s/a.md') + blob('s/l1', 4, '120000') + blob('s/l2', 4, '120000'),
         )
+        const logger = createMockLogger()
 
         // #when staging
-        const error = unwrapErr(await stage({exec, limits: {maxSourceEntries: 3}}))
+        const staged = unwrapOk(await stage({exec, logger, limits: {maxSourceEntries: 3}}))
 
         // #then the rejected entries were part of the count
-        expect(error).toContain('4 entries')
+        expect(staged).toBeNull()
+        expect(droppedWarnings(logger)[0]?.[1]).toMatchObject({id: 's', reason: 'too-many-entries', observed: 4})
         expectNothingMaterialized(commands)
       })
 
-      it('rejects a tree of empty-looking directories by counting trees', async () => {
+      it('drops a skill of empty-looking directories by counting trees', async () => {
         // #given four tree entries against a budget of three
         setUpBareDirectories()
-        const trees = ['s', 's/a', 's/a/b', 's/a/b/c'].map(
-          directory => `040000 tree ${'a'.repeat(40)}       -\t.agents/skills/${directory}\0`,
-        )
-        const {exec, commands} = fakeExec(trees.join(''))
+        const {exec, commands} = fakeExec(['s', 's/a', 's/a/b', 's/a/b/c'].map(treeAt).join(''))
+        const logger = createMockLogger()
 
         // #when staging
-        const error = unwrapErr(await stage({exec, limits: {maxSourceEntries: 3}}))
+        const staged = unwrapOk(await stage({exec, logger, limits: {maxSourceEntries: 3}}))
 
         // #then they counted
-        expect(error).toContain('4 entries')
+        expect(staged).toBeNull()
+        expect(droppedWarnings(logger)[0]?.[1]).toMatchObject({id: 's', reason: 'too-many-entries', observed: 4})
+        expectNothingMaterialized(commands)
+      })
+
+      it('loads the small skills when one is too big, with one warning that names the big one', async () => {
+        // #given two small skills around a skill over the byte limit (distinct object ids per blob)
+        setUpBareDirectories()
+        const {exec, inputs} = fakeExec(
+          blobAt(oidOf(1), 'alpha/SKILL.md', 3) +
+            treeAt('big') +
+            blobAt(oidOf(2), 'big/SKILL.md', 50) +
+            blobAt(oidOf(3), 'big/secret-bundle.js', 400) +
+            blobAt(oidOf(4), 'zulu/SKILL.md', 3),
+          Buffer.concat([frame(oidOf(1), 'abc'), frame(oidOf(4), 'xyz')]),
+        )
+        const logger = createMockLogger()
+
+        // #when staging against a 100 byte per-skill limit
+        const staged = unwrapOk(await stage({exec, logger, limits: {maxBytes: 100}})) as StagedSkills
+
+        // #then both small skills are written and the big one is not
+        expect(listFiles(staged.sourceDir)).toEqual(['alpha/SKILL.md', 'zulu/SKILL.md'])
+        // #and only the admitted blobs were asked for: cat-file would fail as truncated if the dropped ones were listed
+        expect(inputs).toEqual([`${oidOf(1)}\n${oidOf(4)}\n`])
+        // #and exactly one warning, carrying the id, the reason and the counts, but no path
+        expect(droppedWarnings(logger)).toHaveLength(1)
+        expect(droppedWarnings(logger)[0]?.[1]).toEqual({
+          id: 'big',
+          reason: 'too-many-bytes',
+          observed: 450,
+          limit: 100,
+        })
+        const logged = serializeLoggerCalls(logger)
+        expect(logged).toContain('big')
+        expect(logged).not.toContain('secret-bundle')
+        expect(logged).not.toContain('SKILL.md')
+        expect(logged).not.toContain('.agents')
+      })
+
+      it('drops the later-sorted skills that would overflow the total, and warns for each', async () => {
+        // #given three skills of 60 bytes each against a total of 100, listed backwards
+        setUpBareDirectories()
+        const {exec, inputs} = fakeExec(
+          blobAt(oidOf(3), 'c/SKILL.md', 60) + blobAt(oidOf(2), 'b/SKILL.md', 60) + blobAt(oidOf(1), 'a/SKILL.md', 60),
+          frame(oidOf(1), 'a'.repeat(60)),
+        )
+        const logger = createMockLogger()
+
+        // #when staging
+        const staged = unwrapOk(await stage({exec, logger, limits: {maxBytes: 100}})) as StagedSkills
+
+        // #then the first by id is kept and each later one is dropped with its own warning
+        expect(listFiles(staged.sourceDir)).toEqual(['a/SKILL.md'])
+        expect(inputs).toEqual([`${oidOf(1)}\n`])
+        expect(droppedWarnings(logger).map(call => call[1])).toEqual([
+          {id: 'b', reason: 'over-total-bytes', observed: 120, limit: 100},
+          {id: 'c', reason: 'over-total-bytes', observed: 120, limit: 100},
+        ])
+      })
+
+      it('loads the small skills of an infra-shaped tree: one 5.3 MB generated skill among small ones', async () => {
+        // #given marcusrbrown/infra's real shape (run 43799401388): archify is 219 entries and 5,327,669 bytes, so the
+        // total of 5,372,686 bytes is over the 5 MiB (5,242,880) budget and the old check refused the lot
+        setUpBareDirectories()
+        const bundleSizes = [...Array.from({length: 216}, () => 24_000), 143_669]
+        const archify =
+          treeAt('archify') +
+          treeAt('archify/dist') +
+          bundleSizes.map((size, i) => blobAt(oidOf(100 + i), `archify/dist/bundle-${i}.js`, size)).join('')
+        const goke = treeAt('goke') + blobAt(oidOf(1), 'goke/SKILL.md', 22_211)
+        const docs = treeAt('generating-project-docs') + blobAt(oidOf(2), 'generating-project-docs/SKILL.md', 22_806)
+        const {exec, inputs} = fakeExec(
+          archify + goke + docs,
+          Buffer.concat([frame(oidOf(2), 'd'.repeat(22_806)), frame(oidOf(1), 'g'.repeat(22_211))]),
+        )
+        const logger = createMockLogger()
+
+        // #when staging with the default limits
+        const staged = unwrapOk(await stage({exec, logger})) as StagedSkills
+
+        // #then the two small skills load, in id order, and archify alone is dropped
+        expect(listFiles(staged.sourceDir)).toEqual(['generating-project-docs/SKILL.md', 'goke/SKILL.md'])
+        expect(inputs).toEqual([`${oidOf(2)}\n${oidOf(1)}\n`])
+        expect(droppedWarnings(logger)).toHaveLength(1)
+        expect(droppedWarnings(logger)[0]?.[1]).toEqual({
+          id: 'archify',
+          reason: 'too-many-bytes',
+          observed: 5_327_669,
+          limit: DEFAULT_REPO_SKILLS_LIMITS.maxBytes,
+        })
+        expect(serializeLoggerCalls(logger)).not.toContain('bundle-')
+      })
+
+      it('does not report a dropped skill as symlinked, so admission never meets it', async () => {
+        // #given an oversized skill that holds a symlink, and a small skill that holds one too
+        setUpBareDirectories()
+        const {exec} = fakeExec(
+          blobAt(oidOf(1), 'big/SKILL.md', 500) +
+            blobAt(oidOf(2), 'big/link', 4, '120000') +
+            blobAt(oidOf(3), 'small/SKILL.md', 3) +
+            blobAt(oidOf(4), 'small/link', 4, '120000'),
+          frame(oidOf(3), 'abc'),
+        )
+
+        // #when staging
+        const staged = unwrapOk(await stage({exec, limits: {maxBytes: 100}})) as StagedSkills
+
+        // #then only the admitted skill's link is reported
+        expect(staged.symlinkedSkillIds).toEqual(['small'])
+      })
+
+      it('refuses the whole source for a submodule inside a skill that would be dropped anyway', async () => {
+        // #given an oversized skill with a gitlink, next to a clean small skill
+        setUpBareDirectories()
+        const {exec, commands} = fakeExec(
+          `${blobAt(oidOf(1), 'big/SKILL.md', 500)}160000 commit ${oidOf(9)}       -\t.agents/skills/big/sub\0${blobAt(
+            oidOf(2),
+            'ok/SKILL.md',
+            3,
+          )}`,
+          frame(oidOf(2), 'abc'),
+        )
+
+        // #when staging
+        const error = unwrapErr(await stage({exec, limits: {maxBytes: 100}}))
+
+        // #then nothing loads
+        expect(error).toContain('submodule')
+        expectNothingMaterialized(commands)
+      })
+
+      it('refuses the whole source for an unsafe path inside a skill that would be dropped anyway', async () => {
+        // #given an oversized skill with a `..` segment, next to a clean small skill
+        setUpBareDirectories()
+        const {exec, commands} = fakeExec(
+          blobAt(oidOf(1), 'big/../SKILL.md', 500) + blobAt(oidOf(2), 'ok/SKILL.md', 3),
+          frame(oidOf(2), 'abc'),
+        )
+
+        // #when staging
+        const error = unwrapErr(await stage({exec, limits: {maxBytes: 100}}))
+
+        // #then nothing loads, and the message names no path
+        expect(error).toContain('unsafe path')
+        expect(error).not.toContain('big')
         expectNothingMaterialized(commands)
       })
 
@@ -1496,20 +1786,61 @@ describe('repo-skills', () => {
         expect(fs.readdirSync(staging)).toEqual([])
       })
 
-      it('refuses a committed symlink, as admission does, and counts it first', async () => {
-        // #given a default branch whose skill holds a symlink, against a budget of one entry
+      it('counts a committed symlink toward the skill it is dropped for', async () => {
+        // #given a default branch whose skill holds a symlink, against a budget of two entries
         setUpRepos()
         fs.symlinkSync('/etc/hosts', path.join(origin, '.agents', 'skills', 'probe', 'link.md'))
         git(origin, 'add', '-A')
         git(origin, 'commit', '-qm', 'link')
         const {exec, calls} = recordingExec()
+        const logger = createMockLogger()
 
         // #when staging against a tiny budget
-        const error = unwrapErr(await stage({exec, limits: {maxSourceEntries: 2}}))
+        const staged = unwrapOk(await stage({exec, logger, limits: {maxSourceEntries: 2}}))
 
-        // #then the symlink was counted (probe/, SKILL.md, references/, r.md, link.md) and no blob was read
-        expect(error).toContain('5 entries')
+        // #then the symlink was counted (probe/, SKILL.md, references/, r.md, link.md), the skill dropped and no blob read
+        expect(staged).toBeNull()
+        expect(vi.mocked(logger.warning).mock.calls[0]?.[1]).toMatchObject({id: 'probe', observed: 5, limit: 2})
         expect(calls.some(call => call.args.includes('cat-file'))).toBe(false)
+      })
+
+      it('stages the small skills past an oversized one through real git, and admission sees only those', async () => {
+        // #given a default branch with an oversized skill (which also holds a symlink) beside two small skills
+        setUpRepos()
+        const skills = path.join(origin, '.agents', 'skills')
+        writeFile(path.join(skills, 'huge', 'SKILL.md'), skillMd('huge'))
+        fs.writeFileSync(path.join(skills, 'huge', 'bundle.js'), Buffer.alloc(300_000, 'x'))
+        fs.symlinkSync('/etc/hosts', path.join(skills, 'huge', 'link.md'))
+        writeFile(path.join(skills, 'other', 'SKILL.md'), skillMd('other'))
+        git(origin, 'add', '-A')
+        git(origin, 'commit', '-qm', 'huge')
+        const bundled = path.join(root, 'bundled', '@fro.bot', 'systematic', 'skills')
+        writeFile(path.join(bundled, 'ce-review', 'SKILL.md'), skillMd('ce:review'))
+        const {exec, inputs} = fakeExecOverReal()
+        const logger = createMockLogger()
+
+        // #when staging with a 200 KB budget and admitting what staging reported
+        const staged = unwrapOk(await stage({exec, logger, limits: {maxBytes: 200_000}})) as StagedSkills
+        const written = listFiles(staged.sourceDir)
+        const admitted = unwrapOk(
+          await admitRepoSkills({
+            sourceDir: staged.sourceDir,
+            stagingRoot: staging,
+            bundledSkillsDirectories: [bundled],
+            symlinkedSkillIds: staged.symlinkedSkillIds,
+            logger,
+          }),
+        )
+
+        // #then only the small skills were read, written and admitted
+        expect(written).toEqual(['other/SKILL.md', 'probe/SKILL.md', 'probe/references/r.md'])
+        expect(inputs[0]?.trim().split('\n')).toHaveLength(3)
+        expect(admitted.admitted).toEqual(['other', 'probe'])
+        // #and the dropped skill's symlink never reached admission: one budget warning, and no symlink one
+        expect(staged.symlinkedSkillIds).toEqual([])
+        expect(admitted.skipped).toEqual([])
+        expect(vi.mocked(logger.warning).mock.calls).toHaveLength(1)
+        expect(vi.mocked(logger.warning).mock.calls[0]?.[1]).toMatchObject({id: 'huge', reason: 'too-many-bytes'})
       })
 
       it('admits a file exactly at the depth limit and refuses one a directory deeper', async () => {
@@ -1536,7 +1867,7 @@ describe('repo-skills', () => {
         expect(admitted.admitted).toEqual(['probe'])
         expect(fs.existsSync(path.join(staging, 'skills', 'probe', 'a', 'b', 'c', 'd', 'e', 'f', 'deep.md'))).toBe(true)
 
-        // #and one directory deeper is refused before any blob is read
+        // #and one directory deeper drops the skill before any blob is read
         fs.rmSync(staging, {recursive: true, force: true})
         fs.mkdirSync(staging)
         writeFile(
@@ -1546,8 +1877,9 @@ describe('repo-skills', () => {
         git(origin, 'add', '-A')
         git(origin, 'commit', '-qm', 'seven deep')
         const {exec, calls} = recordingExec()
-        const error = unwrapErr(await stage({exec}))
-        expect(error).toContain('deep')
+        const logger = createMockLogger()
+        expect(unwrapOk(await stage({exec, logger}))).toBeNull()
+        expect(vi.mocked(logger.warning).mock.calls[0]?.[1]).toMatchObject({id: 'probe', reason: 'too-deep'})
         expect(calls.some(call => call.args.includes('cat-file'))).toBe(false)
       })
     })

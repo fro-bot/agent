@@ -28,6 +28,12 @@ export const STATE_KEYS = {
    * or the copy was discarded), and no logs are published.
    */
   LOG_SNAPSHOT_DIR: 'logSnapshotDir',
+  /**
+   * The run's `gh` config directory (`<RUNNER_TEMP>/gh-config-*`, holds the token in `hosts.yml`), recorded by the main step as
+   * soon as setup creates it and cleared once the main step removed it. If still set in the post hook, the main step died
+   * before its cleanup (cancellation, a kill), and the post hook removes the directory instead.
+   */
+  GH_CONFIG_DIR: 'ghConfigDir',
   /** Session ID used in this run (for logging) */
   SESSION_ID: 'sessionId',
   /** Whether main action already saved cache successfully */

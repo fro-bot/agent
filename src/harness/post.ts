@@ -1,11 +1,13 @@
 import type {ObjectStoreConfig} from '@fro-bot/runtime'
 import type {Logger} from '../shared/logger.js'
 import * as path from 'node:path'
+import process from 'node:process'
 import * as core from '@actions/core'
 import {createS3Adapter, syncArtifactsToStore, syncMetadataToStore} from '@fro-bot/runtime'
 import {writeCacheSaveResultSummary} from '../features/observability/job-summary.js'
 import {uploadLogArtifact} from '../services/artifact/index.js'
 import {buildCacheKeyComponents, saveCache} from '../services/cache/index.js'
+import {removeGhConfigDir} from '../services/setup/gh-config-dir.js'
 import {parseCacheSaveStateValue} from '../shared/cache-save-result.js'
 import {
   getGitHubRepository,
@@ -116,7 +118,35 @@ export async function runPost(options: PostOptions = {}): Promise<void> {
   try {
     await persistRunState(logger)
   } finally {
-    await releaseOrphanedLock(logger)
+    try {
+      await releaseOrphanedLock(logger)
+    } finally {
+      await removeOrphanedGhConfigDir(logger)
+    }
+  }
+}
+
+/**
+ * Removes the run's `gh` config directory when the main step recorded it and died before removing it (cancelled or killed;
+ * its own `finally` clears the record once the directory is gone). It holds the token in `hosts.yml`, which a later step in
+ * the caller's job could read. On an isolated run the directory belongs to the sandbox user until the main step confirmed the
+ * take-back, so it is left alone for anything but an explicit `restored`. Never throws.
+ */
+async function removeOrphanedGhConfigDir(logger: Logger): Promise<void> {
+  try {
+    const dir = readOptionalState(STATE_KEYS.GH_CONFIG_DIR)
+    if (dir == null) return
+    const isolatedRun = core.getState(STATE_KEYS.ISOLATED_RUN) === 'true'
+    const sandboxState = core.getState(STATE_KEYS.SANDBOX_STATE)
+    if (!(sandboxState === 'restored' || (sandboxState === '' && !isolatedRun))) {
+      logger.warning(
+        'Leaving the gh config directory in place: the main step did not confirm the isolate-agent sandbox was stopped and restored',
+      )
+      return
+    }
+    await removeGhConfigDir(dir, process.env, logger)
+  } catch (error) {
+    logger.warning('Post-action gh config directory removal threw (non-fatal)', {error: toErrorMessage(error)})
   }
 }
 

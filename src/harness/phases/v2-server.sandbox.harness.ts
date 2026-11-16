@@ -508,6 +508,121 @@ export function mountNamespaceIds(run?: InspectionRunner): string[] {
   ).toSorted()
 }
 
+/** One process's mount-namespace membership, as the scan read it. */
+export interface NamespaceMember {
+  readonly id: string
+  readonly uid: number
+  readonly comm: string
+  /** The first line of `/proc/<pid>/cgroup`. */
+  readonly cgroup: string
+  /** The NUL-separated command line, with the separators turned into spaces. */
+  readonly cmdline: string
+}
+
+/** What decides whether a namespace that appeared during a test belongs to the launch under test. */
+export interface LaunchScope {
+  /** The sandbox account's uid, captured while the account existed; null when it is not known. */
+  readonly sandboxUid: number | null
+  /**
+   * Patterns (the `pgrep -f` / extended-regex syntax the suites already use, so a plain name is its own pattern) that a
+   * member's command line matches when the member belongs to the launch. Empty patterns are dropped: they match everything.
+   */
+  readonly markers: readonly string[]
+  /** The test process's own cgroup line. Defaults to the first line of `/proc/self/cgroup`. */
+  readonly cgroup?: string
+}
+
+export interface LaunchNamespaces {
+  /** Namespaces that are new and have a member that belongs to the launch. The assertion is that this is empty. */
+  readonly kept: readonly string[]
+  /** One member of each kept namespace, for the failure message. */
+  readonly keptMembers: readonly NamespaceMember[]
+  /** One member of each new namespace that is not the launch's (host services such as `systemd-timedated`). */
+  readonly ignored: readonly NamespaceMember[]
+}
+
+/**
+ * Everything is read in one root shell pass over `/proc`, so the answer is one consistent moment rather than one `lsns` plus
+ * a lookup per namespace. A process that exits mid-scan is skipped (`|| continue`); a scan that fails as a whole is not. The
+ * real uid comes from `status`, since `/proc/<pid>` is owned by root for a process that is not dumpable.
+ */
+const NAMESPACE_MEMBER_SCAN = String.raw`for p in /proc/[0-9]*; do
+  ns=$(readlink "$p/ns/mnt" 2>/dev/null) || continue
+  uid=$(awk '/^Uid:/ {print $2}' "$p/status" 2>/dev/null) || continue
+  cg=$(head -n 1 "$p/cgroup" 2>/dev/null) || continue
+  comm=$(tr '\0\n\t' '   ' 2>/dev/null <"$p/comm") || continue
+  cmd=$(tr '\0\n\t' '   ' 2>/dev/null <"$p/cmdline") || continue
+  printf '%s\t%s\t%s\t%s\t%s\n' "$ns" "$uid" "$comm" "$cg" "$cmd"
+done`
+
+function parseNamespaceMembers(text: string): NamespaceMember[] {
+  return nonEmptyLines(text).map(line => {
+    const [ns, uid, comm, cgroup, ...rest] = line.split('\t')
+    const id = /^mnt:\[(\d+)\]$/.exec(ns ?? '')?.[1]
+    if (id === undefined || !/^\d+$/.test(uid ?? '') || comm === undefined || cgroup === undefined) {
+      throw new Error(`scanning mount namespace members: unreadable line ${JSON.stringify(line.slice(0, 200))}`)
+    }
+    // `tr` turned the trailing newline of `comm` and `cmdline` into a space.
+    return {id, uid: Number(uid), comm: comm.trim(), cgroup, cmdline: rest.join('\t').trim()}
+  })
+}
+
+function ownCgroupLine(): string {
+  return fs.readFileSync('/proc/self/cgroup', 'utf8').split('\n')[0] ?? ''
+}
+
+/** A short, single-line description of members, for an assertion message. */
+export function describeNamespaceMembers(members: readonly NamespaceMember[]): string {
+  return members.length === 0
+    ? 'none'
+    : members
+        .map(m => `${m.id} (uid ${m.uid}, ${m.comm}, cgroup ${m.cgroup}, cmd ${m.cmdline.trim().slice(0, 80)})`)
+        .join('; ')
+}
+
+/**
+ * The mount namespaces that appeared since `before` and belong to the launch. A hosted runner creates namespaces of its own
+ * during a job (`snapd` makes D-Bus activate `systemd-timedated`, which lives in a private namespace for about 30 s), so
+ * "no new namespace id" is not the property; "no new namespace with a member of ours" is. A member is ours when it runs as
+ * the sandbox uid, sits in the test process's own cgroup, or has a command line that names the launch. The rest are
+ * returned as `ignored`, with their owner, so a failure can say what was set aside. Throws when the scan fails.
+ */
+export function newLaunchNamespaces(
+  before: readonly string[],
+  scope: LaunchScope,
+  run?: InspectionRunner,
+): LaunchNamespaces {
+  // The root cgroup (`0::/`) would make every process look like ours, so it never counts as a match.
+  const own = scope.cgroup ?? ownCgroupLine()
+  const ownCgroup = /::\/?$/.test(own) ? null : own
+  const patterns = scope.markers.filter(marker => marker.length > 0).map(marker => new RegExp(marker))
+  const members = parseNamespaceMembers(
+    inspectOutput('sudo', ['-n', 'sh', '-c', NAMESPACE_MEMBER_SCAN], 'scanning mount namespace members', run),
+  )
+  const ours = (member: NamespaceMember): boolean =>
+    (scope.sandboxUid !== null && member.uid === scope.sandboxUid) ||
+    (ownCgroup !== null && member.cgroup === ownCgroup) ||
+    patterns.some(pattern => pattern.test(member.cmdline))
+
+  const kept: string[] = []
+  const keptMembers: NamespaceMember[] = []
+  const ignored: NamespaceMember[] = []
+  const decided = new Set<string>()
+  const fresh = members.filter(member => !before.includes(member.id))
+  for (const member of fresh) {
+    if (decided.has(member.id)) continue
+    const mine = fresh.find(candidate => candidate.id === member.id && ours(candidate))
+    decided.add(member.id)
+    if (mine === undefined) {
+      ignored.push(member)
+    } else {
+      kept.push(member.id)
+      keptMembers.push(mine)
+    }
+  }
+  return {kept: kept.toSorted(), keptMembers, ignored}
+}
+
 /** The first line of what the runner's own shell command prints. Throws when the command fails. */
 export function runnerFirstLine(command: string, run?: InspectionRunner): string {
   return inspectOutput('sh', ['-c', command], `running ${command}`, run).split('\n')[0]?.trim() ?? ''

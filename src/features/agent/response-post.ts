@@ -479,7 +479,10 @@ async function postCommentWithRetry(
  * (`review-guards.ts`) before calling `submitReview`. A guard-blocked APPROVE
  * on a permitted mention surface degrades to a comment: the review is refused,
  * but the model's response is still delivered. Required review surfaces remain
- * fail-closed when a guarded review cannot be submitted.
+ * fail-closed when a guarded review cannot be submitted -- except a self-authored
+ * PR (the PR author is the posting account), where GitHub rejects APPROVE and
+ * REQUEST_CHANGES: the verdict is posted as a COMMENT review with the same body
+ * and reviewed-head pin.
  */
 export async function runResponsePost(params: RunResponsePostParams, logger: Logger): Promise<ResponsePostResult> {
   const {
@@ -608,7 +611,17 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
     logger,
   )
 
-  if (guard.allowed === false) {
+  // GitHub rejects APPROVE and REQUEST_CHANGES (HTTP 422) from the PR's own author, so a
+  // self-authored PR can only carry a COMMENT review. The body, head pin and receipt are unchanged;
+  // COMMENT can neither satisfy nor block branch protection, so the downgrade never widens authority.
+  // Only the required review surface turns a guard-blocked approval into this COMMENT review: a
+  // review-permitted mention keeps degrading a blocked approval to a plain comment below.
+  const downgradeToSelfAuthoredComment =
+    guard.selfAuthored &&
+    reviewEvent !== 'COMMENT' &&
+    (guard.allowed || RESPONSE_SURFACE_POLICIES[surface].verdictRequired)
+
+  if (guard.allowed === false && downgradeToSelfAuthoredComment === false) {
     if (RESPONSE_SURFACE_POLICIES[surface].verdictRequired === false) {
       logger.warning('Response-post: review guard blocked the verdict; degrading to comment', {
         reason: guard.reason,
@@ -630,6 +643,14 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
     return failure('review-guard-blocked', `Review guard blocked submission: ${guard.reason}`)
   }
 
+  const submitEvent: ReviewEvent = downgradeToSelfAuthoredComment ? 'COMMENT' : reviewEvent
+  if (downgradeToSelfAuthoredComment) {
+    logger.warning(
+      'Response-post: self-authored PR; posting the verdict as a COMMENT review because GitHub rejects APPROVE and REQUEST_CHANGES from the PR author',
+      {prNumber: target.number, originalEvent: reviewEvent},
+    )
+  }
+
   // Reviews are NOT idempotent (unlike comments, there is no marker-based
   // find-and-update path) — a create that fails ambiguously (GitHub records
   // the review but the client sees a network error) risks a duplicate review
@@ -642,7 +663,7 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
         owner: target.owner,
         repo: target.repo,
         prNumber: target.number,
-        event: reviewEvent,
+        event: submitEvent,
         body: reviewSubmitBody,
         reviewedHeadSha,
         ...(reviewDeliveryReceiptOps == null
