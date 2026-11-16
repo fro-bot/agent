@@ -1,8 +1,11 @@
 ---
 type: architecture
-last-updated: "2026-11-08"
-updated-by: "f7c20f94"
+last-updated: "2026-11-15"
+updated-by: "962b70bc"
 sources:
+  - src/harness/phases/sandbox-lifecycle.ts
+  - src/services/setup/sandbox-preflight.ts
+  - packages/runtime/src/agent/key-proxy.ts
   - packages/runtime/src/session/generation.ts
   - packages/runtime/src/agent/server-v2.ts
   - packages/runtime/src/agent/directory-quiescence-v2.ts
@@ -88,13 +91,13 @@ The project is organized as a Bun workspace monorepo with two workspace areas:
 | Package | Path | Purpose |
 | --- | --- | --- |
 | `@fro-bot/runtime` | `packages/runtime/` | Shared runtime library: agent prompt, session management, object store, coordination primitives, and shared utilities. Consumed by both the Action and the Gateway. |
-| `@fro.bot/harness` | `packages/harness/` | Published, patched OpenCode binary built via LLM-merge integration. Acts as a drop-in replacement for the stock OpenCode CLI in the action setup. Ships as a main package plus per-platform binary packages (`@fro.bot/harness-linux-x64`, etc.). |
+| `@fro.bot/harness` | `packages/harness/` | Historical patched OpenCode V1 CLI and per-platform binary packages. Published builds remain available, but current Action setup does not install them. |
 | `@fro-bot/gateway` | `packages/gateway/` | Discord gateway daemon. Listens for Discord mentions and slash commands, acquires the per-repo gateway lock (`repo.json`), and dispatches agent runs via the runtime. Built with Effect for typed error handling and structured concurrency. |
 | Action root | `src/` + `apps/action/` | The GitHub Action itself. Contains the harness (orchestration phases), features (triggers, comments, reviews, observability), and service adapters (GitHub API, cache, setup). Imports `@fro-bot/runtime` for core logic. |
 | `@fro.bot/opencode-plugin` | `packages/opencode-plugin/` | OpenCode V2 plugin providing workspace session-history tools and a pre-dispatch subagent-session reuse guard. |
 | workspace-agent | `apps/workspace-agent/` | Sandboxed Hono HTTP service alongside the gateway. It clones, inspects, updates, and recovers checkouts in the workspace container; hosts an unprivileged OpenCode process behind a bearer-token proxy; and exposes health/readiness probes. |
 
-The `apps/action/` directory holds the thinnest possible entry points — `main.ts` and `post.ts` — which simply re-export from `src/main.ts` and `src/post.ts`. The split exists to support multiple surfaces (the Discord gateway and workspace-agent are now live) that share the runtime package but have their own entry points.
+The `apps/action/` directory holds thin entry points for the main step, post hook, provider-key proxy, and read-only filesystem-view builder. The first two delegate to `src/main.ts` and `src/post.ts`; the latter two run separately so privileged setup and provider credentials stay outside the model-driven process. The surfaces share the runtime package without sharing their orchestrators.
 
 ## Layered Architecture (Action)
 
@@ -132,9 +135,9 @@ Both entry points are thin wrappers. `main.ts` delegates to `harness/run.ts`; `p
 
 ### Harness Package (`packages/harness/`)
 
-`@fro.bot/harness` is a published, patched OpenCode binary built via the LLM-merge integration method (`cortexkit/orw`). Rather than downloading stock OpenCode, the action setup can install the harness binary, which carries a curated set of integration refs (stalled or closed upstream PRs, branch URLs) merged onto each deliberately-pinned upstream release via a one-time `opencode run` LLM merge. The produced binary is frozen: the merge runs once in CI per release bump, is reviewed as a bump PR, and the integration commit SHA is pinned before per-platform binaries are built and published.
+`@fro.bot/harness` contains the historical patched OpenCode V1 CLI. Its LLM-merge integration method (`cortexkit/orw`) merged selected upstream refs onto a pinned release, then froze the reviewed integration SHA into per-platform binaries. Current execution uses digest-pinned stock V2 instead; the Action no longer accepts harness versions.
 
-The CLI is a drop-in replacement — all arguments pass through to the patched OpenCode binary. Own subcommands (`info`, `patches`, `doctor`) report provenance (upstream tag, integration refs, build SHA) and health. The `integrate` merge step (`integrate.ts`) runs the OpenCode merge agent in CI over prompt-injectable upstream PR content, so both of its GitHub credentials are short-lived and minted just-in-time rather than drawn from durable secrets. The merge agent's own auth is minted from an OIDC broker (`scripts/harness/mint-broker-credential.ts`), and the credential used to `git push` the merge result is a scoped GitHub App installation token — single-repo, `contents: write`-only, roughly one-hour TTL — minted inline by a trusted no-post step (`scripts/harness/mint-app-token.ts`) that validates the returned token's scope all-or-nothing and fails closed on any mismatch. Neither mint has a durable-credential fallback, and the App private key is mapped only to the mint step's environment, never to job-level env or disk. As further defense-in-depth, the harness masks the `github-token` value and scrubs the raw `INPUT_GITHUB-TOKEN` copy from the merge child's environment so the OpenCode subprocess never inherits it.
+The retained CLI passes ordinary arguments through to its native binary, while `info`, `patches`, and `doctor` report provenance and health. The release and integration workflows and the broker-credential mint were removed with the V1 cut. Published artifacts remain available for consumers pinned to the pre-cut Action, not as a selectable backend in the current release.
 
 The package ships as `@fro.bot/harness` (the main resolver) plus four per-platform packages (`@fro.bot/harness-linux-x64`, `-linux-arm64`, `-darwin-x64`, `-darwin-arm64`), each containing only its native binary. Its two commands have different roles: `harness` reserves provenance and maintenance subcommands, while `opencode` passes every argument directly to the native binary. Both passthrough paths share `run-passthrough.ts`, which resolves without a version-probe subprocess, forwards signals, and propagates the child's exit. Resolution selects an explicit native `OPENCODE_PATH`, then the platform package, and searches `PATH` only with `HARNESS_ALLOW_PATH_FALLBACK=1`; realpath and inode checks reject the shims themselves to prevent recursion. The advisory `postinstall` check is not required for command execution. Per-platform `optionalDependencies` are injected at publish time and are not listed in the workspace `package.json`. [[Setup and Configuration]] explains how Action setup separately verifies the requested version.
 
@@ -179,6 +182,10 @@ The service retains root authority for protected staging, journal, and network f
 The OpenCode server binds to loopback only. The workspace runs it through `opencode-server-v2.ts` and `opencode-proxy-v2.ts`, with a fresh database and Basic credential per spawn. The proxy exchanges the gateway's bearer for that credential and forwards only the gateway client's route allowlist, excluding credential enumeration. The gateway does not own the remote server's lifetime; the workspace supervisor does.
 
 The proxy ties connection lifetimes together: an upstream error or incomplete close destroys the downstream response, while a departed SSE consumer destroys its upstream event request. SSE remains exempt from the ordinary inactivity timeout; connection teardown prevents that exemption from leaving abandoned subscriptions alive.
+
+### Action isolation
+
+The Action has a separate, opt-in boundary for hosted Linux runners. `sandbox-preflight.ts` validates the published install and runner prerequisites; `sandbox-lifecycle.ts` manages an unprivileged account, a private mount namespace, path handoff, and confirmed teardown. Shared filesystem paths are read-only inside that view, while the checkout and run-owned state remain writable. A runner-owned key-proxy process holds provider keys and forwards only supported model routes. This is distinct from the workspace container's identity split: provisioned GitHub credentials and the OpenCode server password remain accessible to the Action's agent. [[Setup and Configuration]] describes the limits and toolchain access.
 
 ### Runtime Package (`packages/runtime/`)
 
@@ -331,8 +338,8 @@ Discord messageCreate event
               │     → SSE event stream → discord/streaming.ts → thread reply
               │
               ├─→ background dispatch observation (ownership ledger)
-              │     `task` tool completes with state.metadata.background === true
-              │     → ledger.adopt(childSessionId) + coordinator.addOwnedSession
+              │     native V2 subagent dispatch metadata identifies the child session
+              │     → ledger adoption + coordinator ownership registration
               │     → descendant's deltas/tools/approvals now route like the root's
               │
               ├─→ tool approval (if any tool set to `ask`; root or adopted descendant)
@@ -376,7 +383,7 @@ The harness release workflows (`harness-release.yaml`, `harness-integrate.yaml`)
 
 ## Build and Bundle
 
-The project uses `tsdown` (a Rolldown-based bundler) to produce `dist/main.js` and `dist/post.js`. The `dist/` directory is committed to the repository — GitHub Actions requires it. CI validates that `dist/` stays in sync with source by running `bun run build` and checking for diffs.
+The project uses `tsdown` (a Rolldown-based bundler) to produce `dist/main.js`, `dist/post.js`, `dist/key-proxy.js`, and `dist/sandbox-view.js`. The `dist/` directory is committed to the repository — GitHub Actions requires it. CI validates that `dist/` stays in sync with source by running `bun run build` and checking for diffs.
 
 The runtime package (`packages/runtime/`) is consumed as a workspace dependency via its TypeScript source — no separate build step is required for development, though it has its own `tsdown` config for publishing.
 

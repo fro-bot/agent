@@ -1,8 +1,12 @@
 ---
 type: subsystem
-last-updated: "2026-11-08"
-updated-by: "f7c20f94"
+last-updated: "2026-11-15"
+updated-by: "962b70bc"
 sources:
+  - src/services/cache/paths.ts
+  - src/harness/phases/log-snapshot.ts
+  - packages/runtime/src/shared/safe-read.ts
+  - packages/runtime/src/agent/server-v2.ts
   - src/harness/phases/execute-v2.ts
   - packages/runtime/src/session/version.ts
   - packages/runtime/src/session/generation.ts
@@ -56,11 +60,12 @@ The defining feature of Fro Bot is persistent memory. Unlike typical CI-based AI
 
 ## The Persistence Stack
 
-Session persistence involves three cooperating subsystems:
+Current session persistence combines transport and native V2 readers:
 
 1. **Cache layer** (`src/services/cache/`) — Saves and restores the OpenCode storage directory to/from GitHub Actions cache, with optional S3 write-through backup.
-2. **Session layer** (`packages/runtime/src/session/`) — Reads, searches, and manages sessions through the V1 SDK or native V2 routes, with generation-specific mappers. Part of `@fro-bot/runtime` (see [[Architecture Overview]]).
-3. **Writeback** — Injects a synthetic summary into session history, making past work discoverable. V1 only, via `writeback.ts`. V2 writes no summary (see [Run Summary Writeback](#run-summary-writeback)).
+2. **Session layer** (`packages/runtime/src/session/`) — Reads, searches, and manages active session context through native V2 routes and mappers. Part of `@fro-bot/runtime` (see [[Architecture Overview]]).
+
+Older SDK readers remain for compatibility, but the Action does not execute V1. V2 writes no synthetic run summary (see [Run Summary Writeback](#run-summary-writeback)); future discovery uses the conversation that was actually delivered.
 
 ## Cache Strategy
 
@@ -75,13 +80,15 @@ The repository segment replaces its slash with a dash. Branch-specific restore i
 
 For a V2 run, restore first checks the configured object store's `sessions-v2/` object, then its V1 `sessions/` object. Only after those miss does Actions-cache restore try V2 branch, V1 branch, V2 repository, and V1 repository, in that order. Each cache tier has its own path list and call because Actions cache derives an archive version from those paths. V2 saves only to its own namespace, leaving V1 backups available. Both generations currently name the main database `opencode.db`, but share neither cache prefix nor object-store prefix.
 
+V2 is now the default in cache-key and content-sync helpers, not a choice derived from a saved version string. The main step and post hook always save V2 paths; V1 is requested explicitly only by restore fallback tiers. This retains migration without retaining a V1 execution backend.
+
 ### V1 history import on a V2 run
 
 The Action's default now selects V2, so an existing V1-only repository reaches this import path without an explicit version override. V2 saves remain isolated from V1 archives, preserving the old namespace for a consumer that pins the previous harness build. The default switch does not change the workspace image's generation or make its fresh per-spawn database part of Action persistence.
 
 Restoring a V1 database into a V2 invocation begins a history import, not a prompt. `src/harness/phases/v1-import-wait.ts` polls `/api/experimental/migration/v1` until it reports completed. Required or running states keep waiting; errors fail immediately. The whole wait is bounded to 300 seconds, reported progress that stalls for 60 seconds fails earlier, and five consecutive unreadable observations fail rather than count as success. No prompt and no session save follow a failed import gate.
 
-Before spawning, restored V2 held execution claims are cleared (`held-claims-v2.ts`), preventing a killed invocation's claimed work from automatically resuming. Provider secrets use external key files and stale `auth.json` is removed so it cannot be imported into the persisted database. These are separate preparation steps: clearing claims is not deleting session history. [[Setup and Configuration]] describes credential and permission gates.
+Before spawning, restored V2 held execution claims are cleared (`held-claims-v2.ts`), preventing a killed invocation's claimed work from automatically resuming. Provider secrets use external key files on ordinary runs and a separate key proxy on isolated runs. Stale `auth.json` is removed so it cannot be imported into the persisted database. These are separate preparation steps: clearing claims is not deleting session history. [[Setup and Configuration]] describes credential and permission gates.
 
 ### Save keys and transport checks
 
@@ -153,6 +160,12 @@ The object store integrates with restore, save, and cleanup:
 
 S3 operations are always best-effort: failures are logged as warnings but never abort the run. The action supports AWS S3, Cloudflare R2, Backblaze B2, and MinIO, with SSE encryption auto-selected per endpoint type (`aws:kms` for AWS, `AES256` for custom endpoints).
 
+### Isolated logs and verified upload reads
+
+On `isolate-agent` runs, the shared OpenCode log directory can be handed to a later isolated step before the earlier step's post hook executes. `src/harness/phases/log-snapshot.ts` therefore copies logs only after confirmed sandbox take-back into a private runner-owned directory under `RUNNER_TEMP`. Both cleanup and the post hook use that invocation's snapshot; a missing snapshot never falls back to the shared directory.
+
+The copy admits only regular runner-owned files and spends one budget across the whole tree: 100 MiB and 10,000 visited entries. Symlinks and special files are skipped; exceeding either bound discards the partial copy rather than publishing it as complete. Unsafe sandbox teardown suppresses log publication entirely. Session and artifact uploads also use verified file handles (`packages/runtime/src/shared/safe-read.ts`, called by `s3-adapter.ts`), so a symlink or special file at an upload path is refused and the size comes from the handle actually streamed. This protects file selection, not the truth of model-written log content.
+
 The common settings parser (`packages/runtime/src/object-store/settings.ts`) gives the Action, gateway, and backfill the same prefix, endpoint, expected-owner, and encryption validation. A supplied expected owner is a 12-digit AWS account ID, and a KMS key requires an effective `aws:kms` mode; custom endpoints therefore need that mode explicitly when using KMS. Surface-specific credential reads and region requirements stay outside the parser. See [[Setup and Configuration]].
 
 ## SDK Session Operations
@@ -174,9 +187,7 @@ These runtime-side operations are distinct from the native agent tools described
 
 V2 provides the same four tool names through `@fro.bot/opencode-plugin`, backed by `storage-v2.ts`, `search-v2.ts`, and the V2 mappers. Reads and searches cover the active context window since the latest compaction, including its compaction summary, rather than promising an unlimited original transcript. Todos are recovered from the last completed `todowrite` in that window. The Action's eager context lookup uses those same reader primitives, so plugin tools and injected history agree on session IDs and titles. The plugin must be active before a V2 run is admitted.
 
-The file-tool installation described next is the V1 path.
-
-`packages/runtime/src/agent/session-tools.ts` implements the always-on `session_list` / `session_read` / `session_search` / `session_info` tool contract as a plain config-dir file tool (`tool/session.js`), independent of any plugin. Setup copies the compiled asset into the CI OpenCode config dir via `writeSessionToolsFile` (`src/services/setup/session-tools-config.ts`); OpenCode's tool registry loads it as a file tool before plugin tools, so a plugin tool of the same id overrides it at registry time (later-wins). The tools resolve an OpenCode client from `FRO_BOT_OPENCODE_URL` at call time (never at import time) and delegate to the same `packages/runtime/src/session/` primitives (`listSessions`, `getSession`, `getSessionMessages`, `getSessionTodos`, `getSessionInfo`, `searchSessions`) described above — they are a thin, string-formatted, model-facing wrapper over the SDK operations, not a separate storage path. Every failure path returns a `'session store unavailable: ...'` string rather than throwing, so a session-tool failure never fails the run; if the asset is missing at setup time, setup warns and continues, and the tools are simply absent from that run.
+The former V1 config-directory file tool and its setup writer were removed with the V1 execution path. Current tool availability comes from the required Fro Bot plugin and its activation gate, not a best-effort copied JavaScript asset.
 
 ## Mapper Architecture
 
@@ -208,7 +219,7 @@ When a session grows past the model's context window, continuing to resume it wo
 
 Continuity depends on each run resolving to a stable _logical session key_ derived from the triggering context (`packages/runtime/src/session/logical-key.ts`). For entity-bound events — issue comments, PR reviews, and the like — the key is built from the issue or PR identity, so a follow-up comment resumes the same thread the agent was already working in. Resolution filters candidate sessions for eligibility — dropping any that are archived or compacting — _before_ matching by title, in both the workspace-scoped and global lookups. This means an overflowed session that was archived by recovery can never be re-selected by title, even though its title still matches; the resolver skips past it to an eligible thread or starts fresh.
 
-Time-based triggers are subtler. Earlier, `schedule` runs keyed their logical session on the cron expression alone. Every scheduled run therefore resumed one ever-growing thread. As that single session's history bloated, the agent would read it, conclude the work was already done, and exit without making any tool calls — reporting success while silently doing nothing. To fix this, the schedule key now appends the workflow run ID to the cron-derived hash. Each scheduled run starts a fresh thread, while same-run reruns (which share a run ID) still resume correctly. The key is also qualified by the job's invocation identity (see [Invocation Identity](#invocation-identity-job-qualified-keys)): two jobs of one scheduled run — say, Remediate then Observe — are different tasks, and without the job component the second resolved the first's key and continued its root session. The trade-off is deliberate: scheduled maintenance tasks are expected to be idempotent against the repository state they inspect, not against an accumulating conversation, so cross-run memory still flows through [run summary writeback](#run-summary-writeback) and `searchSessions` rather than through a shared thread.
+Time-based triggers are subtler. Earlier, `schedule` runs keyed their logical session on the cron expression alone. Every scheduled run therefore resumed one ever-growing thread. As that single session's history bloated, the agent would read it, conclude the work was already done, and exit without making any tool calls — reporting success while silently doing nothing. To fix this, the schedule key now appends the workflow run ID to the cron-derived hash. Each scheduled run starts a fresh thread, while same-run reruns (which share a run ID) still resume correctly. The key is also qualified by the job's invocation identity (see [Invocation Identity](#invocation-identity-job-qualified-keys)): two jobs of one scheduled run — say, Remediate then Observe — are different tasks, and without the job component the second resolved the first's key and continued its root session. The trade-off is deliberate: scheduled maintenance tasks are expected to be idempotent against the repository state they inspect, not against an accumulating conversation, so cross-run memory flows through persisted conversation text and native session search rather than a shared thread.
 
 ## Pruning
 
@@ -225,9 +236,9 @@ This "age OR count" approach prevents both unbounded growth (count limit) and pr
 
 ## Run Summary Writeback
 
-Summary writeback is an optional backend capability, not a common finalization operation. The `ExecutionBackend` contract in `src/harness/phases/execute-v2.ts` exposes `writeSummary` for V1 and omits it for V2. V2 release still observes late work, refreshes usage, and prunes sessions before shutdown; it does not enqueue a synthetic summary. Cross-run discovery on V2 therefore relies on delivered conversation text and the session-history tools rather than a harness-generated writeback message. See [[Background Subagents and Ownership]].
+The current `ExecutionBackend` contract in `src/harness/phases/execute-v2.ts` has no summary-write capability. V2 release still observes late work, refreshes usage, and prunes sessions before shutdown; it does not enqueue a synthetic summary. Cross-run discovery therefore relies on delivered conversation text and the session-history tools rather than a harness-generated writeback message. See [[Background Subagents and Ownership]].
 
-On V1, each run's session writeback records a structured summary of what the agent did, including the event type, repository, cache status, session ID, and errors. It becomes searchable by future runs through session search. The write happens during V1 execution, while the server remains available, and the summary is not treated as an authoritative run-state record.
+Historical V1 runs wrote a structured summary while the server was available. That describes pre-cut archives, not an operation performed by the current Action.
 
 V2 writes no summary. Its only route for adding text to a session, `POST /api/session/:id/synthetic`, admits the text to the session inbox and delivers it as a message at the next step boundary. With `resume: false` and the server about to shut down, nothing delivers it, so the old V2 write never reached the transcript. It stayed as a queued inbox row in the saved database, and a run that started within ten minutes read that row as queued work on every pass and never drained quiet (#2029). Nothing on V2 read the summary: prior-work search matches message text, and no summary message ever existed.
 
@@ -237,9 +248,11 @@ Symbol-level reference for mechanisms that [ARCHITECTURE.md](../../ARCHITECTURE.
 
 ### SQLite WAL Checkpoint Repair (Cache Bootstrap Trap)
 
-`src/services/cache/checkpoint.ts` (`checkpointDatabase`) merges the OpenCode session database's write-ahead log into the main `opencode.db` file via `PRAGMA wal_checkpoint(TRUNCATE)` (`node:sqlite`, unflagged on Node 24), and runs at two call sites: inside `saveCache` (`src/services/cache/save.ts`), before file sizes are inspected or bytes transported, and again on the restore side in `runCacheRestore` (`src/harness/phases/cache-restore.ts`), before `bootstrapOpenCodeServer` ever opens the database. Restore keys are prefixes that return the most recent entry and save keys are unique per run, so a run that declines to save leaves a poisoned entry as the newest one for the next restore to hit again — checkpointing on restore heals a stuck repository in place instead of letting it loop. Success is judged by the WAL's on-disk size after the attempt, never by the pragma's own `checkpointed` count (verified to under-report on a fully successful truncation). A busy or lock-contended writer surfaces as a busy database and is retried within a bounded attempt count and wall-clock deadline; the deadline is checked only between attempts, so an in-flight pragma is never interrupted. An **idle** live writer does not surface this way at all: a checkpoint against it can report success and then have the WAL grow again moments later from a write that was already in flight when the child was signalled. Closing that gap is `packages/runtime/src/agent/server.ts`'s job, not the checkpoint's — `OpenCodeServerHandle.shutdown()` sends the child's kill signal and then polls its listening port (bounded, best-effort; the SDK exposes no pid or exit event to await directly) until connections start being refused or a timeout elapses, and `src/harness/phases/cleanup.ts` awaits that before `saveCache` ever runs. A timed-out poll does not fail the run, but is logged, since the checkpoint that follows is not then running against a confirmed-quiet database.
+`src/services/cache/checkpoint.ts` (`checkpointDatabase`) merges the session database's write-ahead log into `opencode.db` via SQLite's truncating checkpoint. It runs inside `saveCache` before inspecting or transporting bytes and during restore before server startup. This prevents the newest restored entry from repeatedly trapping a repository behind an unmerged WAL. Success is judged by the WAL's on-disk size, not the pragma's reported checkpoint count.
 
-The write-ahead log itself no longer crosses either transport on save: `DB_TRANSPORTABLE_BASENAMES` (`packages/runtime/src/session/version.ts`) and `buildCachePaths` (`src/services/cache/paths.ts`) both include only the main database file. The object store's per-key upload/overwrite is not atomic across two files, so a healthy save that only refreshes `opencode.db` could otherwise leave an older `opencode.db-wal` object paired with a newer database on the next restore; `src/services/cache/restore.ts` deletes any write-ahead log downloaded from the object store immediately after the sync call returns, before anything opens the database. Restore and save now build the Actions-cache path list from that same shared `buildCachePaths`, so its version hash is identical by construction; a legacy database+WAL cache entry (built from the old five-path list) no longer matches that hash and is therefore never restored at all, not repaired in place.
+A checkpoint is not evidence that a writer stopped: an idle process can write again afterwards. Current release therefore confirms the V2 child process exit (`packages/runtime/src/agent/server-v2.ts`) before saving, and isolated runs additionally confirm namespace and uid teardown. Unconfirmed release declines persistence; the old V1 listening-port shutdown probe is not the current safety boundary.
+
+The write-ahead log itself no longer crosses either transport on save. The transportable-basename constants in `packages/runtime/src/session/version.ts` include only the main database, and `buildCachePathsV2` (`src/services/cache/paths.ts`) is shared by V2 cache restore and save. V1 fallback tiers explicitly use `buildCachePathsV1Sqlite` to match the older archive path hash. The object store's overwrites are not atomic across files, so restore removes downloaded WAL and SHM sidecars before opening a database; an old sidecar must not be paired with a newer main file.
 
 `src/services/cache/integrity.ts` (`verifyDatabaseUsable`) closes the gap a hot WAL would otherwise mask: a structurally corrupt database with no pending write-ahead data reports `nothing-to-checkpoint` and would sail through unprobed, later getting re-persisted under a fresh key. It runs only on the restore path (`SELECT count(*) FROM sqlite_master`, a schema-page read, not a full `PRAGMA integrity_check`) and only when `checkpointDatabase` itself reports `nothing-to-checkpoint`.
 
