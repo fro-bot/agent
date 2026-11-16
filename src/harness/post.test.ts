@@ -8,6 +8,7 @@ import {err, ok} from '../shared/types.js'
 
 vi.mock('@actions/core', () => ({
   getState: vi.fn(),
+  saveState: vi.fn(),
   warning: vi.fn(),
   info: vi.fn(),
   debug: vi.fn(),
@@ -1333,5 +1334,153 @@ describe('post action', () => {
         )
       })
     })
+  })
+})
+
+async function exists(target: string): Promise<boolean> {
+  return fs.lstat(target).then(
+    () => true,
+    () => false,
+  )
+}
+
+describe('post action: gh config directory left by a main step that did not finish (#2156)', () => {
+  let runnerTemp: string
+  let dir: string
+
+  beforeEach(async () => {
+    vi.resetModules()
+    vi.clearAllMocks()
+    runnerTemp = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'post-gh-config-')))
+    dir = await fs.mkdtemp(path.join(runnerTemp, 'gh-config-'))
+    await fs.writeFile(path.join(dir, 'hosts.yml'), 'token', {mode: 0o600})
+    vi.stubEnv('RUNNER_TEMP', runnerTemp)
+  })
+
+  afterEach(async () => {
+    vi.unstubAllEnvs()
+    await fs.rm(runnerTemp, {recursive: true, force: true})
+  })
+
+  it('removes the directory the main step recorded and never removed', async () => {
+    // #given a main step killed before its cleanup (cancellation): the state still names the directory
+    await stubState({ghConfigDir: dir})
+    const {runPost} = await import('./post.js')
+
+    // #when
+    await runPost({logger: createMockLogger()})
+
+    // #then
+    expect(await exists(dir)).toBe(false)
+  })
+
+  it('removes it on an isolated run whose main step confirmed the restore', async () => {
+    // #given
+    await stubState({ghConfigDir: dir, isolatedRun: 'true', sandboxState: 'restored'})
+    const {runPost} = await import('./post.js')
+
+    // #when
+    await runPost({logger: createMockLogger()})
+
+    // #then
+    expect(await exists(dir)).toBe(false)
+  })
+
+  it.each([
+    ['no teardown state (the main step died)', {isolatedRun: 'true'}],
+    ['a pending teardown', {isolatedRun: 'true', sandboxState: 'pending'}],
+    ['an unsafe teardown', {isolatedRun: 'true', sandboxState: 'unsafe'}],
+  ])('leaves it alone on an isolated run with %s', async (_label, state) => {
+    // #given a directory the sandbox user may still own
+    await stubState({ghConfigDir: dir, ...state})
+    const {runPost} = await import('./post.js')
+
+    // #when
+    await runPost({logger: createMockLogger()})
+
+    // #then
+    expect(await exists(path.join(dir, 'hosts.yml'))).toBe(true)
+  })
+
+  it('removes the directory of a run terminated right after gh auth login created it', async () => {
+    // #given the real setup code creating the directory, with the state the runner would persist captured as it is written
+    const state: Record<string, string> = {}
+    const core = await import('@actions/core')
+    await stubState({})
+    vi.mocked(core.saveState).mockImplementation((key: string, value: unknown) => {
+      state[key] = String(value)
+    })
+    vi.mocked(core.getState).mockImplementation((key: string) => state[key] ?? '')
+    const {configureGhAuth} = await import('../services/setup/gh-auth.js')
+    const {recordRunGhConfigDir} = await import('./phases/gh-config.js')
+    let loginStarted: () => void = () => {}
+    const started = new Promise<void>(resolve => {
+      loginStarted = resolve
+    })
+    const execAdapter = {
+      exec: vi.fn(),
+      getExecOutput: vi.fn(),
+      // `gh auth login` writes hosts.yml, then the process is cut off: this never settles, like a killed main step
+      execWithTimeout: vi.fn(
+        async (
+          _cmd: string,
+          _args: string[] | undefined,
+          _timeout: number,
+          options?: {env?: Record<string, string>},
+        ) => {
+          await fs.writeFile(path.join(options?.env?.GH_CONFIG_DIR as string, 'hosts.yml'), 'token', {mode: 0o600})
+          loginStarted()
+          return new Promise<never>(() => {})
+        },
+      ),
+    }
+    const neverSettles = configureGhAuth(
+      null,
+      null,
+      'ghs_token',
+      createMockLogger(),
+      execAdapter,
+      true,
+      recordRunGhConfigDir,
+    )
+    neverSettles.catch(() => {})
+    await started
+
+    // #then the only trace is the action state, and it names a directory holding the token
+    const created = state.ghConfigDir as string
+    expect(created).toMatch(/gh-config-/)
+    expect(await exists(path.join(created, 'hosts.yml'))).toBe(true)
+
+    // #when the post hook runs in the next process
+    const {runPost} = await import('./post.js')
+    await runPost({logger: createMockLogger()})
+
+    // #then it removes the directory
+    expect(await exists(created)).toBe(false)
+  })
+
+  it('does nothing when the main step already removed it (the record was cleared)', async () => {
+    // #given
+    await stubState({ghConfigDir: ''})
+    const {runPost} = await import('./post.js')
+
+    // #when
+    await runPost({logger: createMockLogger()})
+
+    // #then a directory nobody recorded is not touched
+    expect(await exists(path.join(dir, 'hosts.yml'))).toBe(true)
+  })
+
+  it('never removes a recorded path that is not a gh-config-* directory under RUNNER_TEMP', async () => {
+    // #given a corrupted record pointing at RUNNER_TEMP itself
+    await stubState({ghConfigDir: runnerTemp})
+    const {runPost} = await import('./post.js')
+
+    // #when
+    await runPost({logger: createMockLogger()})
+
+    // #then
+    expect(await exists(runnerTemp)).toBe(true)
+    expect(await exists(dir)).toBe(true)
   })
 })

@@ -9,6 +9,7 @@ import {createMockLogger} from '../../shared/test-helpers.js'
 import {createMockOctokit} from '../github/test-helpers.js'
 import {createExecAdapter} from './adapters.js'
 import {configureGhAuth, configureGitIdentity, getBotLogin, getBotUserId} from './gh-auth.js'
+import {removeGhConfigDir} from './gh-config-dir.js'
 
 vi.mock('node:fs/promises', async () => {
   const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises')
@@ -17,6 +18,11 @@ vi.mock('node:fs/promises', async () => {
     mkdtemp: vi.fn(actual.mkdtemp),
     chmod: vi.fn(actual.chmod),
   }
+})
+
+vi.mock('./gh-config-dir.js', async () => {
+  const actual = await vi.importActual<typeof import('./gh-config-dir.js')>('./gh-config-dir.js')
+  return {...actual, removeGhConfigDir: vi.fn(actual.removeGhConfigDir)}
 })
 
 function createMockExecAdapter(overrides: Partial<ExecAdapter> = {}): ExecAdapter {
@@ -615,5 +621,198 @@ describe('gh-auth', () => {
       // #then
       expect(mockOctokit.rest.users.getByUsername).toHaveBeenCalledWith({username: 'my-app[bot]'})
     })
+  })
+})
+
+// Stands in for `gh auth login --with-token`: writes hosts.yml where GH_CONFIG_DIR points, then reports `exit`.
+function loginThatWritesHostsYml(exit: number | 'timed-out') {
+  return vi.fn(
+    async (_cmd: string, _args: string[] | undefined, _timeout: number, options?: {env?: Record<string, string>}) => {
+      const dir = options?.env?.GH_CONFIG_DIR as string
+      await fs.writeFile(join(dir, 'hosts.yml'), 'github.com:\n  oauth_token: secret\n', {mode: 0o600})
+      return exit
+    },
+  )
+}
+
+describe("gh-auth: the run's gh config directory (#2156)", () => {
+  let originalEnv: NodeJS.ProcessEnv
+  let runnerTemp: string
+  let mockLogger: Logger
+
+  beforeEach(async () => {
+    originalEnv = {...process.env}
+    mockLogger = createMockLogger()
+    runnerTemp = await fs.realpath(await fs.mkdtemp(join(tmpdir(), 'gh-auth-runner-')))
+    process.env.RUNNER_TEMP = runnerTemp
+    delete process.env.GH_CONFIG_DIR
+  })
+
+  afterEach(async () => {
+    process.env = originalEnv
+    vi.restoreAllMocks()
+    await fs.rm(runnerTemp, {recursive: true, force: true})
+  })
+
+  async function configDirs(): Promise<string[]> {
+    return (await fs.readdir(runnerTemp)).filter(name => name.startsWith('gh-config-'))
+  }
+
+  it('records the directory the moment it exists, before gh auth login runs', async () => {
+    // #given a login that checks what had been recorded when it started
+    const record = vi.fn()
+    let recordedAtLogin: string | null | undefined
+    let existedAtLogin = false
+    const execWithTimeout = vi.fn(
+      async (_cmd: string, _args: string[] | undefined, _t: number, options?: {env?: Record<string, string>}) => {
+        recordedAtLogin = record.mock.calls[0]?.[0] as string | undefined
+        existedAtLogin =
+          recordedAtLogin !== undefined &&
+          (await fs.lstat(recordedAtLogin).then(
+            () => true,
+            () => false,
+          ))
+        expect(options?.env?.GH_CONFIG_DIR).toBe(recordedAtLogin)
+        return 0
+      },
+    )
+    const mockExec = createMockExecAdapter({execWithTimeout})
+
+    // #when
+    await configureGhAuth(createMockOctokit(), 'app-token', 'default', mockLogger, mockExec, true, record)
+
+    // #then a process killed during the login would already have left a record naming a directory that exists
+    expect(recordedAtLogin).toMatch(/gh-config-/)
+    expect(existedAtLogin).toBe(true)
+    expect(record).toHaveBeenCalledTimes(1)
+    expect(record).toHaveBeenCalledWith(process.env.GH_CONFIG_DIR)
+  })
+
+  it('removes the directory and clears the record when gh auth login exits non-zero after writing hosts.yml', async () => {
+    // #given
+    const record = vi.fn()
+    const execWithTimeout = loginThatWritesHostsYml(1)
+    const mockExec = createMockExecAdapter({execWithTimeout})
+
+    // #when
+    const result = await configureGhAuth(
+      createMockOctokit(),
+      'app-token',
+      'default',
+      mockLogger,
+      mockExec,
+      true,
+      record,
+    )
+
+    // #then the token-bearing directory is gone, was never published, and no stale record is left
+    expect(result.authenticated).toBe(true)
+    expect(await configDirs()).toEqual([])
+    expect(process.env.GH_CONFIG_DIR).toBeUndefined()
+    expect(record.mock.calls.map(call => (call[0] === null ? null : 'dir'))).toEqual(['dir', null])
+    expect(mockLogger.warning).toHaveBeenCalledWith(
+      expect.stringContaining('gh auth login failed'),
+      expect.objectContaining({exitCode: 1}),
+    )
+  })
+
+  it('removes the directory and clears the record when gh auth login times out after writing hosts.yml', async () => {
+    // #given
+    const record = vi.fn()
+    const mockExec = createMockExecAdapter({execWithTimeout: loginThatWritesHostsYml('timed-out')})
+
+    // #when
+    await configureGhAuth(createMockOctokit(), 'app-token', 'default', mockLogger, mockExec, true, record)
+
+    // #then
+    expect(await configDirs()).toEqual([])
+    expect(process.env.GH_CONFIG_DIR).toBeUndefined()
+    expect(record.mock.calls.map(call => (call[0] === null ? null : 'dir'))).toEqual(['dir', null])
+  })
+
+  it('removes the directory when running gh throws (gh missing from PATH)', async () => {
+    // #given
+    const record = vi.fn()
+    const execWithTimeout = vi.fn().mockRejectedValue(Object.assign(new Error('spawn gh ENOENT'), {code: 'ENOENT'}))
+    const mockExec = createMockExecAdapter({execWithTimeout})
+
+    // #when
+    const result = await configureGhAuth(
+      createMockOctokit(),
+      'app-token',
+      'default',
+      mockLogger,
+      mockExec,
+      true,
+      record,
+    )
+
+    // #then
+    expect(result.authenticated).toBe(true)
+    expect(await configDirs()).toEqual([])
+    expect(record.mock.calls.map(call => (call[0] === null ? null : 'dir'))).toEqual(['dir', null])
+  })
+
+  it('warns and keeps the record when the directory of a failed login cannot be removed', async () => {
+    // #given a failed login whose cleanup fails
+    const record = vi.fn()
+    vi.mocked(removeGhConfigDir).mockResolvedValueOnce('failed')
+    const mockExec = createMockExecAdapter({execWithTimeout: loginThatWritesHostsYml(1)})
+
+    // #when
+    const result = await configureGhAuth(
+      createMockOctokit(),
+      'app-token',
+      'default',
+      mockLogger,
+      mockExec,
+      true,
+      record,
+    )
+
+    // #then setup carries on, and the record stays so the end-of-run cleanup and the post hook retry it
+    expect(result.authenticated).toBe(true)
+    expect(mockLogger.warning).toHaveBeenCalledWith(expect.stringContaining('could not be removed'), expect.anything())
+    expect(record.mock.calls.map(call => (call[0] === null ? null : 'dir'))).toEqual(['dir'])
+    expect(process.env.GH_CONFIG_DIR).toBeUndefined()
+  })
+
+  it('leaves a successful login unchanged: published, kept, recorded once', async () => {
+    // #given
+    const record = vi.fn()
+    const mockExec = createMockExecAdapter({execWithTimeout: loginThatWritesHostsYml(0)})
+
+    // #when
+    await configureGhAuth(createMockOctokit(), 'app-token', 'default', mockLogger, mockExec, true, record)
+
+    // #then
+    const [dir] = await configDirs()
+    expect(dir).toBeDefined()
+    expect(process.env.GH_CONFIG_DIR).toBe(join(runnerTemp, dir as string))
+    await expect(fs.lstat(join(runnerTemp, dir as string, 'hosts.yml'))).resolves.toBeDefined()
+    expect(record).toHaveBeenCalledTimes(1)
+    expect(record).toHaveBeenCalledWith(process.env.GH_CONFIG_DIR)
+    expect(removeGhConfigDir).not.toHaveBeenCalled()
+  })
+
+  it('records nothing when the credential is withheld (no directory is created)', async () => {
+    // #given
+    const record = vi.fn()
+    const execWithTimeout = vi.fn().mockResolvedValue(0)
+
+    // #when
+    await configureGhAuth(
+      createMockOctokit(),
+      'app-token',
+      'default',
+      mockLogger,
+      createMockExecAdapter({execWithTimeout}),
+      false,
+      record,
+    )
+
+    // #then
+    expect(record).not.toHaveBeenCalled()
+    expect(await configDirs()).toEqual([])
   })
 })

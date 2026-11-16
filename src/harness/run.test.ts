@@ -59,6 +59,10 @@ vi.mock('./phases/cache-restore.js', () => ({
   runCacheRestore: vi.fn(),
 }))
 
+vi.mock('./phases/gh-config.js', () => ({
+  releaseRunGhConfig: vi.fn(async () => undefined),
+}))
+
 vi.mock('./phases/cleanup.js', () => ({
   runCleanup: vi.fn().mockResolvedValue({quiescenceConfirmed: true, continuityUnverified: false}),
 }))
