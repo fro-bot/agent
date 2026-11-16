@@ -9,6 +9,23 @@ import {toErrorMessage} from '../../shared/errors.js'
 import {getUserByUsername} from '../github/api.js'
 import {getBotLogin as getAuthenticatedUser} from '../github/client.js'
 
+const GH_LOGIN_TIMEOUT_MS = 30_000
+
+/**
+ * `@actions/exec` writes stdin with no `'error'` listener, so a `gh` that exits before reading the token raises an
+ * unhandled EPIPE that kills the Action. `execWithTimeout` handles stdin errors and reports a non-zero exit instead.
+ */
+async function runGhLogin(
+  execAdapter: ExecAdapter,
+  options: NonNullable<Parameters<ExecAdapter['exec']>[2]>,
+): Promise<number | 'timed-out'> {
+  const args = ['auth', 'login', '--with-token']
+  if (execAdapter.execWithTimeout != null) {
+    return execAdapter.execWithTimeout('gh', args, GH_LOGIN_TIMEOUT_MS, options)
+  }
+  return (await execAdapter.getExecOutput('gh', args, options)).exitCode
+}
+
 export async function configureGhAuth(
   client: Octokit | null,
   appToken: string | null,
@@ -70,13 +87,13 @@ export async function configureGhAuth(
       const loginEnv: Record<string, string> = {...process.env, GH_CONFIG_DIR: ghConfigDir}
       delete loginEnv.GH_TOKEN
       delete loginEnv.GITHUB_TOKEN
-      const loginResult = await execAdapter.getExecOutput('gh', ['auth', 'login', '--with-token'], {
+      const loginExit = await runGhLogin(execAdapter, {
         env: loginEnv,
         input: Buffer.from(token, 'utf8'),
         silent: true,
         ignoreReturnCode: true,
       })
-      if (loginResult.exitCode === 0) {
+      if (loginExit === 0) {
         // Only repoint the global env at the temp config dir once we know login succeeded —
         // if login fails, leave GH_CONFIG_DIR unset so gh falls back to any pre-existing
         // default config instead of an empty directory.
@@ -93,7 +110,7 @@ export async function configureGhAuth(
         // `gh auth login` only degrades the model's own `gh` usage in the child, it does not
         // break setup.
         logger.warning('gh auth login failed; model gh CLI usage in the child may be unauthenticated', {
-          exitCode: loginResult.exitCode,
+          exitCode: loginExit,
         })
       }
 
