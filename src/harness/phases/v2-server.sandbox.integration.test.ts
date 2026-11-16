@@ -2236,6 +2236,8 @@ describe.skipIf(!gated)('isolate-agent read-only view: a launcher killed while t
   let markerAfterWait = true
   let sandboxUid: number | null = null
   let launchNamespaces: LaunchNamespaces | undefined
+  let gateNamespace = 'not read'
+  let namespacesAtGate: LaunchNamespaces | undefined
 
   beforeAll(async () => {
     const tools = await preflightTools(logger)
@@ -2243,6 +2245,7 @@ describe.skipIf(!gated)('isolate-agent read-only view: a launcher killed while t
     const keyFile = writeKeyFile(keyDir)
     initWorkspace(workspace)
     const namespacesBefore = mountNamespaces()
+    const markers = (): string[] => [path.basename(gateDir), strayPattern, path.basename(scratch)]
 
     lifecycle = createSandboxLifecycle({
       tools,
@@ -2287,6 +2290,10 @@ describe.skipIf(!gated)('isolate-agent read-only view: a launcher killed while t
       // What a group kill from the runner does: only `sudo` dies; its root child is orphaned at the gate.
       child.kill('SIGKILL')
       await new Promise(resolve => setTimeout(resolve, 500))
+      // Positive control for the scan the teardown check relies on: the orphan is still at the gate, so its namespace
+      // must be found as the launch's.
+      gateNamespace = /\d+/.exec(fs.readFileSync(path.join(gateDir, 'ns'), 'utf8'))?.[0] ?? 'unreadable'
+      namespacesAtGate = launchNamespacesSince(namespacesBefore, sandboxUid, markers())
       return {value: 'killed at the gate', unconfirmed: false}
     })
 
@@ -2295,11 +2302,7 @@ describe.skipIf(!gated)('isolate-agent read-only view: a launcher killed while t
     await new Promise(resolve => setTimeout(resolve, 3000))
     markerAfterWait = fs.existsSync(marker)
     processesAfter = strayProcesses(`${path.basename(gateDir)}|${strayPattern}`)
-    launchNamespaces = launchNamespacesSince(namespacesBefore, sandboxUid, [
-      path.basename(gateDir),
-      strayPattern,
-      path.basename(scratch),
-    ])
+    launchNamespaces = launchNamespacesSince(namespacesBefore, sandboxUid, markers())
   }, 300_000)
 
   afterAll(async () => {
@@ -2315,6 +2318,12 @@ describe.skipIf(!gated)('isolate-agent read-only view: a launcher killed while t
     expect(gateReported).toBe(true)
     expect(processesAtGate).not.toBe('')
     expect(markerAfterWait).toBe(false)
+  })
+
+  it('found the orphan’s namespace as the launch’s while it waited, so the teardown check can fail', () => {
+    // #given the scan ran with the orphan still at the gate
+    // #then the namespace the gate reported is among the kept ones
+    expect(namespacesAtGate?.kept).toContain(gateNamespace)
   })
 
   it('is restored only because the orphaned root process was confirmed gone', () => {
