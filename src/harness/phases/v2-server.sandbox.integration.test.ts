@@ -2511,6 +2511,14 @@ describe.skipIf(!gated)('isolate-agent runs bun and pnpm from their install root
         `else R tool_uv_install FAILED "rc=$rc [$(printf %s "$o" | tail -c 300 | ev)]"; fi`,
     },
     {
+      // The agent's runtime directory is its own: tools that keep sockets there (agent-browser) can create them.
+      id: 'runtime_dir_own',
+      category: 'works',
+      cmd:
+        `case "$XDG_RUNTIME_DIR" in "$HOME"/*) ;; *) R runtime_dir_own FAILED "not under the home: $XDG_RUNTIME_DIR"; exit 0;; esac; ` +
+        `mkdir -p "$XDG_RUNTIME_DIR/fro-bot-it" && R runtime_dir_own WORKS "$XDG_RUNTIME_DIR" || R runtime_dir_own FAILED "cannot write $XDG_RUNTIME_DIR"`,
+    },
+    {
       // A missing command is "not found", not "permission denied": the agent's PATH holds no directory it can't enter
       // (the runner image puts `~/.cargo/bin` and `~/.dotnet/tools` on the runner's).
       id: 'path_missing_command',
@@ -2761,6 +2769,12 @@ describe.skipIf(!gated)('isolate-agent runs bun and pnpm from their install root
     expect(facts.aclAfter).toEqual([])
     expect(facts.aclChanged).toEqual([])
     expect(result?.released).toMatchObject({stop: 'stopped', restore: 'restored'})
+  })
+
+  it('gives the agent a runtime directory of its own that it can write', () => {
+    // #given the agent created a directory under $XDG_RUNTIME_DIR
+    // #then it is under the account's home and the write succeeded
+    expect(failuresFor(result?.rows ?? new Map(), 'runtime_dir_own', 'WORKS')).toEqual([])
   })
 
   it('reports a missing command as not found and lets git use the runner’s checkout with its config files off', () => {

@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-11-08"
-updated-by: "f7c20f94"
+last-updated: "2026-11-15"
+updated-by: "962b70bc"
 sources:
   - src/harness/phases/brokered-push-plan.ts
   - src/features/agent/prompt-sender-v2.ts
@@ -94,6 +94,8 @@ For issue and PR events, the prompt builder can include rich context fetched via
 
 Every prompt includes a response protocol section requiring the agent to produce exactly one response per run, include a run summary block with the `<!-- fro-bot-agent -->` marker, and never post the run summary as a separate comment. This protocol is enforced at the prompt level — the agent is instructed to self-enforce it — but its _content_ varies with the delivery mode (below). The marker comment allows the system to identify bot-generated comments for potential future editing or deduplication.
 
+For model-posted comments and reviews, `packages/runtime/src/agent/prompt.ts` describes stdin delivery through `--body-file -` and a quoted heredoc. Markdown backticks, dollar signs, and quotes then reach `gh` unchanged instead of being expanded by the shell. The examples and review directive use the same delivery form; this changes body transport, not the single-response or verdict contract.
+
 ## Response Delivery Modes
 
 How the agent is told to deliver its answer is decided in bootstrap by `resolveResponseDelivery()` (see [[Execution Lifecycle]]) and threaded into `buildPrompt` as a `ResponseDelivery` value. Three modes reshape the harness rules and, for reviews, the `<output_contract>` section:
@@ -126,16 +128,10 @@ Mismatches degrade asymmetrically, in the direction that preserves work. A verdi
 
 V2 keeps the XML prompt and delivery contracts above, but changes their transport. `src/features/agent/prompt-sender-v2.ts` sends text and file attachments through the native prompt route; agent and model are set on session creation or continuation in `execution-v2.ts`, rather than attached to each prompt as on V1. The event subscription must connect before submission because it has no replay.
 
-The V1 continuation-prompt loop below is not applied to an admitted V2 turn. V2 retries transient provider failures itself. The Action retries eligible failures before sending, or explicit submission refusals, but never resends a prompt whose POST lost its transport acknowledgment: that request may already have started tools or GitHub writes. Such a run records `sendUncertain`, stops directory activity, and declines persistence and endorsement. Error diagnostics retain call kind and status rather than response bodies that could echo the task.
+V2 retries transient provider failures itself. The Action retries eligible failures before sending, or explicit submission refusals, but never resends a prompt whose POST lost its transport acknowledgment: that request may already have started tools or GitHub writes. Such a run records `sendUncertain`, stops directory activity, and declines persistence and endorsement. Error diagnostics retain call kind and status rather than response bodies that could echo the task.
 
 V2 also obtains injected prior-work context through the native session reader used by the Fro Bot plugin's session tools. Those reads represent the active context window, including the latest compaction summary, so the prompt's invitation to search history does not imply access to every pre-compaction message. [[Session Persistence]] describes the continuity and import boundaries.
 
 After V2 submission, `src/features/agent/retry-v2.ts` observes completion through events, session waiting, and a poll watchdog. Each session-wait long poll is bounded to 60 seconds and renewed when that local bound expires; this avoids the HTTP client's longer headers timeout without resending the prompt. A real wait-route failure logs the switch to polling, while the run's own cancellation and overall deadline remain authoritative.
 
-### V1 SDK submission
-
-The assembled prompt text and reference files are sent to an OpenCode V2 session by `sendPromptToSessionV2()` in `src/features/agent/prompt-sender-v2.ts`. (This module lives in the action layer — the runtime no longer carries a parallel prompt-sender after the execution stack was consolidated; see [[Architecture Overview]].) The function handles model resolution (if a model override is configured), directory scoping to the GitHub workspace, and the construction of the SDK message payload with both text and file parts. For retry attempts after LLM failures, a short continuation prompt is sent instead of the full initial prompt, since the session already has the full context. That continuation text is built from the observed error type rather than a fixed string, and asks the model to continue the remaining objective rather than blindly resume — the [[Execution Lifecycle]] covers how the attempt outcome is classified and how the continuation is phrased.
-
-Submission is also where the run's completion evidence is armed. Immediately before the prompt is sent, the retry loop resets the root-freshness tracker so the attempt starts with no accumulated evidence that a turn has ended. This matters because the send is the boundary between "nothing is running" and "something is," and any idle observation carried across that boundary would describe the previous turn. See [[Background Subagents and Ownership]].
-
-The SDK may return an error envelope rather than throw. Submission keeps that structured value as classification evidence and uses `formatSdkError` (`packages/runtime/src/shared/errors.ts`) only for its readable description, bounded to 500 characters. This avoids opaque `[object Object]` diagnostics without making formatted prose the authority for retry decisions.
+The V1 SDK sender and continuation-retry implementation have been removed. Current submission and observation are owned by the Action's V2 modules, not a parallel runtime orchestrator. [[Execution Lifecycle]] describes the admission boundary and [[Background Subagents and Ownership]] explains why completion evidence must belong to the current turn.

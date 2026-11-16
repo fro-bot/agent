@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-11-08"
-updated-by: "f7c20f94"
+last-updated: "2026-11-15"
+updated-by: "962b70bc"
 sources:
   - docs/wiki/Architecture Overview.md
   - docs/wiki/Background Subagents and Ownership.md
@@ -35,9 +35,9 @@ An Obsidian-powered project wiki maintained by Fro Bot. This vault provides huma
 | Page | Type | Summary |
 | --- | --- | --- |
 | [Session Persistence](Session%20Persistence.md) | subsystem | Generation-isolated session transport, V1-to-V2 history import, session tools, and durable run memory |
-| [Background Subagents and Ownership](Background%20Subagents%20and%20Ownership.md) | subsystem | How ownership accounting and generation-specific release gates contain background subagents, shells, and follow-up turns |
+| [Background Subagents and Ownership](Background%20Subagents%20and%20Ownership.md) | subsystem | How ownership accounting, V2 directory release, and isolated-process teardown contain background work |
 | [Prompt Architecture](Prompt%20Architecture.md) | subsystem | How the multi-section XML-tagged prompt is assembled and why each section exists |
-| [Setup and Configuration](Setup%20and%20Configuration.md) | subsystem | Generation-aware tool installation, permission gates, provider credentials, plugins, and tools caching |
+| [Setup and Configuration](Setup%20and%20Configuration.md) | subsystem | Pinned V2 installation, permission gates, trusted repository skills, and optional hosted-runner isolation |
 | [Operator Web Control Surface](Operator%20Web%20Control%20Surface.md) | subsystem | Authenticated browser surface for gateway runs, OAuth admission, durable sessions, bindings-based repo access, checkout provenance, live observation, and push health |
 
 ### Conventions
@@ -54,7 +54,7 @@ An Obsidian-powered project wiki maintained by Fro Bot. This vault provides huma
 
 ## About This Wiki
 
-Current coverage includes the Action's stock-V2-only runtime and the pre-cut rollback tag, generation-neutral execution contracts, directory-based release diagnostics, generation-isolated session restore, brokered-push prompt handoff, reviewed-head pinning, credential-withheld MCP filtering, and cross-surface approvals and cancellation. The Action currently pins OpenCode `2.2.6` and Systematic `3.32.0`. The gateway and the workspace image are V2-only: the image builds only from the pin, and the gateway admits a workspace only when it reports a V2 version.
+Current coverage includes the V2-only execution paths and pre-cut rollback artifacts, directory-based release diagnostics, generation-isolated session restore, brokered-push handoff, reviewed-head pinning, credential-withheld MCP filtering, and cross-surface approvals and cancellation. The Action currently pins OpenCode `2.3.0` and Systematic `3.33.2`. Hosted-runner isolation adds a separate agent identity, a read-only filesystem view, a provider-key proxy, and invocation-owned log snapshots. Optional repository skills come from a fresh default-branch fetch rather than the checkout. The gateway and workspace image remain V2-only.
 
 - **Audience:** Human developers — contributors, reviewers, and maintainers
 - **Content:** Descriptive documentation (how the system works, why decisions were made)
