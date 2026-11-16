@@ -958,23 +958,36 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
         state: path.join(stateBase, 'opencode'),
       })
       await writeSandboxGitConfig(options.workspacePath, input.ghConfigDir !== null)
-      const toolLocations = TOOL_LOCATION_VARIABLES.flatMap(name => {
-        const value = env[name]
-        return value !== undefined && path.isAbsolute(value) ? [[name, value] as const] : []
-      })
-      const reachable = await reachableInView([
-        ...agentPath.split(path.delimiter),
-        ...toolLocations.map(([, value]) => value),
-      ])
-      const launchPath = reachablePath(agentPath, reachable)
-      const passedToolLocations = Object.fromEntries(toolLocations.filter(([, value]) => reachable.has(value)))
-      const droppedToolLocations = toolLocations.filter(([, value]) => !reachable.has(value)).map(([name]) => name)
-      if (droppedToolLocations.length > 0) {
-        logger.info('Tool locations the agent cannot enter were not passed to it', {names: droppedToolLocations})
-      }
-
       const view = await buildView(manifest, account, runnerTemp)
       if (!view.success) return await failAndRelease(view.error)
+
+      // A tool location is passed as its resolved path, so no link has to be followed in the view, and only when that
+      // path is still there: outside the view's private temp mounts, or under a root the view binds back.
+      const {policy} = view.data
+      const boundRoots = [...policy.writable, ...policy.readOnly]
+      const toolLocations: (readonly [string, string])[] = []
+      for (const name of TOOL_LOCATION_VARIABLES) {
+        const value = env[name]
+        if (value === undefined || !path.isAbsolute(value)) continue
+        const resolved = await deps.realpath(value)
+        const visible =
+          resolved !== null &&
+          (!SANDBOX_VIEW_TEMP_MOUNTS.some(mount => isWithin(mount.path, resolved)) ||
+            boundRoots.some(root => isWithin(root, resolved)))
+        toolLocations.push([name, visible ? resolved : ''])
+      }
+      const reachable = await reachableDirectories([
+        ...agentPath.split(path.delimiter),
+        ...toolLocations.flatMap(([, resolved]) => (resolved === '' ? [] : [resolved])),
+      ])
+      const launchPath = reachablePath(agentPath, reachable)
+      const passedToolLocations = Object.fromEntries(toolLocations.filter(([, resolved]) => reachable.has(resolved)))
+      const droppedToolLocations = toolLocations
+        .filter(([, resolved]) => !reachable.has(resolved))
+        .map(([name]) => name)
+      if (droppedToolLocations.length > 0) {
+        logger.info('Tool locations the agent cannot use were not passed to it', {names: droppedToolLocations})
+      }
 
       const extraEnv: Record<string, string> = {
         ...(input.ghConfigDir === null ? {} : {GH_CONFIG_DIR: input.ghConfigDir}),
@@ -1100,23 +1113,6 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     )
     if (result.exitCode !== 0) throw new Error(`checking the sandbox PATH failed (exit ${result.exitCode})`)
     return new Set(result.stdout.split('\n').filter(line => line.length > 0))
-  }
-
-  /**
-   * The candidates the agent can enter once it runs in its view. The view mounts empty private tmpfs on `/tmp`, `/var/tmp`
-   * and `/dev/shm`, so a directory that resolves under one of them is gone there even though the account can enter it
-   * on the host.
-   */
-  async function reachableInView(candidates: readonly string[]): Promise<ReadonlySet<string>> {
-    const enterable = await reachableDirectories(candidates)
-    const visible = new Set<string>()
-    for (const candidate of enterable) {
-      const resolved = await deps.realpath(candidate)
-      if (resolved !== null && !SANDBOX_VIEW_TEMP_MOUNTS.some(mount => isWithin(mount.path, resolved))) {
-        visible.add(candidate)
-      }
-    }
-    return visible
   }
 
   function reachablePath(candidate: string, reachable: ReadonlySet<string>): string {

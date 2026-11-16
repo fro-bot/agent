@@ -81,6 +81,11 @@ interface Harness {
   readonly sudoCalls: string[][]
 }
 
+const REALPATHS: Readonly<Record<string, string>> = {
+  '/tmp/browser-link': '/opt/browsers',
+  '/opt/links/uv': '/tmp/uv-python',
+}
+
 function createHarness(): Harness {
   const viewRootRemovals: string[] = []
   const gateRemovals: string[] = []
@@ -121,8 +126,8 @@ function createHarness(): Harness {
     stopLaunch: vi.fn(async () => 'stopped' as const),
     isProcessAlive: vi.fn(() => false),
     isDirectory: vi.fn((directory: string) => !directory.includes('missing')),
-    // Links resolve to themselves, except the one test fixture that points into the view's private /tmp.
-    realpath: vi.fn(async (target: string) => (target === '/opt/links/browsers' ? '/tmp/ms-playwright' : target)),
+    // Links resolve to themselves, except the fixtures that model links into or out of the view's private /tmp.
+    realpath: vi.fn(async (target: string) => REALPATHS[target] ?? target),
     resolveToolRoots: vi.fn(async (): Promise<ToolRootResult> => ({granted: [], skipped: []})),
   }
   const sudoCalls: string[][] = []
@@ -1120,40 +1125,60 @@ describe('createSandboxLifecycle', () => {
         ...TRUSTED_CHECKOUT_ENV,
         PLAYWRIGHT_BROWSERS_PATH: '/opt/hostedtoolcache/ms-playwright',
       })
-      expect(logger.info).toHaveBeenCalledWith('Tool locations the agent cannot enter were not passed to it', {
+      expect(logger.info).toHaveBeenCalledWith('Tool locations the agent cannot use were not passed to it', {
         names: ['UV_PYTHON_INSTALL_DIR'],
       })
     })
 
-    it('drops a tool location or PATH entry that resolves into the view’s private temp mounts', async () => {
-      // #given a browser path linked into /tmp, a uv path under /var/tmp and a PATH entry under /dev/shm, all enterable on
-      // the host
+    it('passes a tool location as its resolved path, and only where the view still shows it', async () => {
+      // #given a browser path that is a link in /tmp to a directory outside it, a uv path that links into /tmp, and a mise path in a checkout under /tmp, which the view binds back
       const harness = createHarness()
       const logger = createMockLogger()
       const lifecycle = create(harness, {
         logger,
+        workspacePath: '/tmp/checkout',
         env: {
           ...baseEnv(),
-          PLAYWRIGHT_BROWSERS_PATH: '/opt/links/browsers',
-          UV_PYTHON_INSTALL_DIR: '/var/tmp/uv-python',
-          MISE_DATA_DIR: '/opt/hostedtoolcache/mise',
+          PLAYWRIGHT_BROWSERS_PATH: '/tmp/browser-link',
+          UV_PYTHON_INSTALL_DIR: '/opt/links/uv',
+          MISE_DATA_DIR: '/tmp/checkout/.mise',
         },
-        runnerPath: '/dev/shm/bin:/usr/bin',
+        runnerPath: '/tmp/checkout/bin:/usr/bin',
         signals: fakeHost(),
       })
 
       // #when prepared
       const prepared = await lifecycle.prepare(prepareInput)
 
-      // #then only the location outside the private mounts reaches the agent, and the PATH entry is gone too
+      // #then the link is replaced by its target, the location inside the private /tmp is dropped, the checkout's stays,
+      // and PATH keeps the checkout's directory
       expect(prepared.success && prepared.data.extraEnv).toEqual({
         ...TRUSTED_CHECKOUT_ENV,
-        MISE_DATA_DIR: '/opt/hostedtoolcache/mise',
+        GIT_CONFIG_VALUE_0: '/tmp/checkout',
+        PLAYWRIGHT_BROWSERS_PATH: '/opt/browsers',
+        MISE_DATA_DIR: '/tmp/checkout/.mise',
       })
-      expect(prepared.success && prepared.data.path).toBe('/usr/bin:/usr/local/bin:/bin')
-      expect(logger.info).toHaveBeenCalledWith('Tool locations the agent cannot enter were not passed to it', {
-        names: ['PLAYWRIGHT_BROWSERS_PATH', 'UV_PYTHON_INSTALL_DIR'],
+      expect(prepared.success && prepared.data.path).toBe('/tmp/checkout/bin:/usr/bin:/usr/local/bin:/bin')
+      expect(logger.info).toHaveBeenCalledWith('Tool locations the agent cannot use were not passed to it', {
+        names: ['UV_PYTHON_INSTALL_DIR'],
       })
+    })
+
+    it('leaves out a tool location whose path cannot be resolved', async () => {
+      // #given a browser path realpath cannot resolve
+      const harness = createHarness()
+      const lifecycle = create(harness, {
+        deps: {...harness.deps, realpath: vi.fn(async () => null)},
+        env: {...baseEnv(), PLAYWRIGHT_BROWSERS_PATH: '/opt/gone'},
+        runnerPath: '/usr/bin',
+        signals: fakeHost(),
+      })
+
+      // #when prepared
+      const prepared = await lifecycle.prepare(prepareInput)
+
+      // #then preparation succeeds without it
+      expect(prepared.success && prepared.data.extraEnv).toEqual(TRUSTED_CHECKOUT_ENV)
     })
 
     it('gives the agent its own runtime directory, made as the account', async () => {
