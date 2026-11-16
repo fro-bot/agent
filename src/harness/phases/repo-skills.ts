@@ -102,7 +102,7 @@ export async function resolveRepoSkillsSource(
     const stagedSkills = staged.data
 
     if (stagedSkills === null) {
-      logger.info('Repository skills are enabled but the default branch has no .agents/skills')
+      logger.info('Repository skills are enabled but the default branch has no .agents/skills to load')
       await removeStagingRoot(stagingRoot)
       return null
     }
