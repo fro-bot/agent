@@ -33,11 +33,21 @@ export type ForkOrSelfBlockReason = 'self-or-fork'
 export interface ForkOrSelfGuardBlocked {
   readonly allowed: false
   readonly reason: ForkOrSelfBlockReason
+  /**
+   * The PR author is the posting account (login compared case-insensitively, `[bot]` stripped).
+   * Distinguishes self-authorship from a fork block so a caller can downgrade to a COMMENT review.
+   */
+  readonly selfAuthored: boolean
 }
 
 export interface ForkOrSelfGuardAllowed {
   readonly allowed: true
   readonly currentHeadSha: string
+  /**
+   * The PR author is the posting account. GitHub rejects APPROVE and REQUEST_CHANGES from a PR's own
+   * author (HTTP 422), so a caller submitting either must downgrade to a COMMENT review.
+   */
+  readonly selfAuthored: boolean
 }
 
 export type ForkOrSelfGuardResult = ForkOrSelfGuardAllowed | ForkOrSelfGuardBlocked
@@ -55,7 +65,9 @@ function normalizeLogin(login: string): string {
  * the only review event that can satisfy branch protection and merge
  * attacker-controlled fork content, or self-approve the bot's own PR.
  * REQUEST_CHANGES and COMMENT can only block a PR, never unblock one, so
- * they are always permitted on a fork or self-authored PR.
+ * the guard permits them on a fork or self-authored PR. GitHub itself rejects
+ * APPROVE and REQUEST_CHANGES from the PR's own author (422), so `selfAuthored`
+ * is returned for callers to downgrade either to a COMMENT review.
  *
  * All events still fetch and return the head SHA observed at this fetch when
  * allowed. It is a delivery-time read, never the review's pin.
@@ -79,16 +91,16 @@ export async function checkForkOrSelfGuard(
   if (event === 'APPROVE') {
     if (isSelfAuthored) {
       logger.info('Review guard: blocking self-authored PR', {prNumber, prAuthorLogin})
-      return {allowed: false, reason: 'self-or-fork'}
+      return {allowed: false, reason: 'self-or-fork', selfAuthored: true}
     }
 
     if (isFork) {
       logger.info('Review guard: blocking fork PR', {prNumber, headRepoFullName, baseRepoFullName})
-      return {allowed: false, reason: 'self-or-fork'}
+      return {allowed: false, reason: 'self-or-fork', selfAuthored: false}
     }
   }
 
-  return {allowed: true, currentHeadSha}
+  return {allowed: true, currentHeadSha, selfAuthored: isSelfAuthored}
 }
 
 /**

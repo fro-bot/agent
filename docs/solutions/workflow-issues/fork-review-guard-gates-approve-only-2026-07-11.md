@@ -36,11 +36,13 @@ Correct shape (`checkForkOrSelfGuard` in `src/features/reviews/review-guards.ts`
 
 ```ts
 if (event === 'APPROVE') {
-  if (isSelfAuthored) return {allowed: false, reason: 'self-or-fork'}
-  if (isFork) return {allowed: false, reason: 'self-or-fork'}
+  if (isSelfAuthored) return {allowed: false, reason: 'self-or-fork', selfAuthored: true}
+  if (isFork) return {allowed: false, reason: 'self-or-fork', selfAuthored: false}
 }
-return {allowed: true, currentHeadSha}
+return {allowed: true, currentHeadSha, selfAuthored: isSelfAuthored}
 ```
+
+The guard decides risk, not what GitHub accepts. GitHub rejects both `APPROVE` and `REQUEST_CHANGES` from a PR's own author (HTTP 422, "Can not approve / request changes on your own pull request"), so the guard reports `selfAuthored` and the caller (`runResponsePost` in `src/features/agent/response-post.ts`) posts such a verdict as a `COMMENT` review with the same body, head pin and receipt. A `COMMENT` can neither approve nor block, so the downgrade never widens authority. Only the required `pull_request` surface downgrades a blocked self-authored approval; a review-permitted mention still degrades it to a plain comment, and a fork PR that is not self-authored still blocks the approval.
 
 ## Why This Matters
 
@@ -61,7 +63,7 @@ Gate on the *specific outcome that carries risk*, not on the presence of an untr
 
 ```ts
 if (isSelfAuthored || isFork) {
-  return {allowed: false, reason: 'self-or-fork'}
+  return {allowed: false, reason: 'self-or-fork', selfAuthored: isSelfAuthored}
 }
 ```
 
@@ -71,7 +73,7 @@ A legitimate `REQUEST_CHANGES` on a malicious fork PR now fails to deliver.
 
 ```ts
 if (event === 'APPROVE' && (isSelfAuthored || isFork)) {
-  return {allowed: false, reason: 'self-or-fork'}
+  return {allowed: false, reason: 'self-or-fork', selfAuthored: isSelfAuthored}
 }
 ```
 

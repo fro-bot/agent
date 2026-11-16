@@ -71,6 +71,10 @@ vi.mock('./phases/repo-skills.js', () => ({
   removeRepoSkillsStaging: vi.fn(async () => undefined),
 }))
 
+vi.mock('./phases/gh-config.js', () => ({
+  releaseRunGhConfig: vi.fn(async () => undefined),
+}))
+
 vi.mock('./phases/cleanup.js', () => ({
   runCleanup: vi.fn().mockResolvedValue({quiescenceConfirmed: true, continuityUnverified: false}),
 }))
@@ -399,6 +403,101 @@ describe('run on an OpenCode V2 server', () => {
 
       // #then the (no-op) removal receives null
       expect(vi.mocked(removeRepoSkillsStaging)).toHaveBeenCalledWith(null)
+    })
+  })
+
+  describe('gh config directory cleanup (#2156)', () => {
+    const order = (mock: {mock: {invocationCallOrder: number[]}}): number =>
+      mock.mock.invocationCallOrder[0] ?? Number.NaN
+
+    it('releases the directory on a successful run', async () => {
+      // #given
+      const {releaseRunGhConfig} = await import('./phases/gh-config.js')
+      await arrange()
+
+      // #when
+      const exitCode = await run()
+
+      // #then
+      expect(exitCode).toBe(0)
+      expect(vi.mocked(releaseRunGhConfig)).toHaveBeenCalledTimes(1)
+      expect(vi.mocked(releaseRunGhConfig).mock.calls[0]?.[0]).toMatchObject({sandboxTrusted: true})
+    })
+
+    it('releases it when a phase throws after the server started', async () => {
+      // #given execution that throws
+      const {releaseRunGhConfig} = await import('./phases/gh-config.js')
+      await arrange({executeError: new Error('boom')})
+
+      // #when
+      const exitCode = await run()
+
+      // #then the finally block still releases it
+      expect(exitCode).toBe(1)
+      expect(vi.mocked(releaseRunGhConfig).mock.calls[0]?.[0]).toMatchObject({sandboxTrusted: true})
+    })
+
+    it('releases it when the server failed to start', async () => {
+      // #given a cache-restore (server start) that fails
+      const {runCacheRestore} = await import('./phases/cache-restore.js')
+      const {releaseRunGhConfig} = await import('./phases/gh-config.js')
+      await arrange()
+      vi.mocked(runCacheRestore).mockResolvedValue(null)
+
+      // #when
+      const exitCode = await run()
+
+      // #then
+      expect(exitCode).toBe(1)
+      expect(vi.mocked(releaseRunGhConfig).mock.calls[0]?.[0]).toMatchObject({sandboxTrusted: true})
+    })
+
+    it('releases it when bootstrap throws after setup created the directory', async () => {
+      // #given a bootstrap that throws
+      const {runBootstrap} = await import('./phases/bootstrap.js')
+      const {releaseRunGhConfig} = await import('./phases/gh-config.js')
+      await arrange()
+      vi.mocked(runBootstrap).mockRejectedValue(new Error('bootstrap exploded'))
+
+      // #when
+      await run()
+
+      // #then
+      expect(vi.mocked(releaseRunGhConfig)).toHaveBeenCalledTimes(1)
+    })
+
+    it('releases it when cleanup itself rejects', async () => {
+      // #given
+      const {runCleanup} = await import('./phases/cleanup.js')
+      const {releaseRunGhConfig} = await import('./phases/gh-config.js')
+      await arrange()
+      vi.mocked(runCleanup).mockRejectedValue(new Error('cleanup blew up'))
+
+      // #when
+      await expect(run()).rejects.toThrow('cleanup blew up')
+
+      // #then the credential is still ended
+      expect(vi.mocked(releaseRunGhConfig)).toHaveBeenCalledTimes(1)
+    })
+
+    it('releases it only after the last thing that uses it: release, review reconciliation, finalize and cleanup', async () => {
+      // #given
+      const {runCleanup} = await import('./phases/cleanup.js')
+      const {runFinalizeWithResult} = await import('./phases/finalize.js')
+      const {releaseRunGhConfig} = await import('./phases/gh-config.js')
+      const {runReleaseV2} = await import('./phases/release-v2.js')
+      const {runReviewReconciliation} = await import('./phases/review-reconciliation.js')
+      await arrange()
+
+      // #when
+      await run()
+
+      // #then
+      const removal = order(vi.mocked(releaseRunGhConfig))
+      expect(order(vi.mocked(runReleaseV2))).toBeLessThan(removal)
+      expect(order(vi.mocked(runReviewReconciliation))).toBeLessThan(removal)
+      expect(order(vi.mocked(runFinalizeWithResult))).toBeLessThan(removal)
+      expect(order(vi.mocked(runCleanup))).toBeLessThan(removal)
     })
   })
 
@@ -1082,6 +1181,95 @@ describe('run with isolate-agent', () => {
     expect(vi.mocked(runCleanup).mock.calls[0]?.[0]).toMatchObject({
       skipSessionPersistence: true,
       sandboxOutputUntrusted: true,
+    })
+  })
+
+  describe('gh config directory under isolate-agent (#2156)', () => {
+    const order = (mock: {mock: {invocationCallOrder: number[]}}): number =>
+      mock.mock.invocationCallOrder[0] ?? Number.NaN
+
+    it('removes it only after take-back restored the sandbox-owned directory', async () => {
+      // #given a sandbox that stops and restores cleanly
+      const {releaseRunGhConfig} = await import('./phases/gh-config.js')
+      const {release} = await arrangeIsolated(RESTORED)
+
+      // #when
+      await run()
+
+      // #then the directory is released after the sandbox release gave it back, and is trusted
+      expect(order(release)).toBeLessThan(order(vi.mocked(releaseRunGhConfig)))
+      expect(vi.mocked(releaseRunGhConfig).mock.calls[0]?.[0]).toMatchObject({sandboxTrusted: true})
+    })
+
+    it.each([
+      ['an unconfirmed stop', {stop: 'unconfirmed', restore: 'unsafe', reason: 'sandbox processes survived'} as const],
+      ['an unsafe take-back', {stop: 'stopped', restore: 'unsafe', reason: 'ancestor /x is a symlink'} as const],
+    ])('leaves it alone after %s', async (_label, outcome) => {
+      // #given a sandbox that cannot be confirmed stopped and restored
+      const {releaseRunGhConfig} = await import('./phases/gh-config.js')
+      await arrangeIsolated(outcome)
+
+      // #when
+      await run()
+
+      // #then the directory is handed to the release as untrusted, which does not touch it
+      expect(vi.mocked(releaseRunGhConfig).mock.calls[0]?.[0]).toMatchObject({
+        sandboxTrusted: false,
+      })
+    })
+
+    it('removes it on the exception path once that path restored the sandbox', async () => {
+      // #given execution that throws, and a sandbox the finally path then restores
+      const {releaseRunGhConfig} = await import('./phases/gh-config.js')
+      const {release} = await arrangeIsolated(RESTORED, {executeError: new Error('boom')})
+
+      // #when
+      await run()
+
+      // #then
+      expect(order(release)).toBeLessThan(order(vi.mocked(releaseRunGhConfig)))
+      expect(vi.mocked(releaseRunGhConfig).mock.calls[0]?.[0]).toMatchObject({sandboxTrusted: true})
+    })
+
+    it('leaves it alone when the exception path cannot restore the sandbox', async () => {
+      // #given an exception and a sandbox that cannot be restored
+      const {releaseRunGhConfig} = await import('./phases/gh-config.js')
+      await arrangeIsolated(
+        {stop: 'unconfirmed', restore: 'unsafe', reason: 'still running'},
+        {executeError: new Error('boom')},
+      )
+
+      // #when
+      await run()
+
+      // #then
+      expect(vi.mocked(releaseRunGhConfig).mock.calls[0]?.[0]).toMatchObject({
+        sandboxTrusted: false,
+      })
+    })
+
+    it('leaves it alone when a failed start left an unsafe sandbox, and removes it when the sandbox never started', async () => {
+      // #given a start that failed after the sandbox was prepared, and its release was unsafe
+      const {releaseRunGhConfig} = await import('./phases/gh-config.js')
+      await arrangeFailedStart({stop: 'unconfirmed', restore: 'unsafe', reason: 'still running'})
+
+      // #when
+      await run()
+
+      // #then
+      expect(vi.mocked(releaseRunGhConfig).mock.calls[0]?.[0]).toMatchObject({
+        sandboxTrusted: false,
+      })
+
+      // #given the same failed start, but the sandbox never started (nothing was handed over)
+      vi.mocked(releaseRunGhConfig).mockClear()
+      await arrangeFailedStart({stop: 'never-started', restore: 'not-needed'})
+
+      // #when
+      await run()
+
+      // #then
+      expect(vi.mocked(releaseRunGhConfig).mock.calls[0]?.[0]).toMatchObject({sandboxTrusted: true})
     })
   })
 

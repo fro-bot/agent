@@ -33,7 +33,7 @@
 import type {SandboxToolPaths} from '../../services/setup/sandbox-preflight.js'
 import type {Logger} from '../../shared/logger.js'
 import type {SandboxLifecycle, SandboxLifecycleDeps, SandboxReleaseResult} from './sandbox-lifecycle.js'
-import type {Probe, Row, ScriptedProvider} from './v2-server.sandbox.harness.js'
+import type {LaunchNamespaces, Probe, Row, ScriptedProvider} from './v2-server.sandbox.harness.js'
 import {spawn, spawnSync} from 'node:child_process'
 import {createHash} from 'node:crypto'
 import * as fs from 'node:fs'
@@ -75,12 +75,14 @@ import {
   changedFilesSince,
   controlCoversMatrix,
   copyBundleWithImports,
+  describeNamespaceMembers,
   describeReconstruction,
   failuresFor,
   findPaths,
   matrixDirectories,
   matrixSentinels,
   mountNamespaceIds,
+  newLaunchNamespaces,
   parseRows,
   pgrepOutput,
   PRELUDE,
@@ -1773,6 +1775,32 @@ function mountNamespaces(): string[] {
   return mountNamespaceIds()
 }
 
+/**
+ * Of the namespaces that appeared since `before`, those that belong to the launch. A hosted runner makes namespaces of its
+ * own during a job (`snapd` has D-Bus activate `systemd-timedated`, which lives about 30 s in a private one), and no delay
+ * outlasts that, so "no new id" is not the property: "no new namespace with a member of ours" is.
+ */
+function launchNamespacesSince(
+  before: readonly string[],
+  sandboxUid: number | null,
+  markers: readonly string[],
+): LaunchNamespaces {
+  return newLaunchNamespaces(before, {sandboxUid, markers})
+}
+
+/** Fails when the launch left a namespace; the diff names its members and the host namespaces that were set aside. */
+function expectNoLaunchNamespaces(result: LaunchNamespaces | undefined): void {
+  // #given a check that ran (an unset result is "not checked", never "clean")
+  expect(result).toBeDefined()
+  const ignored = describeNamespaceMembers(result?.ignored ?? [])
+  // #then no namespace of the launch is left; `ignored` is in both objects so a failure shows what was set aside
+  expect({
+    kept: result?.kept ?? ['not checked'],
+    owners: describeNamespaceMembers(result?.keptMembers ?? []),
+    ignored,
+  }).toEqual({kept: [], owners: 'none', ignored})
+}
+
 /** Removes what a view probe may have left in the shared directories. The runner may remove any of it: they are mode 777. */
 function sweepViewFiles(): void {
   for (const dir of [...matrixDirs, '/tmp', '/var/tmp', '/dev/shm']) {
@@ -1809,12 +1837,13 @@ describe.skipIf(!gated)('isolate-agent read-only view: the write boundary on a h
 
   let lifecycle: SandboxLifecycle | undefined
   let released: SandboxReleaseResult | undefined
+  let sandboxUid: number | null = null
   let rows = new Map<string, readonly Row[]>()
   let controls = new Map<string, Row[]>()
   const facts = {
     mountsBefore: [] as string[],
     mountsAfter: [] as string[],
-    newNamespaces: [] as string[],
+    launchNamespaces: undefined as LaunchNamespaces | undefined,
     changedSentinels: [] as string[],
     privateLeft: [] as string[],
   }
@@ -1934,12 +1963,15 @@ describe.skipIf(!gated)('isolate-agent read-only view: the write boundary on a h
       onLifecycle: value => {
         lifecycle = value
       },
+      onPrepared: launch => {
+        sandboxUid = launch.account.uid
+      },
     })
     rows = new Map(result.rows)
     released = result.released
 
     facts.mountsAfter = hostMountSet()
-    facts.newNamespaces = mountNamespaces().filter(namespace => !namespacesBefore.includes(namespace))
+    facts.launchNamespaces = launchNamespacesSince(namespacesBefore, sandboxUid, [path.basename(scratch)])
     for (const dir of matrixDirs) {
       const [, , sandboxAppend, sandboxUnlink] = matrixSentinels(dir, VIEW_TAG)
       for (const file of [sandboxAppend, sandboxUnlink]) {
@@ -2020,7 +2052,7 @@ describe.skipIf(!gated)('isolate-agent read-only view: the write boundary on a h
   it('left no mount namespace and no change to the host mount table', () => {
     // #given the runner's view before and after
     // #then no new namespace remains, and the host's mounts are the same
-    expect(facts.newNamespaces).toEqual([])
+    expectNoLaunchNamespaces(facts.launchNamespaces)
     expect(facts.mountsAfter).toEqual(facts.mountsBefore)
   })
 
@@ -2048,7 +2080,7 @@ describe.skipIf(!gated)('isolate-agent read-only view: a server torn down while 
   let released: SandboxReleaseResult | undefined
   let strays = 'not checked'
   let markerLeft = true
-  let newNamespaces: string[] = ['not checked']
+  let launchNamespaces: LaunchNamespaces | undefined
   let mountsEqual = false
 
   const steps = (): Probe[] => [
@@ -2083,13 +2115,14 @@ describe.skipIf(!gated)('isolate-agent read-only view: a server torn down while 
     })
     const prepared = await lifecycle.prepare({keyFilePaths: [keyFile], ghConfigDir: null, repoSkills: null})
     if (!prepared.success) throw new Error(prepared.error)
+    const sandboxUid = prepared.data.account.uid
     await startScriptedSession({binary: BINARY ?? '', workspace, env, lifecycle, keyFile, provider, logger})
 
     // No graceful shutdown: the lifecycle is torn down with the server and its strays still running.
     released = await lifecycle.release()
     strays = strayProcesses(strayPattern)
     markerLeft = fs.existsSync(marker)
-    newNamespaces = mountNamespaces().filter(namespace => !namespacesBefore.includes(namespace))
+    launchNamespaces = launchNamespacesSince(namespacesBefore, sandboxUid, [strayPattern, path.basename(scratch)])
     mountsEqual = hostMountSet().join('\n') === mountsBefore.join('\n')
   }, 600_000)
 
@@ -2113,7 +2146,7 @@ describe.skipIf(!gated)('isolate-agent read-only view: a server torn down while 
     // #given the runner's view afterwards
     // #then the namespace and its mounts are gone with its last member
     expect(markerLeft).toBe(false)
-    expect(newNamespaces).toEqual([])
+    expectNoLaunchNamespaces(launchNamespaces)
     expect(mountsEqual).toBe(true)
   })
 })
@@ -2201,7 +2234,10 @@ describe.skipIf(!gated)('isolate-agent read-only view: a launcher killed while t
   let processesAtGate = 'not checked'
   let processesAfter = 'not checked'
   let markerAfterWait = true
-  let newNamespaces: string[] = ['not checked']
+  let sandboxUid: number | null = null
+  let launchNamespaces: LaunchNamespaces | undefined
+  let gateNamespace = 'not read'
+  let namespacesAtGate: LaunchNamespaces | undefined
 
   beforeAll(async () => {
     const tools = await preflightTools(logger)
@@ -2209,6 +2245,7 @@ describe.skipIf(!gated)('isolate-agent read-only view: a launcher killed while t
     const keyFile = writeKeyFile(keyDir)
     initWorkspace(workspace)
     const namespacesBefore = mountNamespaces()
+    const markers = (): string[] => [path.basename(gateDir), strayPattern, path.basename(scratch)]
 
     lifecycle = createSandboxLifecycle({
       tools,
@@ -2224,6 +2261,7 @@ describe.skipIf(!gated)('isolate-agent read-only view: a launcher killed while t
     })
     const prepared = await lifecycle.prepare({keyFilePaths: [keyFile], ghConfigDir: null, repoSkills: null})
     if (!prepared.success) throw new Error(prepared.error)
+    sandboxUid = prepared.data.account.uid
 
     await lifecycle.launch(async context => {
       gateDir = context.spec.view?.gate.dir ?? ''
@@ -2252,6 +2290,10 @@ describe.skipIf(!gated)('isolate-agent read-only view: a launcher killed while t
       // What a group kill from the runner does: only `sudo` dies; its root child is orphaned at the gate.
       child.kill('SIGKILL')
       await new Promise(resolve => setTimeout(resolve, 500))
+      // Positive control for the scan the teardown check relies on: the orphan is still at the gate, so its namespace
+      // must be found as the launch's.
+      gateNamespace = /\d+/.exec(fs.readFileSync(path.join(gateDir, 'ns'), 'utf8'))?.[0] ?? 'unreadable'
+      namespacesAtGate = launchNamespacesSince(namespacesBefore, sandboxUid, markers())
       return {value: 'killed at the gate', unconfirmed: false}
     })
 
@@ -2260,7 +2302,7 @@ describe.skipIf(!gated)('isolate-agent read-only view: a launcher killed while t
     await new Promise(resolve => setTimeout(resolve, 3000))
     markerAfterWait = fs.existsSync(marker)
     processesAfter = strayProcesses(`${path.basename(gateDir)}|${strayPattern}`)
-    newNamespaces = mountNamespaces().filter(namespace => !namespacesBefore.includes(namespace))
+    launchNamespaces = launchNamespacesSince(namespacesBefore, sandboxUid, markers())
   }, 300_000)
 
   afterAll(async () => {
@@ -2278,12 +2320,18 @@ describe.skipIf(!gated)('isolate-agent read-only view: a launcher killed while t
     expect(markerAfterWait).toBe(false)
   })
 
+  it('found the orphan’s namespace as the launch’s while it waited, so the teardown check can fail', () => {
+    // #given the scan ran with the orphan still at the gate
+    // #then the namespace the gate reported is among the kept ones
+    expect(namespacesAtGate?.kept).toContain(gateNamespace)
+  })
+
   it('is restored only because the orphaned root process was confirmed gone', () => {
     // #given the launcher was killed and its child orphaned
     // #then the release confirmed the stop, and no process of the launch is left
     expect(released).toMatchObject({stop: 'stopped', restore: 'restored'})
     expect(processesAfter).toBe('')
-    expect(newNamespaces).toEqual([])
+    expectNoLaunchNamespaces(launchNamespaces)
   })
 })
 

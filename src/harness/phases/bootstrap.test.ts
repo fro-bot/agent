@@ -18,6 +18,7 @@ const mocks = vi.hoisted(() => ({
   assertNoPersistedGitCredentials: vi.fn(),
   runSandboxPreflight: vi.fn(),
   createSandboxLifecycle: vi.fn(),
+  runSetup: vi.fn(),
 }))
 
 vi.mock('@actions/core', () => ({
@@ -51,6 +52,10 @@ vi.mock('@fro-bot/runtime', async importOriginal => {
 // Mocked here only, not globally: other suites still exercise the real function.
 vi.mock('../../services/setup/git-credential-check.js', () => ({
   assertNoPersistedGitCredentials: mocks.assertNoPersistedGitCredentials,
+}))
+
+vi.mock('../../services/setup/setup.js', () => ({
+  runSetup: mocks.runSetup,
 }))
 
 vi.mock('./sandbox-lifecycle.js', () => ({
@@ -724,5 +729,40 @@ describe('runBootstrap isolate-agent preflight', () => {
     // #then the preflight never ran
     expect(mocks.runSandboxPreflight).not.toHaveBeenCalled()
     expect(result?.sandboxTools).toBeNull()
+  })
+})
+
+describe('runBootstrap gh config directory recording (#2156)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mocks.githubContext.eventName = 'schedule'
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({responseMode: 'github'})})
+    mocks.ensureOpenCodeAvailable.mockResolvedValue({version: DEFAULT_OPENCODE_VERSION})
+    mocks.assertNoPersistedGitCredentials.mockResolvedValue(ok(undefined))
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('hands setup a recorder that writes the directory to the action state the moment setup creates it', async () => {
+    // #given bootstrap ran and handed the setup adapter to ensureOpenCodeAvailable
+    const {runBootstrap} = await import('./bootstrap.js')
+    await runBootstrap(createMockLogger())
+    const adapter = mocks.ensureOpenCodeAvailable.mock.calls[0]?.[1] as {
+      runSetup: (inputs: unknown, token: string) => Promise<unknown>
+    }
+
+    // #when that adapter runs setup, and setup reports the directory it just created
+    await adapter.runSetup({}, 'ghs_token')
+    const options = mocks.runSetup.mock.calls[0]?.[2] as {recordGhConfigDir: (dir: string | null) => void}
+    options.recordGhConfigDir('/runner/_temp/gh-config-abc123')
+
+    // #then the state the post hook reads names it, before bootstrap has returned anything
+    expect(mocks.saveState).toHaveBeenCalledWith('ghConfigDir', '/runner/_temp/gh-config-abc123')
+
+    // #and setup forgetting it (a failed login removed it) clears the record
+    options.recordGhConfigDir(null)
+    expect(mocks.saveState).toHaveBeenCalledWith('ghConfigDir', '')
   })
 })

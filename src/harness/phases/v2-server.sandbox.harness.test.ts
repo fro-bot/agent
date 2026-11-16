@@ -10,11 +10,13 @@ import {
   changedFilesSince,
   controlCoversMatrix,
   copyBundleWithImports,
+  describeNamespaceMembers,
   findPaths,
   inspectOutput,
   matrixDirectories,
   matrixSentinels,
   mountNamespaceIds,
+  newLaunchNamespaces,
   parseRows,
   pgrepOutput,
   PRELUDE,
@@ -259,6 +261,11 @@ describe('inspections that feed an absence assertion', () => {
       'files the sandbox still owns',
     ],
     ['mountNamespaceIds', run => mountNamespaceIds(run), 'mount namespaces'],
+    [
+      'newLaunchNamespaces',
+      run => newLaunchNamespaces([], {sandboxUid: 999, markers: [], cgroup: '0::/runner'}, run),
+      'mount namespace members',
+    ],
     ['runnerFirstLine', run => runnerFirstLine('cd /tmp && bun --version', run), 'bun --version'],
     ['pgrepOutput', run => pgrepOutput(['-f', 'sleep 777'], run), 'sleep 777'],
   ]
@@ -390,6 +397,148 @@ describe('inspections that feed an absence assertion', () => {
     it('returns the first line of the runner’s own command', () => {
       // #then
       expect(runnerFirstLine('x', returning(done({stdout: '1.4.4\nextra\n'})))).toBe('1.4.4')
+    })
+  })
+
+  describe('newLaunchNamespaces', () => {
+    const RUNNER_CGROUP = '0::/system.slice/hosted-compute-agent.service'
+    const HOST_CGROUP = '0::/system.slice/systemd-timedated.service'
+    const GATE_DIR = 'fro-bot-gate-abc123'
+    /** One scan line, tab separated as the real scan prints it. */
+    const member = (ns: string, uid: number, comm: string, cgroup: string, cmdline: string): string =>
+      `mnt:[${ns}]\t${uid}\t${comm} \t${cgroup}\t${cmdline} `
+    const scan = (...lines: string[]): InspectionRunner => returning(done({stdout: `${lines.join('\n')}\n`}))
+    const scope = {sandboxUid: 999, markers: [GATE_DIR, 'sleep 778[12]'], cgroup: RUNNER_CGROUP}
+    const hostNamespace = member('4026532755', 0, 'systemd-timedat', HOST_CGROUP, '/usr/lib/systemd/systemd-timedated')
+    // The namespace every machine already had: the host's own, shared by everything not in a namespace of its own.
+    const hostRoot = member('4026531841', 0, 'systemd', '0::/init.scope', '/sbin/init')
+
+    it('ignores a host-service namespace: root, a system.slice service cgroup and an unrelated command line', () => {
+      // #given timedated appeared during the test, in a namespace that was not there before
+      const result = newLaunchNamespaces(['4026531841'], scope, scan(hostRoot, hostNamespace))
+
+      // #then it is set aside, with its owner named, and nothing is kept
+      expect(result.kept).toEqual([])
+      expect(result.ignored).toEqual([
+        {
+          id: '4026532755',
+          uid: 0,
+          comm: 'systemd-timedat',
+          cgroup: HOST_CGROUP,
+          cmdline: '/usr/lib/systemd/systemd-timedated',
+        },
+      ])
+    })
+
+    it('keeps a namespace with a member that runs as the sandbox uid', () => {
+      // #given a leftover of the sandbox account
+      const result = newLaunchNamespaces(
+        ['4026531841'],
+        scope,
+        scan(hostRoot, member('4026532800', 999, 'sleep', HOST_CGROUP, 'sleep 1')),
+      )
+
+      // #then
+      expect(result.kept).toEqual(['4026532800'])
+      expect(result.keptMembers.map(m => m.comm)).toEqual(['sleep'])
+    })
+
+    it('keeps a namespace with a root member in the test process’s own cgroup', () => {
+      // #given a root process the launch started, still in the runner's cgroup
+      const result = newLaunchNamespaces(
+        ['4026531841'],
+        scope,
+        scan(hostRoot, member('4026532801', 0, 'unshare', RUNNER_CGROUP, 'unshare --mount')),
+      )
+
+      // #then
+      expect(result.kept).toEqual(['4026532801'])
+    })
+
+    it('does not count the root cgroup as ours, where every process shares it', () => {
+      // #given a test process in the root cgroup and a host service there too
+      const result = newLaunchNamespaces(
+        ['4026531841'],
+        {...scope, cgroup: '0::/'},
+        scan(hostRoot, member('4026532804', 0, 'systemd-timedat', '0::/', '/usr/lib/systemd/systemd-timedated')),
+      )
+
+      // #then the host namespace is ignored
+      expect(result.kept).toEqual([])
+    })
+
+    it('keeps a namespace with a root member whose command line names the gate directory', () => {
+      // #given the orphaned gate: root, another cgroup, but the gate directory on its command line
+      const result = newLaunchNamespaces(
+        ['4026531841'],
+        scope,
+        scan(hostRoot, member('4026532802', 0, 'sh', HOST_CGROUP, `sh -c wait /tmp/${GATE_DIR}/go`)),
+      )
+
+      // #then
+      expect(result.kept).toEqual(['4026532802'])
+    })
+
+    it('matches a marker as a pattern, the way the suites’ pgrep patterns are written', () => {
+      // #given a stray `sleep 7782` and the suite's `sleep 778[12]`
+      const result = newLaunchNamespaces([], scope, scan(member('4026532803', 0, 'sleep', HOST_CGROUP, 'sleep 7782')))
+
+      // #then
+      expect(result.kept).toEqual(['4026532803'])
+    })
+
+    it('keeps a namespace if any one member is ours, and ignores one that was already there', () => {
+      // #given a mixed new namespace, and a pre-existing one that also holds a sandbox-uid process
+      const result = newLaunchNamespaces(
+        ['4026531841'],
+        scope,
+        scan(
+          member('4026532804', 0, 'systemd-timedat', HOST_CGROUP, '/usr/lib/systemd/systemd-timedated'),
+          member('4026532804', 999, 'sleep', HOST_CGROUP, 'sleep 1'),
+          member('4026531841', 999, 'sleep', RUNNER_CGROUP, 'sleep 2'),
+        ),
+      )
+
+      // #then only the new one is reported, once
+      expect(result.kept).toEqual(['4026532804'])
+      expect(result.ignored).toEqual([])
+    })
+
+    it('does not treat an unknown sandbox uid or an empty marker as a match for everything', () => {
+      // #given no uid and an empty marker
+      const result = newLaunchNamespaces(
+        [],
+        {sandboxUid: null, markers: [''], cgroup: RUNNER_CGROUP},
+        scan(hostNamespace),
+      )
+
+      // #then
+      expect(result.kept).toEqual([])
+      expect(result.ignored).toHaveLength(1)
+    })
+
+    it('asks root for one scan over /proc, and describes a member for a failure message', () => {
+      // #given a runner that records the call
+      const calls: (readonly string[])[] = []
+      const run: InspectionRunner = (command, args) => {
+        calls.push([command, ...args])
+        return done({stdout: `${hostNamespace}\n`})
+      }
+
+      // #when
+      const result = newLaunchNamespaces([], scope, run)
+
+      // #then
+      expect(calls).toHaveLength(1)
+      expect(calls[0]?.slice(0, 3)).toEqual(['sudo', '-n', 'sh'])
+      expect(calls[0]?.[4]).toContain('/proc/[0-9]*')
+      expect(describeNamespaceMembers(result.ignored)).toContain('4026532755 (uid 0, systemd-timedat')
+      expect(describeNamespaceMembers([])).toBe('none')
+    })
+
+    it('throws on a line it cannot read rather than guessing', () => {
+      // #then
+      expect(() => newLaunchNamespaces([], scope, scan('garbage'))).toThrow('unreadable line')
     })
   })
 

@@ -115,7 +115,8 @@ In the workflow that opens the PR, request the review as the human account:
 
 **Limits.**
 
-- The review guard (`checkForkOrSelfGuard` in `src/features/reviews/review-guards.ts`) never posts `APPROVE` on a PR whose author matches the reviewing identity after lowercasing and stripping `[bot]`, and never on a fork PR. `REQUEST_CHANGES` is still posted. On a `pull_request` event an approving verdict that the guard refuses posts no review and the delivery fails as `review-guard-blocked`, so the override cannot produce an approval in that case.
+- The review guard (`checkForkOrSelfGuard` in `src/features/reviews/review-guards.ts`) never posts `APPROVE` on a PR whose author matches the reviewing identity after lowercasing and stripping `[bot]`, and never on a fork PR. On a fork PR that is not self-authored, a `pull_request` approving verdict posts no review and the delivery fails as `review-guard-blocked`, so the override cannot produce an approval in that case. `REQUEST_CHANGES` is still posted on a fork PR.
+- On a self-authored PR GitHub rejects both `APPROVE` and `REQUEST_CHANGES` from the PR's author (HTTP 422, "Can not approve / request changes on your own pull request"), so the harness posts the same body as a `COMMENT` review pinned to the reviewed head and the run succeeds. A `COMMENT` review neither approves nor blocks the PR, so it cannot satisfy a required-approval rule. This applies to an approve verdict on the `pull_request` surface and to a request-changes verdict on any review surface. If the reviewing identity cannot be determined, nothing is posted and delivery fails (`missing-target-context`). A mention on a self-authored PR still posts an approving verdict as a plain comment.
 - A review request made by the App or by `GITHUB_TOKEN` does not admit the PR. The first resolves to no permission; the second starts no run.
 
 ## Cache Issues

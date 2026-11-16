@@ -31,7 +31,20 @@ function isTruthyFlag(value: string | undefined): boolean {
   return normalized !== '' && !['0', 'false', 'no', 'off', 'n'].includes(normalized)
 }
 
-export async function runSetup(inputs: SetupInputs, githubToken: string): Promise<SetupResult | null> {
+export interface RunSetupOptions {
+  /**
+   * Told the `gh` config directory as soon as setup creates it (provision mode), and `null` when setup removes it again
+   * after a failed login. The harness records it in the action state, so a run terminated before setup returns still leaves
+   * the post hook a path to remove.
+   */
+  readonly recordGhConfigDir?: (dir: string | null) => void
+}
+
+export async function runSetup(
+  inputs: SetupInputs,
+  githubToken: string,
+  options: RunSetupOptions = {},
+): Promise<SetupResult | null> {
   const startTime = Date.now()
   const logger = createLogger({component: 'setup'})
   const toolCache = createToolCacheAdapter()
@@ -181,12 +194,19 @@ export async function runSetup(inputs: SetupInputs, githubToken: string): Promis
     // the token in-heap directly (accepted residual — see plan Scope Boundaries).
     const octokit = getOctokit(githubToken)
     const provisionChildCredential = inputs.credential === 'provision'
-    const ghResult = await configureGhAuth(octokit, null, githubToken, logger, execAdapter, provisionChildCredential)
+    const ghResult = await configureGhAuth(
+      octokit,
+      null,
+      githubToken,
+      logger,
+      execAdapter,
+      provisionChildCredential,
+      options.recordGhConfigDir,
+    )
     if (provisionChildCredential) {
-      core.exportVariable('GH_TOKEN', githubToken)
-      if (process.env.GH_CONFIG_DIR != null && process.env.GH_CONFIG_DIR.length > 0) {
-        core.exportVariable('GH_CONFIG_DIR', process.env.GH_CONFIG_DIR)
-      }
+      // `configureGhAuth` already set process.env.GH_TOKEN and GH_CONFIG_DIR for this process, which is all the
+      // Action and the server it spawns need. Do NOT `core.exportVariable` them: that writes $GITHUB_ENV and hands
+      // the write token to every later step in the caller's job (#2156).
       logger.info('GitHub CLI configured')
     } else {
       logger.info('GitHub CLI credential withheld from child (affected trigger)')
