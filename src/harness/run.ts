@@ -43,7 +43,7 @@ import {
   type ExecutePhaseResult,
 } from './phases/execute.js'
 import {runFinalizeWithResult} from './phases/finalize.js'
-import {releaseRunGhConfig, trackRunGhConfigDir} from './phases/gh-config.js'
+import {releaseRunGhConfig} from './phases/gh-config.js'
 import {snapshotLogDirectory} from './phases/log-snapshot.js'
 import {mergeObservedTurn, recordObservedTurn} from './phases/observed-turn-v2.js'
 import {releaseOptionsFromExecution, runReleaseV2} from './phases/release-v2.js'
@@ -64,12 +64,6 @@ export async function run(): Promise<number> {
   // From the raw input, read before bootstrap: a bootstrap that fails (the runner preflight, the persisted-credential check,
   // an unparseable value) returns before any lifecycle exists, and cleanup must still treat the run as isolated.
   const isolationRequested = isIsolationRequested(core.getInput('isolate-agent'))
-
-  // What `GH_CONFIG_DIR` held before this run's setup could change it: an earlier step's directory, which is not ours to remove.
-  const ambientGhConfigDir = process.env.GH_CONFIG_DIR
-  // The `gh` config directory this run's setup created (provision mode), or null. Removed in the `finally` block once
-  // nothing uses it, so a later step in the caller's job cannot read the token from its `hosts.yml` (#2156).
-  let ghConfigDir: string | null = null
 
   let reactionCtx: ReactionContext | null = null
   let exitCode = 0
@@ -221,9 +215,6 @@ export async function run(): Promise<number> {
 
     requestedOutputModeState = resolveRequestedOutputModeState()
     const bootstrap = await runBootstrap(bootstrapLogger)
-    // Setup has run, whether or not bootstrap went on to succeed. Recorded now so the post hook can remove the directory if
-    // this step is killed before the `finally` block gets to it.
-    ghConfigDir = trackRunGhConfigDir(ambientGhConfigDir)
     if (bootstrap == null) {
       deliveryOutcome = 'failed'
       setUnavailableActionOutputs(Date.now() - startTime)
@@ -595,9 +586,9 @@ export async function run(): Promise<number> {
       // runCleanup shuts the V2 server down; only then is the staging root, which the server reads, safe to remove.
       await removeRepoSkillsStaging(repoSkillsStagingRoot)
       // The same holds for the `gh` config directory: the server and the sandbox read it, and what runs after this point
-      // uses the Action's Octokit client, never `gh`. A bootstrap that threw after setup never recorded it above.
-      ghConfigDir ??= trackRunGhConfigDir(ambientGhConfigDir)
-      await releaseRunGhConfig({dir: ghConfigDir, sandboxTrusted: !sandboxRestoreUnsafe, logger: bootstrapLogger})
+      // uses the Action's Octokit client, never `gh`. Setup recorded the directory when it created it, so this covers a
+      // bootstrap that threw after setup too.
+      await releaseRunGhConfig({sandboxTrusted: !sandboxRestoreUnsafe, logger: bootstrapLogger})
     })
 
     // FINAL assessment: the single call to this pure function, made only now that

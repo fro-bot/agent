@@ -249,6 +249,25 @@ describe('setup', () => {
       expect(process.env.GH_CONFIG_DIR).toBe('/tmp/gh-config-mock')
     })
 
+    it('hands the gh config directory recorder to configureGhAuth (#2156)', async () => {
+      // #given
+      vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')
+      vi.mocked(exec.getExecOutput).mockResolvedValue({exitCode: 0, stdout: '{"tag_name": "v1.0.300"}', stderr: ''})
+      vi.mocked(exec.exec).mockResolvedValue(0)
+      vi.mocked(fs.writeFile).mockResolvedValue()
+      vi.mocked(fs.mkdir).mockResolvedValue(undefined)
+      vi.mocked(fs.access).mockRejectedValue(new Error('not found'))
+      vi.mocked(fs.mkdtemp).mockResolvedValue('/tmp/gh-config-mock')
+      vi.mocked(fs.chmod).mockResolvedValue(undefined)
+      const recordGhConfigDir = vi.fn()
+
+      // #when
+      await runSetup(createSetupInputs({credential: 'provision'}), 'ghs_test_token', {recordGhConfigDir})
+
+      // #then the directory is recorded where setup creates it, not only when setup returns
+      expect(recordGhConfigDir).toHaveBeenCalledWith('/tmp/gh-config-mock')
+    })
+
     it('withholds the credential everywhere the child can read it when credential is "withhold"', async () => {
       // #given
       vi.mocked(tc.find).mockReturnValue('/cached/opencode/1.0.300')

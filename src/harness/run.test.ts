@@ -60,7 +60,6 @@ vi.mock('./phases/cache-restore.js', () => ({
 }))
 
 vi.mock('./phases/gh-config.js', () => ({
-  trackRunGhConfigDir: vi.fn((): string | null => null),
   releaseRunGhConfig: vi.fn(async () => undefined),
 }))
 

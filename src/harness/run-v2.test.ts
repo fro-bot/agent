@@ -72,7 +72,6 @@ vi.mock('./phases/repo-skills.js', () => ({
 }))
 
 vi.mock('./phases/gh-config.js', () => ({
-  trackRunGhConfigDir: vi.fn((): string | null => null),
   releaseRunGhConfig: vi.fn(async () => undefined),
 }))
 
@@ -408,22 +407,10 @@ describe('run on an OpenCode V2 server', () => {
   })
 
   describe('gh config directory cleanup (#2156)', () => {
-    const GH_CONFIG_DIR = '/runner-temp/gh-config-abc123'
-
-    beforeEach(async () => {
-      const {trackRunGhConfigDir} = await import('./phases/gh-config.js')
-      vi.mocked(trackRunGhConfigDir).mockReturnValue(GH_CONFIG_DIR)
-    })
-
-    afterEach(async () => {
-      const {trackRunGhConfigDir} = await import('./phases/gh-config.js')
-      vi.mocked(trackRunGhConfigDir).mockReturnValue(null)
-    })
-
     const order = (mock: {mock: {invocationCallOrder: number[]}}): number =>
       mock.mock.invocationCallOrder[0] ?? Number.NaN
 
-    it('removes the directory on a successful run', async () => {
+    it('releases the directory on a successful run', async () => {
       // #given
       const {releaseRunGhConfig} = await import('./phases/gh-config.js')
       await arrange()
@@ -434,10 +421,10 @@ describe('run on an OpenCode V2 server', () => {
       // #then
       expect(exitCode).toBe(0)
       expect(vi.mocked(releaseRunGhConfig)).toHaveBeenCalledTimes(1)
-      expect(vi.mocked(releaseRunGhConfig).mock.calls[0]?.[0]).toMatchObject({dir: GH_CONFIG_DIR, sandboxTrusted: true})
+      expect(vi.mocked(releaseRunGhConfig).mock.calls[0]?.[0]).toMatchObject({sandboxTrusted: true})
     })
 
-    it('removes it when a phase throws after the server started', async () => {
+    it('releases it when a phase throws after the server started', async () => {
       // #given execution that throws
       const {releaseRunGhConfig} = await import('./phases/gh-config.js')
       await arrange({executeError: new Error('boom')})
@@ -445,12 +432,12 @@ describe('run on an OpenCode V2 server', () => {
       // #when
       const exitCode = await run()
 
-      // #then the finally block still removes it
+      // #then the finally block still releases it
       expect(exitCode).toBe(1)
-      expect(vi.mocked(releaseRunGhConfig).mock.calls[0]?.[0]).toMatchObject({dir: GH_CONFIG_DIR, sandboxTrusted: true})
+      expect(vi.mocked(releaseRunGhConfig).mock.calls[0]?.[0]).toMatchObject({sandboxTrusted: true})
     })
 
-    it('removes it when the server failed to start', async () => {
+    it('releases it when the server failed to start', async () => {
       // #given a cache-restore (server start) that fails
       const {runCacheRestore} = await import('./phases/cache-restore.js')
       const {releaseRunGhConfig} = await import('./phases/gh-config.js')
@@ -462,10 +449,24 @@ describe('run on an OpenCode V2 server', () => {
 
       // #then
       expect(exitCode).toBe(1)
-      expect(vi.mocked(releaseRunGhConfig).mock.calls[0]?.[0]).toMatchObject({dir: GH_CONFIG_DIR, sandboxTrusted: true})
+      expect(vi.mocked(releaseRunGhConfig).mock.calls[0]?.[0]).toMatchObject({sandboxTrusted: true})
     })
 
-    it('removes it when cleanup itself rejects', async () => {
+    it('releases it when bootstrap throws after setup created the directory', async () => {
+      // #given a bootstrap that throws
+      const {runBootstrap} = await import('./phases/bootstrap.js')
+      const {releaseRunGhConfig} = await import('./phases/gh-config.js')
+      await arrange()
+      vi.mocked(runBootstrap).mockRejectedValue(new Error('bootstrap exploded'))
+
+      // #when
+      await run()
+
+      // #then
+      expect(vi.mocked(releaseRunGhConfig)).toHaveBeenCalledTimes(1)
+    })
+
+    it('releases it when cleanup itself rejects', async () => {
       // #given
       const {runCleanup} = await import('./phases/cleanup.js')
       const {releaseRunGhConfig} = await import('./phases/gh-config.js')
@@ -476,54 +477,10 @@ describe('run on an OpenCode V2 server', () => {
       await expect(run()).rejects.toThrow('cleanup blew up')
 
       // #then the credential is still ended
-      expect(vi.mocked(releaseRunGhConfig).mock.calls[0]?.[0]).toMatchObject({dir: GH_CONFIG_DIR})
+      expect(vi.mocked(releaseRunGhConfig)).toHaveBeenCalledTimes(1)
     })
 
-    it('records the directory before the first phase that can fail, so the post hook has it', async () => {
-      // #given
-      const {runBootstrap} = await import('./phases/bootstrap.js')
-      const {trackRunGhConfigDir} = await import('./phases/gh-config.js')
-      const {runRouting} = await import('./phases/routing.js')
-      await arrange()
-
-      // #when
-      await run()
-
-      // #then it was recorded right after bootstrap returned, before routing
-      expect(order(vi.mocked(runBootstrap))).toBeLessThan(order(vi.mocked(trackRunGhConfigDir)))
-      expect(order(vi.mocked(trackRunGhConfigDir))).toBeLessThan(order(vi.mocked(runRouting)))
-    })
-
-    it('still records the directory when bootstrap throws after setup created it', async () => {
-      // #given a bootstrap that throws (setup already ran), so the post-bootstrap record never happened
-      const {runBootstrap} = await import('./phases/bootstrap.js')
-      const {releaseRunGhConfig, trackRunGhConfigDir} = await import('./phases/gh-config.js')
-      await arrange()
-      vi.mocked(runBootstrap).mockRejectedValue(new Error('bootstrap exploded'))
-
-      // #when
-      await run()
-
-      // #then the finally block picks it up and removes it
-      expect(vi.mocked(trackRunGhConfigDir)).toHaveBeenCalled()
-      expect(vi.mocked(releaseRunGhConfig).mock.calls[0]?.[0]).toMatchObject({dir: GH_CONFIG_DIR, sandboxTrusted: true})
-    })
-
-    it("passes the ambient GH_CONFIG_DIR the run started with, so an earlier step's directory is never removed", async () => {
-      // #given
-      vi.stubEnv('GH_CONFIG_DIR', '/runner-temp/gh-config-from-an-earlier-step')
-      const {trackRunGhConfigDir} = await import('./phases/gh-config.js')
-      await arrange()
-
-      // #when
-      await run()
-      vi.unstubAllEnvs()
-
-      // #then
-      expect(vi.mocked(trackRunGhConfigDir).mock.calls[0]?.[0]).toBe('/runner-temp/gh-config-from-an-earlier-step')
-    })
-
-    it('removes it only after the last thing that uses it: release, review reconciliation, finalize and cleanup', async () => {
+    it('releases it only after the last thing that uses it: release, review reconciliation, finalize and cleanup', async () => {
       // #given
       const {runCleanup} = await import('./phases/cleanup.js')
       const {runFinalizeWithResult} = await import('./phases/finalize.js')
@@ -541,19 +498,6 @@ describe('run on an OpenCode V2 server', () => {
       expect(order(vi.mocked(runReviewReconciliation))).toBeLessThan(removal)
       expect(order(vi.mocked(runFinalizeWithResult))).toBeLessThan(removal)
       expect(order(vi.mocked(runCleanup))).toBeLessThan(removal)
-    })
-
-    it('asks for no removal when the run created no directory', async () => {
-      // #given
-      const {releaseRunGhConfig, trackRunGhConfigDir} = await import('./phases/gh-config.js')
-      vi.mocked(trackRunGhConfigDir).mockReturnValue(null)
-      await arrange()
-
-      // #when
-      await run()
-
-      // #then the release still drops the process env, with nothing to delete
-      expect(vi.mocked(releaseRunGhConfig).mock.calls[0]?.[0]).toMatchObject({dir: null})
     })
   })
 
@@ -1241,18 +1185,6 @@ describe('run with isolate-agent', () => {
   })
 
   describe('gh config directory under isolate-agent (#2156)', () => {
-    const GH_CONFIG_DIR = '/runner-temp/gh-config-abc123'
-
-    beforeEach(async () => {
-      const {trackRunGhConfigDir} = await import('./phases/gh-config.js')
-      vi.mocked(trackRunGhConfigDir).mockReturnValue(GH_CONFIG_DIR)
-    })
-
-    afterEach(async () => {
-      const {trackRunGhConfigDir} = await import('./phases/gh-config.js')
-      vi.mocked(trackRunGhConfigDir).mockReturnValue(null)
-    })
-
     const order = (mock: {mock: {invocationCallOrder: number[]}}): number =>
       mock.mock.invocationCallOrder[0] ?? Number.NaN
 
@@ -1266,7 +1198,7 @@ describe('run with isolate-agent', () => {
 
       // #then the directory is released after the sandbox release gave it back, and is trusted
       expect(order(release)).toBeLessThan(order(vi.mocked(releaseRunGhConfig)))
-      expect(vi.mocked(releaseRunGhConfig).mock.calls[0]?.[0]).toMatchObject({dir: GH_CONFIG_DIR, sandboxTrusted: true})
+      expect(vi.mocked(releaseRunGhConfig).mock.calls[0]?.[0]).toMatchObject({sandboxTrusted: true})
     })
 
     it.each([
@@ -1282,7 +1214,6 @@ describe('run with isolate-agent', () => {
 
       // #then the directory is handed to the release as untrusted, which does not touch it
       expect(vi.mocked(releaseRunGhConfig).mock.calls[0]?.[0]).toMatchObject({
-        dir: GH_CONFIG_DIR,
         sandboxTrusted: false,
       })
     })
@@ -1297,7 +1228,7 @@ describe('run with isolate-agent', () => {
 
       // #then
       expect(order(release)).toBeLessThan(order(vi.mocked(releaseRunGhConfig)))
-      expect(vi.mocked(releaseRunGhConfig).mock.calls[0]?.[0]).toMatchObject({dir: GH_CONFIG_DIR, sandboxTrusted: true})
+      expect(vi.mocked(releaseRunGhConfig).mock.calls[0]?.[0]).toMatchObject({sandboxTrusted: true})
     })
 
     it('leaves it alone when the exception path cannot restore the sandbox', async () => {
@@ -1313,7 +1244,6 @@ describe('run with isolate-agent', () => {
 
       // #then
       expect(vi.mocked(releaseRunGhConfig).mock.calls[0]?.[0]).toMatchObject({
-        dir: GH_CONFIG_DIR,
         sandboxTrusted: false,
       })
     })
@@ -1328,7 +1258,6 @@ describe('run with isolate-agent', () => {
 
       // #then
       expect(vi.mocked(releaseRunGhConfig).mock.calls[0]?.[0]).toMatchObject({
-        dir: GH_CONFIG_DIR,
         sandboxTrusted: false,
       })
 
@@ -1340,7 +1269,7 @@ describe('run with isolate-agent', () => {
       await run()
 
       // #then
-      expect(vi.mocked(releaseRunGhConfig).mock.calls[0]?.[0]).toMatchObject({dir: GH_CONFIG_DIR, sandboxTrusted: true})
+      expect(vi.mocked(releaseRunGhConfig).mock.calls[0]?.[0]).toMatchObject({sandboxTrusted: true})
     })
   })
 

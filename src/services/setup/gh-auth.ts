@@ -7,7 +7,7 @@ import process from 'node:process'
 import {toErrorMessage} from '../../shared/errors.js'
 import {getUserByUsername} from '../github/api.js'
 import {getBotLogin as getAuthenticatedUser} from '../github/client.js'
-import {GH_CONFIG_DIR_PREFIX, ghConfigBaseDir} from './gh-config-dir.js'
+import {GH_CONFIG_DIR_PREFIX, ghConfigBaseDir, removeGhConfigDir} from './gh-config-dir.js'
 
 const GH_LOGIN_TIMEOUT_MS = 30_000
 
@@ -26,6 +26,26 @@ async function runGhLogin(
   return (await execAdapter.getExecOutput('gh', args, options)).exitCode
 }
 
+/**
+ * Removes a `gh` config directory this run created and never published, with the same no-follow remover the end of the run
+ * uses. The record is cleared only once it is gone; a failed removal warns and leaves the record, so the end-of-run cleanup
+ * and the post hook retry it. Never throws.
+ */
+async function discardUnpublishedGhConfigDir(
+  dir: string,
+  logger: Logger,
+  recordGhConfigDir: ((dir: string | null) => void) | undefined,
+): Promise<void> {
+  const outcome = await removeGhConfigDir(dir, process.env, logger)
+  if (outcome === 'removed' || outcome === 'absent') {
+    recordGhConfigDir?.(null)
+    return
+  }
+  logger.warning('The gh config directory of a failed gh auth login could not be removed; the end of the run retries', {
+    outcome,
+  })
+}
+
 export async function configureGhAuth(
   client: Octokit | null,
   appToken: string | null,
@@ -33,6 +53,7 @@ export async function configureGhAuth(
   logger: Logger,
   execAdapter: ExecAdapter,
   provisionChildCredential = true,
+  recordGhConfigDir?: (dir: string | null) => void,
 ): Promise<GhAuthResult> {
   const token = appToken ?? defaultToken
   const method: GhAuthResult['method'] =
@@ -74,8 +95,14 @@ export async function configureGhAuth(
     // dir, or `gh` not being on PATH (ENOENT), must degrade to a warning rather than crash
     // setup — the harness already has GH_TOKEN set above; only the model's child `gh` usage
     // is affected.
+    // Declared outside the try so a login that fails, times out or throws can still remove what it created.
+    let ghConfigDir: string | null = null
     try {
-      const ghConfigDir = await mkdtemp(join(ghConfigBaseDir(), GH_CONFIG_DIR_PREFIX))
+      ghConfigDir = await mkdtemp(join(ghConfigBaseDir(), GH_CONFIG_DIR_PREFIX))
+      // Recorded the moment it exists, before `gh` writes the token into it: a run terminated mid-login (cancellation, a
+      // kill) leaves the record the post hook removes it by. The harness keeps this record as the one source of truth for
+      // what the end-of-run cleanup removes.
+      recordGhConfigDir?.(ghConfigDir)
       await chmod(ghConfigDir, 0o700)
 
       // `gh auth login --with-token` refuses to persist credentials when GH_TOKEN/GITHUB_TOKEN
@@ -110,6 +137,9 @@ export async function configureGhAuth(
         logger.warning('gh auth login failed; model gh CLI usage in the child may be unauthenticated', {
           exitCode: loginExit,
         })
+        // A login that fails or times out can already have written hosts.yml, and nothing publishes this directory, so
+        // nothing else would ever clean it up.
+        await discardUnpublishedGhConfigDir(ghConfigDir, logger, recordGhConfigDir)
       }
 
       // HONEST RESIDUAL: the token now lives in `${ghConfigDir}/hosts.yml`, readable by the
@@ -124,6 +154,11 @@ export async function configureGhAuth(
       logger.warning('Failed to configure off-environment gh auth; child gh CLI will be unauthenticated', {
         error: toErrorMessage(error),
       })
+      // Whatever was created before the failure is not published either. A directory already published (a throw after a
+      // successful login) belongs to the run and stays.
+      if (ghConfigDir !== null && process.env.GH_CONFIG_DIR !== ghConfigDir) {
+        await discardUnpublishedGhConfigDir(ghConfigDir, logger, recordGhConfigDir)
+      }
     }
   }
 

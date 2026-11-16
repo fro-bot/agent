@@ -6,7 +6,7 @@ import * as core from '@actions/core'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {STATE_KEYS} from '../config/state-keys.js'
-import {releaseRunGhConfig, trackRunGhConfigDir} from './gh-config.js'
+import {recordRunGhConfigDir, releaseRunGhConfig} from './gh-config.js'
 
 vi.mock('@actions/core', () => ({
   saveState: vi.fn(),
@@ -29,6 +29,8 @@ describe('run gh config directory', () => {
 
   beforeEach(async () => {
     vi.clearAllMocks()
+    recordRunGhConfigDir(null)
+    vi.mocked(core.saveState).mockClear()
     runnerTemp = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'gh-config-phase-')))
     process.env.RUNNER_TEMP = runnerTemp
     delete process.env.GH_TOKEN
@@ -49,48 +51,31 @@ describe('run gh config directory', () => {
     return dir
   }
 
-  describe('trackRunGhConfigDir', () => {
-    it('returns the directory setup pointed GH_CONFIG_DIR at and records it for the post hook', async () => {
-      // #given
-      const dir = await makeConfigDir()
-      process.env.GH_CONFIG_DIR = dir
-
+  describe('recordRunGhConfigDir', () => {
+    it('writes the directory to the action state for the post hook, and an empty string to forget it', () => {
       // #when
-      const tracked = trackRunGhConfigDir(undefined)
+      recordRunGhConfigDir('/runner/gh-config-abc')
+      recordRunGhConfigDir(null)
 
       // #then
-      expect(tracked).toBe(dir)
-      expect(core.saveState).toHaveBeenCalledWith(STATE_KEYS.GH_CONFIG_DIR, dir)
-    })
-
-    it('returns null when GH_CONFIG_DIR is unset (withheld credential, or a failed gh login)', () => {
-      expect(trackRunGhConfigDir(undefined)).toBeNull()
-      expect(core.saveState).not.toHaveBeenCalled()
-    })
-
-    it('returns null for a GH_CONFIG_DIR that was already in the environment when the run started', async () => {
-      // #given an earlier step's config dir, which this run did not create
-      const ambient = await makeConfigDir()
-      process.env.GH_CONFIG_DIR = ambient
-
-      // #when
-      const tracked = trackRunGhConfigDir(ambient)
-
-      // #then
-      expect(tracked).toBeNull()
-      expect(core.saveState).not.toHaveBeenCalled()
+      expect(vi.mocked(core.saveState).mock.calls).toEqual([
+        [STATE_KEYS.GH_CONFIG_DIR, '/runner/gh-config-abc'],
+        [STATE_KEYS.GH_CONFIG_DIR, ''],
+      ])
     })
   })
 
   describe('releaseRunGhConfig', () => {
-    it('removes the directory and clears the process env and the post-hook record when the sandbox is trusted', async () => {
+    it('removes the recorded directory and clears the process env and the post-hook record when the sandbox is trusted', async () => {
       // #given
       const dir = await makeConfigDir()
+      recordRunGhConfigDir(dir)
       process.env.GH_CONFIG_DIR = dir
       process.env.GH_TOKEN = 'ghs_x'
+      vi.mocked(core.saveState).mockClear()
 
       // #when
-      await releaseRunGhConfig({dir, sandboxTrusted: true, logger: createMockLogger()})
+      await releaseRunGhConfig({sandboxTrusted: true, logger: createMockLogger()})
 
       // #then
       expect(await exists(dir)).toBe(false)
@@ -99,15 +84,42 @@ describe('run gh config directory', () => {
       expect(core.saveState).toHaveBeenCalledWith(STATE_KEYS.GH_CONFIG_DIR, '')
     })
 
+    it('removes the recorded directory even when GH_CONFIG_DIR was never published (a login that was cut short)', async () => {
+      // #given a directory recorded at creation, with the env never pointed at it
+      const dir = await makeConfigDir()
+      recordRunGhConfigDir(dir)
+
+      // #when
+      await releaseRunGhConfig({sandboxTrusted: true, logger: createMockLogger()})
+
+      // #then
+      expect(await exists(dir)).toBe(false)
+    })
+
+    it('never touches a directory that was not recorded, whatever GH_CONFIG_DIR says', async () => {
+      // #given an earlier step's directory in the env, and nothing recorded by this run
+      const ambient = await makeConfigDir()
+      process.env.GH_CONFIG_DIR = ambient
+
+      // #when
+      await releaseRunGhConfig({sandboxTrusted: true, logger: createMockLogger()})
+
+      // #then
+      expect(await exists(path.join(ambient, 'hosts.yml'))).toBe(true)
+      expect(core.saveState).not.toHaveBeenCalled()
+    })
+
     it('leaves the directory in place when the sandbox take-back was not confirmed', async () => {
       // #given a directory the sandbox user may still own or hold open
       const dir = await makeConfigDir()
+      recordRunGhConfigDir(dir)
       process.env.GH_CONFIG_DIR = dir
       process.env.GH_TOKEN = 'ghs_x'
+      vi.mocked(core.saveState).mockClear()
       const logger = createMockLogger()
 
       // #when
-      await releaseRunGhConfig({dir, sandboxTrusted: false, logger})
+      await releaseRunGhConfig({sandboxTrusted: false, logger})
 
       // #then it is not touched, and the post hook's record is not cleared
       expect(await exists(path.join(dir, 'hosts.yml'))).toBe(true)
@@ -123,7 +135,7 @@ describe('run gh config directory', () => {
       process.env.GH_TOKEN = 'ghs_x'
 
       // #when
-      await releaseRunGhConfig({dir: null, sandboxTrusted: true, logger: createMockLogger()})
+      await releaseRunGhConfig({sandboxTrusted: true, logger: createMockLogger()})
 
       // #then
       expect(process.env.GH_TOKEN).toBeUndefined()
@@ -131,12 +143,14 @@ describe('run gh config directory', () => {
     })
 
     it('does not fail the run, and keeps the post-hook record, when the removal is refused', async () => {
-      // #given a path that is not a gh-config-* directory under RUNNER_TEMP
+      // #given a recorded path that is not a gh-config-* directory under RUNNER_TEMP
       const stray = await fs.mkdtemp(path.join(runnerTemp, 'not-ours-'))
+      recordRunGhConfigDir(stray)
+      vi.mocked(core.saveState).mockClear()
       const logger = createMockLogger()
 
       // #when
-      await expect(releaseRunGhConfig({dir: stray, sandboxTrusted: true, logger})).resolves.toBeUndefined()
+      await expect(releaseRunGhConfig({sandboxTrusted: true, logger})).resolves.toBeUndefined()
 
       // #then
       expect(await exists(stray)).toBe(true)

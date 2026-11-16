@@ -18,12 +18,13 @@ import {
 } from '@fro-bot/runtime'
 import {createExecAdapter} from '../../services/setup/adapters.js'
 import {assertNoPersistedGitCredentials} from '../../services/setup/git-credential-check.js'
-import {runtimeSetupAdapter} from '../../services/setup/runtime-setup-adapter.js'
+import {createRuntimeSetupAdapter} from '../../services/setup/runtime-setup-adapter.js'
 import {createSandboxPreflightDeps, runSandboxPreflight} from '../../services/setup/sandbox-preflight.js'
 import {getGitHubRunAttempt, getGitHubRunId, getGitHubWorkspace} from '../../shared/env.js'
 import {createLogger} from '../../shared/logger.js'
 import {parseActionInputs} from '../config/inputs.js'
 import {STATE_KEYS} from '../config/state-keys.js'
+import {recordRunGhConfigDir} from './gh-config.js'
 import {createSandboxLifecycle, type SandboxLifecycle} from './sandbox-lifecycle.js'
 
 export interface BootstrapPhaseResult {
@@ -142,7 +143,7 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
       systematicConfig: inputs.systematicConfig,
       credential,
     },
-    runtimeSetupAdapter,
+    createRuntimeSetupAdapter({recordGhConfigDir: recordRunGhConfigDir}),
   )
 
   logger.info('OpenCode ready', {version: opencodeResult.version})

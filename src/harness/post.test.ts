@@ -8,6 +8,7 @@ import {err, ok} from '../shared/types.js'
 
 vi.mock('@actions/core', () => ({
   getState: vi.fn(),
+  saveState: vi.fn(),
   warning: vi.fn(),
   info: vi.fn(),
   debug: vi.fn(),
@@ -1399,6 +1400,63 @@ describe('post action: gh config directory left by a main step that did not fini
 
     // #then
     expect(await exists(path.join(dir, 'hosts.yml'))).toBe(true)
+  })
+
+  it('removes the directory of a run terminated right after gh auth login created it', async () => {
+    // #given the real setup code creating the directory, with the state the runner would persist captured as it is written
+    const state: Record<string, string> = {}
+    const core = await import('@actions/core')
+    await stubState({})
+    vi.mocked(core.saveState).mockImplementation((key: string, value: unknown) => {
+      state[key] = String(value)
+    })
+    vi.mocked(core.getState).mockImplementation((key: string) => state[key] ?? '')
+    const {configureGhAuth} = await import('../services/setup/gh-auth.js')
+    const {recordRunGhConfigDir} = await import('./phases/gh-config.js')
+    let loginStarted: () => void = () => {}
+    const started = new Promise<void>(resolve => {
+      loginStarted = resolve
+    })
+    const execAdapter = {
+      exec: vi.fn(),
+      getExecOutput: vi.fn(),
+      // `gh auth login` writes hosts.yml, then the process is cut off: this never settles, like a killed main step
+      execWithTimeout: vi.fn(
+        async (
+          _cmd: string,
+          _args: string[] | undefined,
+          _timeout: number,
+          options?: {env?: Record<string, string>},
+        ) => {
+          await fs.writeFile(path.join(options?.env?.GH_CONFIG_DIR as string, 'hosts.yml'), 'token', {mode: 0o600})
+          loginStarted()
+          return new Promise<never>(() => {})
+        },
+      ),
+    }
+    const neverSettles = configureGhAuth(
+      null,
+      null,
+      'ghs_token',
+      createMockLogger(),
+      execAdapter,
+      true,
+      recordRunGhConfigDir,
+    )
+    neverSettles.catch(() => {})
+    await started
+
+    // #then the only trace is the action state, and it names a directory holding the token
+    const created = state.ghConfigDir as string
+    expect(created).toMatch(/gh-config-/)
+    expect(await exists(path.join(created, 'hosts.yml'))).toBe(true)
+
+    // #when the post hook runs in the next process
+    const {runPost} = await import('./post.js')
+    await runPost({logger: createMockLogger()})
+
+    // #then it removes the directory
+    expect(await exists(created)).toBe(false)
   })
 
   it('does nothing when the main step already removed it (the record was cleared)', async () => {
