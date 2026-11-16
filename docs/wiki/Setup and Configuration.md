@@ -1,8 +1,17 @@
 ---
 type: subsystem
-last-updated: "2026-11-08"
-updated-by: "f7c20f94"
+last-updated: "2026-11-15"
+updated-by: "962b70bc"
 sources:
+  - src/harness/phases/sandbox-lifecycle.ts
+  - src/services/setup/sandbox-preflight.ts
+  - src/services/setup/sandbox-handoff.ts
+  - src/services/setup/sandbox-tool-roots.ts
+  - src/services/setup/sandbox-toolchain-path.ts
+  - src/services/setup/sandbox-view-probe.ts
+  - src/services/setup/key-proxy-providers.ts
+  - packages/runtime/src/agent/key-proxy.ts
+  - packages/runtime/src/agent/sandbox-view.ts
   - packages/runtime/src/agent/workspace-config-v2.ts
   - deploy/gateway.Dockerfile
   - tsdown.config.ts
@@ -57,7 +66,7 @@ sources:
   - RFCs/RFC-011-Setup-Action-Environment-Bootstrap.md
   - RFCs/RFC-019-S3-Storage-Backend.md
   - ARCHITECTURE.md
-summary: "Generation-aware tool installation, permission gates, provider credentials, plugins, and tools caching"
+summary: "Pinned V2 installation, permission gates, trusted repository skills, and optional hosted-runner isolation"
 ---
 
 # Setup and Configuration
@@ -78,17 +87,17 @@ The `runSetup()` orchestrator installs OpenCode and the Systematic plugin, assem
 
 3. **Restore tools cache** — Checks for a cached bundle of previously installed tools, keyed by OS and the OpenCode and Systematic versions. A cache hit skips download steps entirely. The cache holds only the OpenCode tool-cache and cache directories, never `~/.config/opencode`, so a stale config is never restored.
 
-4. **Install OpenCode CLI** — Downloads the platform-appropriate release binary, extracts it, verifies it (`--version`), and registers it in the GitHub Actions tool cache. The supported matrix is Linux and macOS on x64 or arm64; anything else is rejected by name before a URL is built (see [Platform Support](#platform-support)). The download source depends on whether the target is a stock OpenCode release or a [harness build](#harness-builds) — harness builds are fetched from `fro-bot/agent` releases and verified against a published `SHA256SUMS` manifest.
+4. **Install OpenCode CLI** — Downloads the platform-appropriate stock V2 release binary, extracts it, verifies its digest and version, and registers it in the GitHub Actions tool cache. The supported matrix is Linux and macOS on x64 or arm64; anything else is rejected by name before a URL is built (see [Platform Support](#platform-support)). Historical [harness builds](#harness-builds) are not install candidates.
 
 5. **Build CI config** — Builds the V2 config when the server spawns (`buildCIConfigV2`) and exports no `OPENCODE_CONFIG_CONTENT`; it strips `permission`, `tools`, `autoupdate` and `subagent_depth` from `opencode-config`.
 
 6. **Merge user config** — The operator's `opencode-config` is merged into the V2 config at spawn time, so nothing is written to the checkout or the global config. V2 retains its native plural `plugins` key.
 
-7. **Install plugins** — Runs plugin preparation before caching, gated on either a fresh OpenCode install _or_ a tools-cache miss (see [When the Plugin Install Runs](#when-the-plugin-install-runs)). On V1, a failed Systematic install warns and skips saving the tools cache. On V2, preparing both Systematic and the Fro Bot plugin is required; failure stops setup.
+7. **Install plugins** — Checks for both exact-version plugins and prepares missing ones before caching (see [When the Plugin Install Runs](#when-the-plugin-install-runs)). Systematic and the Fro Bot plugin are required; failure stops setup.
 
 8. **Save tools cache** — If the plugin install ran and succeeded, saves the installed binaries for future runs.
 
-9. **Configure authentication** — Sets up `gh` CLI auth and configures Git identity as `{bot}[bot]` for audit trails. The provider keys are provisioned as external key files at server startup; `auth.json` is never written.
+9. **Configure authentication** — Sets up `gh` CLI auth according to the trigger's credential disposition and configures Git identity as `{bot}[bot]` for audit trails. At server startup provider keys use external files on ordinary runs, or a runner-owned proxy on isolated runs; `auth.json` is never written.
 
 ## Pinned Versions
 
@@ -101,11 +110,11 @@ Default versions are defined in `packages/runtime/src/shared/constants.ts` (shar
 
 `systematic-version` can be overridden per run. `opencode-version` accepts only the recorded V2 pin (unset, `latest`, or the exact pin with or without a `v`): any other value fails input parsing, so a binary of another version already on the runner is never used. Stock tool pins are updated via Renovate-managed PRs. The OpenCode default is the stock V2 pin in `opencode-v2-pin.json`: Renovate bumps its `version` and a post-upgrade task regenerates the per-asset digests. A harness release does not change the Action default.
 
-The bundled Systematic default is currently `3.32.0`, shared by V1 and V2. Its pin participates in the tools-cache key, so advancing it triggers a fresh plugin installation even when the OpenCode binary itself is already cached.
+The bundled Systematic default is currently `3.33.2`. Its pin participates in the tools-cache key, so advancing it triggers a fresh plugin installation even when the OpenCode binary itself is already cached.
 
 Bun is the package manager for this project's own workspace, not a tool the Action installs. Every workflow in this repository gets its Bun from the root `package.json` `packageManager` field through `.github/actions/setup`, which fails the job if the installed Bun differs from it.
 
-`DEFAULT_OPENCODE_VERSION` is the **stock OpenCode V2 pin** (currently `2.2.6`), read from `packages/runtime/src/shared/opencode-v2-pin.json`, which records the version and each release asset's SHA-256. Installation requires both the recorded digest and the release's `SHA256SUMS` line to match. The build checks that the version and digests survive bundling (`tsdown.config.ts`). `latest` selects this same recorded pin without an upstream lookup.
+`DEFAULT_OPENCODE_VERSION` is the **stock OpenCode V2 pin** (currently `2.3.0`), read from `packages/runtime/src/shared/opencode-v2-pin.json`, which records the version and each release asset's SHA-256. Installation requires both the recorded digest and the release's `SHA256SUMS` line to match. The build checks that the version and digests survive bundling (`tsdown.config.ts`). `latest` selects this same recorded pin without an upstream lookup.
 
 The Action no longer runs V1. A V1 `opencode-version` (a stock 1.x version or a `+harness.`/`-harness.` build) fails input parsing with an error that names the input and the value, and so does any V2 version other than the pin. To keep running V1, pin the Action to its last pre-cut release, `fro-bot/agent@v0.137.0`, and set `opencode-version` to the final V1 harness build `1.19.5+harness.bf7f7dfe`. A V1 run cannot see sessions created on V2, and a later V2 run keeps its own copy; nothing reconciles the two. The gateway and the workspace image are V2-only too; to roll back past the cut, redeploy the previous image pair from GHCR.
 
@@ -115,11 +124,13 @@ The Action no longer runs V1. A V1 `opencode-version` (a stock 1.x version or a 
 
 `src/services/setup/opencode.ts` verifies stock V2 archives against the asset digests recorded in `packages/runtime/src/shared/opencode-v2-pin.json`. An unrecorded V2 version or missing digest fails closed, as does a mismatched download; V2 does not silently fall back to a V1 binary. Linux uses tar archives and macOS uses zip archives; the workspace image selects the matching Linux musl asset.
 
-V2 installs both Systematic and `@fro.bot/opencode-plugin` (`0.1.0`). The latter supplies the four session-history tools and the subagent-session reuse guard. `plugin-install-v2.ts` performs bounded preparation outside the real session database. `src/harness/phases/v2-server.ts` checks both exact plugin specs before every spawn, even when a preinstalled matching binary skipped setup. A warm plugin cache makes this a cheap check; a missing plugin uses the bounded installer before the shorter server-readiness deadline begins. Unlike V1's advisory Systematic install, failed V2 preparation or an inactive required plugin prevents execution.
+V2 installs both Systematic and `@fro.bot/opencode-plugin` (`0.1.0`). The latter supplies the four session-history tools and the subagent-session reuse guard. `plugin-install-v2.ts` performs bounded preparation outside the real session database. `src/harness/phases/v2-server.ts` checks both exact plugin specs before every spawn. A warm plugin cache makes this a cheap check; a missing plugin uses the bounded installer before the shorter server-readiness deadline begins. Failed preparation or an inactive required plugin prevents execution.
+
+Plugin activation has its own readiness gate in `packages/runtime/src/agent/server-v2.ts`. Since upstream 2.2.7, `/api/agent` can answer successfully while `/api/plugin` is still empty. The harness polls the plugin list for up to 60 seconds until every expected plugin is active; a listed failure stops the gate immediately. An HTTP-ready server is therefore not yet a runnable agent.
 
 ### Provider credentials and restored state
 
-The Action narrows `auth-json` to supported API-key entries and writes each key to its own owner-only file outside cached paths (`credential-files-v2.ts`). Configuration refers to those files through `{file:...}` rather than embedding key bytes. The provided file reference wins over an inline operator key for the same provider while preserving its other settings. Stale `auth.json` is removed before spawn so V2's legacy migration cannot import provider secrets into the database that will later be cached.
+On non-isolated runs, the Action narrows `auth-json` to supported API-key entries and writes each key to its own owner-only file outside cached paths (`credential-files-v2.ts`). Configuration refers to those files through `{file:...}` rather than embedding key bytes. The provided file reference wins over an inline operator key for the same provider while preserving its other settings. Isolated runs instead use [the key proxy](#isolate-agent-the-key-proxy), without key files. Stale `auth.json` is removed before spawn so V2's legacy migration cannot import provider secrets into the database that will later be cached.
 
 Held execution claims from a killed invocation are cleared in the restored database before the server starts. After spawn, a provider credential gate checks the effective model's provider, or the supplied providers when no model selects one. It accepts configured authentication references or a reported connection without reading secret values. Startup then waits for V1 history import to complete before any prompt; [[Session Persistence]] explains that migration barrier.
 
@@ -143,7 +154,7 @@ The Action adds no permission rule for a configured server. On stock 2.2.5 the `
 
 On a credential-withheld trigger (`resolveResponseDelivery`, the `pull_request`, `issue_comment` and `issues` events) untrusted text drives the model, so only static local MCP servers run. `applyOperatorMcpV2` filters `mcp` server by server, in both spellings, and keeps a server only when its `type` is the literal `local` and no `{file:` or `{env:` opening appears anywhere in its original definition: the server name, every known field and every nested or unknown key or string. Everything else is dropped: all `remote` servers, any server with a reference, any malformed entry, a non-literal `type`, and servers whose names sanitize to one tool prefix. A kept server is passed through as authored, in the spelling it was written in, and a literal `environment` is allowed. A literal `mcp.timeout` block stays when a server is kept. When no server is kept, the `mcp` key is removed. The helper logs the kept servers (info) and the dropped servers (warning) by sanitized, bounded name and never a value. A block whose layout cannot be read is removed whole, and the withheld path never fails setup. The filter exists because OpenCode substitutes `{file:...}` and `{env:...}` in `OPENCODE_CONFIG_CONTENT` as text before it parses it (`core/src/config/variable.ts`), so a header value, a query string, a `mcp.timeout` block with a substituted `type` or a name can resolve to something the harness never inspected, and the default agent allows every MCP tool. For the same reason a top-level operator key whose own name carries a `{file:}` reference is removed on those runs, since it could resolve to `mcp`; that check is on the top-level key names only, not recursive. A kept server is trusted operator code, not a sandbox: its command comes from the workflow config and its definition reaches a process the checkout controls, so operators must not put secrets in the command, its arguments or a literal `environment`. The child environment is unchanged (`filterAgentEnv(process.env)` plus the server keys), and fork pull requests remain the caller's restriction. The substituted file content is JSON-escaped (`variable.ts`, `JSON.stringify(...).slice(1, -1)`), so a `{file:}` reference inside a string cannot add structure. The `{env:}` pass is different: it splices the raw value first and escapes only when that fails to parse (`variable.ts:27-37`), so an attacker-influenced allowlisted value (a branch name in `GITHUB_HEAD_REF`, say) could inject JSON after the Action's strips. So on a withheld run `buildCIConfigV2` fails setup, before anything else, if the operator's `opencode-config` contains `{env:` in a key, a value or a nested string (checked on the serialized object, case-sensitively, as upstream matches it); the error names the rule and the trigger and echoes no value. This check runs first, so a server with `{env:` fails setup instead of being dropped; the server-by-server drop of `{env:` applies to the helper only. The check reads only the operator's input; the Action's own generated config uses `{file:}` references alone. Provisioned runs are unchanged.
 
-On a provisioned run `mcp` passes through after validation. The parser checks what the 2.2.5 source shows: the legacy server schema in full, `mcp.timeout` as a positive integer or an object of positive integers, and for native entries the fields both spellings share. Native-only fields (`protocol`, the snake_case `oauth` keys) pass through because the native schema is not in the readable source. A string field that holds a `{env:}` or `{file:}` reference also passes without a format check, because the server substitutes it before it reads the config: a whole-value `url` reference is accepted, a literal `url` still needs to be http(s), and a referenced `type` parses as a server of unresolved kind whose launch fields are not checked. Structure (`command` an array, `environment` and `headers` maps) is still checked as written. The credential disposition comes from `cache-restore.ts` to `startActionOpenCodeV2` to `buildCIConfigV2` as a required input. The V1 path is unchanged: it passes `mcp` through without validation or trigger rules.
+On a provisioned run `mcp` passes through after validation. The parser checks the legacy server schema, positive-integer timeout settings, and the fields shared with native entries. Native-only fields pass through for OpenCode to validate. String fields containing `{env:}` or `{file:}` references are checked after substitution by the server rather than format-checked by the harness; structural checks still apply. The credential disposition reaches `buildCIConfigV2` as a required input through cache restore and server startup. No V1 pass-through execution path remains.
 
 ### Server and workspace boundary
 
@@ -155,7 +166,7 @@ The runtime images separate tool needs as well. `deploy/gateway.Dockerfile` remo
 
 A V2 workspace uses a fresh database for every spawn rather than restoring Action memory. Its supervisor provisions API keys over authenticated loopback `POST /api/credential`, then verifies the required provider before reporting ready (`apps/workspace-agent/src/opencode-credentials-v2.ts`). A fresh database skips the legacy auth import, so merely writing `auth.json` would leave it unauthenticated. Keys are not put in argv, environment, or config content on this path.
 
-The workspace proxy translates the gateway bearer to the current spawn's Basic credential and forwards only `V2_GATEWAY_ROUTES`; credential enumeration never reaches the gateway-facing surface. Between spawns it returns unavailable instead of reusing a stale password. The image's baked `WORKSPACE_IMAGE_OPENCODE_VERSION` is reported on readiness and selects the gateway's matching loop. Plugins are baked at image-build time, and the supervisor preserves the unprivileged process identity described below.
+The workspace proxy translates the gateway bearer to the current spawn's Basic credential and forwards only `V2_GATEWAY_ROUTES`; credential enumeration never reaches the gateway-facing surface. Between spawns it returns unavailable instead of reusing a stale password. The image's baked `WORKSPACE_IMAGE_OPENCODE_VERSION` is reported on readiness and must pass the gateway's V2 admission check. Plugins are baked at image-build time, and the supervisor preserves the unprivileged process identity described below.
 
 ## Harness Builds
 
@@ -240,9 +251,11 @@ The agent's `PATH`: the runner's `PATH` as the Action saw it at the start of the
 
 Git treats the runner-owned checkout as safe for the agent through `safe.directory`, set both in the agent's `~/.gitconfig` and in its environment (`GIT_CONFIG_COUNT`), so a test that turns off git's global and system config files still sees a trusted checkout.
 
+The agent's general-purpose XDG roots live inside its own home. Only each root's `opencode` entry links to the handed-over runner directory used by cache restore and save (`createAgentXdg` in `sandbox-lifecycle.ts`). Other tools, including uv and pip, can create their own configuration, data, state, and caches without trying to write into the read-only runner home. Bun has a separate install-cache override into the sandbox home; the runner's caches are not granted wholesale.
+
 What the view does not cover: the checkout stays writable by the agent, so treat what it contains as untrusted in later steps. Read-only mounts do not stop use of sockets or devices the agent can already open, and the network is shared with the runner. Earlier steps and the runner's own files are trusted: the view protects what the job runs afterwards from the agent, not the agent from what was already there.
 
-When to turn it on: for any run whose `github-token` has write access, on every trigger. Without isolation the agent can read the token from the action's `/proc` environment (see above). With it, the agent can neither read the token nor change the programs the job runs next. The input stays off by default because a workflow has to meet the requirements below first.
+Isolation blocks extraction of the Action process's token through `/proc` and prevents writes to shared executables. It does not hide a GitHub token deliberately provisioned to the agent on autonomous triggers, and it does not make the writable checkout safe for later steps to execute. The input stays off by default because its published-install and runner prerequisites are narrower than the Action's ordinary platform support.
 
 The checkout must not carry persisted credentials: `actions/checkout` must run with `persist-credentials: false`, because the agent user can read `.git/config`. The Action checks this on every trigger when the input is on and fails the run before setup if it finds one.
 
@@ -351,7 +364,7 @@ The workspace container runs two identities. The workspace-agent **service** (`a
 - **Agent-uid size walker.** `runAgentWalk` (`apps/workspace-agent/src/agent-walk.ts`) measures a checkout or quarantine generation's size and entry count as the agent uid via a spawned child; when that plain walk is incomplete or fails, `measureSealedTree`/`measureSealedTreeFromFd` fall back to measuring the same sealed tree through a root-opened file descriptor, so the service never has to traverse an agent-owned directory by path.
 - **Private-repo auth.** The installation token reaches git only through a `GIT_ASKPASS` helper that exact-matches git's literal `https://github.com` prompts and exits non-zero otherwise, with global/system git config sealed and `GIT_ALLOW_PROTOCOL=https`.
 - **Directory ownership.** `/workspace/repos` and each owner directory stay root-owned, so the agent can edit a checkout but cannot replace where it lives. Secrets and the raw mitmproxy CA mount under the root-only `/run/workspace-agent/` tmpfs; only the installed public trust bundle is readable by both identities.
-- **Entrypoint.** `deploy/workspace-entrypoint.sh` creates the protected state directory (`deploy/scripts/ensure-protected-dir.mjs`), migrates legacy root-owned checkouts to the agent uid (`deploy/scripts/migrate-repo-ownership.mjs` — filesystem-only, symlink/hardlink-safe, per-checkout completion markers, bounded by `WORKSPACE_MIGRATION_DEADLINE_MS`, refuses to start on timeout, never deletes), and writes OpenCode's merged config (and, on V1 images only, its `auth.json`; a V2 image writes none and removes a stale one) from a process already running as the agent, fed via stdin (`deploy/scripts/provision-agent-config.mjs`) — root never writes into an agent-owned directory, where a planted symlink would turn into a privileged write.
+- **Entrypoint.** `deploy/workspace-entrypoint.sh` creates protected state (`deploy/scripts/ensure-protected-dir.mjs`), migrates legacy root-owned checkouts through a bounded, symlink/hardlink-safe filesystem handoff (`deploy/scripts/migrate-repo-ownership.mjs`), and feeds merged configuration over stdin to a process already running as the agent (`deploy/scripts/provision-agent-config.mjs`). It writes no `auth.json` and removes a stale one; credentials arrive through the per-spawn V2 API. Root never writes config into an agent-owned directory, where a planted symlink could redirect a privileged write.
 - **Verification.** Kernel permission boundaries cannot be proven by unit tests: `deploy/tests/isolation-harness.sh` starts the image exactly as compose does and pairs each attempted violation as the agent (reading service home/secrets/env/memory, replacing a checkout parent, taking a control port) with the same operation succeeding as root. `deploy/validate-stack.sh` requires the service identity, the exact capability set, `no-new-privileges`, and the protected mount locations; `deploy/egress-smoke.sh` and the CI image smoke run with production's user, capabilities, and mount layout. CI also builds the `workspace-test` target of `deploy/workspace.Dockerfile` and runs the workspace-agent suite inside it, so the git fixtures exercise the image's own Alpine git.
 
 ### Systematic Plugin Install (Setup-Time, Not Server-Boot)

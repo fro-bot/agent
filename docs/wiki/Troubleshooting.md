@@ -1,8 +1,15 @@
 ---
 type: convention
-last-updated: "2026-11-08"
-updated-by: "f7c20f94"
+last-updated: "2026-11-15"
+updated-by: "962b70bc"
 sources:
+  - src/harness/phases/sandbox-lifecycle.ts
+  - src/harness/phases/log-snapshot.ts
+  - src/harness/phases/key-proxy-probe.ts
+  - src/services/setup/sandbox-view-probe.ts
+  - packages/runtime/src/agent/server-v2.ts
+  - packages/runtime/src/agent/sandbox-namespace.ts
+  - src/features/delegated/reconstruct-changes.ts
   - packages/runtime/src/agent/drain-progress-v2.ts
   - src/features/reviews/reviewed-head.ts
   - src/services/setup/ci-config-v2.ts
@@ -137,6 +144,8 @@ See [[Session Persistence]] for how memory survives across runs.
 
 V2 startup names its failing stage: credentials, plugins, config, held claims, spawn, permission gate, credential gate, or import wait (`src/harness/phases/v2-server.ts`). These fail before any prompt and disable session persistence, so the next run does not restore a half-imported or half-gated database.
 
+An empty plugin list immediately after HTTP readiness is not proof that installation failed. Since OpenCode 2.2.7, `/api/agent` can answer before plugins activate. The startup gate polls `/api/plugin` for up to 60 seconds, fails immediately for an expected plugin explicitly marked failed, and otherwise waits for every required plugin to become active. Permission verification also tolerates transient plugin-activation readiness responses. [[Setup and Configuration]] distinguishes installation, activation, and effective-rule checks.
+
 An unrecorded stock V2 version, missing asset digest, or checksum mismatch prevents installation without a V1 fallback. The recorded version and platform assets are in `packages/runtime/src/shared/opencode-v2-pin.json`. This is separate from the V1 harness checksum manifest.
 
 A V2 import wait can report an import error, a 60-second progress stall, five consecutive unreadable observations, or the 300-second hard bound. Waiting for history import is expected after restoring V1 state; repeated failure is not a missing-session signal. [[Session Persistence]] describes restore precedence and the migration barrier.
@@ -145,21 +154,31 @@ A V2 import wait can report an import error, a 60-second progress stall, five co
 
 In a V2 workspace, a provider credential failure before readiness often means only legacy `auth.json` was provisioned. Fresh per-spawn databases skip its import; the supervisor separately creates credentials over authenticated loopback and verifies the effective model's provider. The proxy never exposes credential enumeration. An upstream authentication failure is surfaced as `502` with `x-fro-bot-proxy-error: upstream-auth`; a server between spawns remains unavailable instead of forwarding an old password.
 
-The platform and executable-path checks apply across generations; the advisory Systematic-install warning below describes the V1 path.
+The platform and executable-path checks still apply. The former V1 advisory Systematic-install warning is historical: current required-plugin installation failures stop setup rather than continuing without the plugin.
 
 If the run fails during setup rather than during agent execution:
 
 - **`Unsupported platform: <platform>/<arch>`** — the action supports Linux and macOS on x64 or arm64 only. This is rejected by name before any download is attempted. Windows runners and architectures outside that matrix are not supported. The default V2 pin also requires a recorded digest for the selected asset. See [[Setup and Configuration]].
 - **`EACCES` when spawning OpenCode** — historically caused by handing a consumer the install _directory_ where an executable path was required. If this recurs, the `OpenCode setup completed` log line records both the directory and the resolved binary path, which is enough to tell which one was exported as `OPENCODE_PATH`.
-- **`Skipping tools cache save because Systematic plugin install did not complete`** — setup continues without the plugin rather than failing the run, so this is a warning, not a fatal error. Two hints accompany it. If the parent environment carries `NPM_CONFIG_*` variables, the warning names them and notes that the install child deliberately does not inherit them; that scrub is intentional and should not be worked around by allowlisting those keys. If the failure was a spawn error, the warning carries a path diagnosis stating what was actually found at the binary path — absent, a dangling symlink, a directory, or present-but-not-executable — along with the tail of the child's stderr.
+- **Required plugin preparation failed** — current setup stops rather than caching an incomplete installation. A plugin present on disk can still fail its separate activation gate; the named stage distinguishes these cases.
 
-There is no install fallback. A V1 request (a harness build or a stock V1 version) that fails to download or verify fails the run with an error naming the requested version; it never falls back to the V2 pin. A failed V2 pin install fails the run, and a V2 version with no recorded digest is rejected before any download. [[Setup and Configuration]] explains the version identity and verification boundaries.
+There is no install fallback. A V1 request (a harness build or a stock V1 version) fails input parsing before a download; so does any version other than the recorded V2 pin. A failed pin install fails the run, and a missing or mismatched asset digest cannot be bypassed by a binary already on the runner. [[Setup and Configuration]] explains the version identity and verification boundaries.
+
+### Isolated runner diagnostics
+
+`isolate-agent` failures identify a runner preflight, path handoff, view launch, provider-proxy, or take-back problem rather than silently reverting to same-user execution. A local `uses: ./` install is refused; a composite action wrapping a real published install is supported because provenance comes from the running bundle, not `GITHUB_ACTION_PATH`.
+
+`Read-only view probe passed`, `Key proxy probe passed`, `Key proxy stopped` with `exitConfirmed: true`, and the namespace stop's empty confirmation are positive lifecycle evidence. They establish different facts: a passing models probe does not prove the upstream requires authentication, and a passing preflight probe does not replace confirmation that the real launch stopped. An unsafe take-back blocks response reads, brokered pushes, and session saves.
+
+`Sandbox PATH left out directories the agent cannot enter` is expected when the runner advertises private home paths. Hosted tool-cache binaries remain usable; Bun and pnpm have narrow read/execute grants. General XDG roots and uv/pip caches belong to the sandbox home. A write failure elsewhere in the runner home is not a reason to grant the whole home.
+
+An isolated run without a confirmed log snapshot publishes no logs and never reads the shared directory as a fallback. A snapshot over 100 MiB or 10,000 entries is discarded whole; this can explain absent artifacts even after the agent completed. [[Session Persistence]] describes snapshot ownership and verified file reads.
 
 ## Model Resolution Failures
 
 SDK failures now retain readable envelope details in diagnostics rather than collapsing to `[object Object]`. The shared `formatSdkError` helper prefers the nested SDK message and bounds the result to 500 characters; an unreadable or unserializable value becomes `[unprintable error]`. These strings are diagnostic descriptions, while retry and terminal-failure decisions retain their structured evidence (`packages/runtime/src/shared/errors.ts`).
 
-`model_not_found` means OpenCode could not resolve the configured provider/model identifier, not that a network request to the model timed out. The Action stops immediately and reports a sanitized model ID and any validated suggestions, plus a suggested action in the job summary (`packages/runtime/src/agent/error-format/format.ts`, `src/features/agent/execution.ts`). The two usual causes are an incorrect identifier and a model catalog that did not load; the latter can occur when the job cannot reach `models.opencode.ai` and the model is not defined explicitly in OpenCode config. Repeating the same turn or increasing its timeout does not repair either configuration problem.
+`model_not_found` means OpenCode could not resolve the configured provider/model identifier, not that a network request to the model timed out. The Action stops immediately and reports structured diagnostics through `src/features/agent/execution-v2.ts` and the shared formatter in `packages/runtime/src/agent/error-format/format.ts`. The two usual causes are an incorrect identifier and a model catalog that did not load; the latter can occur when the job cannot reach `models.opencode.ai` and the model is not defined explicitly in OpenCode config. Repeating the same turn or increasing its timeout does not repair either configuration problem.
 
 ## Timeout Errors
 
