@@ -121,6 +121,8 @@ function createHarness(): Harness {
     stopLaunch: vi.fn(async () => 'stopped' as const),
     isProcessAlive: vi.fn(() => false),
     isDirectory: vi.fn((directory: string) => !directory.includes('missing')),
+    // Links resolve to themselves, except the one test fixture that points into the view's private /tmp.
+    realpath: vi.fn(async (target: string) => (target === '/opt/links/browsers' ? '/tmp/ms-playwright' : target)),
     resolveToolRoots: vi.fn(async (): Promise<ToolRootResult> => ({granted: [], skipped: []})),
   }
   const sudoCalls: string[][] = []
@@ -1120,6 +1122,37 @@ describe('createSandboxLifecycle', () => {
       })
       expect(logger.info).toHaveBeenCalledWith('Tool locations the agent cannot enter were not passed to it', {
         names: ['UV_PYTHON_INSTALL_DIR'],
+      })
+    })
+
+    it('drops a tool location or PATH entry that resolves into the view’s private temp mounts', async () => {
+      // #given a browser path linked into /tmp, a uv path under /var/tmp and a PATH entry under /dev/shm, all enterable on
+      // the host
+      const harness = createHarness()
+      const logger = createMockLogger()
+      const lifecycle = create(harness, {
+        logger,
+        env: {
+          ...baseEnv(),
+          PLAYWRIGHT_BROWSERS_PATH: '/opt/links/browsers',
+          UV_PYTHON_INSTALL_DIR: '/var/tmp/uv-python',
+          MISE_DATA_DIR: '/opt/hostedtoolcache/mise',
+        },
+        runnerPath: '/dev/shm/bin:/usr/bin',
+        signals: fakeHost(),
+      })
+
+      // #when prepared
+      const prepared = await lifecycle.prepare(prepareInput)
+
+      // #then only the location outside the private mounts reaches the agent, and the PATH entry is gone too
+      expect(prepared.success && prepared.data.extraEnv).toEqual({
+        ...TRUSTED_CHECKOUT_ENV,
+        MISE_DATA_DIR: '/opt/hostedtoolcache/mise',
+      })
+      expect(prepared.success && prepared.data.path).toBe('/usr/bin:/usr/local/bin:/bin')
+      expect(logger.info).toHaveBeenCalledWith('Tool locations the agent cannot enter were not passed to it', {
+        names: ['PLAYWRIGHT_BROWSERS_PATH', 'UV_PYTHON_INSTALL_DIR'],
       })
     })
 

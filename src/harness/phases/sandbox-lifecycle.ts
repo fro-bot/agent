@@ -36,7 +36,9 @@ import {
   GATE_ERR_FILE,
   GATE_GO_FILE,
   GATE_NS_FILE,
+  isWithin,
   parseMountInfo,
+  SANDBOX_VIEW_TEMP_MOUNTS,
   stopLaunch,
   stopSandboxProcesses,
   validateViewPolicy,
@@ -246,6 +248,8 @@ export interface SandboxLifecycleDeps {
   readonly isProcessAlive: (pid: number) => boolean
   /** True when the path is an existing directory (following links), for the agent's `PATH`. */
   readonly isDirectory: (directory: string) => boolean
+  /** The path with every link resolved, or null when it can't be resolved. */
+  readonly realpath: (target: string) => Promise<string | null>
   /** Which of the supported tool install roots (bun, pnpm) the sandbox may read. */
   readonly resolveToolRoots: (input: ToolRootInput) => Promise<ToolRootResult>
 }
@@ -299,6 +303,7 @@ const defaultDeps: SandboxLifecycleDeps = {
   stopLaunch,
   isProcessAlive,
   isDirectory: directory => fsSync.statSync(directory, {throwIfNoEntry: false})?.isDirectory() === true,
+  realpath: async target => fs.realpath(target).catch(() => null),
   resolveToolRoots: async input => resolveToolRoots(input),
 }
 
@@ -957,7 +962,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
         const value = env[name]
         return value !== undefined && path.isAbsolute(value) ? [[name, value] as const] : []
       })
-      const reachable = await reachableDirectories([
+      const reachable = await reachableInView([
         ...agentPath.split(path.delimiter),
         ...toolLocations.map(([, value]) => value),
       ])
@@ -1095,6 +1100,23 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     )
     if (result.exitCode !== 0) throw new Error(`checking the sandbox PATH failed (exit ${result.exitCode})`)
     return new Set(result.stdout.split('\n').filter(line => line.length > 0))
+  }
+
+  /**
+   * The candidates the agent can enter once it runs in its view. The view mounts empty private tmpfs on `/tmp`, `/var/tmp`
+   * and `/dev/shm`, so a directory that resolves under one of them is gone there even though the account can enter it
+   * on the host.
+   */
+  async function reachableInView(candidates: readonly string[]): Promise<ReadonlySet<string>> {
+    const enterable = await reachableDirectories(candidates)
+    const visible = new Set<string>()
+    for (const candidate of enterable) {
+      const resolved = await deps.realpath(candidate)
+      if (resolved !== null && !SANDBOX_VIEW_TEMP_MOUNTS.some(mount => isWithin(mount.path, resolved))) {
+        visible.add(candidate)
+      }
+    }
+    return visible
   }
 
   function reachablePath(candidate: string, reachable: ReadonlySet<string>): string {
