@@ -2245,7 +2245,11 @@ function stateHomeSuite(layout: 'connect' | 'link'): void {
       // The connect layout: the runner's XDG_STATE_HOME is the state home itself (`connect.yaml` exports it to `$GITHUB_ENV`).
       const env = {...hostedEnv(workspace, xdgRoot), ...(connect ? {XDG_STATE_HOME: stateHome} : {})}
       const written = path.join(stateHome, 'systematic', 'connect', 'run.json')
-      const note = path.join(stateHome, 'opencode', 'agent-note')
+      // In the link layout the note goes through the link into the runner's own state directory, and the link is gone
+      // after take-back; in the connect layout `opencode` is that directory.
+      const note = connect
+        ? path.join(stateHome, 'opencode', 'agent-note')
+        : path.join(xdgRoot, 'state', 'opencode', 'agent-note')
       const dbPath = path.join(xdgRoot, 'data', 'opencode', getSessionDbBasenames('v2').main)
       const uid = process.getuid?.()
 
