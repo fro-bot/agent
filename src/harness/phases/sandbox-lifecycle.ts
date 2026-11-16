@@ -36,7 +36,9 @@ import {
   GATE_ERR_FILE,
   GATE_GO_FILE,
   GATE_NS_FILE,
+  isWithin,
   parseMountInfo,
+  SANDBOX_VIEW_TEMP_MOUNTS,
   stopLaunch,
   stopSandboxProcesses,
   validateViewPolicy,
@@ -246,6 +248,8 @@ export interface SandboxLifecycleDeps {
   readonly isProcessAlive: (pid: number) => boolean
   /** True when the path is an existing directory (following links), for the agent's `PATH`. */
   readonly isDirectory: (directory: string) => boolean
+  /** The path with every link resolved, or null when it can't be resolved. */
+  readonly realpath: (target: string) => Promise<string | null>
   /** Which of the supported tool install roots (bun, pnpm) the sandbox may read. */
   readonly resolveToolRoots: (input: ToolRootInput) => Promise<ToolRootResult>
 }
@@ -299,6 +303,7 @@ const defaultDeps: SandboxLifecycleDeps = {
   stopLaunch,
   isProcessAlive,
   isDirectory: directory => fsSync.statSync(directory, {throwIfNoEntry: false})?.isDirectory() === true,
+  realpath: async target => fs.realpath(target).catch(() => null),
   resolveToolRoots: async input => resolveToolRoots(input),
 }
 
@@ -315,6 +320,11 @@ const LAUNCHER_EXIT_BOUND_MS = 3000
 /** A privileged command that takes this long is logged: slow `useradd` or `setfacl` calls are what a hung step looks like. */
 const SLOW_PRIVILEGED_COMMAND_MS = 5000
 const STDERR_TAIL_BYTES = 2048
+/**
+ * Install locations a caller may set for tools the agent runs. Each is passed to the agent only when it names a directory
+ * the agent can enter, so a location under the runner's home or temp directory leaves the tool's own default in place.
+ */
+const TOOL_LOCATION_VARIABLES = ['PLAYWRIGHT_BROWSERS_PATH', 'UV_PYTHON_INSTALL_DIR', 'MISE_DATA_DIR'] as const
 
 /** Applied to a privileged command that names no timeout of its own (`useradd`, `userdel`, `mkdir`, ...). */
 export const DEFAULT_PRIVILEGED_TIMEOUT_MS = 60_000
@@ -938,6 +948,9 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
 
       const sandboxTmp = path.join(account.home, 'tmp')
       await runAsSandbox([tools.mkdir, '-m', '0700', sandboxTmp])
+      // The runner's own runtime directory (`/run/user/<uid>`) is not the agent's; tools that keep sockets there need one.
+      const runtimeDir = path.join(account.home, '.run')
+      await runAsSandbox([tools.mkdir, '-m', '0700', runtimeDir])
       const agentXdg = await createAgentXdg(account.home, {
         data: path.join(dataBase, 'opencode'),
         config: path.join(configBase, 'opencode'),
@@ -945,10 +958,36 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
         state: path.join(stateBase, 'opencode'),
       })
       await writeSandboxGitConfig(options.workspacePath, input.ghConfigDir !== null)
-      const launchPath = await reachablePath(agentPath)
-
       const view = await buildView(manifest, account, runnerTemp)
       if (!view.success) return await failAndRelease(view.error)
+
+      // A tool location is passed as its resolved path, so no link has to be followed in the view, and only when that
+      // path is still there: outside the view's private temp mounts, or under a root the view binds back.
+      const {policy} = view.data
+      const boundRoots = [...policy.writable, ...policy.readOnly]
+      const toolLocations: (readonly [string, string])[] = []
+      for (const name of TOOL_LOCATION_VARIABLES) {
+        const value = env[name]
+        if (value === undefined || !path.isAbsolute(value)) continue
+        const resolved = await deps.realpath(value)
+        const visible =
+          resolved !== null &&
+          (!SANDBOX_VIEW_TEMP_MOUNTS.some(mount => isWithin(mount.path, resolved)) ||
+            boundRoots.some(root => isWithin(root, resolved)))
+        toolLocations.push([name, visible ? resolved : ''])
+      }
+      const reachable = await reachableDirectories([
+        ...agentPath.split(path.delimiter),
+        ...toolLocations.flatMap(([, resolved]) => (resolved === '' ? [] : [resolved])),
+      ])
+      const launchPath = reachablePath(agentPath, reachable)
+      const passedToolLocations = Object.fromEntries(toolLocations.filter(([, resolved]) => reachable.has(resolved)))
+      const droppedToolLocations = toolLocations
+        .filter(([, resolved]) => !reachable.has(resolved))
+        .map(([name]) => name)
+      if (droppedToolLocations.length > 0) {
+        logger.info('Tool locations the agent cannot use were not passed to it', {names: droppedToolLocations})
+      }
 
       const extraEnv: Record<string, string> = {
         ...(input.ghConfigDir === null ? {} : {GH_CONFIG_DIR: input.ghConfigDir}),
@@ -957,6 +996,8 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
         GIT_CONFIG_COUNT: '1',
         GIT_CONFIG_KEY_0: 'safe.directory',
         GIT_CONFIG_VALUE_0: options.workspacePath,
+        XDG_RUNTIME_DIR: runtimeDir,
+        ...passedToolLocations,
         ...toolCacheEnv(installRoots.granted, runnerHome, account.home),
       }
       const spec: OpenCodeV2SandboxLaunch = {
@@ -1059,24 +1100,26 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
    * grant covers) turns a missing command into "permission denied", so it is left out. Checked as the account, after the
    * handoff's grants.
    */
-  async function reachablePath(candidate: string): Promise<string> {
+  async function reachableDirectories(candidates: readonly string[]): Promise<ReadonlySet<string>> {
     if (account === null) throw new Error('no sandbox account')
-    const dirs = candidate.split(path.delimiter)
     const result = await run(
       buildRunAsSandboxArgv(account, tools, [
         tools.sh,
         '-c',
         String.raw`for d do if [ -d "$d" ] && [ -x "$d" ]; then printf "%s\n" "$d"; fi; done`,
         'sh',
-        ...dirs,
+        ...candidates,
       ]),
     )
     if (result.exitCode !== 0) throw new Error(`checking the sandbox PATH failed (exit ${result.exitCode})`)
-    const reachable = new Set(result.stdout.split('\n').filter(line => line.length > 0))
-    const kept = dirs.filter(dir => reachable.has(dir))
+    return new Set(result.stdout.split('\n').filter(line => line.length > 0))
+  }
+
+  function reachablePath(candidate: string, reachable: ReadonlySet<string>): string {
+    const dirs = candidate.split(path.delimiter)
     const dropped = dirs.filter(dir => !reachable.has(dir))
     if (dropped.length > 0) logger.info('Sandbox PATH left out directories the agent cannot enter', {dropped})
-    return kept.join(path.delimiter)
+    return dirs.filter(dir => reachable.has(dir)).join(path.delimiter)
   }
 
   /** `command[0]` is an absolute tool path. */

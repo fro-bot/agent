@@ -45,11 +45,12 @@ const TOOLS = Object.fromEntries(
 ) as unknown as SandboxToolPaths
 
 const ACCOUNT = {name: 'fro-bot-sandbox', uid: 998, gid: 997, home: '/home/fro-bot-sandbox'}
-// The checkout every test's lifecycle is given, trusted for git through the environment.
+// What every launch adds: the checkout trusted for git through the environment, and the agent's own runtime directory.
 const TRUSTED_CHECKOUT_ENV = {
   GIT_CONFIG_COUNT: '1',
   GIT_CONFIG_KEY_0: 'safe.directory',
   GIT_CONFIG_VALUE_0: '/home/runner/work/r/r',
+  XDG_RUNTIME_DIR: '/home/fro-bot-sandbox/.run',
 }
 
 interface Harness {
@@ -78,6 +79,11 @@ interface Harness {
   readonly gateFiles: Map<string, string>
   readonly exec: ExecAdapter
   readonly sudoCalls: string[][]
+}
+
+const REALPATHS: Readonly<Record<string, string>> = {
+  '/tmp/browser-link': '/opt/browsers',
+  '/opt/links/uv': '/tmp/uv-python',
 }
 
 function createHarness(): Harness {
@@ -120,6 +126,8 @@ function createHarness(): Harness {
     stopLaunch: vi.fn(async () => 'stopped' as const),
     isProcessAlive: vi.fn(() => false),
     isDirectory: vi.fn((directory: string) => !directory.includes('missing')),
+    // Links resolve to themselves, except the fixtures that model links into or out of the view's private /tmp.
+    realpath: vi.fn(async (target: string) => REALPATHS[target] ?? target),
     resolveToolRoots: vi.fn(async (): Promise<ToolRootResult> => ({granted: [], skipped: []})),
   }
   const sudoCalls: string[][] = []
@@ -1091,6 +1099,111 @@ describe('createSandboxLifecycle', () => {
       expect(logger.info).toHaveBeenCalledWith('Sandbox PATH left out directories the agent cannot enter', {
         dropped: ['/home/runner/.cargo/unreachable/bin'],
       })
+    })
+
+    it('passes a caller’s tool install locations the agent can enter, and only those', async () => {
+      // #given three tool locations: one the agent can enter, one it can't, and one that isn't absolute
+      const harness = createHarness()
+      const logger = createMockLogger()
+      const lifecycle = create(harness, {
+        logger,
+        env: {
+          ...baseEnv(),
+          PLAYWRIGHT_BROWSERS_PATH: '/opt/hostedtoolcache/ms-playwright',
+          UV_PYTHON_INSTALL_DIR: '/home/runner/work/_temp/unreachable/uv-python',
+          MISE_DATA_DIR: 'relative/mise',
+        },
+        runnerPath: '/usr/bin',
+        signals: fakeHost(),
+      })
+
+      // #when prepared
+      const prepared = await lifecycle.prepare(prepareInput)
+
+      // #then only the enterable one reaches the agent, and the refused one is named
+      expect(prepared.success && prepared.data.extraEnv).toEqual({
+        ...TRUSTED_CHECKOUT_ENV,
+        PLAYWRIGHT_BROWSERS_PATH: '/opt/hostedtoolcache/ms-playwright',
+      })
+      expect(logger.info).toHaveBeenCalledWith('Tool locations the agent cannot use were not passed to it', {
+        names: ['UV_PYTHON_INSTALL_DIR'],
+      })
+    })
+
+    it('passes a tool location as its resolved path, and only where the view still shows it', async () => {
+      // #given a browser path that is a link in /tmp to a directory outside it, a uv path that links into /tmp, and a mise path in a checkout under /tmp, which the view binds back
+      const harness = createHarness()
+      const logger = createMockLogger()
+      const lifecycle = create(harness, {
+        logger,
+        workspacePath: '/tmp/checkout',
+        env: {
+          ...baseEnv(),
+          PLAYWRIGHT_BROWSERS_PATH: '/tmp/browser-link',
+          UV_PYTHON_INSTALL_DIR: '/opt/links/uv',
+          MISE_DATA_DIR: '/tmp/checkout/.mise',
+        },
+        runnerPath: '/tmp/checkout/bin:/usr/bin',
+        signals: fakeHost(),
+      })
+
+      // #when prepared
+      const prepared = await lifecycle.prepare(prepareInput)
+
+      // #then the link is replaced by its target, the location inside the private /tmp is dropped, the checkout's stays,
+      // and PATH keeps the checkout's directory
+      expect(prepared.success && prepared.data.extraEnv).toEqual({
+        ...TRUSTED_CHECKOUT_ENV,
+        GIT_CONFIG_VALUE_0: '/tmp/checkout',
+        PLAYWRIGHT_BROWSERS_PATH: '/opt/browsers',
+        MISE_DATA_DIR: '/tmp/checkout/.mise',
+      })
+      expect(prepared.success && prepared.data.path).toBe('/tmp/checkout/bin:/usr/bin:/usr/local/bin:/bin')
+      expect(logger.info).toHaveBeenCalledWith('Tool locations the agent cannot use were not passed to it', {
+        names: ['UV_PYTHON_INSTALL_DIR'],
+      })
+    })
+
+    it('leaves out a tool location whose path cannot be resolved', async () => {
+      // #given a browser path realpath cannot resolve
+      const harness = createHarness()
+      const lifecycle = create(harness, {
+        deps: {...harness.deps, realpath: vi.fn(async () => null)},
+        env: {...baseEnv(), PLAYWRIGHT_BROWSERS_PATH: '/opt/gone'},
+        runnerPath: '/usr/bin',
+        signals: fakeHost(),
+      })
+
+      // #when prepared
+      const prepared = await lifecycle.prepare(prepareInput)
+
+      // #then preparation succeeds without it
+      expect(prepared.success && prepared.data.extraEnv).toEqual(TRUSTED_CHECKOUT_ENV)
+    })
+
+    it('gives the agent its own runtime directory, made as the account', async () => {
+      // #given a runner environment that names the runner's own runtime directory
+      const harness = createHarness()
+      const lifecycle = create(harness, {
+        env: {...baseEnv(), XDG_RUNTIME_DIR: '/run/user/1001'},
+        runnerPath: '/usr/bin',
+        signals: fakeHost(),
+      })
+
+      // #when prepared
+      const prepared = await lifecycle.prepare(prepareInput)
+
+      // #then the launch names the account's directory, which it created with mode 0700
+      expect(prepared.success && prepared.data.extraEnv?.XDG_RUNTIME_DIR).toBe('/home/fro-bot-sandbox/.run')
+      const mkdir = harness.sudoCalls.find(
+        call => call.includes('--reuid=998') && call.includes('/home/fro-bot-sandbox/.run'),
+      )
+      expect(mkdir?.slice(mkdir.indexOf('/usr/bin/mkdir'))).toEqual([
+        '/usr/bin/mkdir',
+        '-m',
+        '0700',
+        '/home/fro-bot-sandbox/.run',
+      ])
     })
 
     it('fails the launch when the account’s PATH check fails', async () => {
