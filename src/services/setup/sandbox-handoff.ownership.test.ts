@@ -149,9 +149,21 @@ function buildWorld(extraHandedOver: (dirs: {runnerTemp: string; home: string}) 
     sandboxWrites: target => {
       // Whatever the sandbox creates is its own; a path that already existed keeps the owner the handoff gave it.
       const created: string[] = []
-      for (let current = target; !fsSync.existsSync(current); current = path.dirname(current)) created.push(current)
-      fsSync.mkdirSync(path.dirname(target), {recursive: true})
-      fsSync.writeFileSync(target, 'sandbox-wrote')
+      // `mkdirSync` reports the first directory it made; every directory from there down to the parent is new.
+      const firstMade = fsSync.mkdirSync(path.dirname(target), {recursive: true})
+      if (firstMade !== undefined) {
+        for (let current = path.dirname(target); ; current = path.dirname(current)) {
+          created.push(current)
+          if (current === firstMade) break
+        }
+      }
+      try {
+        fsSync.writeFileSync(target, 'sandbox-wrote', {flag: 'wx'})
+        created.push(target)
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+        fsSync.writeFileSync(target, 'sandbox-wrote')
+      }
       for (const entry of created) model.owners.set(entry, SANDBOX)
     },
   }
