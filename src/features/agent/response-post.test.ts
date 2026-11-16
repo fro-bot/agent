@@ -174,6 +174,34 @@ function makeOctokit(overrides?: {
   }
 }
 
+function selfAuthoredPR(login: string) {
+  return () => ({
+    data: {
+      head: {sha: 'head-sha', repo: {full_name: 'owner/repo'}},
+      base: {repo: {full_name: 'owner/repo'}},
+      user: {login},
+    },
+  })
+}
+
+async function runPullRequestReview(
+  octokit: ReturnType<typeof makeOctokit>,
+  filePath: string,
+  logger: Logger,
+  botLogin: string | null = 'fro-bot[bot]',
+) {
+  return runResponsePost(
+    {
+      octokit: octokit as unknown as Octokit,
+      agentContext: makeAgentContext({eventName: 'pull_request', issueType: 'pr', issueNumber: 7}),
+      triggerResult: makeTriggerResult('pull_request'),
+      botLogin,
+      responseFilePath: filePath,
+    },
+    logger,
+  )
+}
+
 async function writeFixture(content: string): Promise<string> {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'response-post-test-'))
   const filePath = path.join(dir, 'response.md')
@@ -1534,39 +1562,193 @@ describe('runResponsePost', () => {
     expect(octokit.rest.issues.createComment).toHaveBeenCalledTimes(1)
   })
 
-  it('blocks an approving required review on a self-authored PR through the existing guard', async () => {
-    // #given an approving pull_request response and a PR authored by the bot
-    const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
-    tempFiles.push(filePath)
-    const octokit = makeOctokit({
-      getPR: () => ({
+  describe('self-authored PR (GitHub forbids the account approving or requesting changes on its own PR)', () => {
+    it('posts an approving verdict on a self-authored PR as one COMMENT review with the same body and pin', async () => {
+      // #given an approving pull_request response, and the same response on another author's PR as the baseline
+      const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
+      tempFiles.push(filePath)
+      const baseline = makeOctokit()
+      await runPullRequestReview(baseline, filePath, logger)
+      const baselineBody = (baseline.rest.pulls.createReview.mock.calls[0]?.[0] as {readonly body: string}).body
+      const octokit = makeOctokit({getPR: selfAuthoredPR('fro-bot[bot]')})
+
+      // #when running response-post for the required review surface
+      const result = await runPullRequestReview(octokit, filePath, logger)
+
+      // #then exactly one COMMENT review is posted with the same body, pinned to the reviewed head
+      expect(result).toEqual({delivered: true, kind: 'review'})
+      expect(octokit.rest.pulls.createReview).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({event: 'COMMENT', pull_number: 7, commit_id: 'head-sha', body: baselineBody}),
+      )
+      expect(octokit.rest.issues.createComment).not.toHaveBeenCalled()
+      expect(logger.warning).toHaveBeenCalledWith(
+        'Response-post: self-authored PR; posting the verdict as a COMMENT review because GitHub rejects APPROVE and REQUEST_CHANGES from the PR author',
+        {prNumber: 7, originalEvent: 'APPROVE'},
+      )
+    })
+
+    it('treats a user-account author (no [bot] suffix) as the bot itself', async () => {
+      // #given a PR authored by the user account the agent runs as
+      const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
+      tempFiles.push(filePath)
+      const octokit = makeOctokit({getPR: selfAuthoredPR('fro-bot')})
+
+      // #when running response-post as the same account
+      const result = await runPullRequestReview(octokit, filePath, logger, 'fro-bot')
+
+      // #then it is downgraded to a COMMENT review
+      expect(result).toEqual({delivered: true, kind: 'review'})
+      expect(octokit.rest.pulls.createReview).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({event: 'COMMENT', commit_id: 'head-sha'}),
+      )
+    })
+
+    it('keeps APPROVE for another author’s PR', async () => {
+      // #given an approving response on a PR by someone else
+      const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
+      tempFiles.push(filePath)
+      const octokit = makeOctokit({getPR: selfAuthoredPR('someone-else')})
+
+      // #when running response-post
+      const result = await runPullRequestReview(octokit, filePath, logger)
+
+      // #then the approval is posted unchanged
+      expect(result).toEqual({delivered: true, kind: 'review'})
+      expect(octokit.rest.pulls.createReview).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({event: 'APPROVE', commit_id: 'head-sha'}),
+      )
+    })
+
+    it('fails closed when the bot login is unknown, posting nothing', async () => {
+      // #given the posting account cannot be determined
+      const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
+      tempFiles.push(filePath)
+      const octokit = makeOctokit({getPR: selfAuthoredPR('fro-bot[bot]')})
+
+      // #when running response-post without a bot login
+      const result = await runPullRequestReview(octokit, filePath, logger, null)
+
+      // #then it is not guessed at: no review is posted and delivery fails
+      expect(result).toEqual({
+        delivered: false,
+        reason: 'missing-target-context',
+        detail: 'Cannot submit a review: bot login is unavailable',
+      })
+      expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+    })
+
+    it('posts a request-changes verdict on a self-authored PR as a COMMENT review (GitHub 422s REQUEST_CHANGES on own PR)', async () => {
+      // #given a request-changes response on a PR authored by the posting account
+      const filePath = await writeFixture('---\nverdict: request-changes\n---\n\nPlease fix X.')
+      tempFiles.push(filePath)
+      const octokit = makeOctokit({getPR: selfAuthoredPR('fro-bot[bot]')})
+
+      // #when running response-post
+      const result = await runPullRequestReview(octokit, filePath, logger)
+
+      // #then one COMMENT review carries the findings instead of a REQUEST_CHANGES GitHub would reject
+      expect(result).toEqual({delivered: true, kind: 'review'})
+      expect(octokit.rest.pulls.createReview).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({event: 'COMMENT', pull_number: 7, commit_id: 'head-sha'}),
+      )
+    })
+
+    it('still rejects a self-authored approval when the head moved before submission', async () => {
+      // #given a self-authored PR whose head moves between the guard and the submit-time re-check
+      const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
+      tempFiles.push(filePath)
+      const octokit = makeOctokit()
+      octokit.rest.pulls.get.mockResolvedValueOnce(selfAuthoredPR('fro-bot[bot]')()).mockResolvedValueOnce({
         data: {
-          head: {sha: 'head-sha', repo: {full_name: 'owner/repo'}},
+          head: {sha: 'moved-head', repo: {full_name: 'owner/repo'}},
           base: {repo: {full_name: 'owner/repo'}},
           user: {login: 'fro-bot[bot]'},
         },
-      }),
+      })
+
+      // #when running response-post
+      const result = await runPullRequestReview(octokit, filePath, logger)
+
+      // #then the downgraded review is dropped like any other stale review
+      expect(result).toEqual({
+        delivered: false,
+        reason: 'review-guard-blocked',
+        detail: 'Review guard blocked submission: head-moved-before-submit',
+      })
+      expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
     })
 
-    // #when running response-post for the required review surface
-    const result = await runResponsePost(
-      {
-        octokit: octokit as unknown as Octokit,
-        agentContext: makeAgentContext({eventName: 'pull_request', issueType: 'pr', issueNumber: 7}),
-        triggerResult: makeTriggerResult('pull_request'),
-        botLogin: 'fro-bot[bot]',
-        responseFilePath: filePath,
-      },
-      logger,
-    )
+    it('keeps the mention surface degrading a self-authored approval to a comment', async () => {
+      // #given an approving mention response on a self-authored PR (issue_comment surface)
+      const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
+      tempFiles.push(filePath)
+      const octokit = makeOctokit({getPR: selfAuthoredPR('fro-bot[bot]')})
 
-    // #then the shared self-authored guard blocks APPROVE before review creation
-    expect(result).toEqual({
-      delivered: false,
-      reason: 'review-guard-blocked',
-      detail: 'Review guard blocked submission: self-or-fork',
+      // #when running response-post for the review-permitted surface
+      const result = await runResponsePost(
+        {
+          octokit: octokit as unknown as Octokit,
+          agentContext: makeAgentContext({eventName: 'issue_comment', issueType: 'pr', issueNumber: 7}),
+          triggerResult: makeTriggerResult('issue_comment'),
+          botLogin: 'fro-bot[bot]',
+          responseFilePath: filePath,
+        },
+        logger,
+      )
+
+      // #then behavior is unchanged: one issue comment, no review
+      expect(result).toEqual({delivered: true, kind: 'comment'})
+      expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+      expect(octokit.rest.issues.createComment).toHaveBeenCalledTimes(1)
     })
-    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+
+    it('posts a mention-surface request-changes verdict on a self-authored PR as a COMMENT review', async () => {
+      // #given a request-changes mention response on a self-authored PR (issue_comment surface)
+      const filePath = await writeFixture('---\nverdict: request-changes\n---\n\nPlease fix X.')
+      tempFiles.push(filePath)
+      const octokit = makeOctokit({getPR: selfAuthoredPR('fro-bot[bot]')})
+
+      // #when running response-post for the review-permitted surface
+      const result = await runResponsePost(
+        {
+          octokit: octokit as unknown as Octokit,
+          agentContext: makeAgentContext({eventName: 'issue_comment', issueType: 'pr', issueNumber: 7}),
+          triggerResult: makeTriggerResult('issue_comment'),
+          botLogin: 'fro-bot[bot]',
+          responseFilePath: filePath,
+        },
+        logger,
+      )
+
+      // #then GitHub's own-PR rejection is avoided with a single COMMENT review
+      expect(result).toEqual({delivered: true, kind: 'review'})
+      expect(octokit.rest.pulls.createReview).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({event: 'COMMENT', pull_number: 7, commit_id: 'head-sha'}),
+      )
+    })
+
+    it('does not rescue a self-authored fork PR into an approval', async () => {
+      // #given an approving response on a bot-authored PR whose head is a fork
+      const filePath = await writeFixture('---\nverdict: approve\n---\n\nLGTM.')
+      tempFiles.push(filePath)
+      const octokit = makeOctokit({
+        getPR: () => ({
+          data: {
+            head: {sha: 'head-sha', repo: {full_name: 'attacker/repo'}},
+            base: {repo: {full_name: 'owner/repo'}},
+            user: {login: 'fro-bot[bot]'},
+          },
+        }),
+      })
+
+      // #when running response-post
+      await runPullRequestReview(octokit, filePath, logger)
+
+      // #then whatever is posted is never an APPROVE
+      for (const call of octokit.rest.pulls.createReview.mock.calls) {
+        expect((call[0] as {readonly event: string}).event).not.toBe('APPROVE')
+      }
+    })
   })
 
   it.each([

@@ -55,7 +55,7 @@ describe('checkForkOrSelfGuard', () => {
     )
 
     // #then it is allowed, with the head SHA returned
-    expect(result).toEqual({allowed: true, currentHeadSha: 'head-sha-abc'})
+    expect(result).toEqual({allowed: true, currentHeadSha: 'head-sha-abc', selfAuthored: false})
   })
 
   it('allows a normal PR authored by a human on the base repo for REQUEST_CHANGES', async () => {
@@ -69,7 +69,7 @@ describe('checkForkOrSelfGuard', () => {
     )
 
     // #then it is allowed, with the head SHA returned
-    expect(result).toEqual({allowed: true, currentHeadSha: 'head-sha-abc'})
+    expect(result).toEqual({allowed: true, currentHeadSha: 'head-sha-abc', selfAuthored: false})
   })
 
   it('blocks a self-authored PR on APPROVE', async () => {
@@ -90,8 +90,8 @@ describe('checkForkOrSelfGuard', () => {
       logger,
     )
 
-    // #then it is blocked
-    expect(result).toEqual({allowed: false, reason: 'self-or-fork'})
+    // #then it is blocked, and the block is identified as self-authorship
+    expect(result).toEqual({allowed: false, reason: 'self-or-fork', selfAuthored: true})
   })
 
   it('allows a self-authored PR on REQUEST_CHANGES', async () => {
@@ -112,8 +112,8 @@ describe('checkForkOrSelfGuard', () => {
       logger,
     )
 
-    // #then it is allowed, since a request-changes can only block, never merge, the bot's own PR
-    expect(result).toEqual({allowed: true, currentHeadSha: 'head-sha-abc'})
+    // #then the guard allows it but reports self-authorship so the caller can avoid GitHub's own-PR 422
+    expect(result).toEqual({allowed: true, currentHeadSha: 'head-sha-abc', selfAuthored: true})
   })
 
   it('blocks a fork PR on APPROVE', async () => {
@@ -134,8 +134,8 @@ describe('checkForkOrSelfGuard', () => {
       logger,
     )
 
-    // #then it is blocked
-    expect(result).toEqual({allowed: false, reason: 'self-or-fork'})
+    // #then it is blocked, and the block is not self-authorship
+    expect(result).toEqual({allowed: false, reason: 'self-or-fork', selfAuthored: false})
   })
 
   it('allows a fork PR on REQUEST_CHANGES', async () => {
@@ -157,7 +157,29 @@ describe('checkForkOrSelfGuard', () => {
     )
 
     // #then it is allowed, since a request-changes can only block, never merge, fork-controlled code
-    expect(result).toEqual({allowed: true, currentHeadSha: 'head-sha-abc'})
+    expect(result).toEqual({allowed: true, currentHeadSha: 'head-sha-abc', selfAuthored: false})
+  })
+
+  it('reports a self-authored fork PR on APPROVE as blocked and self-authored', async () => {
+    // #given the bot authored a PR from a fork head
+    const octokit = makeOctokit({
+      getPR: () => ({
+        data: {
+          head: {sha: 'head-sha-abc', repo: {full_name: 'attacker/repo'}},
+          base: {repo: {full_name: 'owner/repo'}},
+          user: {login: 'fro-bot'},
+        },
+      }),
+    }) as unknown as Octokit
+
+    // #when checking the guard for an approve
+    const result = await checkForkOrSelfGuard(
+      {octokit, owner: 'owner', repo: 'repo', prNumber: 1, botLogin: 'fro-bot[bot]', event: 'APPROVE'},
+      logger,
+    )
+
+    // #then it stays blocked; the caller may only ever downgrade it to a non-approving COMMENT
+    expect(result).toEqual({allowed: false, reason: 'self-or-fork', selfAuthored: true})
   })
 })
 
