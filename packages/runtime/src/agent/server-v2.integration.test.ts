@@ -17,7 +17,7 @@ import type {Logger} from '../shared/logger.js'
 import type {OpenCodeV2ServerHandle, StartOpenCodeV2ServerOptions} from './server-v2.js'
 import {Buffer} from 'node:buffer'
 import {execFileSync} from 'node:child_process'
-import {existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs'
+import {existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync} from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
@@ -26,6 +26,7 @@ import {DatabaseSync} from 'node:sqlite'
 import {fileURLToPath} from 'node:url'
 import {afterAll, beforeAll, describe, expect, it, vi} from 'vitest'
 import {clearHeldClaims} from './held-claims-v2.js'
+import {createRemoteOpenCodeV2Client} from './remote-client-v2.js'
 import {startOpenCodeV2Server} from './server-v2.js'
 
 const BINARY = process.env.FRO_BOT_OPENCODE_V2_BIN
@@ -228,10 +229,7 @@ async function startHeldTurn(box: Sandbox, overrides: Partial<StartOpenCodeV2Ser
 
 describe.skipIf(!hasBinary)('startOpenCodeV2Server against the real stock binary', () => {
   beforeAll(() => {
-    const reported = execFileSync(BINARY as string, ['--version'], {encoding: 'utf8'}).trim()
-    if (!reported.includes(PIN.version)) {
-      throw new Error(`FRO_BOT_OPENCODE_V2_BIN reports "${reported}", not the pinned ${PIN.version}`)
-    }
+    assertPinnedBinary()
   })
 
   afterAll(async () => {
@@ -389,5 +387,263 @@ describe.skipIf(!hasBinary)('startOpenCodeV2Server against the real stock binary
       expect(cleared).toMatchObject({success: true, data: {status: 'cleared', claims: 1}})
       expect(readSessionClaim(box.dbPath, turn.sessionId)).toBeNull()
     })
+  })
+})
+
+// --- The event stream contract (fro-bot/agent#2191) ------------------------------------------------------------------
+//
+// What the Action's and the gateway's prompt loops assume about `GET /api/event`, pinned on the stock binary through the
+// raw client they both use (`createRemoteOpenCodeV2Client`). No test here needs a model turn: a held provider keeps a turn
+// open where one is needed, and a session create is the cheap event to publish.
+
+interface WireFrame {
+  readonly id?: string
+  readonly type: string
+  readonly location?: {readonly directory?: string}
+  readonly data?: {readonly sessionID?: string}
+}
+
+function rawClient(handle: OpenCodeV2ServerHandle, extraHeaders: Readonly<Record<string, string>> = {}) {
+  return createRemoteOpenCodeV2Client({
+    baseUrl: handle.url,
+    headers: {authorization: handle.authorizationHeader(), ...extraHeaders},
+  })
+}
+
+interface OpenStream {
+  readonly iterator: AsyncIterator<unknown>
+  /** Frames read so far, in order. */
+  readonly seen: WireFrame[]
+  readonly abort: AbortController
+}
+
+/** Frames read from a stream until `done` accepts one; the frames read so far are in `seen` either way. */
+async function readUntil(stream: OpenStream, done: (frame: WireFrame) => boolean, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (true) {
+    const step = await Promise.race([
+      stream.iterator.next(),
+      new Promise<'timeout'>(resolve => setTimeout(() => resolve('timeout'), Math.max(0, deadline - Date.now()))),
+    ])
+    if (step === 'timeout')
+      throw new Error(`no matching frame in ${timeoutMs} ms; saw ${stream.seen.map(f => f.type).join(',')}`)
+    if (step.done === true) throw new Error(`the stream ended; saw ${stream.seen.map(f => f.type).join(',')}`)
+    const frame = step.value as WireFrame
+    // The transport's stand-in for an SSE comment (heartbeat) has no id and no event; it is not a server frame.
+    if (frame.type === 'server.heartbeat') continue
+    stream.seen.push(frame)
+    if (done(frame)) return
+  }
+}
+
+async function createSessionAt(handle: OpenCodeV2ServerHandle, directory: string): Promise<string> {
+  const created = (await json(handle, '/api/session', {
+    method: 'POST',
+    body: JSON.stringify({location: {directory}}),
+  })) as {data: {id: string}}
+  return created.data.id
+}
+
+const isCreated =
+  (sessionId: string) =>
+  (frame: WireFrame): boolean =>
+    frame.type === 'session.created' && frame.data?.sessionID === sessionId
+
+function assertPinnedBinary(): void {
+  const reported = execFileSync(BINARY as string, ['--version'], {encoding: 'utf8'}).trim()
+  if (!reported.includes(PIN.version)) {
+    throw new Error(`FRO_BOT_OPENCODE_V2_BIN reports "${reported}", not the pinned ${PIN.version}`)
+  }
+}
+
+describe.skipIf(!hasBinary)('GET /api/event against the real stock binary (fro-bot/agent#2191)', () => {
+  const streams: OpenStream[] = []
+  let box: Sandbox
+  let handle: OpenCodeV2ServerHandle
+  let held: HeldProvider
+
+  async function open(
+    directory: string,
+    client = rawClient(handle),
+    signal = new AbortController(),
+  ): Promise<OpenStream> {
+    const subscribed = await client.subscribeEvents({directory, signal: signal.signal})
+    if (!subscribed.success) throw new Error(`subscribeEvents failed: ${subscribed.error.kind}`)
+    const stream = {iterator: subscribed.data[Symbol.asyncIterator](), seen: [] as WireFrame[], abort: signal}
+    streams.push(stream)
+    return stream
+  }
+
+  beforeAll(async () => {
+    assertPinnedBinary()
+    box = sandbox()
+    held = await startHeldProvider()
+    providers.push(held)
+    const started = await boot(box, {config: providerConfig(held.baseURL)})
+    if (!started.success) throw new Error(`start failed: ${started.error.kind}`)
+    handle = started.data
+  }, 120_000)
+
+  afterAll(() => {
+    for (const stream of streams) stream.abort.abort()
+  })
+
+  it('a1: the first frame of every subscription is server.connected, also while a turn is running', async () => {
+    // #given a turn held open on the server, so events are flowing while subscriptions open
+    const turnBox = sandbox()
+    const sessionId = await createSessionAt(handle, turnBox.repo)
+    const prompt = await handle.fetch(`/api/session/${sessionId}/prompt`, {
+      method: 'POST',
+      headers: {'content-type': 'application/json', 'x-opencode-directory': turnBox.repo},
+      body: JSON.stringify({text: 'go'}),
+    })
+    expect(prompt.status).toBeLessThan(300)
+
+    // #when ten subscriptions are opened one after another
+    for (let attempt = 0; attempt < 10; attempt++) {
+      const startedAt = performance.now()
+      const stream = await open(box.repo)
+      await readUntil(stream, () => true)
+
+      // #then each one's first frame is the connect announcement, with an id and an empty payload, and it is prompt
+      // (the loops wait 10 s for it)
+      expect(stream.seen[0]).toMatchObject({type: 'server.connected', data: {}})
+      expect(stream.seen[0]?.id).toMatch(/^evt_/)
+      expect(performance.now() - startedAt).toBeLessThan(5000)
+      stream.abort.abort()
+    }
+  })
+
+  it('a1b: a second subscriber joining mid-run does not make the first one see a second server.connected', async () => {
+    // #given one subscriber, then another that joins while the first is live
+    const first = await open(box.repo)
+    await readUntil(first, frame => frame.type === 'server.connected')
+    const second = await open(box.repo)
+    await readUntil(second, frame => frame.type === 'server.connected')
+
+    // #when an event is published after both are connected, and both read up to it
+    const sessionId = await createSessionAt(handle, box.repo)
+    await readUntil(first, isCreated(sessionId))
+    await readUntil(second, isCreated(sessionId))
+
+    // #then each stream announced itself exactly once, as its first frame (a second one would be a replaced stream)
+    for (const stream of [first, second]) {
+      expect(stream.seen.filter(frame => frame.type === 'server.connected')).toHaveLength(1)
+      expect(stream.seen[0]?.type).toBe('server.connected')
+    }
+    first.abort.abort()
+    second.abort.abort()
+  })
+
+  it('a2: subscribeEvents returns after the server registered the subscription, before the iterator is read', async () => {
+    for (let attempt = 0; attempt < 10; attempt++) {
+      // #given a subscription whose iterator nobody has read (`open` only calls subscribeEvents)
+      const stream = await open(box.repo)
+
+      // #when an event is published at once, with no frame read yet
+      const sessionId = await createSessionAt(handle, box.repo)
+
+      // #then reading afterwards still yields the announcement and then that event: nothing was missed while unread
+      await readUntil(stream, isCreated(sessionId))
+      expect(stream.seen[0]?.type).toBe('server.connected')
+      stream.abort.abort()
+    }
+  })
+
+  it('a3: a late or reconnecting subscriber gets no replay, with or without Last-Event-ID', async () => {
+    for (const mode of ['plain', 'last-event-id'] as const) {
+      // #given a subscriber that saw one event and went away, and another event published while nobody listened
+      const before = await open(box.repo)
+      const seenSession = await createSessionAt(handle, box.repo)
+      await readUntil(before, isCreated(seenSession))
+      const lastId = before.seen.at(-1)?.id as string
+      before.abort.abort()
+      const missedSession = await createSessionAt(handle, box.repo)
+
+      // #when it reconnects (the header is the SSE resume mechanism; the server frames carry their id in the payload)
+      const client = rawClient(handle, mode === 'last-event-id' ? {'last-event-id': lastId} : {})
+      const after = await open(box.repo, client)
+      const controlSession = await createSessionAt(handle, box.repo)
+      await readUntil(after, isCreated(controlSession))
+
+      // #then it got the announcement first and, of the session events, only the live one: neither the event it saw nor
+      // the one it missed (other frames, such as a still-running turn's, are not what this pins)
+      expect(after.seen[0]?.type).toBe('server.connected')
+      expect(after.seen.filter(frame => frame.type === 'session.created').map(frame => frame.data?.sessionID)).toEqual([
+        controlSession,
+      ])
+      expect(after.seen.map(frame => frame.id)).not.toContain(lastId)
+      expect(JSON.stringify(after.seen)).not.toContain(seenSession)
+      expect(JSON.stringify(after.seen)).not.toContain(missedSession)
+      after.abort.abort()
+    }
+  })
+
+  it('a4: a first prompt at a fresh location is not admitted until its request returns; an interrupt sent meanwhile is a no-op', async () => {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      // #given a session at a location the server has not run a prompt in yet
+      const fresh = sandbox()
+      const sessionId = await createSessionAt(handle, fresh.repo)
+      const active = async (): Promise<Record<string, {type: string}>> =>
+        ((await json(handle, '/api/session/active')) as {data: Record<string, {type: string}>}).data
+
+      // #when the prompt is sent and, without waiting for it, the session is interrupted and the active list read
+      let returned = false
+      const isReturned = (): boolean => returned
+      const prompt = handle
+        .fetch(`/api/session/${sessionId}/prompt`, {
+          method: 'POST',
+          headers: {'content-type': 'application/json', 'x-opencode-directory': fresh.repo},
+          body: JSON.stringify({text: 'go'}),
+        })
+        .finally(() => {
+          returned = true
+        })
+      const early = (await json(handle, `/api/session/${sessionId}/interrupt`, {method: 'POST'})) as {
+        interrupted: boolean
+      }
+      const listedBeforeReturn: boolean[] = []
+      while (!isReturned()) {
+        listedBeforeReturn.push(sessionId in (await active()))
+        await new Promise(resolve => setTimeout(resolve, 5))
+      }
+
+      // #then the early interrupt found nothing to interrupt (so a reply of false is not a stop), the session was not
+      // listed during the first reads while the request was in flight (the window is ~150 ms; a read that straddles the
+      // moment admission completes may see it, so only the early reads count), and it is listed once the request returned
+      expect((await prompt).status).toBeLessThan(300)
+      expect(early).toEqual({interrupted: false})
+      expect(listedBeforeReturn.length).toBeGreaterThanOrEqual(3)
+      expect(listedBeforeReturn.slice(0, 3)).toEqual([false, false, false])
+      expect((await active())[sessionId]).toEqual({type: 'running'})
+      // #and the session-wait route no longer answers at once (an early 204 is what "not admitted yet" looked like)
+      const waiting = new AbortController()
+      const waitAnswer = handle
+        .fetch(`/api/experimental/session/${sessionId}/wait`, {method: 'POST', signal: waiting.signal})
+        .then(response => response.status)
+        .catch(() => 'aborted' as const)
+      expect(
+        await Promise.race([waitAnswer, new Promise<'pending'>(resolve => setTimeout(resolve, 300, 'pending'))]),
+      ).toBe('pending')
+      waiting.abort()
+      // #and an interrupt after the return takes effect
+      expect(await json(handle, `/api/session/${sessionId}/interrupt`, {method: 'POST'})).toEqual({interrupted: true})
+    }
+  })
+
+  it('a7: the stream is not scoped by the directory it is opened with: a subscriber for A sees a session created in B', async () => {
+    // #given a stream opened for directory A, and a second directory B on the same server
+    const other = sandbox()
+    const stream = await open(box.repo)
+
+    // #when a session is created in B
+    const otherSession = await createSessionAt(handle, other.repo)
+
+    // #then A's stream carries B's `session.created`, tagged with B's location (consumers must filter by session ownership)
+    await readUntil(stream, isCreated(otherSession))
+    const frame = stream.seen.find(isCreated(otherSession))
+    expect([other.repo, realpathSync(other.repo)]).toContain(frame?.location?.directory)
+    expect(frame?.location?.directory).not.toBe(box.repo)
+    stream.abort.abort()
   })
 })
