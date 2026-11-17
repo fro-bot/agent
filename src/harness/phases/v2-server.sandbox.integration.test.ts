@@ -2556,7 +2556,8 @@ describe.skipIf(!gated)("isolate-agent PATH mirrors the runner's", () => {
       // Nothing on the runner's PATH provides `opencode`, so it resolves only through the Action's directory, appended last.
       id: 'path_opencode',
       category: 'works',
-      cmd: 'p=$(command -v opencode); v=$(opencode --version 2>&1 | head -1); [ -n "$p" ] && [ -n "$v" ] && R path_opencode WORKS "$p $v" || R path_opencode FAILED "opencode did not run"',
+      // The exit status must be zero: an executable that resolves but fails to start is not a working `opencode`.
+      cmd: String.raw`if ! p=$(command -v opencode); then R path_opencode FAILED "not on PATH"; elif v=$(opencode --version 2>&1); then R path_opencode WORKS "$p $(printf "%s\n" "$v" | sed -n 1p)"; else R path_opencode FAILED "opencode --version failed"; fi`,
     },
     {
       id: 'path_value',
@@ -2606,7 +2607,7 @@ describe.skipIf(!gated)("isolate-agent PATH mirrors the runner's", () => {
     // #then both succeed, it resolves into the Action's directory, and that directory is the final PATH entry
     expect(failuresFor(result?.rows ?? new Map(), 'path_opencode', 'WORKS')).toEqual([])
     expect(evidence.startsWith(`${opencodeDirectory}/opencode `)).toBe(true)
-    expect(evidence.length).toBeGreaterThan(`${opencodeDirectory}/opencode `.length)
+    expect(evidence.slice(`${opencodeDirectory}/opencode `.length)).toMatch(/^v?\d+\.\d+\.\d+/)
     expect(agentPath.at(-1)).toBe(opencodeDirectory)
   })
 
