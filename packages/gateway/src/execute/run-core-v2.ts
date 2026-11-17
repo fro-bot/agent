@@ -635,8 +635,9 @@ export async function runOpenCodeCoreV2(params: RunCoreV2Params): Promise<void> 
   eventStream = resumeWith(eventIterator, firstFrame.value)
 
   // ── 3. Send prompt ─────────────────────────────────────────────────────────
-  // Admission is not instant (about 270 ms on a cold location, probe P1), and an interrupt sent before it is admitted
-  // leaves no trace. That is why nothing below ever reads an interrupt reply as a stop.
+  // Admission is not instant (probe P1: 130 to 220 ms at a location whose first prompt this is, on 2.3.0, and all of it
+  // inside the prompt request itself: once that returns the session is active), and an interrupt sent before it is
+  // admitted leaves no trace. That is why nothing below ever reads an interrupt reply as a stop.
   try {
     const prompted = await client.prompt({sessionId, text: promptText, directory, signal: combinedSignal})
     if (!prompted.success) {

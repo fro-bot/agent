@@ -242,7 +242,12 @@ export interface RemoteOpenCodeV2Client {
     readonly sessionId: string
     readonly signal?: AbortSignal
   }) => Promise<Result<{readonly interrupted: boolean}, V2CallError>>
-  /** Resolves once the response headers arrive. The first frame the stream yields is `server.connected`. */
+  /**
+   * Resolves once the response headers arrive; the first frame the stream yields is `server.connected` (the server
+   * registers the subscriber before it emits it). `directory` rides in `x-opencode-directory` but does not scope the
+   * stream: it carries the events of every location, so consumers filter by session. Nothing is replayed to a late or
+   * reconnecting subscriber, whatever `Last-Event-ID` says.
+   */
   readonly subscribeEvents: (input: {
     readonly directory: string
     readonly signal?: AbortSignal
