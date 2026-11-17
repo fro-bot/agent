@@ -1,5 +1,6 @@
-import {readFileSync} from 'node:fs'
-import {resolve} from 'node:path'
+import * as fs from 'node:fs'
+import * as os from 'node:os'
+import * as path from 'node:path'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {RECORDED_V2_PIN} from '../../services/setup/opencode.js'
@@ -10,6 +11,7 @@ const mocks = vi.hoisted(() => ({
   getInput: vi.fn<(name: string) => string>(),
   setSecret: vi.fn<(value: string) => void>(),
   warning: vi.fn<(message: string) => void>(),
+  info: vi.fn<(message: string) => void>(),
   githubContext: {
     payload: {},
   },
@@ -19,6 +21,7 @@ vi.mock('@actions/core', () => ({
   getInput: mocks.getInput,
   setSecret: mocks.setSecret,
   warning: mocks.warning,
+  info: mocks.info,
 }))
 
 vi.mock('@actions/github', () => ({
@@ -230,9 +233,9 @@ describe('parseActionInputs', () => {
 
         // #then every page that tells an operator which tag to pin names the same tag, so a release bump is one edit
         const named = docs.filter(doc =>
-          readFileSync(resolve(import.meta.dirname, '../../..', doc), 'utf8').includes(
-            `fro-bot/agent@${LAST_V1_ACTION_RELEASE}`,
-          ),
+          fs
+            .readFileSync(path.resolve(import.meta.dirname, '../../..', doc), 'utf8')
+            .includes(`fro-bot/agent@${LAST_V1_ACTION_RELEASE}`),
         )
         expect(named).toEqual(docs)
       })
@@ -341,7 +344,7 @@ describe('parseActionInputs', () => {
 
     it('pins the action.yaml metadata default for review-skip-label', () => {
       // #given the committed action metadata (defaults apply at runtime via core.getInput, not in parsing code)
-      const actionYaml = readFileSync(resolve(import.meta.dirname, '../../../action.yaml'), 'utf8')
+      const actionYaml = fs.readFileSync(path.resolve(import.meta.dirname, '../../../action.yaml'), 'utf8')
 
       // #when locating the review-skip-label input block
       const block = actionYaml.slice(actionYaml.indexOf('review-skip-label:'))
@@ -646,7 +649,7 @@ describe('parseActionInputs', () => {
 
     it('pins the false action metadata default', () => {
       // #given the committed action metadata
-      const actionYaml = readFileSync(resolve(import.meta.dirname, '../../../action.yaml'), 'utf8')
+      const actionYaml = fs.readFileSync(path.resolve(import.meta.dirname, '../../../action.yaml'), 'utf8')
 
       // #when locating the repo-skills input block
       const block = /\n {2}repo-skills:\n([\s\S]*?)(?=\n {2}[\w-]+:\n|\n\S)/.exec(actionYaml)?.[1] ?? ''
@@ -712,7 +715,7 @@ describe('parseActionInputs', () => {
 
     it('pins the false action metadata default', () => {
       // #given the committed action metadata
-      const actionYaml = readFileSync(resolve(import.meta.dirname, '../../../action.yaml'), 'utf8')
+      const actionYaml = fs.readFileSync(path.resolve(import.meta.dirname, '../../../action.yaml'), 'utf8')
 
       // #when locating the isolate-agent input block
       const block = /\n {2}isolate-agent:\n([\s\S]*?)(?=\n {2}[\w-]+:\n|\n\S)/.exec(actionYaml)?.[1] ?? ''
@@ -720,6 +723,125 @@ describe('parseActionInputs', () => {
       // #then the opt-in is disabled by default
       expect(block.length).toBeGreaterThan(0)
       expect(block).toContain("default: 'false'")
+    })
+  })
+
+  describe('agent-state-home', () => {
+    let workspace: string
+
+    beforeEach(() => {
+      workspace = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'inputs-state-home-')))
+      vi.stubEnv('GITHUB_WORKSPACE', workspace)
+    })
+
+    afterEach(() => {
+      fs.rmSync(workspace, {recursive: true, force: true})
+    })
+
+    it('is null when unset, with isolation on or off', () => {
+      // #given no agent-state-home input
+      mockInputs({'isolate-agent': 'true'})
+      const isolated = parseActionInputs()
+      mockInputs({})
+      const plain = parseActionInputs()
+
+      // #then there is nothing to hand over, and nothing is logged about it
+      expect(isolated.success && isolated.data.agentStateHome).toBeNull()
+      expect(plain.success && plain.data.agentStateHome).toBeNull()
+      expect(mocks.info).not.toHaveBeenCalled()
+    })
+
+    it('resolves an absolute path inside the checkout when isolation is on', () => {
+      // #given a state home under the checkout
+      const stateHome = path.join(workspace, 'connect', 'state')
+      mockInputs({'isolate-agent': 'true', 'agent-state-home': ` ${stateHome} `})
+
+      // #when parsing action inputs
+      const result = parseActionInputs()
+
+      // #then the trimmed path is carried through
+      expect(result.success && result.data.agentStateHome).toBe(stateHome)
+    })
+
+    it('fails closed on a relative path', () => {
+      // #given a relative value
+      mockInputs({'isolate-agent': 'true', 'agent-state-home': 'connect/state'})
+
+      // #when parsing action inputs
+      const result = parseActionInputs()
+
+      // #then the error names the input and the rule
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.message).toContain('agent-state-home')
+      expect(!result.success && result.error.message).toContain('absolute')
+    })
+
+    it('fails closed on a path outside the checkout', () => {
+      // #given a path next to the checkout
+      mockInputs({'isolate-agent': 'true', 'agent-state-home': `${workspace}-other/state`})
+
+      // #when parsing action inputs
+      const result = parseActionInputs()
+
+      // #then
+      expect(result.success).toBe(false)
+      expect(!result.success && result.error.message).toContain('inside the checkout')
+    })
+
+    it('fails closed on a symlink that leaves the checkout', () => {
+      // #given a link in the checkout pointing out of it
+      const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 'inputs-state-out-'))
+      try {
+        fs.symlinkSync(elsewhere, path.join(workspace, 'link'))
+        mockInputs({'isolate-agent': 'true', 'agent-state-home': path.join(workspace, 'link')})
+
+        // #when parsing action inputs
+        const result = parseActionInputs()
+
+        // #then
+        expect(result.success).toBe(false)
+        expect(!result.success && result.error.message).toContain('symlink')
+      } finally {
+        fs.rmSync(elsewhere, {recursive: true, force: true})
+      }
+    })
+
+    it('is ignored, with an info log, and not even validated, when isolation is off', () => {
+      // #given an invalid value but no isolation
+      mockInputs({'agent-state-home': 'relative/and/invalid'})
+
+      // #when parsing action inputs
+      const result = parseActionInputs()
+
+      // #then the run is not failed by it, it has no effect, and the operator is told why
+      expect(result.success && result.data.agentStateHome).toBeNull()
+      expect(mocks.info).toHaveBeenCalledWith(expect.stringContaining('agent-state-home'))
+      expect(mocks.info).toHaveBeenCalledWith(expect.stringContaining('isolate-agent'))
+    })
+
+    it('is ignored when isolate-agent is explicitly false', () => {
+      // #given isolation explicitly off and a valid value
+      mockInputs({'isolate-agent': 'false', 'agent-state-home': path.join(workspace, 'state')})
+
+      // #when parsing action inputs
+      const result = parseActionInputs()
+
+      // #then
+      expect(result.success && result.data.agentStateHome).toBeNull()
+      expect(mocks.info).toHaveBeenCalledTimes(1)
+    })
+
+    it('pins an empty action metadata default', () => {
+      // #given the committed action metadata
+      const actionYaml = fs.readFileSync(path.resolve(import.meta.dirname, '../../../action.yaml'), 'utf8')
+
+      // #when locating the agent-state-home input block
+      const block = /\n {2}agent-state-home:\n([\s\S]*?)(?=\n {2}[\w-]+:\n|\n\S)/.exec(actionYaml)?.[1] ?? ''
+
+      // #then it is optional with no default
+      expect(block.length).toBeGreaterThan(0)
+      expect(block).toContain('required: false')
+      expect(block).not.toContain('default:')
     })
   })
 
@@ -738,7 +860,7 @@ describe('parseActionInputs', () => {
 
     it('pins the empty action metadata default for brokered-push extra paths', () => {
       // #given the committed action metadata
-      const actionYaml = readFileSync(resolve(import.meta.dirname, '../../../action.yaml'), 'utf8')
+      const actionYaml = fs.readFileSync(path.resolve(import.meta.dirname, '../../../action.yaml'), 'utf8')
 
       // #when locating the brokered-push-extra-paths input block
       const block = actionYaml.slice(actionYaml.indexOf('brokered-push-extra-paths:'))

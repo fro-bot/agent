@@ -113,6 +113,9 @@ export interface ActionInputs {
   readonly repoSkills: boolean
   // Opt-in: run the OpenCode V2 server and its tools as a separate local user (the `isolate-agent` input).
   readonly isolateAgent: boolean
+  // The resolved `agent-state-home` input: an absolute directory inside the checkout that becomes the isolated agent's
+  // `XDG_STATE_HOME`. Null when unset, and always null without `isolate-agent` (the input is ignored there).
+  readonly agentStateHome: string | null
 }
 
 // Action outputs

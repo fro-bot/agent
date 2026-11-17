@@ -98,6 +98,7 @@ function bootstrap(): BootstrapPhaseResult {
       brokeredPushExtraPaths: [],
       repoSkills: false,
       isolateAgent: false,
+      agentStateHome: null,
     },
     logger: mocks.logger,
     opencodeResult: {path: 'opencode', version: '2.2.5'},

@@ -168,7 +168,7 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
     responseFilePathCandidates: responseFile?.responseFilePathCandidates ?? null,
     trustedHeadSha: inputs.trustedHeadSha,
     sandboxTools,
-    sandbox: createRunSandbox(sandboxTools, responseFile?.responseFilePath ?? null, runnerPath),
+    sandbox: createRunSandbox(sandboxTools, responseFile?.responseFilePath ?? null, runnerPath, inputs.agentStateHome),
   }
 }
 
@@ -177,6 +177,7 @@ function createRunSandbox(
   tools: SandboxToolPaths | null,
   responseFilePath: string | null,
   runnerPath: string | undefined,
+  agentStateHome: string | null,
 ): SandboxLifecycle | null {
   if (tools === null) return null
   const runnerTemp = process.env.RUNNER_TEMP?.trim() ?? ''
@@ -185,6 +186,7 @@ function createRunSandbox(
     env: process.env,
     runnerPath,
     workspacePath: getGitHubWorkspace(),
+    agentStateHome,
     responseDir: responseFilePath === null ? null : path.dirname(responseFilePath),
     attachmentDir:
       runnerTemp.length === 0

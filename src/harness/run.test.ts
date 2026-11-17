@@ -159,6 +159,7 @@ function createBootstrap(): BootstrapPhaseResult {
       brokeredPushExtraPaths: [],
       repoSkills: false,
       isolateAgent: false,
+      agentStateHome: null,
     },
     logger: createLogger({phase: 'test'}),
     opencodeResult: {path: 'opencode', version: '2.2.6'},

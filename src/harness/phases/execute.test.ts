@@ -124,6 +124,7 @@ function createBootstrap(
       brokeredPushExtraPaths: [],
       repoSkills: false,
       isolateAgent: false,
+      agentStateHome: null,
     },
     logger: mocks.logger,
     opencodeResult: {path: 'opencode', version: '1.0.0'},

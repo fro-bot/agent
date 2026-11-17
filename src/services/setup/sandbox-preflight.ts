@@ -161,12 +161,47 @@ export async function runSandboxPreflight(deps: SandboxPreflightDeps): Promise<S
     }
   }
 
+  await noteGitTrustSupport(deps, tools.paths.git)
+
   // Last: it runs the real builder as root, so every cheaper check has passed first.
   const view = await deps.probeView(tools.paths)
   if (!view.ok) return fail('view', view.message)
 
   deps.logger.debug('Sandbox preflight passed', {tools: tools.paths})
   return {ok: true, tools: tools.paths}
+}
+
+/**
+ * The first git release with `safe.directory` prefix matching (`<dir>/*`): 2.46.0, backported to 2.45.3. The sandbox trusts
+ * `<checkout>/*` for the repositories a runner step cloned under the checkout; an older git ignores that entry.
+ */
+const GIT_PREFIX_TRUST_MIN = [2, 45, 3] as const
+
+/** The `major.minor.patch` of `git --version` output (`git version 2.45.2.windows.1`), or null when it cannot be read. */
+function parseGitVersion(output: string): readonly [number, number, number] | null {
+  const match = /git version (\d+)\.(\d+)(?:\.(\d+))?/.exec(output)
+  if (match === null) return null
+  return [Number(match[1]), Number(match[2]), Number(match[3] ?? 0)]
+}
+
+/**
+ * Says, once and at info, when the runner's git is too old to honor `safe.directory` prefix entries. Never a failure: the
+ * checkout itself is still trusted, only repositories under it are not. An unreadable or unparseable version says nothing,
+ * because it proves nothing either way.
+ */
+async function noteGitTrustSupport(deps: SandboxPreflightDeps, git: string): Promise<void> {
+  const output = await deps.exec
+    .getExecOutput(git, ['--version'], {silent: true, ignoreReturnCode: true})
+    .catch(() => null)
+  const version = output === null || output.exitCode !== 0 ? null : parseGitVersion(output.stdout)
+  if (version === null) return
+  const older = version.findIndex((part, index) => part !== GIT_PREFIX_TRUST_MIN[index])
+  if (older === -1 || (version[older] ?? 0) > (GIT_PREFIX_TRUST_MIN[older] ?? 0)) return
+  deps.logger.info(
+    `git ${version.join('.')} is older than 2.45.3: repositories under the checkout won't be trusted for the agent ` +
+      '(only the checkout itself is)',
+    {gitVersion: version.join('.')},
+  )
 }
 
 /** The sub-path of the runner's work directory that holds downloaded actions. Reserved: the sandbox may never write it. */
