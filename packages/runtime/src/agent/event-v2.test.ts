@@ -483,8 +483,35 @@ describe('mapV2Event: subagent notices', () => {
       kind: 'subagent_notice',
       sessionId: PARENT_SESSION_ID,
       notice: {childSessionId: CHILD_SESSION_ID, state: 'completed', agent: 'General', description: 'bg child'},
+      observation: {tagState: 'completed', metadataState: 'completed', backgroundWorkRunning: false},
       inboxId: SUBAGENT_NOTICE_MESSAGE.id,
     })
+  })
+
+  it('carries the tag state apart from the metadata state: a running tag over completed metadata', () => {
+    // #given a mid-flight report, as the 2.3.0 server sends it, on both frames that deliver a notice
+    const text = `<subagent sessionID="${CHILD_SESSION_ID}" state="running" description="d">\nSTARTED\n\nBackground work still running:\n- shell (sh_1): sleep 45\n</subagent>`
+    const metadata = {source: 'subagent', childID: CHILD_SESSION_ID, agent: 'General', state: 'completed'}
+
+    // #when
+    const inbox = mapV2Event({
+      type: 'session.inbox.enqueued',
+      data: {
+        inboxID: 'msg_running',
+        sessionID: PARENT_SESSION_ID,
+        item: {type: 'synthetic', payload: {text, metadata}},
+      },
+    })
+    const synthetic = mapV2Event({type: 'session.synthetic', data: {sessionID: PARENT_SESSION_ID, text, metadata}})
+
+    // #then the reader still takes the metadata (settlement is unchanged); the observation records the disagreement
+    for (const event of [inbox, synthetic]) {
+      expect(event).toMatchObject({
+        kind: 'subagent_notice',
+        notice: {state: 'completed'},
+        observation: {tagState: 'running', metadataState: 'completed', backgroundWorkRunning: true},
+      })
+    }
   })
 
   it('maps an inbox delivery, captured from a real turn, to the item that entered the model turn', () => {
@@ -562,6 +589,26 @@ describe('mapV2Event: subagent notices', () => {
       eventType: 'session.synthetic',
       sessionId: PARENT_SESSION_ID,
       reason: 'unreadable subagent notice',
+      subagentObservation: {tagState: null, metadataState: 'completed', backgroundWorkRunning: false},
+    })
+  })
+
+  it('carries what an unreadable notice looked like, so the log can say why it was unreadable', () => {
+    // #given a notice whose metadata state is `running` and whose tag agrees
+    const event = mapV2Event({
+      type: 'session.synthetic',
+      data: {
+        sessionID: PARENT_SESSION_ID,
+        text: `<subagent sessionID="${CHILD_SESSION_ID}" state="running">\nBackground work still running:\n</subagent>`,
+        metadata: {source: 'subagent', childID: CHILD_SESSION_ID, state: 'running'},
+      },
+    })
+
+    // #when / #then
+    expect(event).toMatchObject({
+      kind: 'malformed',
+      childSessionId: CHILD_SESSION_ID,
+      subagentObservation: {tagState: 'running', metadataState: 'running', backgroundWorkRunning: true},
     })
   })
 
