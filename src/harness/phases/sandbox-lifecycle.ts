@@ -205,6 +205,12 @@ export interface SandboxLifecycleOptions {
   readonly responseDir: string | null
   /** The run-scoped attachment directory (created here so default ACLs cover files the runner writes later). */
   readonly attachmentDir?: string | null
+  /**
+   * The `agent-state-home` input, already resolved: an absolute directory strictly inside the checkout. It becomes the
+   * agent's `XDG_STATE_HOME`, handed over and taken back like the other handed-over directories. Null or absent keeps the
+   * state root in the agent's own home. Checked again in `prepare`, which refuses anything else before it creates anything.
+   */
+  readonly agentStateHome?: string | null
   readonly logger: Logger
   /** Override for tests and the integration suite; defaults to the real home of the current user. */
   readonly runnerHome?: string
@@ -252,7 +258,20 @@ export interface SandboxLifecycleDeps {
   readonly realpath: (target: string) => Promise<string | null>
   /** Which of the supported tool install roots (bun, pnpm) the sandbox may read. */
   readonly resolveToolRoots: (input: ToolRootInput) => Promise<ToolRootResult>
+  /** What is at `target`, without following a link: nothing, a link (and where it points), or something else. */
+  readonly inspectEntry: (target: string) => Promise<EntryFound>
+  /**
+   * Removes `target` only if it is a symlink to exactly `expected`: never a file or a directory, and never a link that points
+   * anywhere else. `left` means something else is there and was not touched.
+   */
+  readonly removeLink: (target: string, expected: string) => Promise<'absent' | 'left' | 'removed'>
 }
+
+/** What `inspectEntry` found. `unreadable` is anything but a clean "no such entry" (a file where a parent should be, say). */
+export type EntryFound =
+  | {readonly kind: 'absent'}
+  | {readonly kind: 'symlink'; readonly target: string}
+  | {readonly kind: 'directory' | 'other' | 'unreadable'}
 
 const defaultDeps: SandboxLifecycleDeps = {
   createAccount: createSandboxAccount,
@@ -305,6 +324,26 @@ const defaultDeps: SandboxLifecycleDeps = {
   isDirectory: directory => fsSync.statSync(directory, {throwIfNoEntry: false})?.isDirectory() === true,
   realpath: async target => fs.realpath(target).catch(() => null),
   resolveToolRoots: async input => resolveToolRoots(input),
+  inspectEntry: async target => {
+    let stats
+    try {
+      stats = await fs.lstat(target)
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === 'ENOENT' ? {kind: 'absent'} : {kind: 'unreadable'}
+    }
+    if (stats.isSymbolicLink()) {
+      const linked = await fs.readlink(target).catch(() => null)
+      return linked === null ? {kind: 'unreadable'} : {kind: 'symlink', target: linked}
+    }
+    return {kind: stats.isDirectory() ? 'directory' : 'other'}
+  },
+  removeLink: async (target, expected) => {
+    const stats = await fs.lstat(target).catch(() => null)
+    if (stats === null) return 'absent'
+    if (!stats.isSymbolicLink() || (await fs.readlink(target)) !== expected) return 'left'
+    await fs.unlink(target)
+    return 'removed'
+  },
 }
 
 /** Where the view's old root is moved before it is unmounted. An empty directory on every supported image. */
@@ -473,6 +512,9 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   let proxyUnconfirmed = false
   // Set once the teardown has taken its decision about the proxy. A proxy that turns up after that is stopped on the spot.
   let proxyTeardownDone = false
+  // The `opencode` link this lifecycle made inside `agentStateHome` (where it is, and where it points), removed once the files
+  // are back. Set only after the link command succeeded, so an entry this run did not make is never recorded. Null when none.
+  let agentStateLink: {readonly path: string; readonly target: string} | null = null
   const closeAdmission = (): void => {
     admissionClosed = true
     for (const controller of pendingLaunches.values()) controller.abort()
@@ -669,6 +711,24 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     let restore: TakeBackOutcome = {status: 'restored'}
     if (manifest !== null && journal !== null) restore = await deps.takeBack(manifest, journal, handoffDeps())
     if (restore.status === 'unsafe') logger.error('Sandbox take-back was unsafe', {reason: restore.reason})
+    // Only from a restored tree: the link is ours, in a directory that is the runner's again. After an unsafe take-back the
+    // tree is not trusted and nothing in it is touched.
+    if (restore.status === 'restored' && agentStateLink !== null) {
+      const link = agentStateLink
+      agentStateLink = null
+      try {
+        const removed = await deps.removeLink(link.path, link.target)
+        if (removed === 'left') {
+          logger.warning('The opencode entry in the agent state directory is not the link this run made; it was left', {
+            path: link.path,
+          })
+        }
+      } catch (error) {
+        logger.warning('The opencode link in the agent state directory could not be removed', {
+          error: toErrorMessage(error),
+        })
+      }
+    }
     const timedOutDuringTakeBack = timedOut()
     if (timedOutDuringTakeBack !== null) {
       // Whatever take-back concluded: a command it ran was killed and is not known to have stopped, and it may still be
@@ -867,9 +927,53 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
 
   const prepare = async (input: SandboxPrepareInput): Promise<Result<OpenCodeV2SandboxLaunch, string>> => {
     if (cancelled || released !== undefined) return err('isolate-agent setup was cancelled before it started')
+    const stateHome = options.agentStateHome ?? null
+    if (stateHome !== null) {
+      // The input parser guarantees this. Checked again where the directory is handed over, before an account exists.
+      const insideCheckout =
+        path.isAbsolute(stateHome) && stateHome !== options.workspacePath && isWithin(options.workspacePath, stateHome)
+      if (!insideCheckout) return err('agent-state-home must be an absolute directory inside the checkout')
+      // Before an account exists or anything is handed over: an entry already there that is not this run's own to replace is
+      // the user's, and refusing now leaves it untouched.
+      const entryProblem = await prepareStateEntry(stateHome)
+      if (entryProblem !== null) return err(entryProblem)
+      if (cancelled || released !== undefined) return err('isolate-agent setup was cancelled before it started')
+    }
     record('pending')
     preparing = prepareInner(input)
     return preparing as Promise<Result<OpenCodeV2SandboxLaunch, string>>
+  }
+
+  /** The runner's own `<XDG_STATE_HOME>/opencode`: where the agent's `opencode` state entry has to lead. */
+  const runnerOpencodeState = (): string =>
+    path.join(xdgBase(env, 'XDG_STATE_HOME', '.local/state', runnerHome), 'opencode')
+
+  /**
+   * Decides what may sit at `<agent-state-home>/opencode` before anything is changed. Null when it is fine (nothing there,
+   * the runner's real directory itself, or a stale link of ours, which is removed here, by the runner, in a directory it
+   * still owns); else why not. Anything else there (a file, a directory, a link elsewhere) belongs to the user.
+   */
+  async function prepareStateEntry(stateHome: string): Promise<string | null> {
+    const entry = path.join(stateHome, 'opencode')
+    const target = runnerOpencodeState()
+    // The runner's `XDG_STATE_HOME` is the state home: this is the handed-over directory itself, and no link is made.
+    if (entry === target) return null
+    const found = await deps.inspectEntry(entry)
+    if (found.kind === 'absent') return null
+    if (found.kind === 'symlink' && found.target === target) {
+      // What a crashed run of this Action leaves behind, and only that: a link to the runner's own opencode state.
+      return (await deps.removeLink(entry, target)) === 'left'
+        ? `agent-state-home: ${entry} changed while it was being checked`
+        : null
+    }
+    const what =
+      found.kind === 'symlink'
+        ? `a link to ${found.target}`
+        : `${found.kind === 'directory' ? 'a directory' : 'not a link'}`
+    return (
+      `agent-state-home: ${entry} already exists and is ${what}, but the Action links the agent's OpenCode state there ` +
+      `(to ${target}). Move it away, or set the runner's XDG_STATE_HOME to the agent-state-home so that entry is the real directory`
+    )
   }
 
   async function prepareInner(input: SandboxPrepareInput): Promise<Result<OpenCodeV2SandboxLaunch, string>> {
@@ -900,6 +1004,8 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
         path.join(stateBase, 'opencode'),
         ...input.keyFilePaths.map(file => path.dirname(file)),
       ])
+      const stateHome = options.agentStateHome ?? null
+      if (stateHome !== null) handedOver.add(stateHome)
       if (options.responseDir !== null) handedOver.add(options.responseDir)
       if (input.ghConfigDir !== null) handedOver.add(input.ghConfigDir)
 
@@ -951,12 +1057,16 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       // The runner's own runtime directory (`/run/user/<uid>`) is not the agent's; tools that keep sockets there need one.
       const runtimeDir = path.join(account.home, '.run')
       await runAsSandbox([tools.mkdir, '-m', '0700', runtimeDir])
-      const agentXdg = await createAgentXdg(account.home, {
-        data: path.join(dataBase, 'opencode'),
-        config: path.join(configBase, 'opencode'),
-        cache: path.join(cacheBase, 'opencode'),
-        state: path.join(stateBase, 'opencode'),
-      })
+      const agentXdg = await createAgentXdg(
+        account.home,
+        {
+          data: path.join(dataBase, 'opencode'),
+          config: path.join(configBase, 'opencode'),
+          cache: path.join(cacheBase, 'opencode'),
+          state: path.join(stateBase, 'opencode'),
+        },
+        stateHome,
+      )
       await writeSandboxGitConfig(options.workspacePath, input.ghConfigDir !== null)
       const view = await buildView(manifest, account, runnerTemp)
       if (!view.success) return await failAndRelease(view.error)
@@ -993,9 +1103,13 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
         ...(input.ghConfigDir === null ? {} : {GH_CONFIG_DIR: input.ghConfigDir}),
         // The checkout is the runner's, so git needs it trusted. Set in the environment as well as `~/.gitconfig`, because
         // tests commonly turn off the global and system config files and keep the environment.
-        GIT_CONFIG_COUNT: '1',
+        // `<checkout>/*` trusts every repository under it (git 2.45.3 or later; older git ignores the entry), for the clones a
+        // runner step made there: they are the runner's, and only the checkout itself was trusted before.
+        GIT_CONFIG_COUNT: '2',
         GIT_CONFIG_KEY_0: 'safe.directory',
         GIT_CONFIG_VALUE_0: options.workspacePath,
+        GIT_CONFIG_KEY_1: 'safe.directory',
+        GIT_CONFIG_VALUE_1: path.join(options.workspacePath, '*'),
         XDG_RUNTIME_DIR: runtimeDir,
         ...passedToolLocations,
         ...toolCacheEnv(installRoots.granted, runnerHome, account.home),
@@ -1038,7 +1152,14 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       newRoot: root.newRoot,
       putOld: VIEW_PUT_OLD,
       tools: {mount: tools.mount, umount: tools.umount},
-      writable: [...new Set([handed.workspace, ...handed.handedOver, sandboxAccount.home])],
+      // A handed-over directory inside the checkout (`agent-state-home`) is already under the checkout's writable mount.
+      writable: [
+        ...new Set([
+          handed.workspace,
+          ...handed.handedOver.filter(dir => !isWithin(handed.workspace, dir)),
+          sandboxAccount.home,
+        ]),
+      ],
       // The tool install roots are left out: everything under `/` is already read-only in the view, and the grant only
       // adds permission to read and execute, so binding them again would add nothing but a way to refuse a launch.
       readOnly: [...new Set([...handed.readable, ...handed.traverseOnly])].filter(root => !toolRoots.has(root)),
@@ -1077,20 +1198,45 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
    * The agent's own XDG roots, in its home, so every tool it runs can keep caches and state there. Each root's `opencode`
    * entry links to the handed-over runner directory, where the server's database, logs and config live and which
    * take-back and the cache save read directly. Created as the account in its new, empty home.
+   *
+   * With an `agent-state-home` the state root is that directory instead (already handed over, so the sandbox owns it). The
+   * `opencode` entry still has to reach the runner's session storage, so the link is made inside it, after `prepare` has
+   * refused anything of the user's already there and removed a stale link of ours. It is removed once the files are back. When the
+   * runner's own `<state>/opencode` already is `<state home>/opencode` (the runner's `XDG_STATE_HOME` is the state home) the
+   * real directory is already where the agent looks, and a link would point at itself.
    */
   async function createAgentXdg(
     home: string,
     opencode: Readonly<Record<'data' | 'config' | 'cache' | 'state', string>>,
+    stateHome: string | null,
   ): Promise<Readonly<Record<'data' | 'config' | 'cache' | 'state', string>>> {
     const roots = {
       data: path.join(home, '.local', 'share'),
       config: path.join(home, '.config'),
       cache: path.join(home, '.cache'),
-      state: path.join(home, '.local', 'state'),
+      state: stateHome ?? path.join(home, '.local', 'state'),
     } as const
-    await runAsSandbox([tools.mkdir, '-p', '-m', '0700', roots.data, roots.config, roots.cache, roots.state])
-    for (const kind of ['data', 'config', 'cache', 'state'] as const) {
+    await runAsSandbox([
+      tools.mkdir,
+      '-p',
+      '-m',
+      '0700',
+      roots.data,
+      roots.config,
+      roots.cache,
+      ...(stateHome === null ? [roots.state] : []),
+    ])
+    for (const kind of ['data', 'config', 'cache'] as const) {
       await runAsSandbox([tools.ln, '-sT', opencode[kind], path.join(roots[kind], 'opencode')])
+    }
+    const stateEntry = path.join(roots.state, 'opencode')
+    if (stateHome === null) {
+      await runAsSandbox([tools.ln, '-sT', opencode.state, stateEntry])
+    } else if (stateEntry !== opencode.state) {
+      // No `-f`: `prepare` already refused or removed whatever was there, so an entry that appears since is not ours to replace
+      // and the command fails. Recorded only once it succeeded, so teardown removes nothing this run did not make.
+      await runAsSandbox([tools.ln, '-sT', opencode.state, stateEntry])
+      agentStateLink = {path: stateEntry, target: opencode.state}
     }
     return roots
   }
@@ -1132,7 +1278,8 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   }
 
   /**
-   * `safe.directory` for the checkout (owned by the runner) and the identity setup configured for the runner. In provision
+   * `safe.directory` for the checkout (owned by the runner) and every repository under it (git 2.45.3 or later; older git
+   * ignores the second entry), and the identity setup configured for the runner. In provision
    * mode (the sandbox holds a `gh` config), also a credential helper so the model's `git push` authenticates.
    */
   async function writeSandboxGitConfig(workspace: string, provisioned: boolean): Promise<void> {
@@ -1142,6 +1289,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       await runAsSandbox([tools.git, 'config', '--file', gitConfig, '--add', key, value])
     }
     await set('safe.directory', workspace)
+    await set('safe.directory', path.join(workspace, '*'))
     for (const key of ['user.name', 'user.email']) {
       const value = await exec.getExecOutput(tools.git, ['config', '--global', '--get', key], {
         silent: true,

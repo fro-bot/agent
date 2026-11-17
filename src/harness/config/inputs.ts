@@ -16,6 +16,7 @@ import {
 } from '../../shared/constants.js'
 import {err, ok} from '../../shared/types.js'
 import {validateJsonString, validatePositiveInteger} from '../../shared/validation.js'
+import {resolveAgentStateHome} from './agent-state-home.js'
 
 /**
  * Parse model input string in "provider/model" format.
@@ -241,6 +242,7 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
 
     const repoSkills = parseRepoSkills(core.getInput('repo-skills'))
     const isolateAgent = parseIsolateAgent(core.getInput('isolate-agent'))
+    const agentStateHome = parseAgentStateHome(core.getInput('agent-state-home'), isolateAgent)
 
     const systematicVersionRaw = core.getInput('systematic-version').trim()
     const systematicVersion = systematicVersionRaw.length > 0 ? systematicVersionRaw : DEFAULT_SYSTEMATIC_VERSION
@@ -292,6 +294,7 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
       brokeredPushExtraPaths,
       repoSkills,
       isolateAgent,
+      agentStateHome,
     })
   } catch (error) {
     return err(error instanceof Error ? error : new Error(String(error)))
@@ -328,6 +331,23 @@ function parseIsolateAgent(input: string): boolean {
   if (value === '' || value === 'false') return false
   if (value === 'true') return true
   throw new Error(`Invalid isolate-agent value: "${input.trim()}". Valid values: true, false`)
+}
+
+/**
+ * `agent-state-home` only means something with isolation: without it the agent runs as the runner and already owns its own
+ * `XDG_STATE_HOME`. So it is ignored there (said once, at info, and not validated). With isolation an unusable value fails
+ * the run here, at config, before any account or handoff exists; see {@link resolveAgentStateHome} for the rules.
+ */
+function parseAgentStateHome(input: string, isolateAgent: boolean): string | null {
+  const value = input.trim()
+  if (value.length === 0) return null
+  if (!isolateAgent) {
+    core.info('agent-state-home is ignored because isolate-agent is not enabled')
+    return null
+  }
+  const resolved = resolveAgentStateHome(value, process.env.GITHUB_WORKSPACE)
+  if (!resolved.success) throw resolved.error
+  return resolved.data
 }
 
 /**

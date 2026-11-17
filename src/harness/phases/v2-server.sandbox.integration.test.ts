@@ -9,7 +9,7 @@
  * tool shell as the sandbox user. Each "blocked" probe has a positive control: the same command run as the runner must
  * succeed (be OPEN), otherwise a BLOCKED result proves nothing.
  *
- * Eleven suites run one after another (the sandbox account name is fixed, so two never overlap):
+ * Thirteen suites run one after another (the sandbox account name is fixed, so two never overlap):
  *   1. the boundary: blocked and works rows, identity, quiescence, take-back;
  *   2. a provisioned `gh` config and an admitted repo skill;
  *   3. the persistence round trip (restore, isolated run, checkpoint and save, restore, isolated run);
@@ -24,7 +24,11 @@
  *  10. the agent's PATH is the runner's: `node` and `uv` from the tool cache (put on PATH by `setup-node` and `setup-uv`)
  *      run in the agent's shell and report what they report to the runner;
  *  11. `bun` and `pnpm` run for the agent from their install roots under the runner home, installs work, nothing else in the
- *      home becomes readable, the roots stay read-only, and take-back leaves no ACL entry for the agent's uid.
+ *      home becomes readable, the roots stay read-only, and take-back leaves no ACL entry for the agent's uid;
+ *  12. `agent-state-home` inside the checkout, with the runner's own state elsewhere: the agent's state lands in the checkout,
+ *      runner-owned, its `opencode` entry is a link that is removed afterwards, and a clone under the checkout is trusted;
+ *  13. the same, in connect's layout: the runner's `XDG_STATE_HOME` is the state home, so its real `opencode` directory is
+ *      nested inside the handed-over state home, and the take-back still ends `restored` with the session database readable.
  *
  * Every suite runs through the read-only view, as the Action does: the launch has no other form.
  *
@@ -210,6 +214,8 @@ interface IsolatedRunOptions {
   readonly logger: Logger
   readonly ghConfigDir?: string
   readonly repoSkills?: {readonly stagingRoot: string; readonly admittedDir: string | null}
+  /** The `agent-state-home` input, resolved: an absolute directory inside `workspace`. */
+  readonly agentStateHome?: string
   /** Called with the lifecycle as soon as it exists, so a suite's `afterAll` can release it if the run throws. */
   readonly onLifecycle?: (lifecycle: SandboxLifecycle) => void
   /** Called with the launch the lifecycle prepared (the account's uid is the one the handoff named). */
@@ -231,6 +237,7 @@ async function runIsolated(options: IsolatedRunOptions): Promise<IsolatedRunResu
     runnerHome,
     workspacePath: options.workspace,
     responseDir: options.responseDir,
+    agentStateHome: options.agentStateHome ?? null,
     logger: options.logger,
     viewLauncher,
   })
@@ -2214,6 +2221,155 @@ describe.skipIf(!gated)('isolate-agent read-only view: a second isolated run in 
     expect(first?.rows.get('run1_markers')).toBeDefined()
   })
 })
+
+/**
+ * `agent-state-home` inside the checkout, in the two layouts a runner can have:
+ *  - `link`: the runner's `XDG_STATE_HOME` is elsewhere, so the lifecycle links `<state home>/opencode` to the runner's own
+ *    `<state>/opencode`, and removes the link after take-back;
+ *  - `connect`: the runner's `XDG_STATE_HOME` *is* the state home, exactly as `connect.yaml` sets it, so `<state home>/opencode`
+ *    is the runner's real, handed-over directory, nested inside the handed-over state home.
+ */
+function stateHomeSuite(layout: 'connect' | 'link'): void {
+  const connect = layout === 'connect'
+  describe.skipIf(!gated)(
+    `isolate-agent agent-state-home (${layout} layout): a state directory and a clone inside the checkout`,
+    () => {
+      const logger = createLogger({phase: `sandbox-integration-state-home-${layout}`})
+      const scratch = path.join(runnerTemp, `sandbox-it-state-home-${layout}-${process.pid}`)
+      const xdgRoot = path.join(runnerTemp, `sandbox-it-state-home-${layout}-xdg-${process.pid}`)
+      const workspace = path.join(scratch, 'ws')
+      const stateHome = path.join(workspace, 'connect', 'state')
+      const nested = path.join(workspace, 'connect', 'checkouts', 'nested')
+      const responseDir = path.join(scratch, 'response')
+      const keyDir = path.join(scratch, 'keys')
+      // The connect layout: the runner's XDG_STATE_HOME is the state home itself (`connect.yaml` exports it to `$GITHUB_ENV`).
+      const env = {...hostedEnv(workspace, xdgRoot), ...(connect ? {XDG_STATE_HOME: stateHome} : {})}
+      const written = path.join(stateHome, 'systematic', 'connect', 'run.json')
+      // In the link layout the note goes through the link into the runner's own state directory, and the link is gone
+      // after take-back; in the connect layout `opencode` is that directory.
+      const note = connect
+        ? path.join(stateHome, 'opencode', 'agent-note')
+        : path.join(xdgRoot, 'state', 'opencode', 'agent-note')
+      const dbPath = path.join(xdgRoot, 'data', 'opencode', getSessionDbBasenames('v2').main)
+      const uid = process.getuid?.()
+
+      let result: IsolatedRunResult | undefined
+
+      const steps = (): Probe[] => [
+        {
+          // What the connect helper does: its run record lives under `$XDG_STATE_HOME`, which must be the directory the runner named
+          // and must be the sandbox's to write (the helper refuses a state root another uid owns). `opencode` there must reach the
+          // runner's session storage: a link in one layout, the real directory in the other.
+          id: 'state_home_write',
+          category: 'works',
+          cmd:
+            `if [ "$XDG_STATE_HOME" = ${q(stateHome)} ] && mkdir -p "$XDG_STATE_HOME/systematic/connect" ` +
+            `&& echo recorded > "$XDG_STATE_HOME/systematic/connect/run.json" ` +
+            `&& ${connect ? '[ -d "$XDG_STATE_HOME/opencode" ] && [ ! -L "$XDG_STATE_HOME/opencode" ]' : '[ -L "$XDG_STATE_HOME/opencode" ]'} ` +
+            `&& echo noted > "$XDG_STATE_HOME/opencode/agent-note"; ` +
+            'then R state_home_write WORKS "wrote under XDG_STATE_HOME and through its opencode entry"; ' +
+            'else R state_home_write FAILED "XDG_STATE_HOME=$XDG_STATE_HOME"; fi',
+        },
+        {
+          // A repository the runner cloned under the checkout is the runner's, not the sandbox uid's: git trusts it only through
+          // the `<checkout>/*` entry.
+          id: 'nested_git_status',
+          category: 'works',
+          cmd:
+            `if out=$(git -C ${q(nested)} status --porcelain 2>&1); then R nested_git_status WORKS "status ok"; ` +
+            'else R nested_git_status FAILED "$(printf %s "$out" | ev)"; fi',
+        },
+      ]
+
+      beforeAll(async () => {
+        const tools = await preflightTools(logger)
+        fs.mkdirSync(responseDir, {recursive: true})
+        const keyFile = writeKeyFile(keyDir)
+        initWorkspace(workspace)
+        // Cloned by the runner, as the connect workflow does, before the sandbox exists.
+        fs.mkdirSync(path.dirname(nested), {recursive: true})
+        git(workspace, 'clone', '-q', workspace, nested)
+        // The runner pre-creates the state directory and drops files in it (the connect hand-off files).
+        fs.mkdirSync(stateHome, {recursive: true})
+        fs.writeFileSync(path.join(stateHome, 'runner-handoff.json'), '{}')
+        result = await runIsolated({
+          tools,
+          env,
+          workspace,
+          responseDir,
+          keyFile,
+          steps: steps(),
+          logger,
+          agentStateHome: stateHome,
+        })
+      }, 600_000)
+
+      afterAll(() => {
+        fs.rmSync(scratch, {recursive: true, force: true})
+        fs.rmSync(xdgRoot, {recursive: true, force: true})
+      }, 120_000)
+
+      const everyEntry = (target: string): string[] =>
+        fs.lstatSync(target).isDirectory() && !fs.lstatSync(target).isSymbolicLink()
+          ? [target, ...fs.readdirSync(target).flatMap(entry => everyEntry(path.join(target, entry)))]
+          : [target]
+
+      it('takes everything back: the teardown ends restored', () => {
+        // #given the run, taken back after the server stopped
+        // #then the stop was confirmed and the take-back found nothing foreign (it refused the nested layout once)
+        expect(result?.released).toMatchObject({stop: 'stopped', restore: 'restored'})
+      })
+
+      it('gives the agent the named state home: it writes there and the file is in the checkout, runner-owned', () => {
+        // #given the agent wrote a file under its XDG_STATE_HOME, and through its `opencode` entry
+        // #then the probe saw the variable and the entry, and the runner finds both files owned by itself
+        expect(failuresFor(result?.rows ?? new Map(), 'state_home_write', 'WORKS')).toEqual([])
+        expect(fs.readFileSync(written, 'utf8')).toBe('recorded\n')
+        expect(fs.lstatSync(written).uid).toBe(uid)
+        expect(fs.readFileSync(note, 'utf8')).toBe('noted\n')
+        expect(fs.lstatSync(note).uid).toBe(uid)
+      })
+
+      it('leaves nothing under the state home owned by anyone but the runner', () => {
+        // #given the whole tree, the runner's pre-created file and the server's own state included
+        const foreign = everyEntry(stateHome).filter(entry => fs.lstatSync(entry).uid !== uid)
+
+        // #then none of it stayed the sandbox's
+        expect(foreign).toEqual([])
+        expect(fs.readFileSync(path.join(stateHome, 'runner-handoff.json'), 'utf8')).toBe('{}')
+      })
+
+      it.skipIf(!connect)('keeps the real opencode directory as it was: no link was made over it', () => {
+        // #given the connect layout after take-back
+        // #then `opencode` is still the runner's real directory
+        expect(fs.lstatSync(path.join(stateHome, 'opencode')).isDirectory()).toBe(true)
+      })
+
+      it.skipIf(connect)('removes the opencode link the lifecycle made in the state home', () => {
+        // #given the link layout after take-back
+        // #then our link is gone, and the note that went through it is in the runner's own state directory
+        expect(fs.existsSync(path.join(stateHome, 'opencode'))).toBe(false)
+        expect(fs.readFileSync(path.join(xdgRoot, 'state', 'opencode', 'agent-note'), 'utf8')).toBe('noted\n')
+      })
+
+      it('leaves the OpenCode session database readable by the runner, with the run in it', () => {
+        // #given the session storage the server wrote through the data directory
+        // #then the runner can open it, it is sound, and the scripted session is in it
+        expect(integrityCheck(dbPath)).toBe('ok')
+        expect(readSessionIds(dbPath).length).toBeGreaterThan(0)
+      })
+
+      it('runs git in a repository the runner cloned under the checkout', () => {
+        // #given the probe ran `git -C <checkout>/connect/checkouts/nested status` as the sandbox uid
+        // #then it was trusted
+        expect(failuresFor(result?.rows ?? new Map(), 'nested_git_status', 'WORKS')).toEqual([])
+      })
+    },
+  )
+}
+
+stateHomeSuite('link')
+stateHomeSuite('connect')
 
 describe.skipIf(!gated)('isolate-agent read-only view: a launcher killed while the chain waits at its gate', () => {
   const logger = createLogger({phase: 'sandbox-integration-gate'})

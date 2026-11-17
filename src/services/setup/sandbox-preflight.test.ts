@@ -30,6 +30,8 @@ interface Overrides {
   readonly realpaths?: Readonly<Record<string, string>>
   /** The view probe. Defaults to one that passes. */
   readonly probeView?: SandboxPreflightDeps['probeView']
+  /** What `git --version` prints, or `'throw'` for a git that cannot be run. Defaults to nothing readable. */
+  readonly gitVersion?: string
 }
 
 const HOSTED_ENV: NodeJS.ProcessEnv = {
@@ -61,11 +63,13 @@ function publishedEntries(root: string, work = WORK): Map<string, EntryKind> {
 
 function createDeps(overrides: Overrides = {}) {
   const {probeView} = overrides
-  const getExecOutput = vi.fn<ExecAdapter['getExecOutput']>(async () => ({
-    exitCode: overrides.sudoExitCode ?? 0,
-    stdout: '',
-    stderr: '',
-  }))
+  const getExecOutput = vi.fn<ExecAdapter['getExecOutput']>(async (command, args) => {
+    if (command === '/usr/bin/git' && args?.[0] === '--version') {
+      if (overrides.gitVersion === 'throw') throw new Error('spawn failed')
+      return {exitCode: 0, stdout: overrides.gitVersion ?? '', stderr: ''}
+    }
+    return {exitCode: overrides.sudoExitCode ?? 0, stdout: '', stderr: ''}
+  })
   const exec: ExecAdapter = {exec: vi.fn(async () => 0), getExecOutput}
   const sysctls: Record<string, string | null> = {
     protected_hardlinks: '1\n',
@@ -239,6 +243,86 @@ describe('runSandboxPreflight', () => {
     // #then only the first failure is reported and nothing privileged was attempted
     expect(!result.ok && result.check).toBe('runner-environment')
     expect(getExecOutput).not.toHaveBeenCalled()
+  })
+
+  describe('the git that trusts repositories under the checkout (safe.directory <checkout>/*)', () => {
+    const noticesOf = (logger: SandboxPreflightDeps['logger']): unknown[][] =>
+      vi.mocked(logger.info).mock.calls.filter(call => String(call[0]).includes('2.45.3'))
+
+    it.each(['git version 2.43.0', 'git version 2.45.2', 'git version 2.45.2.windows.1', 'git version 2.39.5\n'])(
+      'says once, at info, that repositories under the checkout will not be trusted by %j, and goes on',
+      async gitVersion => {
+        // #given a git older than 2.45.3
+        const {deps} = createDeps({gitVersion})
+
+        // #when the preflight runs
+        const result = await runSandboxPreflight(deps)
+
+        // #then the run is not refused, and the operator is told once
+        expect(result.ok).toBe(true)
+        const notices = noticesOf(deps.logger)
+        expect(notices).toHaveLength(1)
+        expect(String(notices[0]?.[0])).toContain("won't be trusted")
+        expect((notices[0]?.[1] as {gitVersion: string}).gitVersion).toMatch(/^2\./)
+      },
+    )
+
+    it.each(['git version 2.45.3', 'git version 2.46.0', 'git version 2.56.0', 'git version 3.0.0'])(
+      'says nothing for %j',
+      async gitVersion => {
+        // #given a git that has the prefix match
+        const {deps} = createDeps({gitVersion})
+
+        // #when the preflight runs
+        const result = await runSandboxPreflight(deps)
+
+        // #then
+        expect(result.ok).toBe(true)
+        expect(noticesOf(deps.logger)).toHaveLength(0)
+      },
+    )
+
+    it.each([
+      ['an unreadable version', ''],
+      ['a version it cannot parse', 'git version banana'],
+      ['a git that cannot run', 'throw'],
+    ])('goes on without a notice for %s', async (_name, gitVersion) => {
+      // #given a version that cannot be established
+      const {deps} = createDeps({gitVersion})
+
+      // #when the preflight runs
+      const result = await runSandboxPreflight(deps)
+
+      // #then it is neither a failure nor a claim about trust
+      expect(result.ok).toBe(true)
+      expect(noticesOf(deps.logger)).toHaveLength(0)
+    })
+
+    it('reads the version once, with the resolved git, after the privileged checks', async () => {
+      // #given a supported runner
+      const {deps, getExecOutput} = createDeps({gitVersion: 'git version 2.50.0'})
+
+      // #when the preflight runs
+      await runSandboxPreflight(deps)
+
+      // #then the resolved absolute git is asked exactly once, and sudo was probed before it
+      const calls = getExecOutput.mock.calls.map(call => [call[0], call[1]?.[0]])
+      expect(calls.filter(call => call[1] === '--version')).toEqual([['/usr/bin/git', '--version']])
+      expect(calls.findIndex(call => call[0] === '/usr/bin/sudo')).toBeLessThan(
+        calls.findIndex(call => call[1] === '--version'),
+      )
+    })
+
+    it('does not read it for a runner the preflight refuses first', async () => {
+      // #given a runner that fails the sudo check
+      const {deps, getExecOutput} = createDeps({sudoExitCode: 1, gitVersion: 'git version 2.30.0'})
+
+      // #when the preflight runs
+      await runSandboxPreflight(deps)
+
+      // #then git was never run
+      expect(getExecOutput.mock.calls.some(call => call[1]?.[0] === '--version')).toBe(false)
+    })
   })
 
   describe('published installs only', () => {

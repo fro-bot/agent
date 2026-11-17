@@ -526,6 +526,80 @@ describe('sandbox handoff', () => {
     expect(grantsSandboxWrite(`user:${SANDBOX_UID}:r-x`, SANDBOX_UID)).toBe(false)
   })
 
+  describe('a handed-over directory inside the checkout (agent-state-home)', () => {
+    const insideCheckout = (manifest: HandoffManifest): HandoffManifest => ({
+      ...manifest,
+      handedOver: [...manifest.handedOver, path.join(manifest.workspace, 'connect', 'state')],
+    })
+
+    it('does not read the sandbox grant on the checkout, or on a directory inside it, as a write grant on an ancestor', async () => {
+      // #given a state directory under the checkout, and the checkout and the directory between carrying the sandbox's own grant
+      const manifest = insideCheckout(fx.manifest)
+      fs.mkdirSync(path.join(manifest.workspace, 'connect', 'state'), {recursive: true})
+      const granted = `${BASE_ACL}user:${SANDBOX_UID}:rwx\n`
+      fx.aclFor.set(manifest.workspace, granted)
+      fx.aclFor.set(path.join(manifest.workspace, 'connect'), granted)
+
+      // #when verified at take-back, when that grant is still in place
+      const problem = await verifyRoots(manifest, fx.deps, 'take-back')
+
+      // #then the checkout's by-design grant is not a swap risk
+      expect(problem).toBeNull()
+    })
+
+    it('still refuses a write grant on an ancestor outside the checkout', async () => {
+      // #given the same layout, but the directory above the checkout carries a sandbox write grant
+      const manifest = insideCheckout(fx.manifest)
+      fs.mkdirSync(path.join(manifest.workspace, 'connect', 'state'), {recursive: true})
+      fx.aclFor.set(path.join(manifest.runnerHome, 'work'), `${BASE_ACL}user:${SANDBOX_UID}:rwx\n`)
+
+      // #when verified
+      const problem = await verifyRoots(manifest, fx.deps, 'take-back')
+
+      // #then
+      expect(problem).toContain('grants the sandbox write access')
+    })
+
+    it('refuses the directory when a link stands in for one of its parents', async () => {
+      // #given `connect` swapped for a symlink out of the checkout
+      const manifest = insideCheckout(fx.manifest)
+      const outside = path.join(fx.root, 'outside')
+      fs.mkdirSync(path.join(outside, 'state'), {recursive: true})
+      fs.symlinkSync(outside, path.join(manifest.workspace, 'connect'))
+
+      // #when verified
+      const problem = await verifyRoots(manifest, fx.deps, 'take-back')
+
+      // #then
+      expect(problem).toContain('symlink')
+    })
+
+    it('hands it over like the other directories, locks nothing inside the checkout, and takes it back', async () => {
+      // #given a state directory under the checkout
+      const manifest = insideCheckout(fx.manifest)
+      const stateHome = path.join(manifest.workspace, 'connect', 'state')
+      fs.mkdirSync(stateHome, {recursive: true})
+      fs.writeFileSync(path.join(manifest.workspace, 'sibling.txt'), 'x')
+
+      // #when handed off and taken back
+      const handed = await handOff(manifest, fx.deps)
+      if (!handed.success) throw new Error(handed.error)
+      const argv = mutating(fx.calls).map(call => call.join(' '))
+      fx.calls.length = 0
+      const outcome = await takeBack(manifest, handed.data, fx.deps)
+      const back = mutating(fx.calls).map(call => call.join(' '))
+
+      // #then it is chowned to the sandbox on the way in and back on the way out
+      expect(argv.some(line => line.includes(`find -P ${stateHome} -xdev -user ${manifest.ids.runnerUid} -exec`))).toBe(
+        true,
+      )
+      expect(back.some(line => line.includes(`find -P ${stateHome} -xdev -user ${SANDBOX_UID} -exec`))).toBe(true)
+      // #and nothing inside the checkout was denied to the sandbox
+      expect(argv.some(line => line.includes(`u:${SANDBOX_UID}:--- ${manifest.workspace}/`))).toBe(false)
+      expect(outcome.status).toBe('restored')
+    })
+  })
+
   it('rolls back what it recorded when a step fails partway, and reports the failure', async () => {
     // #given the checkout ACL step failing, after the locks were applied
     fx.failWhen.predicate = argv => argv[0] === TOOLS.setfacl && argv.includes(`u:${SANDBOX_UID}:rwX`)
