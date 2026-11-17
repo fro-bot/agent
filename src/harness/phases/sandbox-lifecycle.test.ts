@@ -211,6 +211,17 @@ function lateStart() {
   return {ready, stop, proxy}
 }
 
+/** The user's file at `entry` is still a regular file holding `precious`, read through one no-follow handle. */
+function expectPreciousFile(entry: string): void {
+  const fd = fs.openSync(entry, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW)
+  try {
+    expect(fs.fstatSync(fd).isFile()).toBe(true)
+    expect(fs.readFileSync(fd, 'utf8')).toBe('precious')
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
 describe('createSandboxLifecycle', () => {
   let temp: string
   // Every lifecycle holds process-wide signal ownership until it is released; a test that never releases its own must not
@@ -673,8 +684,7 @@ describe('createSandboxLifecycle', () => {
       expect(harness.mocks.handOff).not.toHaveBeenCalled()
       expect(linkCalls(harness)).toEqual([])
       // #and the file is untouched
-      expect(fs.lstatSync(entry).isFile()).toBe(true)
-      expect(fs.readFileSync(entry, 'utf8')).toBe('precious')
+      expectPreciousFile(entry)
     })
 
     it('leaves the file alone when a later step of the setup would have failed too', async () => {
