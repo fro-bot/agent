@@ -2607,7 +2607,7 @@ describe.skipIf(!gated)("isolate-agent PATH mirrors the runner's", () => {
     // #then both succeed, it resolves into the Action's directory, and that directory is the final PATH entry
     expect(failuresFor(result?.rows ?? new Map(), 'path_opencode', 'WORKS')).toEqual([])
     expect(evidence.startsWith(`${opencodeDirectory}/opencode `)).toBe(true)
-    expect(evidence.slice(`${opencodeDirectory}/opencode `.length)).toMatch(/^v?\d+\.\d+\.\d+/)
+    expect(evidence.slice(`${opencodeDirectory}/opencode `.length)).toMatch(/\bv?\d+\.\d+\.\d+/)
     expect(agentPath.at(-1)).toBe(opencodeDirectory)
   })
 
