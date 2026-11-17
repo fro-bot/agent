@@ -74,6 +74,7 @@ function inputs(overrides: Partial<ActionInputs> = {}): ActionInputs {
     brokeredPushExtraPaths: [],
     repoSkills: false,
     isolateAgent: false,
+    agentStateHome: null,
     storeConfig: {enabled: false, bucket: '', region: '', prefix: 'fro-bot-state'},
     ...overrides,
   }
