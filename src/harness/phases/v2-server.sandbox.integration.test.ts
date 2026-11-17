@@ -22,7 +22,8 @@
  *   9. a launcher killed while the chain waits at its gate: nothing past the gate ran, and the teardown is not `restored`
  *      unless it confirmed the orphaned root process gone;
  *  10. the agent's PATH is the runner's: `node` and `uv` from the tool cache (put on PATH by `setup-node` and `setup-uv`)
- *      run in the agent's shell and report what they report to the runner;
+ *      run in the agent's shell and report what they report to the runner, and the Action's own OpenCode directory is last,
+ *      so `opencode` resolves there;
  *  11. `bun` and `pnpm` run for the agent from their install roots under the runner home, installs work, nothing else in the
  *      home becomes readable, the roots stay read-only, and take-back leaves no ACL entry for the agent's uid;
  *  12. `agent-state-home` inside the checkout, with the runner's own state elsewhere: the agent's state lands in the checkout,
@@ -213,6 +214,8 @@ interface IsolatedRunOptions {
   readonly steps: readonly Probe[]
   readonly logger: Logger
   readonly ghConfigDir?: string
+  /** The directory of the Action's own OpenCode binary, which the agent's `PATH` gets last. */
+  readonly opencodeDirectory?: string
   readonly repoSkills?: {readonly stagingRoot: string; readonly admittedDir: string | null}
   /** The `agent-state-home` input, resolved: an absolute directory inside `workspace`. */
   readonly agentStateHome?: string
@@ -234,6 +237,7 @@ async function runIsolated(options: IsolatedRunOptions): Promise<IsolatedRunResu
     tools: options.tools,
     env: options.env,
     runnerPath: options.env.PATH,
+    opencodeDirectory: options.opencodeDirectory ?? null,
     runnerHome,
     workspacePath: options.workspace,
     responseDir: options.responseDir,
@@ -2520,6 +2524,8 @@ describe.skipIf(!gated)("isolate-agent PATH mirrors the runner's", () => {
   const responseDir = path.join(scratch, 'response')
   const keyDir = path.join(scratch, 'keys')
   const env = hostedEnv(workspace, xdgRoot)
+  // What setup resolved: the suite's pinned binary, in a directory no runner PATH entry names.
+  const opencodeDirectory = path.dirname(BINARY ?? '')
 
   let result: IsolatedRunResult | undefined
   const expected = {
@@ -2547,6 +2553,12 @@ describe.skipIf(!gated)("isolate-agent PATH mirrors the runner's", () => {
       cmd: 'p=$(command -v git); case "$p" in /*) R path_system WORKS "$p";; *) R path_system FAILED "git not found";; esac',
     },
     {
+      // Nothing on the runner's PATH provides `opencode`, so it resolves only through the Action's directory, appended last.
+      id: 'path_opencode',
+      category: 'works',
+      cmd: 'p=$(command -v opencode); v=$(opencode --version 2>&1 | head -1); [ -n "$p" ] && [ -n "$v" ] && R path_opencode WORKS "$p $v" || R path_opencode FAILED "opencode did not run"',
+    },
+    {
       id: 'path_value',
       category: 'info',
       cmd: 'R path_value INFO "$PATH"',
@@ -2558,7 +2570,7 @@ describe.skipIf(!gated)("isolate-agent PATH mirrors the runner's", () => {
     fs.mkdirSync(responseDir, {recursive: true})
     const keyFile = writeKeyFile(keyDir)
     initWorkspace(workspace)
-    result = await runIsolated({tools, env, workspace, responseDir, keyFile, steps, logger})
+    result = await runIsolated({tools, env, workspace, responseDir, keyFile, steps, logger, opencodeDirectory})
   }, 600_000)
 
   afterAll(() => {
@@ -2584,6 +2596,18 @@ describe.skipIf(!gated)("isolate-agent PATH mirrors the runner's", () => {
     // #then both match what the runner resolves and reports
     expect(failuresFor(result?.rows ?? new Map(), 'path_uv', 'WORKS')).toEqual([])
     expect(result?.rows.get('path_uv')?.[0]?.evidence).toBe(`${expected.uvVersion} ${expected.uvPath}`)
+  })
+
+  it('finds the Action’s own opencode, last on the PATH, and it runs', () => {
+    // #given `command -v opencode` and `opencode --version` in the agent's shell, with the runner's PATH holding no opencode
+    const evidence = result?.rows.get('path_opencode')?.[0]?.evidence ?? ''
+    const agentPath = (result?.rows.get('path_value')?.[0]?.evidence ?? '').split(':')
+
+    // #then both succeed, it resolves into the Action's directory, and that directory is the final PATH entry
+    expect(failuresFor(result?.rows ?? new Map(), 'path_opencode', 'WORKS')).toEqual([])
+    expect(evidence.startsWith(`${opencodeDirectory}/opencode `)).toBe(true)
+    expect(evidence.length).toBeGreaterThan(`${opencodeDirectory}/opencode `.length)
+    expect(agentPath.at(-1)).toBe(opencodeDirectory)
   })
 
   it('still resolves the system tools', () => {

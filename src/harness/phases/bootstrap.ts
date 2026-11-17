@@ -168,7 +168,14 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
     responseFilePathCandidates: responseFile?.responseFilePathCandidates ?? null,
     trustedHeadSha: inputs.trustedHeadSha,
     sandboxTools,
-    sandbox: createRunSandbox(sandboxTools, responseFile?.responseFilePath ?? null, runnerPath, inputs.agentStateHome),
+    sandbox: createRunSandbox(
+      sandboxTools,
+      responseFile?.responseFilePath ?? null,
+      runnerPath,
+      // `opencodeResult.path` is the executable setup resolved; the agent's `PATH` wants its directory.
+      path.isAbsolute(opencodeResult.path) ? path.dirname(opencodeResult.path) : null,
+      inputs.agentStateHome,
+    ),
   }
 }
 
@@ -177,6 +184,7 @@ function createRunSandbox(
   tools: SandboxToolPaths | null,
   responseFilePath: string | null,
   runnerPath: string | undefined,
+  opencodeDirectory: string | null,
   agentStateHome: string | null,
 ): SandboxLifecycle | null {
   if (tools === null) return null
@@ -185,6 +193,7 @@ function createRunSandbox(
     tools,
     env: process.env,
     runnerPath,
+    opencodeDirectory,
     workspacePath: getGitHubWorkspace(),
     agentStateHome,
     responseDir: responseFilePath === null ? null : path.dirname(responseFilePath),

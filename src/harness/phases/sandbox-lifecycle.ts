@@ -201,6 +201,12 @@ export interface SandboxLifecycleOptions {
    * `PATH` is built from this value alone: the live environment's is never read here. Required, so a caller cannot forget it.
    */
   readonly runnerPath: string | undefined
+  /**
+   * The directory of the OpenCode binary the Action itself resolved (setup's `core.addPath` put it on the live `PATH`, after
+   * `runnerPath` was captured). Appended to the very end of the agent's `PATH`, so the agent's shell has `opencode` when
+   * nothing else provides it and never shadows a tool from an earlier step. Null or absent when the path is unknown.
+   */
+  readonly opencodeDirectory?: string | null
   /** The run-scoped response directory, or null when the delivery has none. */
   readonly responseDir: string | null
   /** The run-scoped attachment directory (created here so default ACLs cover files the runner writes later). */
@@ -470,6 +476,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   // The agent's `PATH` is built from the runner's as captured at the start of the run, before setup added the Action's own
   // OpenCode directory. The trusted runner-side `PATH`s (trusted git, `TRUSTED_TOOL_DIRS`) are separate and unchanged.
   const {runnerPath} = options
+  const opencodeDirectory = options.opencodeDirectory ?? null
   const viewLauncher = options.viewLauncher ?? {
     nodePath: process.execPath,
     builderPath: fileURLToPath(new URL('./sandbox-view.js', import.meta.url)),
@@ -1018,7 +1025,10 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
 
       // Install roots of bun and pnpm under the runner home: read and execute for the sandbox, so the tools on its `PATH`
       // resolve. Decided from the same `PATH` the agent gets.
-      const agentPath = buildSandboxPath(runnerPath, deps.isDirectory)
+      if (opencodeDirectory === null) {
+        logger.debug('OpenCode directory is unknown; the agent PATH does not get it', {})
+      }
+      const agentPath = buildSandboxPath(runnerPath, deps.isDirectory, opencodeDirectory)
       const installRoots = await deps.resolveToolRoots({
         runnerHome,
         runnerUid: ids.uid,
