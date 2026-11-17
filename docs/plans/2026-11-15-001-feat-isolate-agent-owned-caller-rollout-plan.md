@@ -345,9 +345,16 @@ Other repo fixes:
 - yield-farmer needed `output-mode: branch-pr` restored for the v0.43 to v0.144 jump.
 - github.io, marcusrbrown.com and tokentoilet first needed their pre-existing red checks fixed (github.io#507, .com#611, tokentoilet#1687).
 
-Still open:
-- The first real post-merge push runs: infra `fro-bot-storage`, bfra-me/works autoheal, yield-farmer's schedule, github.io `fro-bot-scheduled`, and fro-bot/.github's comment path.
-- marcusrbrown/systematic `connect.yaml` stays unisolated. It would pass the preflight, but the Action overrides the workflow's `XDG_STATE_HOME`, so the run record lands in the agent's home, and its nested clones aren't trusted for git. It needs its own design.
+Post-merge gates (2026-11-16), all run as uid 999 and restored:
+- infra `fro-bot-storage` pushed with a plain `git push` and opened infra#1943 (run 43799401388).
+- bfra-me/works autoheal (run 43861735973) and yield-farmer's schedule (run 43898344187) had nothing to push.
+- github.io `fro-bot-scheduled` and `live-audit-discovery` used browsers from the tool cache (run 43799444954).
+
+Systematic `connect.yaml` needed two more Action changes:
+- **v0.145.0 (#2245):** an `agent-state-home` input that hands a checkout directory over as the agent's `XDG_STATE_HOME`, trust for repos cloned under the checkout, and take-back of nested handed-over roots.
+- **#2251:** the Action's own `opencode` appended to the isolated agent's PATH. Run 1 of the probe failed the skill's `opencode --version` host check without it.
+
+A probe of the exact layout (systematic run 44020084504) completed: the run record, the ledger and the nested checkouts all worked under isolation.
 
 ## System-Wide Impact
 
