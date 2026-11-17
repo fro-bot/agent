@@ -104,4 +104,53 @@ describe('buildSandboxPath', () => {
     // #then a space is fine in a path, and the value never starts or ends with a colon
     expect(result).toBe('/opt/a b:/usr/local/bin:/usr/bin:/bin')
   })
+  describe('with the Action’s own OpenCode directory', () => {
+    const OPENCODE = '/opt/hostedtoolcache/opencode/1.19.5/x64'
+
+    it('appends it last, after the system directories', () => {
+      // #given a runner PATH that does not hold the OpenCode directory
+      const result = buildSandboxPath('/opt/hostedtoolcache/node/24/x64/bin:/usr/bin', everyDirectory, OPENCODE)
+
+      // #then it is the final entry, behind the runner's entries and the missing system directories
+      expect(result).toBe(`/opt/hostedtoolcache/node/24/x64/bin:/usr/bin:/usr/local/bin:/bin:${OPENCODE}`)
+    })
+
+    it('leaves an earlier entry that also holds opencode ahead of it', () => {
+      // #given an earlier step's directory (it may hold its own opencode) on the runner PATH
+      const result = buildSandboxPath('/opt/earlier-step/bin:/usr/bin', everyDirectory, OPENCODE)
+      const entries = result.split(':')
+
+      // #then that directory still resolves first
+      expect(entries.indexOf('/opt/earlier-step/bin')).toBeLessThan(entries.indexOf(OPENCODE))
+      expect(entries.at(-1)).toBe(OPENCODE)
+    })
+
+    it('adds it once when the runner PATH already holds it, keeping its earlier position', () => {
+      // #given a runner PATH that already has the directory (a trailing slash included)
+      const result = buildSandboxPath(`/opt/a:${OPENCODE}/:/usr/bin`, everyDirectory, OPENCODE)
+
+      // #then there is one copy, where the runner put it
+      expect(result).toBe(`/opt/a:${OPENCODE}:/usr/bin:/usr/local/bin:/bin`)
+    })
+
+    it('skips it when none is known', () => {
+      // #given no directory, or one that is not usable
+      const without = buildSandboxPath('/opt/a', everyDirectory)
+
+      // #then the PATH is the same as before
+      expect(buildSandboxPath('/opt/a', everyDirectory, null)).toBe(without)
+      expect(buildSandboxPath('/opt/a', everyDirectory, undefined)).toBe(without)
+      expect(buildSandboxPath('/opt/a', everyDirectory, '')).toBe(without)
+      expect(buildSandboxPath('/opt/a', everyDirectory, 'relative/bin')).toBe(without)
+      expect(buildSandboxPath('/opt/a', everyDirectory, '/opt/bad\nbin')).toBe(without)
+    })
+
+    it('skips it when it is not an existing directory', () => {
+      // #given a check that does not know the directory
+      const result = buildSandboxPath('/opt/a', dir => dir !== OPENCODE, OPENCODE)
+
+      // #then
+      expect(result).toBe('/opt/a:/usr/local/bin:/usr/bin:/bin')
+    })
+  })
 })

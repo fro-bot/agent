@@ -8,6 +8,9 @@ import {DEFAULT_OPENCODE_VERSION} from '../../shared/constants.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {err, ok} from '../../shared/types.js'
 
+/** The executable setup resolved: `ensureOpenCodeAvailable` returns the binary path, not the install directory. */
+const OPENCODE_BINARY = '/opt/hostedtoolcache/opencode/1.19.5/x64/opencode'
+
 const mocks = vi.hoisted(() => ({
   setFailed: vi.fn(),
   saveState: vi.fn(),
@@ -119,6 +122,7 @@ describe('runBootstrap response-delivery wiring', () => {
 
     mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs()})
     mocks.ensureOpenCodeAvailable.mockResolvedValue({
+      path: OPENCODE_BINARY,
       version: DEFAULT_OPENCODE_VERSION,
     })
     mocks.assertNoPersistedGitCredentials.mockResolvedValue(ok(undefined))
@@ -403,6 +407,7 @@ describe('runBootstrap git-credential-check wiring', () => {
 
     mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs()})
     mocks.ensureOpenCodeAvailable.mockResolvedValue({
+      path: OPENCODE_BINARY,
       version: DEFAULT_OPENCODE_VERSION,
     })
     mocks.assertNoPersistedGitCredentials.mockResolvedValue(ok(undefined))
@@ -515,7 +520,7 @@ describe('runBootstrap isolate-agent preflight', () => {
     vi.stubEnv('RUNNER_TEMP', runnerTempDir)
     mocks.githubContext.eventName = 'issues'
     mocks.randomUUID.mockReturnValue('test-nonce')
-    mocks.ensureOpenCodeAvailable.mockResolvedValue({version: DEFAULT_OPENCODE_VERSION})
+    mocks.ensureOpenCodeAvailable.mockResolvedValue({path: OPENCODE_BINARY, version: DEFAULT_OPENCODE_VERSION})
     mocks.assertNoPersistedGitCredentials.mockResolvedValue(ok(undefined))
   })
 
@@ -661,6 +666,26 @@ describe('runBootstrap isolate-agent preflight', () => {
     expect(options.runnerPath).toBe(before)
   })
 
+  it('hands the lifecycle the directory of the OpenCode binary setup installed', async () => {
+    // #given a setup that installed the binary at a tool-cache path
+    mocks.ensureOpenCodeAvailable.mockResolvedValue({
+      path: OPENCODE_BINARY,
+      version: '1.19.5',
+      didSetup: true,
+    })
+    mocks.createSandboxLifecycle.mockReturnValue({prepare: vi.fn(), release: vi.fn(), launch: vi.fn()})
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: true})})
+    mocks.runSandboxPreflight.mockResolvedValue({ok: true, tools})
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when bootstrap runs
+    await runBootstrap(createMockLogger())
+
+    // #then the lifecycle gets the binary's directory, not the live PATH
+    const options = mocks.createSandboxLifecycle.mock.calls[0]?.[0] as {opencodeDirectory: string | null | undefined}
+    expect(options.opencodeDirectory).toBe(path.dirname(OPENCODE_BINARY))
+  })
+
   it('hands the lifecycle an undefined PATH when the runner had none, not the one setup made', async () => {
     // #given no PATH, and a setup that creates one
     vi.stubEnv('PATH', undefined)
@@ -738,7 +763,7 @@ describe('runBootstrap gh config directory recording (#2156)', () => {
     vi.clearAllMocks()
     mocks.githubContext.eventName = 'schedule'
     mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({responseMode: 'github'})})
-    mocks.ensureOpenCodeAvailable.mockResolvedValue({version: DEFAULT_OPENCODE_VERSION})
+    mocks.ensureOpenCodeAvailable.mockResolvedValue({path: OPENCODE_BINARY, version: DEFAULT_OPENCODE_VERSION})
     mocks.assertNoPersistedGitCredentials.mockResolvedValue(ok(undefined))
   })
 
