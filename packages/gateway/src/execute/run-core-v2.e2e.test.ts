@@ -31,8 +31,9 @@ import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
-import {createOwnershipLedger, createRemoteOpenCodeV2Client, startOpenCodeV2Server} from '@fro-bot/runtime'
-import {afterAll, describe, expect, it, vi} from 'vitest'
+import {createOwnershipLedger, createRemoteOpenCodeV2Client, mapV2Event, startOpenCodeV2Server} from '@fro-bot/runtime'
+import {SUBAGENT_NOTICE_ENQUEUED_FRAME} from '@fro-bot/runtime/event-v2-fixtures'
+import {afterAll, beforeAll, describe, expect, it, vi} from 'vitest'
 
 import {createPermissionCoordinator} from '../approvals/coordinator.js'
 import {createRunGrants, scopeAlwaysToRun} from '../approvals/run-grants.js'
@@ -840,4 +841,191 @@ describe.skipIf(!hasBinary)('the wait reason on a real run with a background sub
     expect(seenReasons(timeline)).not.toContain('awaiting-background-task')
     expect(timeline.changes.at(-1)?.wire).toBe('cleared')
   }, 120_000)
+})
+
+// --- The wire of one background-child lifecycle (fro-bot/agent#2191, assumptions A5 and A6) ------------------------------
+
+/** The slice of a raw event frame the probes below read. Everything else on the frame is left alone. */
+interface WireFrame {
+  readonly id?: string
+  readonly type: string
+  readonly location?: unknown
+  readonly durable?: unknown
+  readonly data?: {
+    readonly sessionID?: string
+    readonly parentID?: string
+    readonly inboxID?: string
+    readonly item?: {
+      readonly type?: string
+      readonly delivery?: string
+      readonly payload?: {
+        readonly text?: string
+        readonly description?: string
+        readonly metadata?: Readonly<Record<string, unknown>>
+      }
+    }
+  }
+}
+
+interface ActiveSample {
+  /** Ids of the sessions `GET /api/session/active` listed, with their status. */
+  readonly listed: Readonly<Record<string, string>>
+}
+
+interface BackgroundChildCapture {
+  readonly rootId: string
+  readonly childId: string
+  /** Every frame the raw client's stream yielded, in order, from before the session was created to the end. */
+  readonly frames: readonly WireFrame[]
+  /** `session.active` read every 100 ms for 4 s, starting once the root's first execution had succeeded. */
+  readonly whileChildRuns: readonly ActiveSample[]
+  /** `GET /api/session/:root/message` after the lifecycle ended. */
+  readonly rootMessages: readonly {
+    readonly id: string
+    readonly type: string
+    readonly metadata?: Readonly<Record<string, unknown>>
+  }[]
+}
+
+/**
+ * Runs the scripted lifecycle once: the root dispatches ONE background subagent (which runs a foreground `sleep 8` and
+ * answers DONE) and ends its turn; the child's completion notice wakes the root, which answers again. The stream is read
+ * with the raw client the Action and the gateway use, subscribed before anything is sent.
+ */
+async function captureBackgroundChildLifecycle(): Promise<BackgroundChildCapture> {
+  const stock = await startStockServer(() => subagentRouter({dispatch: true}), [])
+  const abort = new AbortController()
+  const subscribed = await stock.client.subscribeEvents({directory: stock.repo, signal: abort.signal})
+  if (!subscribed.success) throw new Error('the raw event stream did not open')
+  const frames: WireFrame[] = []
+  const pump = (async () => {
+    try {
+      for await (const frame of subscribed.data) frames.push(frame as WireFrame)
+    } catch {
+      // The abort at the end of the capture, or a lost stream: the assertions read what arrived.
+    }
+  })()
+  cleanups.push(async () => {
+    abort.abort()
+    await pump
+  })
+  const created = await stock.client.createSession({directory: stock.repo})
+  if (!created.success) throw new Error('session create failed')
+  const rootId = created.data.id
+  const prompted = await stock.client.prompt({sessionId: rootId, text: 'dispatch the sleeper', directory: stock.repo})
+  if (!prompted.success) throw new Error('prompt failed')
+
+  const rootSucceeded = (): number =>
+    frames.filter(frame => frame.type === 'session.execution.succeeded' && frame.data?.sessionID === rootId).length
+  const until = async (predicate: () => boolean, timeoutMs: number): Promise<void> => {
+    const deadline = Date.now() + timeoutMs
+    while (!predicate() && Date.now() < deadline) await sleep(50)
+  }
+
+  // The root's first execution ends after about half a second; the child sleeps 8 s, so the next 4 s are the window in
+  // which the root is idle and its only activity is the background child.
+  await until(() => rootSucceeded() >= 1, 20_000)
+  const whileChildRuns: ActiveSample[] = []
+  const windowEnd = Date.now() + 4000
+  while (Date.now() < windowEnd) {
+    whileChildRuns.push({
+      listed: Object.fromEntries(Object.entries(await stock.client.session.active()).map(([id, v]) => [id, v.type])),
+    })
+    await sleep(100)
+  }
+  // The child's completion wakes the root a second time.
+  await until(() => rootSucceeded() >= 2, 40_000)
+  const messages = await fetch(`${stock.baseUrl}/api/session/${rootId}/message`, {
+    headers: {authorization: stock.authorization},
+  })
+  const rootMessages = ((await messages.json()) as {data: BackgroundChildCapture['rootMessages']}).data
+  abort.abort()
+
+  const childCreated = frames.find(frame => frame.type === 'session.created' && frame.data?.parentID === rootId)
+  const childId = childCreated?.data?.sessionID
+  if (childId === undefined) throw new Error('no child session was created')
+  return {rootId, childId, frames, whileChildRuns, rootMessages}
+}
+
+describe.skipIf(!hasBinary)('one background-child lifecycle on the real server (fro-bot/agent#2191)', () => {
+  let capture: BackgroundChildCapture
+
+  beforeAll(async () => {
+    capture = await captureBackgroundChildLifecycle()
+  }, 120_000)
+
+  it('a5: session.active lists the running child but not its idle parent, whose only activity is that child', () => {
+    // #given the samples taken while the root was idle and the 8 s child was running
+    // #then the window was sampled at length, and every sample lists the child as running and does not list the root
+    expect(capture.whileChildRuns.length).toBeGreaterThanOrEqual(10)
+    for (const sample of capture.whileChildRuns) {
+      expect(sample.listed[capture.childId]).toBe('running')
+      expect(sample.listed[capture.rootId]).toBeUndefined()
+    }
+  })
+
+  it('a6: the child ends with exactly one synthetic notice frame, its delivery and one persisted notice, all one inbox id', () => {
+    // #given the frames of the whole lifecycle
+    const enqueued = capture.frames.filter(frame => frame.type === 'session.inbox.enqueued')
+    const notices = enqueued.filter(frame => frame.data?.item?.type === 'synthetic')
+
+    // #then there is ONE notice among the enqueued items: the other two are the user prompts of the root and the child
+    expect(
+      enqueued.map(frame => frame.data?.item?.type).toSorted((a, b) => String(a).localeCompare(String(b))),
+    ).toEqual(['synthetic', 'user', 'user'])
+    expect(notices).toHaveLength(1)
+    const [notice] = notices as [WireFrame]
+    // #and it is addressed to the root and carries the child's result and the metadata the mapper reads, with the
+    // `steer` delivery the derived fixture assumed
+    expect(notice.data).toMatchObject({
+      sessionID: capture.rootId,
+      item: {
+        type: 'synthetic',
+        delivery: 'steer',
+        payload: {
+          description: 'sleeper',
+          metadata: {source: 'subagent', childID: capture.childId, agent: 'General', state: 'completed'},
+        },
+      },
+    })
+    expect(notice.data?.item?.payload?.text).toContain(`<subagent sessionID="${capture.childId}" state="completed"`)
+    // #and the frame carries no `location` (unlike the user-prompt items), and has the same item and payload keys as the
+    // derived fixture `SUBAGENT_NOTICE_ENQUEUED_FRAME`
+    expect(notice.location).toBeUndefined()
+    const derived = (SUBAGENT_NOTICE_ENQUEUED_FRAME as {data: {item: {payload: object}}}).data
+    expect(Object.keys(notice.data?.item ?? {}).toSorted()).toEqual(Object.keys(derived.item).toSorted())
+    expect(Object.keys(notice.data?.item?.payload ?? {}).toSorted()).toEqual(
+      Object.keys(derived.item.payload).toSorted(),
+    )
+
+    // #and the production mapper reads the real frame as a completed-child notice for the root, carrying the inbox id
+    expect(mapV2Event(notice)).toMatchObject({
+      kind: 'subagent_notice',
+      sessionId: capture.rootId,
+      notice: {childSessionId: capture.childId, state: 'completed', agent: 'General', description: 'sleeper'},
+      inboxId: notice.data?.inboxID,
+    })
+
+    // #and it was delivered once, after it was enqueued, and woke the root: a second execution of the root started
+    const inboxId = notice.data?.inboxID
+    const delivered = capture.frames.filter(
+      frame => frame.type === 'session.inbox.delivered' && frame.data?.inboxID === inboxId,
+    )
+    expect(delivered).toHaveLength(1)
+    const order = (frame: WireFrame): number => capture.frames.indexOf(frame)
+    expect(order(delivered[0] as WireFrame)).toBeGreaterThan(order(notice))
+    const rootStarts = capture.frames.filter(
+      frame => frame.type === 'session.execution.started' && frame.data?.sessionID === capture.rootId,
+    )
+    expect(rootStarts).toHaveLength(2)
+    expect(order(rootStarts[1] as WireFrame)).toBeGreaterThan(order(notice))
+
+    // #and the live stream carries no separate `session.synthetic` frame for it
+    expect(capture.frames.filter(frame => frame.type === 'session.synthetic')).toEqual([])
+
+    // #and the root's history holds exactly one persisted notice, under the same id as the inbox item
+    const persisted = capture.rootMessages.filter(message => message.type === 'synthetic')
+    expect(persisted.map(message => message.id)).toEqual([inboxId])
+    expect(persisted[0]?.metadata).toMatchObject({source: 'subagent', childID: capture.childId, state: 'completed'})
+  })
 })
