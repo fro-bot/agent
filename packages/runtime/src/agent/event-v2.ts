@@ -1,5 +1,6 @@
 import type {Logger} from '../shared/logger.js'
 import type {ShellNoticeRead, ShellNoticeState, V2ShellStatus} from './shell-notice.js'
+import type {SubagentNoticeObservation} from './subagent-notice-observation.js'
 import type {SubagentNotice, SubagentNoticeRead} from './subagent-notice.js'
 
 import {
@@ -10,6 +11,7 @@ import {
   ownValue,
 } from './payload-accessors.js'
 import {classifyShellNotice, classifyShellNoticeItem, isShellStatus} from './shell-notice.js'
+import {observeSubagentNotice, observeSubagentNoticeItem} from './subagent-notice-observation.js'
 import {classifySubagentNotice, classifySubagentNoticeItem} from './subagent-notice.js'
 
 /**
@@ -194,6 +196,8 @@ export type V2DomainEvent =
       readonly kind: 'subagent_notice'
       readonly sessionId: string
       readonly notice: SubagentNotice
+      /** How the notice looked on arrival, for the log only. Never an input to settlement. */
+      readonly observation: SubagentNoticeObservation
       readonly inboxId: string | null
     }
   /**
@@ -245,6 +249,8 @@ export type V2DomainEvent =
       readonly childSessionId?: string
       /** Set for a shell job notice that could not be read and still named its shell; the loop fences that shell. */
       readonly shellId?: string
+      /** Set for a subagent notice that could not be read: how it looked, for the log only. */
+      readonly subagentObservation?: SubagentNoticeObservation
     }
 
 /** Stable identity of an inner call of an `execute` tool call. */
@@ -525,12 +531,13 @@ function mapNotice(
   type: string,
   data: unknown,
   read: SubagentNoticeRead,
+  observation: SubagentNoticeObservation,
   inboxId: string | null,
 ): V2DomainEvent | null {
   const sessionId = getStringProperty(data, 'sessionID')
   if (read.kind === 'none') return null
   if (read.kind === 'notice') {
-    return sessionId === null ? null : {kind: 'subagent_notice', sessionId, notice: read.notice, inboxId}
+    return sessionId === null ? null : {kind: 'subagent_notice', sessionId, notice: read.notice, observation, inboxId}
   }
   // A notice the server sent that this reader cannot take. Dropping it would leave its child unaccounted for.
   return {
@@ -539,6 +546,7 @@ function mapNotice(
     sessionId,
     reason: 'unreadable subagent notice',
     ...(read.childSessionId === null ? {} : {childSessionId: read.childSessionId}),
+    subagentObservation: observation,
   }
 }
 
@@ -686,7 +694,7 @@ export function mapV2Event(frame: unknown): V2DomainEvent | null {
       const subagent = classifySubagentNoticeItem(item)
       return subagent.kind === 'none'
         ? mapShellNotice(type, data, classifyShellNoticeItem(item), inboxId)
-        : mapNotice(type, data, subagent, inboxId)
+        : mapNotice(type, data, subagent, observeSubagentNoticeItem(item), inboxId)
     }
 
     case 'session.inbox.delivered': {
@@ -699,7 +707,7 @@ export function mapV2Event(frame: unknown): V2DomainEvent | null {
       const subagent = classifySubagentNotice(data)
       return subagent.kind === 'none'
         ? mapShellNotice(type, data, classifyShellNotice(data), null)
-        : mapNotice(type, data, subagent, null)
+        : mapNotice(type, data, subagent, observeSubagentNotice(data), null)
     }
 
     default:
