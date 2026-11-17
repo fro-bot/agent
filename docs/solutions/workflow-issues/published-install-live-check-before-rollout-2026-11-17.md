@@ -33,7 +33,7 @@ The hosted-runner integration suite for `isolate-agent` passed on every pull req
 
 ## Guidance
 
-Before calling an Action change done, run the published tag from a real caller. Then roll out per caller, with one live proof per distinct pattern.
+Before rolling an Action change out, run it from a real caller workflow as a published install. A caller can pin the candidate commit (`uses: fro-bot/agent@<sha>`): `dist/` is committed, so the runner installs it in the same layout as a release. Check the released tag the same way before enabling it across callers. Then roll out per caller, with one live proof per distinct pattern.
 
 **What only a published-install run showed**
 
@@ -70,13 +70,7 @@ A passing check proves only what it can observe. The suite could not observe the
 
 ## Examples
 
-After each live find, make the suite reproduce it, so the next change is caught before release. The real-runner suite now replays checkout's own commands instead of a hand-written config:
-
-```ts
-git(workspace, "config", "--local", "lfs.repositoryformatversion", "0")
-git(workspace, "config", "--local", "extensions.worktreeConfig", "true")
-git(workspace, "sparse-checkout", "disable")
-```
+After each live find, make the suite reproduce it, so the next change is caught before release. For the git config keys, the real-runner suite now replays `actions/checkout`'s own commands instead of a hand-written config. The commands are in [Runner-side git after an untrusted process wrote to the checkout](../best-practices/restore-and-audit-git-metadata-before-runner-side-git-2026-11-17.md).
 
 ## Related
 

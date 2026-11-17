@@ -55,7 +55,7 @@ What didn't work:
 
 A read-only allowlist needs no per-file bookkeeping, so there is no denylist to keep complete. The check reads the kernel's own mount table, so a mount the remount pass missed fails the launch instead of passing silently. After the drop the agent has no groups, no capabilities and `NoNewPrivs`, so it cannot remount anything.
 
-The view is not the whole boundary. The checkout stays writable by design, so runner-side git there needs its own controls, and stopping the launch needs positive proof that every process is gone.
+The view limits filesystem writes. It does not limit network egress or reads, it has no PID namespace and no reduced `/dev`, and it does not detect hardlinks that existed before the run. The checkout and the other approved roots stay writable by design, so runner-side git there needs its own controls, and stopping the launch needs positive proof that every process is gone.
 
 ## When to Apply
 

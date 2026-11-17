@@ -62,7 +62,9 @@ If a stop is wrongly believed complete, an orphaned root process can keep changi
 
 ## When to Apply
 
-Use this whenever code starts a process across a privilege boundary and later has to prove that process and its descendants are gone. Do not rely on pids, process groups or uids alone. A wrapper's death never proves its child stopped.
+Use this for a privileged launch that is created inside its own mount namespace and whose processes cannot leave it or create another one. Here the agent has no capabilities and `NoNewPrivs` after the drop, so it cannot. Capture the namespace before admitting the launch, and fail closed when the stop cannot be confirmed. A launch that shares the host's mount namespace, or whose processes can make new namespaces, needs a containment mechanism that covers those descendants; an empty namespace proves nothing about them.
+
+In every case, do not rely on pids, process groups or uids alone. A wrapper's death never proves its child stopped.
 
 ## Examples
 

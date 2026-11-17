@@ -55,6 +55,7 @@ Treat plugin activation and the agent list as two separate waits.
 4. **One-shot scripts and test helpers poll too.** `deploy/scripts/v2-image-smoke.mjs` polls `/api/plugin` inside its existing deadline. The `listAgents` helper in `src/services/setup/ci-config-v2.integration.test.ts` waits for active plugins before it accepts an agent list.
 
 ```js
+let inactive = EXPECTED_PLUGIN_IDS
 await waitFor(
   "/api/plugin (expected plugins active)",
   async () => {
@@ -63,7 +64,9 @@ await waitFor(
     return inactive.length === 0 ? {done: true, value: true} : {done: false, note: `not active: ${inactive.join(", ")}`}
   },
   deadline,
-)
+).catch(() => {
+  throw new Error(`plugins not active: ${inactive.join(", ")}`)
+})
 ```
 
 ## Why This Works

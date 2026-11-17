@@ -38,7 +38,7 @@ Another user or another file mode does not fix this. The agent needs authenticat
 4. **Use `https.request`, not `fetch`.** undici keeps custom auth headers across a cross-origin redirect. A 3xx gets a local 502 and is never followed. An upstream 101 arrives on the `upgrade` event, not `response`; it gets the same 502.
 5. **Make error bodies redactable.** Always send `accept-encoding: identity` upstream, so an error body can be read and every raw and JSON-escaped occurrence of the key replaced. A compressed or oversized error body becomes a fixed generic error. Success responses pass a short fixed list of headers.
 6. **Attach the socket error handler before rejecting CONNECT and Upgrade.** Node detaches its own handler before those events fire, so a client reset on a rejected socket is otherwise an uncaught exception that kills the proxy. Destroy rejected sockets after a short linger so a half-open client cannot hold a connection slot.
-7. **Validate config by structure, not by a list of field names.** `findProviderBypass` in `src/services/setup/key-proxy-providers.ts` refuses an endpoint override (`baseURL`, `endpoint`, `api`) at any scope. `checkConfigForKeys` scans the final config text for every `auth-json` key value, raw and JSON-escaped, before the agent sees it. Credentials are not judged by field name.
+7. **Validate config by structure, not by a list of field names.** The provider's own base URL is the one endpoint setting that is accepted: the resolver validates it and uses it as the proxy's upstream, so the operator-selected upstream must be trusted with the real key. `findProviderBypass` in `src/services/setup/key-proxy-providers.ts` refuses every other endpoint or query override (`baseURL`, `endpoint`, `api`, `queryParams`) in nested scopes such as models and variants, which would route requests around the proxy. `checkConfigForKeys` scans the final config text for every `auth-json` key value, raw and JSON-escaped, before the agent sees it. Credentials are not judged by field name.
 8. **Fail on 401 only at start-up.** `probeKeyProxy` in `src/harness/phases/key-proxy-probe.ts` does one bounded GET on the selected provider's models route. A 401 fails the run. A 403 only warns, because it can be a scope, project or organisation limit on that one route.
 
 What didn't work:
@@ -56,6 +56,7 @@ What the agent can still reach is stated, not hidden: model spend through the pr
 ## When to Apply
 
 - When an untrusted-input agent must call an authenticated API and a separate process can hold the secret.
+- When the provider operations are known. An exact-match route table fails closed on any new route, method or query string a provider SDK starts to use, so someone has to update and test it with provider and SDK changes. It is the wrong design for arbitrary or fast-changing API access.
 - When adding a provider or a route, or touching `opencode-config` handling under `isolate-agent`.
 
 ## Examples
@@ -66,6 +67,7 @@ The real credential goes on last, so nothing copied from the client can override
 headers["accept-encoding"] = "identity"
 if (matched.route.auth === "x-api-key") {
   headers["x-api-key"] = matched.provider.key
+  headers["anthropic-version"] ??= "2023-06-01"
 } else {
   headers.authorization = `Bearer ${matched.provider.key}`
 }

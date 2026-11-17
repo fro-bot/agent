@@ -9,7 +9,7 @@ severity: high
 applies_when:
   - Copying files out of a git tree that contributors or a fork control into a path the agent or harness will read
   - Reading a tree on a CI runner where the checkout, its refs and its config are not trustworthy
-  - Bounding disk use before writing anything extracted from git
+  - Bounding what is extracted from a git tree before any of it is written
 tags:
   - git-cat-file
   - git-archive
@@ -30,8 +30,8 @@ The `repo-skills` input copies `.agents/skills` from a repository's default bran
 ## Guidance
 
 1. **Take the tree from a fresh private fetch, never from the checkout.** `stageDefaultBranchSkills` creates a throwaway bare repository under the staging root and fetches one commit of the default branch into a private ref. It first removes `GIT_DIR`, `GIT_WORK_TREE` and the other redirecting variables (`REDIRECTING_GIT_ENV`). No ref, config or object in the checkout is read, so an earlier step cannot plant or age one.
-2. **Read raw blobs, not `git archive`.** `git archive` applies committed `.gitattributes` (`export-subst`, `ident`, `eol`). About 12 KB of stored blobs can expand to megabytes, past a budget that measured stored sizes. One `git cat-file --batch` returns the bytes as stored. `parseCatFileBatch` checks each frame against the listing and refuses an over-budget frame before reading its body.
-3. **Budget before you write anything.** `git ls-tree -r -l -z -t <ref> -- .agents/skills` gives every path and size. Check entry, byte and depth limits against that listing, then read only the blobs you admit.
+2. **Read raw blobs, not `git archive`.** `git archive` applies committed `.gitattributes` (`export-subst`, `ident`, `eol`). About 12 KB of stored blobs can expand to megabytes, past a budget that measured stored sizes. One `git cat-file --batch` returns the bytes as stored. The command's output is buffered under a cap, and `parseCatFileBatch` then checks each frame against the listing and rejects an over-budget or inconsistent frame before its body is accepted.
+3. **Budget before you extract anything.** `git ls-tree -r -l -z -t <ref> -- .agents/skills` gives every path and size. Check entry, byte and depth limits against that listing, then read only the blobs you admit. This bounds what is extracted. It does not bound the fetch, which has already written the commit's objects; use a filesystem quota or another independent limit if fetch disk use is in scope.
 4. **Decode the listing strictly and refuse aliases.** Parse the raw `-z` bytes and decode each path with a fatal decoder:
 
    ```ts
@@ -42,10 +42,12 @@ The `repo-skills` input copies `.agents/skills` from a repository's default bran
 
 5. **Never write symlinks, and refuse submodules.** Symlink entries are counted, not written; the skills that contain one are rejected. `mkdir -p` follows a symlinked ancestor, and `O_NOFOLLOW` guards only the leaf, so files are created with `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW` into directories this code made itself.
 6. **Publish atomically.** Copy each skill into a private scratch directory, then rename it into the directory the consumer scans. A failed copy is never discoverable.
-7. **Budget per unit, not for the whole tree.** `selectSkillsWithinBudget` skips a skill that is over a limit on its own, or that would push the running total over, with one warning that names its id. The rest load. Structural problems (a submodule, an unsafe path, aliasing, a tampered blob stream) still refuse the whole source.
+7. **Keep the total budget, and decide what one oversized unit does.** Here the units are independent, so `selectSkillsWithinBudget` skips a skill that is over a limit on its own, or that would push the running total over, with one warning that names its id. The rest load, and the total limit still holds. Structural problems (a submodule, an unsafe path, aliasing, a tampered blob stream) still refuse the whole source. A consumer whose files depend on each other should refuse the whole bundle instead of loading part of it.
 8. **Check collisions against the name the consumer registers.** OpenCode registers a `skills.paths` skill under its directory name, not its frontmatter `name`. Reserved ids are matched against the directory name.
 
 ## Why This Matters
+
+These checks make staging resistant to filesystem and resource attacks. They do not make the content trustworthy: an admitted skill is still repository-controlled instruction text, and who may supply it is a separate decision (`src/features/agent/repo-skills-trust.ts`).
 
 Each shortcut fails quietly. Archive attributes make the written size differ from the budgeted size. A lossy decode lets two names address one path. An all-or-nothing budget lets one large skill block every other: on one repository a single 5.3 MB skill pushed the total to 5,372,686 bytes, over the 5 MiB limit, and no skill loaded (#2244).
 

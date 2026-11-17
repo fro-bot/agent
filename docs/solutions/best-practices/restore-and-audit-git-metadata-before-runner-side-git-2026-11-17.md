@@ -39,10 +39,10 @@ Switching keys off on the command line (`-c core.fsmonitor=false -c core.hooksPa
 Treat the metadata as untrusted and replace it. Treat the index, refs and objects as data.
 
 1. **Snapshot before the model starts, restore at take-back.** `snapshotGit` and `restoreGit` in `src/services/setup/sandbox-handoff.ts` cover `config`, `config.worktree`, `hooks/` and `info/`. Restore removes the model's copy and renames the snapshot over it. A rename needs no free space; a copy is used only across devices.
-2. **Audit the snapshot copy, not the live file.** `src/services/setup/git-snapshot-audit.ts` allows no symlinks or special files. Every config key must be on an allowlist of what `actions/checkout` writes. Git parses the copy itself:
+2. **Audit before the model starts.** `src/services/setup/git-snapshot-audit.ts` refuses symlinks and special files in the live metadata before it is copied. Nothing untrusted is running yet, so the live tree cannot change under the check. Config keys are then audited on the snapshot copy: every key must be on an allowlist of what `actions/checkout` writes. Git parses the copy itself:
 
    ```sh
-   git config --file <copy> --list --null --no-includes
+   git config --file "$copy" --list --null --no-includes
    ```
 
    A `remote.*.url` containing `::` is refused as a transport helper.
@@ -67,7 +67,9 @@ The cost of an allowlist is that it must match reality. The first release refuse
 
 ## When to Apply
 
-Apply this whenever a trusted process runs `git` in a directory an untrusted process could write. That includes later workflow steps, which inherit the restored config.
+Apply this whenever a trusted process runs `git` in a directory an untrusted process could write, after that process is confirmed stopped.
+
+The restore is one layer, not the whole control. The Action's own calls are safe because they also go through the hardened wrapper, pass command-specific flags and refuse populated submodules. A later workflow step sees the restored config, hooks and `info/`, but it does not inherit the wrapper. Its git commands still read an index, refs and a working tree the model wrote, so assess them one by one.
 
 ## Examples
 

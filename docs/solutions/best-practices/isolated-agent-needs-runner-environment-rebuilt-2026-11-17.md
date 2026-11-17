@@ -41,10 +41,10 @@ Almost all of the fixes are in the launch environment that `createSandboxLifecyc
 
 - Capture `process.env.PATH` before setup's `core.addPath`, so the Action's own directories cannot shadow tools from earlier steps (`runBootstrap` in `src/harness/phases/bootstrap.ts`).
 - `buildSandboxPath` in `src/services/setup/sandbox-toolchain-path.ts` keeps absolute existing directories in runner order, then the system directories, and puts the Action's OpenCode directory last.
-- After the handoff, one shell run as the agent keeps only the entries it can enter:
+- After the handoff, one shell run as the agent, with the candidate directories as its arguments, keeps only the entries it can enter:
 
   ```sh
-  for d do if [ -d "$d" ] && [ -x "$d" ]; then printf "%s\n" "$d"; fi; done
+  sh -c 'for d do if [ -d "$d" ] && [ -x "$d" ]; then printf "%s\n" "$d"; fi; done' sh /first/candidate /second/candidate
   ```
 
   An entry it cannot enter (`~/.cargo/bin`, `~/.dotnet/tools`) makes a missing command fail with EACCES and exit 126, where tests expect ENOENT and 127.
