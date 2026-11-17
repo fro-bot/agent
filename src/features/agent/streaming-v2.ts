@@ -25,6 +25,7 @@ import {
 import {extractCommitShas, extractGithubUrls} from '../../services/github/urls.js'
 import {outputTextContent, outputToolExecution} from '../../shared/console.js'
 import {toErrorMessage} from '../../shared/errors.js'
+import {classifyNoticeSettlement, createSubagentNoticeLog, readLedgerState} from './subagent-notice-log.js'
 import {toolArgumentV2} from './tool-argument-v2.js'
 
 /**
@@ -274,6 +275,8 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
   // A notice can precede the dispatch result on the stream; the child or shell is then settled the moment it is adopted.
   const noticedChildIds = new Set<string>()
   const noticedShellIds = new Set<string>()
+  // Diagnostic only: nothing below reads it back, so it cannot change what settles.
+  const noticeLog = createSubagentNoticeLog({logger, rootSessionId: sessionId})
   const prsCreated: string[] = []
   const commitsCreated: string[] = []
   const commentsPostedUrls: string[] = []
@@ -309,7 +312,10 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
     if (ownershipLedger === undefined || childSessionId === sessionId) return
     const known = ownershipLedger.isTracked(childSessionId)
     ownershipLedger.adopt(childSessionId, label)
-    if (noticedChildIds.has(childSessionId)) ownershipLedger.settle(childSessionId)
+    if (noticedChildIds.has(childSessionId)) {
+      if (readLedgerState(ownershipLedger, childSessionId) !== 'settled') noticeLog.settledOnAdoption(childSessionId)
+      ownershipLedger.settle(childSessionId)
+    }
     if (known) return
     logger.debug('Owned subagent session discovered; adopted into ownership ledger', {
       sessionId,
@@ -603,10 +609,21 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
       }
 
       case 'subagent_notice': {
+        const noticeEntry = {
+          parentSessionId: event.sessionId,
+          childSessionId: event.notice.childSessionId,
+          observation: event.observation,
+        }
         if (!isOwned(event.sessionId)) {
+          noticeLog.record({...noticeEntry, classification: 'deferred'})
           bufferUnattributed(event.sessionId, event)
           return true
         }
+        // Read before the notice is applied: the classification is what the ledger was when it arrived.
+        noticeLog.record({
+          ...noticeEntry,
+          classification: classifyNoticeSettlement(ownershipLedger, noticeEntry.childSessionId),
+        })
         noticedChildIds.add(event.notice.childSessionId)
         if (ownershipLedger !== undefined) settleLedgerFromSubagentNotice(ownershipLedger, event.notice)
         noteRootNotice(event.sessionId, event.inboxId)
@@ -691,6 +708,14 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
       }
 
       case 'malformed': {
+        if (event.subagentObservation !== undefined) {
+          noticeLog.record({
+            parentSessionId: event.sessionId,
+            childSessionId: event.childSessionId ?? null,
+            observation: event.subagentObservation,
+            classification: 'unreadable',
+          })
+        }
         // The mapper already logged the type and reason. A request nobody can read cannot be answered, so name it.
         if (event.eventType === 'permission.asked' || event.eventType === 'form.created') {
           logger.error('An unreadable OpenCode V2 request cannot be answered; its session may block', {
@@ -732,6 +757,9 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
   }
 
   flushText()
+  // The stream is stopped once the run releases (or at the attempt's end on a failed run): the ledger is as final as the
+  // Action will see it.
+  noticeLog.summarize(ownershipLedger)
   return snapshot()
 }
 

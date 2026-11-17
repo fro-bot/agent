@@ -22,7 +22,7 @@ import {
   TEXT_SESSION_ID,
 } from '@fro-bot/runtime/event-v2-fixtures'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
-import {createMockLogger} from '../../shared/test-helpers.js'
+import {createMockLogger, serializeLoggerCalls} from '../../shared/test-helpers.js'
 import {
   classifyV2Error,
   createActivityTrackerV2,
@@ -868,6 +868,274 @@ describe('processEventStreamV2', () => {
 
       // #then
       expect(consoleMock.outputToolExecution.mock.calls).toEqual([['execute', '']])
+    })
+  })
+})
+
+async function observe(items: readonly unknown[], ledger = createOwnershipLedger(), adopt = true) {
+  if (adopt) ledger.adopt(CHILD_SESSION_ID, 'child')
+  const logger = createMockLogger()
+  const open = openRun(items, {ownershipLedger: ledger, logger}, PARENT_SESSION_ID)
+  await open.settled
+  open.controller.abort()
+  await open.result
+  return {ledger, logger}
+}
+
+function noticeLines(logger: ReturnType<typeof createMockLogger>) {
+  return vi
+    .mocked(logger.info)
+    .mock.calls.filter(([message]) => message === 'Subagent notice observed')
+    .map(([, fields]) => fields)
+}
+
+function summaryLines(logger: ReturnType<typeof createMockLogger>) {
+  return vi
+    .mocked(logger.info)
+    .mock.calls.filter(([message]) => message === 'Subagent notices by child')
+    .map(([, fields]) => fields)
+}
+
+describe('subagent notice diagnostics', () => {
+  const SECRET_BODY = 'SECRET-BODY-ghp_0123456789abcdef'
+  const SECRET_DESCRIPTION = 'SECRET-DESCRIPTION-sk-live-123'
+
+  /** A notice to `parent`: the tag says `tagState`, `metadata.state` says `metadataState`. Delivered as `via`. */
+  function noticeFrame(options: {
+    readonly tagState: string
+    readonly metadataState: string
+    readonly parent?: string
+    readonly child?: string
+    readonly background?: boolean
+    readonly via?: 'inbox' | 'synthetic'
+    readonly inboxId?: string
+  }): unknown {
+    const {tagState, metadataState, parent = PARENT_SESSION_ID, child = CHILD_SESSION_ID, background = false} = options
+    const marker = background ? '\n\nBackground work still running:\n- shell (sh_1): sleep 45' : ''
+    const text = `<subagent sessionID="${child}" state="${tagState}" description="${SECRET_DESCRIPTION}">\n${SECRET_BODY}${marker}\n</subagent>`
+    const metadata = {source: 'subagent', childID: child, agent: 'General', state: metadataState}
+    if (options.via === 'synthetic') {
+      return frame('session.synthetic', {sessionID: parent, text, description: SECRET_DESCRIPTION, metadata})
+    }
+    return frame('session.inbox.enqueued', {
+      inboxID: options.inboxId ?? 'msg_notice_1',
+      sessionID: parent,
+      item: {type: 'synthetic', payload: {text, description: SECRET_DESCRIPTION, metadata}},
+    })
+  }
+
+  const midFlight = noticeFrame({tagState: 'running', metadataState: 'completed', background: true})
+  const terminal = noticeFrame({tagState: 'completed', metadataState: 'completed', inboxId: 'msg_notice_2'})
+
+  it('logs a tag that says running over metadata that says completed, as the two states they are', async () => {
+    // #given / #when the 2.3.0 mid-flight report arrives for a tracked child
+    const {logger} = await observe([midFlight])
+
+    // #then
+    expect(noticeLines(logger)).toEqual([
+      {
+        parentSessionId: PARENT_SESSION_ID,
+        childSessionId: CHILD_SESSION_ID,
+        tagState: 'running',
+        metadataState: 'completed',
+        backgroundWorkRunning: true,
+        classification: 'settled',
+      },
+    ])
+  })
+
+  it('logs the terminal report that follows as already settled', async () => {
+    // #given / #when
+    const {logger} = await observe([midFlight, terminal])
+
+    // #then
+    expect(noticeLines(logger)).toMatchObject([
+      {tagState: 'running', metadataState: 'completed', backgroundWorkRunning: true, classification: 'settled'},
+      {
+        tagState: 'completed',
+        metadataState: 'completed',
+        backgroundWorkRunning: false,
+        classification: 'already-settled',
+      },
+    ])
+  })
+
+  it('logs a notice delivered as a session.synthetic event the same way', async () => {
+    // #given / #when
+    const {logger} = await observe([
+      noticeFrame({tagState: 'running', metadataState: 'completed', background: true, via: 'synthetic'}),
+    ])
+
+    // #then
+    expect(noticeLines(logger)).toMatchObject([
+      {tagState: 'running', metadataState: 'completed', backgroundWorkRunning: true, classification: 'settled'},
+    ])
+  })
+
+  it('never writes a notice body or description to any log line', async () => {
+    // #given notices whose body and description carry secrets, one of each kind of outcome
+    const unreadable = noticeFrame({tagState: 'running', metadataState: 'running', inboxId: 'msg_unreadable'})
+    const stranger = noticeFrame({tagState: 'completed', metadataState: 'completed', child: 'ses_stranger_child'})
+
+    // #when
+    const {logger} = await observe([midFlight, terminal, unreadable, stranger])
+
+    // #then
+    const everything = serializeLoggerCalls(logger)
+    expect(noticeLines(logger)).toHaveLength(4)
+    expect(everything).not.toContain('SECRET')
+    expect(everything).not.toContain('ghp_')
+    expect(everything).not.toContain('sk-live')
+    expect(everything).not.toContain('sleep 45')
+  })
+
+  it('logs a notice the reader cannot take as unreadable, and settles nothing', async () => {
+    // #given metadata state `running`, which the reader never accepts
+    const unreadable = noticeFrame({tagState: 'running', metadataState: 'running', background: true})
+
+    // #when
+    const {ledger, logger} = await observe([unreadable])
+
+    // #then
+    expect(noticeLines(logger)).toEqual([
+      {
+        parentSessionId: PARENT_SESSION_ID,
+        childSessionId: CHILD_SESSION_ID,
+        tagState: 'running',
+        metadataState: 'running',
+        backgroundWorkRunning: true,
+        classification: 'unreadable',
+      },
+    ])
+    expect(ledger.snapshot().map(entry => entry.state)).toEqual(['outstanding'])
+  })
+
+  it('logs a notice for a child the ledger never tracked as untracked', async () => {
+    // #given
+    const stranger = noticeFrame({tagState: 'completed', metadataState: 'completed', child: 'ses_not_adopted'})
+
+    // #when
+    const {ledger, logger} = await observe([stranger])
+
+    // #then
+    expect(noticeLines(logger)).toMatchObject([{childSessionId: 'ses_not_adopted', classification: 'untracked'}])
+    expect(ledger.isTracked('ses_not_adopted')).toBe(false)
+  })
+
+  it('logs a notice for a session that is not owned yet as deferred, and again when it is replayed', async () => {
+    // #given a notice to the child, before the root's dispatch names that child
+    const MSG = 'msg_dispatch'
+    const started = frame('session.tool.input.started', {
+      sessionID: PARENT_SESSION_ID,
+      id: 'call_1',
+      assistantMessageID: MSG,
+      name: 'subagent',
+    })
+    const progress = frame('session.tool.progress', {
+      sessionID: PARENT_SESSION_ID,
+      id: 'call_1',
+      assistantMessageID: MSG,
+      metadata: {sessionID: CHILD_SESSION_ID, status: 'running'},
+    })
+    const early = noticeFrame({
+      tagState: 'completed',
+      metadataState: 'completed',
+      parent: CHILD_SESSION_ID,
+      child: 'ses_grandchild',
+    })
+
+    // #when
+    const {logger} = await observe([early, started, progress], createOwnershipLedger(), false)
+
+    // #then held back first, then taken in once its parent was adopted
+    expect(noticeLines(logger)).toMatchObject([
+      {parentSessionId: CHILD_SESSION_ID, childSessionId: 'ses_grandchild', classification: 'deferred'},
+      {parentSessionId: CHILD_SESSION_ID, childSessionId: 'ses_grandchild', classification: 'untracked'},
+    ])
+  })
+
+  it('summarizes each child when the observation stops', async () => {
+    // #given a child that got the mid-flight and the terminal report
+    // #when
+    const {logger} = await observe([midFlight, terminal])
+
+    // #then
+    expect(summaryLines(logger)).toEqual([
+      {
+        sessionId: PARENT_SESSION_ID,
+        children: [
+          {
+            childSessionId: CHILD_SESSION_ID,
+            notices: 2,
+            lastTagState: 'completed',
+            lastMetadataState: 'completed',
+            settledByNotice: true,
+            ledgerState: 'settled',
+          },
+        ],
+      },
+    ])
+  })
+
+  it('summarizes a child that was never noticed, so a settlement without a notice shows', async () => {
+    // #given a tracked child that no notice reached
+    // #when
+    const {logger} = await observe([])
+
+    // #then
+    expect(summaryLines(logger)).toMatchObject([
+      {children: [{childSessionId: CHILD_SESSION_ID, notices: 0, settledByNotice: false}]},
+    ])
+  })
+
+  describe('settlement is the same with the logging in place', () => {
+    it.each([
+      ['completed', 'settled'],
+      ['error', 'settled'],
+      ['cancelled', 'settled'],
+    ])('settles a tracked child on a %s notice', async (state, expected) => {
+      // #given / #when
+      const {ledger} = await observe([noticeFrame({tagState: state, metadataState: state})])
+
+      // #then
+      expect(ledger.snapshot().map(entry => entry.state)).toEqual([expected])
+    })
+
+    it('still settles on metadata alone when the tag says running (the behavior the log exists to explain)', async () => {
+      // #given / #when
+      const {ledger} = await observe([midFlight])
+
+      // #then the log changes nothing about this
+      expect(ledger.snapshot().map(entry => entry.state)).toEqual(['settled'])
+    })
+
+    it('adopts nothing from a notice for an untracked child', async () => {
+      // #given / #when
+      const {ledger} = await observe(
+        [noticeFrame({tagState: 'completed', metadataState: 'completed', child: 'ses_other'})],
+        createOwnershipLedger(),
+        false,
+      )
+
+      // #then
+      expect(ledger.snapshot()).toEqual([])
+    })
+
+    it('fences the root the same way for a queued notice', async () => {
+      // #given a root that succeeded, then a mid-flight notice queued for it
+      const started = frame('session.execution.started', {sessionID: PARENT_SESSION_ID})
+      const succeeded = frame('session.execution.succeeded', {sessionID: PARENT_SESSION_ID})
+      const tracker = createActivityTrackerV2()
+      const ledger = createOwnershipLedger()
+      ledger.adopt(CHILD_SESSION_ID, 'child')
+      const open = openRun([started, succeeded, midFlight], {ownershipLedger: ledger, tracker}, PARENT_SESSION_ID)
+      await open.settled
+      open.controller.abort()
+      await open.result
+
+      // #then
+      expect(tracker).toMatchObject({rootTerminal: null, turnOwed: true})
+      expect([...tracker.queuedNoticeInboxIds]).toEqual(['msg_notice_1'])
     })
   })
 })

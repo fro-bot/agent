@@ -288,6 +288,7 @@ Per-repo S3 conditional-write locks (`If-None-Match` / `If-Match`) built by `get
 - `runDrain` runs between execute and review reconciliation: reconcile, poll `isDrainComplete()` to the shared deadline, then abort whatever is not `settled`. `runCleanup` consumes `isPersistenceSafe()` (`ownership-declined`).
 - `buildCIConfigV2` (`src/services/setup/ci-config-v2.ts`) strips `subagent_depth` from the operator config with a warning.
 - On V2 the `@fro.bot/opencode-plugin` guard rejects `task_id` reuse, so each background job has its own child session.
+- Diagnostic log of subagent notices (`src/features/agent/subagent-notice-log.ts`, read-only, never an input to settlement): one `Subagent notice observed` line per notice (parent and child ids, the tag's `state`, `metadata.state`, whether the body carries `Background work still running`, and the Action's classification), and one `Subagent notices by child` line when the event stream stops. A 2.3.0 server reports a mid-flight child as `state="running"` in the tag with `metadata.state: "completed"`; the settlement reader trusts the metadata, so these lines are how a premature settlement is told from a terminal one. The body and description are untrusted and never logged.
 
 > See also: [Background Subagents and Ownership](docs/wiki/Background%20Subagents%20and%20Ownership.md#background-subagent-ownership-ledger-action)
 
