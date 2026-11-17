@@ -16,7 +16,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
-import {handOff, takeBack} from './sandbox-handoff.js'
+import {handOff, planLocks, takeBack} from './sandbox-handoff.js'
 
 const RUNNER = 1001
 const RUNNER_GID = 1001
@@ -172,6 +172,12 @@ function buildWorld(extraHandedOver: (dirs: {runnerTemp: string; home: string}) 
 describe('handoff and take-back over a model of ownership', () => {
   let world: World
 
+  async function handedOff(manifest: HandoffManifest = world.manifest) {
+    const handed = await handOff(manifest, world.deps)
+    if (!handed.success) throw new Error(handed.error)
+    return handed.data
+  }
+
   afterEach(() => {
     fsSync.rmSync(world.root, {recursive: true, force: true})
     model.owners.clear()
@@ -261,9 +267,135 @@ describe('handoff and take-back over a model of ownership', () => {
     })
   })
 
+  describe('a nested root is still a root: it is verified on its own, though the outer walk moves it', () => {
+    beforeEach(() => {
+      world = buildWorld()
+    })
+
+    it('plans no locks of its own for the nested root: the outer root is not made a traverse-only chain directory', async () => {
+      // #given the layout, planned
+      const plan = await planLocks(world.manifest)
+
+      // #then the state home, which the outer root owns, is not locked as an ancestor of the nested root
+      expect(plan.traverse).not.toContain(world.stateHome)
+      expect(plan.deny).not.toContain(world.stateHome)
+      expect(plan.deny).not.toContain(world.nested)
+    })
+
+    it('refuses a nested root the sandbox deleted', async () => {
+      // #given the runner's opencode directory, inside the state home, removed during the run
+      const journal = await handedOff()
+      fsSync.rmSync(world.nested, {recursive: true})
+
+      // #when taken back
+      const outcome = await takeBack(world.manifest, journal, world.deps)
+
+      // #then the runner is not told it is restored: it would read session state from a path that is gone
+      expect(outcome.status).toBe('unsafe')
+      expect(outcome.status === 'unsafe' && outcome.reason).toContain(`root ${world.nested} is missing`)
+    })
+
+    it('refuses a nested root the sandbox replaced with a symlink', async () => {
+      // #given the runner's opencode directory replaced by a link to somewhere the runner would then read
+      const journal = await handedOff()
+      const outside = path.join(world.root, 'outside')
+      fsSync.mkdirSync(outside)
+      fsSync.rmSync(world.nested, {recursive: true})
+      fsSync.symlinkSync(outside, world.nested)
+
+      // #when taken back
+      const outcome = await takeBack(world.manifest, journal, world.deps)
+
+      // #then
+      expect(outcome.status).toBe('unsafe')
+      expect(outcome.status === 'unsafe' && outcome.reason).toContain(`root ${world.nested} is a symlink`)
+    })
+
+    it('refuses a nested root the sandbox replaced with a regular file', async () => {
+      // #given a file where the directory was
+      const journal = await handedOff()
+      fsSync.rmSync(world.nested, {recursive: true})
+      fsSync.writeFileSync(world.nested, 'x')
+
+      // #when taken back
+      const outcome = await takeBack(world.manifest, journal, world.deps)
+
+      // #then
+      expect(outcome.status === 'unsafe' && outcome.reason).toContain(`root ${world.nested} is not a directory`)
+    })
+
+    describe('with a directory between the outer root and the nested one', () => {
+      let manifest: HandoffManifest
+      let between: string
+      let deep: string
+
+      beforeEach(() => {
+        between = path.join(world.stateHome, 'sub')
+        deep = path.join(between, 'deep')
+        fsSync.mkdirSync(deep, {recursive: true})
+        manifest = {...world.manifest, handedOver: [...world.manifest.handedOver, deep]}
+      })
+
+      it('allows the sandbox to own it, and to have made it world-writable, at take-back', async () => {
+        // #given handed-over content the sandbox is free to chown-by-creation and chmod
+        const journal = await handedOff(manifest)
+        model.owners.set(between, SANDBOX)
+        fsSync.chmodSync(between, 0o777)
+
+        // #when taken back
+        const outcome = await takeBack(manifest, journal, world.deps)
+
+        // #then the outer take-back moves it, and the nested root is still a verified directory
+        expect(outcome).toEqual({status: 'restored'})
+        expect(ownerOf(between)).toBe(RUNNER)
+      })
+
+      it('refuses it when the sandbox swapped it for a symlink', async () => {
+        // #given the directory above the nested root replaced by a link out of the tree
+        const journal = await handedOff(manifest)
+        const outside = path.join(world.root, 'outside')
+        fsSync.mkdirSync(path.join(outside, 'deep'), {recursive: true})
+        fsSync.rmSync(between, {recursive: true})
+        fsSync.symlinkSync(outside, between)
+
+        // #when taken back
+        const outcome = await takeBack(manifest, journal, world.deps)
+
+        // #then
+        expect(outcome.status === 'unsafe' && outcome.reason).toContain(`${between} is a symlink`)
+      })
+
+      it('refuses the nested root when it is gone', async () => {
+        // #given the deeper root removed
+        const journal = await handedOff(manifest)
+        fsSync.rmSync(deep, {recursive: true})
+
+        // #when taken back
+        const outcome = await takeBack(manifest, journal, world.deps)
+
+        // #then
+        expect(outcome.status === 'unsafe' && outcome.reason).toContain(`root ${deep} is missing`)
+      })
+    })
+  })
+
   describe('roots outside the checkout keep the ancestor check', () => {
     beforeEach(() => {
       world = buildWorld()
+    })
+
+    it('still refuses a world-writable ancestor that no handed-over root contains', async () => {
+      // #given the temp directory above the response root made world-writable
+      const handed = await handOff(world.manifest, world.deps)
+      if (!handed.success) throw new Error(handed.error)
+      const parent = path.join(world.manifest.runnerTemp, 'fro-bot-response')
+      fsSync.chmodSync(parent, 0o777)
+
+      // #when taken back
+      const outcome = await takeBack(world.manifest, handed.data, world.deps)
+
+      // #then
+      expect(outcome.status === 'unsafe' && outcome.reason).toContain(`ancestor ${parent} is world-writable`)
     })
 
     it('refuses a sandbox-owned ancestor of a handed-over root', async () => {

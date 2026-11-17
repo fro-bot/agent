@@ -483,7 +483,7 @@ describe('createSandboxLifecycle', () => {
         .map(call => call.slice(call.indexOf('/usr/bin/ln')))
       expect(links).toContainEqual([
         '/usr/bin/ln',
-        '-sfT',
+        '-sT',
         '/home/runner/.local/state/opencode',
         `${STATE_HOME}/opencode`,
       ])
@@ -515,8 +515,9 @@ describe('createSandboxLifecycle', () => {
         order.push('takeBack')
         return {status: 'restored' as const}
       })
-      const removeLink = vi.fn(async (target: string) => {
-        order.push(`remove ${target}`)
+      const removeLink = vi.fn(async (target: string, expected: string) => {
+        order.push(`remove ${target} -> ${expected}`)
+        return 'removed' as const
       })
       const lifecycle = create(harness, {
         agentStateHome: STATE_HOME,
@@ -529,14 +530,14 @@ describe('createSandboxLifecycle', () => {
       await lifecycle.release()
 
       // #then the workspace is left without our link
-      expect(order).toEqual(['takeBack', `remove ${STATE_HOME}/opencode`])
+      expect(order).toEqual(['takeBack', `remove ${STATE_HOME}/opencode -> /home/runner/.local/state/opencode`])
     })
 
     it('leaves the link alone when the take-back was unsafe', async () => {
       // #given an unsafe take-back
       const harness = createHarness()
       harness.mocks.takeBack.mockResolvedValue({status: 'unsafe', reason: 'ancestor /x is a symlink'})
-      const removeLink = vi.fn(async () => {})
+      const removeLink = vi.fn(async () => 'removed' as const)
       const lifecycle = create(harness, {
         agentStateHome: STATE_HOME,
         signals: fakeHost(),
@@ -554,7 +555,7 @@ describe('createSandboxLifecycle', () => {
     it('removes no link when there is no state home', async () => {
       // #given a run without one
       const harness = createHarness()
-      const removeLink = vi.fn(async () => {})
+      const removeLink = vi.fn(async () => 'removed' as const)
       const lifecycle = create(harness, {signals: fakeHost(), deps: {...harness.deps, removeLink}})
       await lifecycle.prepare(input)
 
@@ -600,6 +601,223 @@ describe('createSandboxLifecycle', () => {
       expect(prepared.success && prepared.data.xdg.state).toBe('/home/fro-bot-sandbox/.local/state')
       const manifest = harness.mocks.handOff.mock.calls[0]?.[0] as unknown as {handedOver: string[]}
       expect(manifest.handedOver).not.toContain(STATE_HOME)
+    })
+  })
+
+  describe('an existing entry where the opencode link goes (real files)', () => {
+    const EXPECTED = '/home/runner/.local/state/opencode'
+    const input = {keyFilePaths: [], ghConfigDir: null, repoSkills: null}
+    let workspace: string
+    let stateHome: string
+    let entry: string
+
+    beforeEach(() => {
+      workspace = path.join(temp, 'ws')
+      stateHome = path.join(workspace, 'connect', 'state')
+      entry = path.join(stateHome, 'opencode')
+      fs.mkdirSync(stateHome, {recursive: true})
+    })
+
+    /**
+     * An exec adapter whose `ln` into the workspace behaves like the real one without `-f`: it creates the link and refuses
+     * to overwrite anything. `beforeLink` runs first (a race the test stages).
+     */
+    function withRealLn(harness: Harness, beforeLink: () => void = () => {}): ExecAdapter {
+      const base = harness.exec
+      return {
+        ...base,
+        getExecOutput: vi.fn(async (command: string, args: string[] = []) => {
+          const result = await base.getExecOutput(command, args)
+          const at = args.indexOf('/usr/bin/ln')
+          const link = at === -1 ? undefined : args[at + 3]
+          if (link?.startsWith(workspace) !== true) return result
+          beforeLink()
+          try {
+            if (args[at + 1] !== '-sT') throw new Error(`unexpected ln flags ${args[at + 1]}`)
+            fs.symlinkSync(args[at + 2] ?? '', link)
+            return result
+          } catch {
+            return {exitCode: 1, stdout: '', stderr: 'File exists'}
+          }
+        }),
+      }
+    }
+
+    function lifecycleFor(harness: Harness, overrides: Partial<Parameters<typeof createSandboxLifecycle>[0]> = {}) {
+      return create(harness, {
+        agentStateHome: stateHome,
+        workspacePath: workspace,
+        signals: fakeHost(),
+        exec: withRealLn(harness),
+        ...overrides,
+      })
+    }
+
+    const linkCalls = (harness: Harness): string[][] =>
+      harness.sudoCalls.filter(call => call.includes('/usr/bin/ln') && call.at(-1)?.startsWith(workspace) === true)
+
+    it('refuses a regular file, before an account exists, and leaves it exactly as it was', async () => {
+      // #given the user's own file where the link would go
+      fs.writeFileSync(entry, 'precious')
+      const harness = createHarness()
+      const lifecycle = lifecycleFor(harness)
+
+      // #when prepared, and released
+      const prepared = await lifecycle.prepare(input)
+      await lifecycle.release()
+
+      // #then it is refused with a message that names the entry, and nothing was created, handed over or linked
+      expect(!prepared.success && prepared.error).toContain(entry)
+      expect(!prepared.success && prepared.error).toContain('already exists')
+      expect(harness.mocks.createAccount).not.toHaveBeenCalled()
+      expect(harness.mocks.handOff).not.toHaveBeenCalled()
+      expect(linkCalls(harness)).toEqual([])
+      // #and the file is untouched
+      expect(fs.lstatSync(entry).isFile()).toBe(true)
+      expect(fs.readFileSync(entry, 'utf8')).toBe('precious')
+    })
+
+    it('leaves the file alone when a later step of the setup would have failed too', async () => {
+      // #given the same file, and a handoff that would fail
+      fs.writeFileSync(entry, 'precious')
+      const harness = createHarness()
+      harness.mocks.handOff.mockResolvedValue(err('Sandbox handoff failed: checkout ACL failed'))
+      const lifecycle = lifecycleFor(harness)
+
+      // #when prepared, and released
+      const prepared = await lifecycle.prepare(input)
+      const released = await lifecycle.release()
+
+      // #then the refusal came first, and neither teardown nor release touched the file
+      expect(!prepared.success && prepared.error).toContain('already exists')
+      expect(released.restore).toBe('not-needed')
+      expect(fs.readFileSync(entry, 'utf8')).toBe('precious')
+    })
+
+    it('refuses a directory and leaves its contents', async () => {
+      // #given a directory with the user's content
+      fs.mkdirSync(path.join(entry, 'kept'), {recursive: true})
+      fs.writeFileSync(path.join(entry, 'kept', 'note'), 'precious')
+      const harness = createHarness()
+      const lifecycle = lifecycleFor(harness)
+
+      // #when prepared
+      const prepared = await lifecycle.prepare(input)
+      await lifecycle.release()
+
+      // #then
+      expect(!prepared.success && prepared.error).toContain('already exists')
+      expect(harness.mocks.createAccount).not.toHaveBeenCalled()
+      expect(fs.readFileSync(path.join(entry, 'kept', 'note'), 'utf8')).toBe('precious')
+    })
+
+    it('refuses a symlink that points anywhere but the expected target, and leaves it', async () => {
+      // #given a link of the user's own
+      fs.symlinkSync('/somewhere/else', entry)
+      const harness = createHarness()
+      const lifecycle = lifecycleFor(harness)
+
+      // #when prepared, and released
+      const prepared = await lifecycle.prepare(input)
+      await lifecycle.release()
+
+      // #then
+      expect(!prepared.success && prepared.error).toContain('/somewhere/else')
+      expect(harness.mocks.createAccount).not.toHaveBeenCalled()
+      expect(fs.readlinkSync(entry)).toBe('/somewhere/else')
+    })
+
+    it('replaces a stale link to the expected target, before the handoff, without forcing the new one', async () => {
+      // #given the link a crashed run left
+      fs.symlinkSync(EXPECTED, entry)
+      const harness = createHarness()
+      let presentAtHandoff: boolean | undefined
+      harness.mocks.handOff.mockImplementation(async () => {
+        presentAtHandoff = fs.existsSync(entry) || fs.lstatSync(entry, {throwIfNoEntry: false}) !== undefined
+        return ok({snapshotDir: '/x', touched: [], chowned: [], aclTrees: [], git: null, gitPresent: false})
+      })
+      const lifecycle = lifecycleFor(harness)
+
+      // #when prepared
+      const prepared = await lifecycle.prepare(input)
+
+      // #then the stale link was removed by the runner first, and the new link is made with plain `-sT`
+      expect(prepared.success).toBe(true)
+      expect(presentAtHandoff).toBe(false)
+      expect(linkCalls(harness).map(call => call.slice(call.indexOf('/usr/bin/ln')))).toEqual([
+        ['/usr/bin/ln', '-sT', EXPECTED, entry],
+      ])
+      expect(fs.readlinkSync(entry)).toBe(EXPECTED)
+    })
+
+    it('removes its own link after the files are back, and no other', async () => {
+      // #given a prepared run whose link the sandbox then replaced with one of its own
+      const harness = createHarness()
+      const logger = createMockLogger()
+      const lifecycle = lifecycleFor(harness, {logger})
+      await lifecycle.prepare(input)
+      expect(fs.readlinkSync(entry)).toBe(EXPECTED)
+      fs.unlinkSync(entry)
+      fs.symlinkSync('/etc', entry)
+
+      // #when released
+      await lifecycle.release()
+
+      // #then a link that is not the one this run made is left, and said so
+      expect(fs.readlinkSync(entry)).toBe('/etc')
+      expect(logger.warning).toHaveBeenCalled()
+    })
+
+    it('removes the link it made when the run completes normally', async () => {
+      // #given a prepared run
+      const harness = createHarness()
+      const lifecycle = lifecycleFor(harness)
+      await lifecycle.prepare(input)
+      expect(fs.readlinkSync(entry)).toBe(EXPECTED)
+
+      // #when released
+      await lifecycle.release()
+
+      // #then it is gone
+      expect(fs.lstatSync(entry, {throwIfNoEntry: false})).toBeUndefined()
+    })
+
+    it('does not remove an entry it did not make when the link command loses a race', async () => {
+      // #given a regular file that appears between the check and the link command, which then refuses
+      const harness = createHarness()
+      const removeLink = vi.fn(async () => 'removed' as const)
+      const lifecycle = lifecycleFor(harness, {
+        exec: withRealLn(harness, () => fs.writeFileSync(entry, 'appeared')),
+        deps: {...harness.deps, removeLink},
+      })
+
+      // #when prepared and released
+      const prepared = await lifecycle.prepare(input)
+      await lifecycle.release()
+
+      // #then setup failed, the file is still there, and teardown was never even asked to remove it: it was not recorded as ours
+      expect(prepared.success).toBe(false)
+      expect(fs.readFileSync(entry, 'utf8')).toBe('appeared')
+      expect(removeLink).not.toHaveBeenCalled()
+    })
+
+    it("in connect's layout, accepts the real directory that is already the handed-over one, untouched", async () => {
+      // #given the runner's XDG_STATE_HOME is the state home, so `<state home>/opencode` is a real directory with content
+      fs.mkdirSync(entry)
+      fs.writeFileSync(path.join(entry, 'session.db'), 'runner-created')
+      const harness = createHarness()
+      const lifecycle = lifecycleFor(harness, {
+        env: {HOME: '/home/runner', RUNNER_TEMP: temp, XDG_STATE_HOME: stateHome},
+      })
+
+      // #when prepared, and released
+      const prepared = await lifecycle.prepare(input)
+      await lifecycle.release()
+
+      // #then it is accepted, no link was made over it, and its content is as it was
+      expect(prepared.success).toBe(true)
+      expect(linkCalls(harness)).toEqual([])
+      expect(fs.readFileSync(path.join(entry, 'session.db'), 'utf8')).toBe('runner-created')
     })
   })
 

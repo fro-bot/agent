@@ -210,13 +210,13 @@ function broadReadGrantProblem(manifest: HandoffManifest): string | null {
 }
 
 /**
- * The handed-over directories that lie inside no other handed-over directory. A nested one (the runner's `<state>/opencode`
- * inside an `agent-state-home` that is the same `<state>`) is covered by its outer root's walk: `find -P <outer> -xdev -user
- * <uid>` chowns it and everything under it, the runner ACL (`find -type d`) and its removal (`setfacl -R`) recurse, and
- * take-back's chown and leftover check do too. Left as a root of its own, it would make its parent an *ancestor* in
- * `verifyRoots`, which at take-back is already the sandbox's and is refused as foreign. The outer root keeps every
- * ancestor check; a nested root has none of its own because nothing lies between it and the outer root but the outer
- * root's own content.
+ * The handed-over directories that lie inside no other handed-over directory, for the *recursive* operations only. A nested
+ * one (the runner's `<state>/opencode` inside an `agent-state-home` that is the same `<state>`) is covered by its outer
+ * root's walk: `find -P <outer> -xdev -user <uid>` chowns it and everything under it, the runner ACL (`find -type d`) and its
+ * removal (`setfacl -R`) recurse, and take-back's chown and leftover check do too. Walking it again would only repeat that.
+ * `planLocks` uses it for the same reason: a nested root adds no chain of its own.
+ *
+ * It is not what gets verified: {@link verifyRoots} checks every explicit root.
  */
 function outermostHandedOver(manifest: HandoffManifest): string[] {
   return [...new Set(manifest.handedOver)].filter(
@@ -224,8 +224,14 @@ function outermostHandedOver(manifest: HandoffManifest): string[] {
   )
 }
 
+/** The roots of the recursive operations: outermost handed-over roots, not the nested ones they cover. */
 function everyRoot(manifest: HandoffManifest): string[] {
   return [manifest.workspace, ...outermostHandedOver(manifest), ...manifest.readable]
+}
+
+/** Every root the manifest names, nested ones included: what has to be a real directory when it matters. */
+function everyExplicitRoot(manifest: HandoffManifest): string[] {
+  return [manifest.workspace, ...new Set(manifest.handedOver), ...manifest.readable]
 }
 
 /**
@@ -245,10 +251,12 @@ export async function verifyRoots(
   const reserved = reservedSubtreeProblem(manifest)
   if (reserved !== null) return reserved
   const ancestors = new Set<string>()
+  const handedOverRoots = new Set(manifest.handedOver)
   const check = async (
     target: string,
     kind: 'ancestor' | 'root',
     allowed: ReadonlySet<number>,
+    insideHandedOver = false,
   ): Promise<string | null> => {
     let stats
     try {
@@ -259,22 +267,33 @@ export async function verifyRoots(
     if (stats.isSymbolicLink()) return `${kind} ${target} is a symlink`
     if (!stats.isDirectory()) return `${kind} ${target} is not a directory`
     if (!allowed.has(stats.uid)) return `${kind} ${target} is owned by uid ${stats.uid}`
-    if (kind === 'ancestor' && (stats.mode & 0o002) !== 0 && (stats.mode & 0o1000) === 0) {
+    if (kind === 'ancestor' && !insideHandedOver && (stats.mode & 0o002) !== 0 && (stats.mode & 0o1000) === 0) {
       return `ancestor ${target} is world-writable without the sticky bit`
     }
     return null
   }
 
-  for (const root of everyRoot(manifest)) {
-    const handedOver = manifest.handedOver.includes(root)
+  // Every explicit root is verified, a nested handed-over one included: the outer walk moves it, but nothing else tells the
+  // runner it is still a real directory, and the runner reads session state through it afterwards.
+  for (const root of everyExplicitRoot(manifest)) {
+    const handedOver = handedOverRoots.has(root)
     const allowed = new Set([runnerUid, 0, ...(phase === 'take-back' && handedOver ? [sandboxUid] : [])])
     const problem = await check(root, 'root', allowed)
     if (problem !== null) return problem
     for (const ancestor of ancestorsOf(root)) ancestors.add(ancestor)
   }
   for (const ancestor of ancestors) {
-    const problem = await check(ancestor, 'ancestor', new Set([runnerUid, 0]))
+    // An ancestor that is a handed-over root, or lies inside one, is handed-over content: the sandbox owns it at take-back
+    // (the outer take-back is what returns it) and may have set any mode on it. It is checked at that moment, with the
+    // sandbox verified dead, so what `lstat` sees is final: a link or a non-directory is still refused, and no later step
+    // can change that before the walk. Chosen over verifying after the outer take-back because that order has no honest
+    // check left to make: the walk has already moved everything, and a swapped link would have been followed by whoever
+    // reads it next.
+    const insideHandedOver = [...handedOverRoots].some(handed => isWithin(handed, ancestor))
+    const owners = new Set([runnerUid, 0, ...(phase === 'take-back' && insideHandedOver ? [sandboxUid] : [])])
+    const problem = await check(ancestor, 'ancestor', owners, insideHandedOver)
     if (problem !== null) return problem
+    if (insideHandedOver) continue
     const stats = await fs.lstat(ancestor)
     if (stats.uid !== runnerUid) continue
     // The checkout, and the directories between it and a handed-over directory inside it (`agent-state-home`), carry the

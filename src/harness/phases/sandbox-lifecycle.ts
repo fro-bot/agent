@@ -258,9 +258,20 @@ export interface SandboxLifecycleDeps {
   readonly realpath: (target: string) => Promise<string | null>
   /** Which of the supported tool install roots (bun, pnpm) the sandbox may read. */
   readonly resolveToolRoots: (input: ToolRootInput) => Promise<ToolRootResult>
-  /** Removes `target` only if it is a symlink (never a directory, never what a link points at). Absent is fine. */
-  readonly removeLink: (target: string) => Promise<void>
+  /** What is at `target`, without following a link: nothing, a link (and where it points), or something else. */
+  readonly inspectEntry: (target: string) => Promise<EntryFound>
+  /**
+   * Removes `target` only if it is a symlink to exactly `expected`: never a file or a directory, and never a link that points
+   * anywhere else. `left` means something else is there and was not touched.
+   */
+  readonly removeLink: (target: string, expected: string) => Promise<'absent' | 'left' | 'removed'>
 }
+
+/** What `inspectEntry` found. `unreadable` is anything but a clean "no such entry" (a file where a parent should be, say). */
+export type EntryFound =
+  | {readonly kind: 'absent'}
+  | {readonly kind: 'symlink'; readonly target: string}
+  | {readonly kind: 'directory' | 'other' | 'unreadable'}
 
 const defaultDeps: SandboxLifecycleDeps = {
   createAccount: createSandboxAccount,
@@ -313,9 +324,25 @@ const defaultDeps: SandboxLifecycleDeps = {
   isDirectory: directory => fsSync.statSync(directory, {throwIfNoEntry: false})?.isDirectory() === true,
   realpath: async target => fs.realpath(target).catch(() => null),
   resolveToolRoots: async input => resolveToolRoots(input),
-  removeLink: async target => {
+  inspectEntry: async target => {
+    let stats
+    try {
+      stats = await fs.lstat(target)
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === 'ENOENT' ? {kind: 'absent'} : {kind: 'unreadable'}
+    }
+    if (stats.isSymbolicLink()) {
+      const linked = await fs.readlink(target).catch(() => null)
+      return linked === null ? {kind: 'unreadable'} : {kind: 'symlink', target: linked}
+    }
+    return {kind: stats.isDirectory() ? 'directory' : 'other'}
+  },
+  removeLink: async (target, expected) => {
     const stats = await fs.lstat(target).catch(() => null)
-    if (stats?.isSymbolicLink() === true) await fs.unlink(target)
+    if (stats === null) return 'absent'
+    if (!stats.isSymbolicLink() || (await fs.readlink(target)) !== expected) return 'left'
+    await fs.unlink(target)
+    return 'removed'
   },
 }
 
@@ -485,8 +512,9 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   let proxyUnconfirmed = false
   // Set once the teardown has taken its decision about the proxy. A proxy that turns up after that is stopped on the spot.
   let proxyTeardownDone = false
-  // The `opencode` link this lifecycle made inside `agentStateHome`, removed once the files are back. Null when none was made.
-  let agentStateLink: string | null = null
+  // The `opencode` link this lifecycle made inside `agentStateHome` (where it is, and where it points), removed once the files
+  // are back. Set only after the link command succeeded, so an entry this run did not make is never recorded. Null when none.
+  let agentStateLink: {readonly path: string; readonly target: string} | null = null
   const closeAdmission = (): void => {
     admissionClosed = true
     for (const controller of pendingLaunches.values()) controller.abort()
@@ -689,7 +717,12 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       const link = agentStateLink
       agentStateLink = null
       try {
-        await deps.removeLink(link)
+        const removed = await deps.removeLink(link.path, link.target)
+        if (removed === 'left') {
+          logger.warning('The opencode entry in the agent state directory is not the link this run made; it was left', {
+            path: link.path,
+          })
+        }
       } catch (error) {
         logger.warning('The opencode link in the agent state directory could not be removed', {
           error: toErrorMessage(error),
@@ -900,10 +933,47 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       const insideCheckout =
         path.isAbsolute(stateHome) && stateHome !== options.workspacePath && isWithin(options.workspacePath, stateHome)
       if (!insideCheckout) return err('agent-state-home must be an absolute directory inside the checkout')
+      // Before an account exists or anything is handed over: an entry already there that is not this run's own to replace is
+      // the user's, and refusing now leaves it untouched.
+      const entryProblem = await prepareStateEntry(stateHome)
+      if (entryProblem !== null) return err(entryProblem)
+      if (cancelled || released !== undefined) return err('isolate-agent setup was cancelled before it started')
     }
     record('pending')
     preparing = prepareInner(input)
     return preparing as Promise<Result<OpenCodeV2SandboxLaunch, string>>
+  }
+
+  /** The runner's own `<XDG_STATE_HOME>/opencode`: where the agent's `opencode` state entry has to lead. */
+  const runnerOpencodeState = (): string =>
+    path.join(xdgBase(env, 'XDG_STATE_HOME', '.local/state', runnerHome), 'opencode')
+
+  /**
+   * Decides what may sit at `<agent-state-home>/opencode` before anything is changed. Null when it is fine (nothing there,
+   * the runner's real directory itself, or a stale link of ours, which is removed here, by the runner, in a directory it
+   * still owns); else why not. Anything else there (a file, a directory, a link elsewhere) belongs to the user.
+   */
+  async function prepareStateEntry(stateHome: string): Promise<string | null> {
+    const entry = path.join(stateHome, 'opencode')
+    const target = runnerOpencodeState()
+    // The runner's `XDG_STATE_HOME` is the state home: this is the handed-over directory itself, and no link is made.
+    if (entry === target) return null
+    const found = await deps.inspectEntry(entry)
+    if (found.kind === 'absent') return null
+    if (found.kind === 'symlink' && found.target === target) {
+      // What a crashed run of this Action leaves behind, and only that: a link to the runner's own opencode state.
+      return (await deps.removeLink(entry, target)) === 'left'
+        ? `agent-state-home: ${entry} changed while it was being checked`
+        : null
+    }
+    const what =
+      found.kind === 'symlink'
+        ? `a link to ${found.target}`
+        : `${found.kind === 'directory' ? 'a directory' : 'not a link'}`
+    return (
+      `agent-state-home: ${entry} already exists and is ${what}, but the Action links the agent's OpenCode state there ` +
+      `(to ${target}). Move it away, or set the runner's XDG_STATE_HOME to the agent-state-home so that entry is the real directory`
+    )
   }
 
   async function prepareInner(input: SandboxPrepareInput): Promise<Result<OpenCodeV2SandboxLaunch, string>> {
@@ -1130,8 +1200,8 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
    * take-back and the cache save read directly. Created as the account in its new, empty home.
    *
    * With an `agent-state-home` the state root is that directory instead (already handed over, so the sandbox owns it). The
-   * `opencode` entry still has to reach the runner's session storage, so the link is made inside it, replacing a stale link
-   * a crashed run may have left (a real directory there is refused). It is removed once the files are back. When the
+   * `opencode` entry still has to reach the runner's session storage, so the link is made inside it, after `prepare` has
+   * refused anything of the user's already there and removed a stale link of ours. It is removed once the files are back. When the
    * runner's own `<state>/opencode` already is `<state home>/opencode` (the runner's `XDG_STATE_HOME` is the state home) the
    * real directory is already where the agent looks, and a link would point at itself.
    */
@@ -1163,9 +1233,10 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     if (stateHome === null) {
       await runAsSandbox([tools.ln, '-sT', opencode.state, stateEntry])
     } else if (stateEntry !== opencode.state) {
-      // Recorded before the link exists: a failure mid-command still leaves the removal to look for it.
-      agentStateLink = stateEntry
-      await runAsSandbox([tools.ln, '-sfT', opencode.state, stateEntry])
+      // No `-f`: `prepare` already refused or removed whatever was there, so an entry that appears since is not ours to replace
+      // and the command fails. Recorded only once it succeeded, so teardown removes nothing this run did not make.
+      await runAsSandbox([tools.ln, '-sT', opencode.state, stateEntry])
+      agentStateLink = {path: stateEntry, target: opencode.state}
     }
     return roots
   }
