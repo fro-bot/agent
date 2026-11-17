@@ -354,6 +354,8 @@ export type {
   ShellNoticeState,
   V2ShellStatus,
 } from './shell-notice.js'
+export {observeSubagentNotice, observeSubagentNoticeItem} from './subagent-notice-observation.js'
+export type {SubagentNoticeObservation} from './subagent-notice-observation.js'
 export {
   readBackgroundDispatch,
   readSubagentNotice,

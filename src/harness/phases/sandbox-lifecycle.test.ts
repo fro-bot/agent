@@ -1684,6 +1684,109 @@ describe('createSandboxLifecycle', () => {
       // #then
       expect(prepared.success && prepared.data.path).toBe('/usr/local/bin:/usr/bin:/bin')
     })
+
+    describe('the Action’s own OpenCode directory', () => {
+      const OPENCODE = '/opt/hostedtoolcache/opencode/1.19.5/x64'
+
+      it('is the last entry, behind the runner’s and the system directories', async () => {
+        // #given the directory setup installed OpenCode in, which the runner PATH did not have
+        const harness = createHarness()
+        const lifecycle = create(harness, {
+          env: baseEnv(),
+          runnerPath: '/opt/hostedtoolcache/node/24/x64/bin:/usr/bin',
+          opencodeDirectory: OPENCODE,
+          signals: fakeHost(),
+        })
+
+        // #when prepared
+        const prepared = await lifecycle.prepare(prepareInput)
+
+        // #then the agent can find `opencode`, but only after everything else
+        expect(prepared.success && prepared.data.path).toBe(
+          `/opt/hostedtoolcache/node/24/x64/bin:/usr/bin:/usr/local/bin:/bin:${OPENCODE}`,
+        )
+      })
+
+      it('does not shadow an earlier entry that also holds opencode', async () => {
+        // #given an earlier step's directory ahead of it
+        const harness = createHarness()
+        const lifecycle = create(harness, {
+          env: baseEnv(),
+          runnerPath: '/opt/earlier-step/bin:/usr/bin',
+          opencodeDirectory: OPENCODE,
+          signals: fakeHost(),
+        })
+
+        // #when prepared
+        const prepared = await lifecycle.prepare(prepareInput)
+
+        // #then the earlier directory resolves first
+        const entries = prepared.success ? prepared.data.path.split(':') : []
+        expect(entries.indexOf('/opt/earlier-step/bin')).toBeGreaterThanOrEqual(0)
+        expect(entries.indexOf('/opt/earlier-step/bin')).toBeLessThan(entries.indexOf(OPENCODE))
+        expect(entries.at(-1)).toBe(OPENCODE)
+      })
+
+      it('is not repeated when the runner PATH already holds it', async () => {
+        // #given the directory already on the runner PATH
+        const harness = createHarness()
+        const lifecycle = create(harness, {
+          env: baseEnv(),
+          runnerPath: `${OPENCODE}:/usr/bin`,
+          opencodeDirectory: OPENCODE,
+          signals: fakeHost(),
+        })
+
+        // #when prepared
+        const prepared = await lifecycle.prepare(prepareInput)
+
+        // #then it appears once, where the runner had it
+        expect(prepared.success && prepared.data.path).toBe(`${OPENCODE}:/usr/bin:/usr/local/bin:/bin`)
+      })
+
+      it('is skipped, with a debug line, when the binary path is unknown', async () => {
+        // #given no directory
+        const harness = createHarness()
+        const logger = createMockLogger()
+        const lifecycle = create(harness, {
+          logger,
+          env: baseEnv(),
+          runnerPath: '/usr/bin',
+          opencodeDirectory: null,
+          signals: fakeHost(),
+        })
+
+        // #when prepared
+        const prepared = await lifecycle.prepare(prepareInput)
+
+        // #then preparation succeeds, the PATH is unchanged, and the skip is logged
+        expect(prepared.success && prepared.data.path).toBe('/usr/bin:/usr/local/bin:/bin')
+        expect(logger.debug).toHaveBeenCalledWith(expect.stringContaining('OpenCode directory'), expect.anything())
+      })
+
+      it('is left out like any other entry when the agent cannot enter it', async () => {
+        // #given a directory the account's check reports as unreachable
+        const harness = createHarness()
+        const logger = createMockLogger()
+        const unreachable = '/home/runner/unreachable/opencode'
+        const lifecycle = create(harness, {
+          logger,
+          env: baseEnv(),
+          runnerPath: '/usr/bin',
+          opencodeDirectory: unreachable,
+          signals: fakeHost(),
+        })
+
+        // #when prepared
+        const prepared = await lifecycle.prepare(prepareInput)
+
+        // #then it is dropped and named, and the launch still succeeds
+        expect(prepared.success && prepared.data.path).toBe('/usr/bin:/usr/local/bin:/bin')
+        expect(logger.info).toHaveBeenCalledWith('Sandbox PATH left out directories the agent cannot enter', {
+          dropped: [unreachable],
+        })
+      })
+    })
   })
 
   describe('tool install roots (bun, pnpm)', () => {
