@@ -1,4 +1,10 @@
-import {createOwnershipLedger, shellLedgerKey} from '@fro-bot/runtime'
+import {
+  createOwnershipLedger,
+  createRemoteOpenCodeV2Client,
+  shellLedgerKey,
+  V2_EVENT_FRAME_MAX_CHARS,
+  V2_EVENT_FRAME_TOO_LARGE_ERROR_NAME,
+} from '@fro-bot/runtime'
 import {
   CHILD_SESSION_ID,
   EXECUTION_STARTED_FRAME,
@@ -195,6 +201,39 @@ describe('processEventStreamV2', () => {
     // #then
     expect(outcome.discontinuity).toEqual({message: 'socket closed', errorName: 'TypeError'})
     expect(consoleMock.outputTextContent.mock.calls).toEqual([['all done']])
+  })
+
+  it('records a frame over the reader cap as a final discontinuity, with no reconnect and no payload', async () => {
+    // #given — the real client over a stream whose second frame never ends and is past the cap
+    const encoder = new TextEncoder()
+    const fetchSpy = vi.fn(async () => {
+      const body = new ReadableStream<Uint8Array>({
+        start(stream) {
+          stream.enqueue(encoder.encode('data: {"type":"server.connected","data":{}}\n\n'))
+          stream.enqueue(encoder.encode(`data: oversize-marker-${'x'.repeat(V2_EVENT_FRAME_MAX_CHARS)}`))
+        },
+      })
+      return new Response(body, {status: 200, headers: {'content-type': 'text/event-stream'}})
+    })
+    const client = createRemoteOpenCodeV2Client({baseUrl: 'http://w', fetch: fetchSpy})
+    const subscribed = await client.subscribeEvents({directory: '/d'})
+    if (!subscribed.success) throw new Error('expected a stream')
+    const tracker = createActivityTrackerV2()
+
+    // #when
+    const outcome = await processEventStreamV2({
+      stream: subscribed.data,
+      sessionId: TEXT_SESSION_ID,
+      signal: new AbortController().signal,
+      logger: createMockLogger(),
+      tracker,
+    })
+
+    // #then — the stream is over for good: observed as blind, one subscription, nothing of the payload kept
+    expect(outcome.discontinuity?.errorName).toBe(V2_EVENT_FRAME_TOO_LARGE_ERROR_NAME)
+    expect(outcome.discontinuity?.message).not.toContain('oversize-marker')
+    expect(tracker.streamBlind).toBe(true)
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
   })
 
   it('clears the root result when a new turn starts, so an earlier success cannot release the run', async () => {

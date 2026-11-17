@@ -213,7 +213,13 @@ export type {TriggerDirective} from './prompt.js'
 export {materializeReferenceFiles} from './reference-files.js'
 export {createActionOpenCodeV2Client} from './remote-client-action-v2.js'
 export type {ActionOpenCodeV2Client} from './remote-client-action-v2.js'
-export {createRemoteOpenCodeV2Client, V2_HEARTBEAT_FRAME} from './remote-client-v2.js'
+export {
+  createRemoteOpenCodeV2Client,
+  isV2EventFrameTooLargeError,
+  V2_EVENT_FRAME_MAX_CHARS,
+  V2_EVENT_FRAME_TOO_LARGE_ERROR_NAME,
+  V2_HEARTBEAT_FRAME,
+} from './remote-client-v2.js'
 export type {
   RemoteOpenCodeV2Client,
   RemoteOpenCodeV2ClientOptions,
