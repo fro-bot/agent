@@ -79,7 +79,7 @@ gh CLI Reference (always)
 
 ### Response surfaces
 
-The Action derives the response surface from trusted routing context and carries it through prompting, parsing, and delivery. A `pull_request` run requires a review; an authorized `issue_comment` mention on a pull request permits either a review when the response includes a verdict or a comment when it does not; other response-file paths are comment-only. Mention authorization uses the existing `OWNER`/`MEMBER`/`COLLABORATOR` association gate. The response file supplies response content, never the delivery target or surface.
+The Action derives the response surface from trusted routing context and carries it through prompting, parsing, and delivery. A `pull_request` run requires a review; an authorized `issue_comment` mention on a pull request permits either a review when the response includes a verdict or a comment when it does not; every other response-file path is comment-only, and a `discussion_comment` or `pull_request_review_comment` reply is a top-level comment (a discussion comment through the GraphQL writer, a PR comment through the issues endpoint). Mention authorization uses the existing `OWNER`/`MEMBER`/`COLLABORATOR` association gate. The response file supplies response content, never the delivery target or surface.
 
 ## PATTERNS
 

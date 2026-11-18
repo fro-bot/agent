@@ -171,7 +171,7 @@ The two `reuse` rows are idioms to follow, not code to call.
 
 ## Implementation Units
 
-- [ ] **Unit 1: Discussion response surface**
+- [x] **Unit 1: Discussion response surface**
 
 **Goal:** A response-file run on a discussion trigger posts a top-level discussion comment to the discussion named by trusted context, and the prompt says where discussion and review-comment replies land.
 
@@ -224,7 +224,7 @@ The two `reuse` rows are idioms to follow, not code to call.
 - The discussion post-path tests fail before the change and pass after it.
 - No test for an existing surface changes its expectation. The existing surface key-list assertion gains the new member.
 
-- [ ] **Unit 2: Allowlist the provisioning triggers, decided once**
+- [x] **Unit 2: Allowlist the provisioning triggers, decided once**
 
 **Goal:** Only `schedule` and `workflow_dispatch` provision the credential and use `model-gh`, and every phase reads the one decision bootstrap made.
 
@@ -273,7 +273,7 @@ The two `reuse` rows are idioms to follow, not code to call.
 - The resolver has one production caller.
 - The existing tests for `schedule`, `workflow_dispatch`, `pull_request`, `issue_comment` and `issues` pass unchanged.
 
-- [ ] **Unit 3: Skip the Action's own comments**
+- [x] **Unit 3: Skip the Action's own comments**
 
 **Goal:** A comment written by the Action's own identity never starts a run.
 
@@ -310,7 +310,7 @@ The two `reuse` rows are idioms to follow, not code to call.
 
 - The self-comment test fails before the change.
 
-- [ ] **Unit 4: Messages and comments**
+- [x] **Unit 4: Messages and comments**
 
 **Goal:** Every string in code that names the old trigger list states the rule.
 
@@ -339,7 +339,7 @@ The two `reuse` rows are idioms to follow, not code to call.
 - A search for the old three-name list in `src/` and `packages/` finds only test data that means it.
 - `dist/` is rebuilt and committed.
 
-- [ ] **Unit 5: Documents and the migration note**
+- [x] **Unit 5: Documents and the migration note**
 
 **Goal:** Documentation states the allowlist, the destinations and the losses.
 
