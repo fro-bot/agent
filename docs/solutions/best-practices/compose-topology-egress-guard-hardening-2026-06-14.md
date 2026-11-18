@@ -123,7 +123,7 @@ Any denylist/allowlist guard over a declarative config that a tool **normalizes 
 
 ## Related
 
-- `docs/solutions/best-practices/workspace-executor-opencode-provisioning-best-practices-2026-06-01.md` — adjacent workspace/deploy hardening (config/auth provisioning, different failure class)
+- `docs/solutions/best-practices/workspace-opencode-provisioning-on-v2-2026-11-17.md` — adjacent workspace/deploy hardening (config/auth provisioning, different failure class)
 - `docs/solutions/build-errors/gateway-docker-runtime-resolution-crash-loop-2026-05-31.md` — sibling Docker/deploy image-safety
 - `docs/solutions/best-practices/cross-libc-build-and-release-safety-2026-06-14.md` — same deploy surface, build/release verification
 - Source: `deploy/validate-stack.sh` (Invariants 1b–1m), `deploy/validate-stack.test.sh`
