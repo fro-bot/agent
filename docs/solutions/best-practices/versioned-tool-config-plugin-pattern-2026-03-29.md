@@ -38,7 +38,7 @@ The initial instinct was to model Systematic after oMo's installer pattern (`bun
 2. OpenCode resolves plugins declared in its config at startup; no separate install step is needed
 3. Creating a `systematic.ts` installer file would have been dead code
 
-Points 2 and 3 were true when written and are no longer the whole story. Letting the server resolve the plugin at startup means it performs a network npm install *after* its HTTP listener is already accepting connections, with no timeout of its own; under registry latency that stalled production runs for minutes. A setup-time installer (`src/services/setup/systematic-plugin.ts`) now exists, and it is not dead code — it runs OpenCode's own `plugin` CLI so the package lands in the directory the server reads, and the server's startup resolution becomes a local no-op. The config-declaration pipeline described below is unchanged; the install just no longer happens inside the server. See [Systematic plugin install stalls OpenCode bootstrap](../integration-issues/systematic-plugin-install-stalls-opencode-bootstrap-2026-09-04.md).
+Points 2 and 3 were true when written and are no longer the whole story. Letting the server resolve the plugin at startup means it performs a network npm install _after_ its HTTP listener is already accepting connections, with no timeout of its own; under registry latency that stalled production runs for minutes. A setup-time installer (`src/services/setup/plugin-install-v2.ts`) now exists, and it is not dead code — it runs the OpenCode executable (`plugin add <spec>`) to install each spec into `<XDG_CACHE_HOME>/opencode/npm/<spec>`, the directory the server reads, and the server's startup resolution becomes a local no-op. The config-declaration pipeline described below is unchanged; the install just no longer happens inside the server. See [Systematic plugin install stalls OpenCode bootstrap](../integration-issues/plugin-install-at-server-start-stalls-first-request-2026-11-17.md).
 
 The versioned-tool skill itself warns: _"Do not copy installer structure blindly between tools. Copy the version-source pattern; verify the install mechanics per tool."_
 
@@ -51,29 +51,30 @@ Instead of a separate installer, the version flows through the existing data pip
 **Data flow:**
 
 ```
-constants.ts → inputs.ts fallback → ActionInputs → bootstrap.ts
-  → EnsureOpenCodeOptions → SetupInputs → setup.ts ciConfig.plugins
-  → OPENCODE_CONFIG_CONTENT env var → OpenCode resolves at startup
+packages/runtime/src/shared/constants.ts → src/harness/config/inputs.ts fallback → ActionInputs
+  → bootstrap.ts → EnsureOpenCodeOptions → SetupInputs
+  → setup.ts (resolvePluginSpecsV2, installPluginsV2) → cache-restore.ts → v2-server.ts (resolvePluginSpecsV2)
+  → ci-config-v2.ts plugins → OPENCODE_CONFIG_CONTENT env var → server finds the plugin in the cache
 ```
 
 ### 1. Version Constant (single source of truth)
 
 ```typescript
-// src/shared/constants.ts
-export const DEFAULT_SYSTEMATIC_VERSION = "2.1.0"
+// packages/runtime/src/shared/constants.ts
+export const DEFAULT_SYSTEMATIC_VERSION = "<version>"
 ```
 
 ### 2. Type Thread (4 interfaces updated)
 
 ```typescript
-// src/shared/types.ts — ActionInputs
+// packages/runtime/src/shared/types.ts — ActionInputs
 readonly systematicVersion: string
 
 // src/services/setup/types.ts — SetupInputs
 readonly systematicVersion: string
 
-// src/features/agent/server.ts — EnsureOpenCodeOptions
-systematicVersion: string
+// packages/runtime/src/agent/server.ts — EnsureOpenCodeOptions
+readonly systematicVersion: string
 ```
 
 ### 3. Input Parsing with Constant Fallback
@@ -87,19 +88,17 @@ const systematicVersion = systematicVersionRaw.length > 0 ? systematicVersionRaw
 ### 4. Plugin Registration in OpenCode Config (the key adaptation)
 
 ```typescript
-// src/services/setup/setup.ts — after user opencode-config merge
-const systematicPlugin = `@fro.bot/systematic@${inputs.systematicVersion}`
-const rawPlugins: unknown[] = Array.isArray(ciConfig.plugins) ? (ciConfig.plugins as unknown[]) : []
-const hasSystematic = rawPlugins.some((p: unknown) => typeof p === "string" && p.startsWith("@fro.bot/systematic"))
-if (!hasSystematic) {
-  ciConfig.plugins = [...rawPlugins, systematicPlugin]
-}
+// src/services/setup/plugin-install-v2.ts — resolvePluginSpecsV2 returns the exact specs
+specs: [`${SYSTEMATIC_PACKAGE}@${systematicVersion}`, `${FRO_BOT_PLUGIN_PACKAGE}@${FRO_BOT_PLUGIN_VERSION}`]
+
+// src/services/setup/ci-config-v2.ts — buildCIConfigV2, after the operator opencode-config is read
+plugins: [...new Set([...inputs.plugins, ...operatorPlugins])],
 ```
 
 Design decisions:
 
-- Plugin appended AFTER user `opencode-config` merge, so it's always present
-- Dedup via `@fro.bot/systematic` prefix match so user version pins win
+- `inputs.plugins` carries the specs from `resolvePluginSpecsV2`, and the `plugins` key is written after the operator `opencode-config` is spread, so the specs are always present
+- Dedup is by exact spec string (`new Set`), not by package-name prefix: an operator spec with a different version is a separate entry, not a replacement
 - Explicit `unknown[]` annotation avoids `@typescript-eslint/no-unsafe-assignment` lint error
 
 ### 5. Renovate Tracking (npm datasource)
@@ -126,7 +125,7 @@ systematic-version:
 
 ## Why This Works
 
-OpenCode reads `OPENCODE_CONFIG_CONTENT` as its highest-precedence config. By adding `plugins: ["@fro.bot/systematic@2.1.0"]` to this env var during setup, OpenCode resolves the plugin at startup — and, since the setup-time install landed, finds it already present rather than fetching it. The version is pinned via the same constant pattern used by all other tools, with Renovate automating npm version bumps through the `customManagers` regex.
+OpenCode reads `OPENCODE_CONFIG_CONTENT` as its highest-precedence config. By adding `plugins: ["@fro.bot/systematic@<version>"]` to this env var during setup, OpenCode resolves the plugin at startup — and, since the setup-time install landed, finds it already present rather than fetching it. The version is pinned via the same constant pattern used by all other tools, with Renovate automating npm version bumps through the `customManagers` regex.
 
 ## Prevention
 
@@ -144,22 +143,22 @@ OpenCode reads `OPENCODE_CONFIG_CONTENT` as its highest-precedence config. By ad
 
 The four tools now use four different installation mechanisms:
 
-| Tool       | Mechanism                                       | Install Location             |
-| ---------- | ----------------------------------------------- | ---------------------------- |
-| OpenCode   | Binary download + tool-cache                    | PATH binary                  |
-| Bun        | Binary download + tool-cache                    | PATH binary                  |
-| oMo        | `bunx` CLI with `install` subcommand            | npm global + config          |
-| Systematic | Config declaration in `OPENCODE_CONFIG_CONTENT` | OpenCode resolves at startup |
+| Tool | Mechanism | Install Location |
+| --- | --- | --- |
+| OpenCode | Binary download + tool-cache | PATH binary |
+| Bun | Binary download + tool-cache | PATH binary |
+| oMo | `bunx` CLI with `install` subcommand | npm global + config |
+| Systematic | Config declaration in `OPENCODE_CONFIG_CONTENT` + setup-time install into the XDG cache (`plugin-install-v2.ts`) | Server finds it in the cache; no network at startup |
 
 When adding a fifth tool, check the tool's README first. The install mechanism determines whether you need an installer file or just config wiring.
 
 ### 3. Dedup array injections
 
-When programmatically injecting into arrays that users can also populate (like `plugins`), always check for existing entries before appending. Prefix matching (`p.startsWith('@fro.bot/systematic')`) handles version differences gracefully.
+When programmatically injecting into arrays that users can also populate (like `plugins`), always check for existing entries before appending. The setup code dedups by exact spec string (`new Set`); if version differences must collapse, match on the package name explicitly.
 
 ### 4. Type safety with `Record<string, unknown>`
 
-When spreading arrays extracted from `unknown`-typed objects, `Array.isArray()` narrows to `any[]` in TypeScript. Use explicit `unknown[]` annotation (`ciConfig.plugins as unknown[]`) to satisfy `@typescript-eslint/no-unsafe-assignment`.
+When spreading arrays extracted from `unknown`-typed objects, `Array.isArray()` narrows to `any[]` in TypeScript. Use explicit `unknown[]` annotation (`operator.plugins as unknown[]`) to satisfy `@typescript-eslint/no-unsafe-assignment`.
 
 ### 5. Update ALL ciConfig test assertions
 
@@ -173,14 +172,15 @@ When changing what goes into `OPENCODE_CONFIG_CONTENT`, grep `setup.test.ts` for
 
 ## Files Changed
 
-| File                              | Change                                          |
-| --------------------------------- | ----------------------------------------------- |
-| `src/shared/constants.ts`         | Added `DEFAULT_SYSTEMATIC_VERSION`              |
-| `src/shared/types.ts`             | Added `systematicVersion` to `ActionInputs`     |
-| `src/harness/config/inputs.ts`    | Parse `systematic-version` with fallback        |
-| `src/services/setup/types.ts`     | Added `systematicVersion` to `SetupInputs`      |
-| `src/features/agent/server.ts`    | Added to `EnsureOpenCodeOptions` + pass-through |
-| `src/harness/phases/bootstrap.ts` | Pass `inputs.systematicVersion` downstream      |
-| `src/services/setup/setup.ts`     | Plugin injection into `ciConfig.plugins`        |
-| `action.yaml`                     | Added `systematic-version` input                |
-| `.github/renovate.json5`          | npm customManager + packageRule                 |
+| File                                       | Change                                                      |
+| ------------------------------------------ | ----------------------------------------------------------- |
+| `packages/runtime/src/shared/constants.ts` | Added `DEFAULT_SYSTEMATIC_VERSION`                          |
+| `packages/runtime/src/shared/types.ts`     | Added `systematicVersion` to `ActionInputs`                 |
+| `src/harness/config/inputs.ts`             | Parse `systematic-version` with fallback                    |
+| `src/services/setup/types.ts`              | Added `systematicVersion` to `SetupInputs`                  |
+| `packages/runtime/src/agent/server.ts`     | Added to `EnsureOpenCodeOptions` + pass-through             |
+| `src/harness/phases/bootstrap.ts`          | Pass `inputs.systematicVersion` downstream                  |
+| `src/services/setup/plugin-install-v2.ts`  | `resolvePluginSpecsV2` and `installPluginsV2` for the specs |
+| `src/services/setup/ci-config-v2.ts`       | Plugin specs into `plugins` of the CI config                |
+| `action.yaml`                              | Added `systematic-version` input                            |
+| `.github/renovate.json5`                   | npm customManager + packageRule                             |

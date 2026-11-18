@@ -24,10 +24,11 @@ import {reconcileOwnedWorkV2} from './reconcile-v2.js'
 /**
  * Releasing a run on OpenCode V2: the Action's sibling of the gateway's `run-core-v2` release machinery (#1985).
  *
- * Why the directory decides and the ledger does not. Stock v2.2.0 gives no way to prove that nothing the run started can
+ * Why the directory decides and the ledger does not. Stock v2.3.0 gives no way to prove that nothing the run started can
  * still wake one of its sessions: a background child's notice and a shell's exit queue an inbox item and wake the owner
- * in a step the event stream does not show (probe P2), the global active list does not list a session whose only
- * activity is a background job, and an `interrupt` reply is a delivery receipt. So the run is released when the run's
+ * (a connected stream carries that notice and the wake, but a lost stream carries nothing and no read proves none is
+ * still to come; probe P2), the global active list lists a running child but not the idle owner whose only activity is
+ * that background job (pinned in `run-core-v2.e2e.test.ts`), and an `interrupt` reply is a delivery receipt. So the run is released when the run's
  * DIRECTORY has shown no active session, no running shell and no queued inbox item for a stability window
  * (`createDirectoryStabilityGate`), and the ledger, the notices and the reconcile passes are inputs to the wait, never
  * the verdict.

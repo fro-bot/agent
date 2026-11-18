@@ -42,9 +42,11 @@ Poisoning vectors an earlier step controls:
 
 `git --no-verify` disables hooks but does **not** make the later step trusted — it closes one vector of many.
 
-Real isolation requires either:
-- a **separate job** (fresh runner, explicit `needs.*`/outputs hand-off, no shared filesystem or env), or — better for credentials —
-- **credential minimization**: give the untrusted step only a short-lived, narrowly-scoped token so there is little worth protecting from it, rather than trying to withhold a broad one until "later" in the same job.
+Real isolation requires one of:
+
+- a **separate job** (fresh runner, explicit `needs.*`/outputs hand-off, no shared filesystem or env);
+- a **separate user in a read-only mount view** (`isolate-agent`, `action.yaml`): the agent runs as its own user inside a private mount namespace where every mount outside a short list of writable roots is read-only, and teardown is confirmed. A separate uid on its own is not enough on a hosted runner, see [the separate-uid learning](./separate-uid-is-not-a-boundary-on-hosted-runners-2026-11-17.md);
+- **credential minimization** (better for credentials): give the untrusted step only a short-lived, narrowly-scoped token so there is little worth protecting from it, rather than trying to withhold a broad one until "later" in the same job.
 
 If a same-job split is unavoidable, the later step needs aggressive hardening (clean env, `BASH_ENV=/dev/null`, safe `PATH`, ignore workspace git config, hardcoded remote/ref) — and even then it is defense-in-depth, not a boundary.
 
@@ -113,7 +115,7 @@ Consequence: any step that must hold a genuinely sensitive key (e.g. a GitHub Ap
 
 ## Mint before the agent, not after (2026-10-12)
 
-In `.github/workflows/harness-integrate.yaml` the App token mint step used to run after the prompt-injectable `Run Fro Bot` step. Both steps run as the same user on the same runner. The agent step could therefore change the checked-in `scripts/harness/mint-app-token.ts`, or anything it imports, and the next step would run that code with `APPLICATION_ID` and `APPLICATION_PRIVATE_KEY` in its environment. The App private key reaches every repository the App is installed on, with the App's full permissions, until it is revoked. Untrusted content can reach the agent through the allowlisted carry PR refs, which are fetched by the mutable `refs/pull/N/head`.
+In `.github/workflows/harness-integrate.yaml` (removed in #2152; the mint now lives in `.github/workflows/fro-bot.yaml`) the App token mint step used to run after the prompt-injectable `Run Fro Bot` step. Both steps run as the same user on the same runner. The agent step could therefore change the checked-in `scripts/harness/mint-app-token.ts`, or anything it imports, and the next step would run that code with `APPLICATION_ID` and `APPLICATION_PRIVATE_KEY` in its environment. The App private key reaches every repository the App is installed on, with the App's full permissions, until it is revoked. Untrusted content can reach the agent through the allowlisted carry PR refs, which are fetched by the mutable `refs/pull/N/head`.
 
 The fix was an ordering change, not a redesign. In #1792 the mint step runs immediately before `Run Fro Bot`. From the agent step onward, no step receives the App secrets. The rule:
 
@@ -122,16 +124,16 @@ The fix was an ordering change, not a redesign. In #1792 the mint step runs imme
 - The token now has to outlive the agent run. Cap the agent step (`timeout-minutes: 40`) so the roughly 1-hour token leaves headroom for the trusted push. A finalization that runs past expiry fails closed at the push.
 
 ```yaml
-      - name: Mint scoped App token for trusted finalization
-        id: mint-app-token
-        run: node --experimental-strip-types scripts/harness/mint-app-token.ts
-        env:
-          APPLICATION_ID: ${{ secrets.APPLICATION_ID }}
-          APPLICATION_PRIVATE_KEY: ${{ secrets.APPLICATION_PRIVATE_KEY }}
+- name: Mint scoped App token for trusted finalization
+  id: mint-app-token
+  run: node --experimental-strip-types scripts/harness/mint-app-token.ts
+  env:
+    APPLICATION_ID: ${{ secrets.APPLICATION_ID }}
+    APPLICATION_PRIVATE_KEY: ${{ secrets.APPLICATION_PRIVATE_KEY }}
 
-      - name: Run Fro Bot
-        uses: ./
-        timeout-minutes: 40
+- name: Run Fro Bot
+  uses: ./
+  timeout-minutes: 40
 ```
 
 `scripts/fro-bot-workflow.test.ts` pins the ordering:

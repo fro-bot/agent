@@ -53,6 +53,21 @@ describe('matrixDirectories', () => {
     ])
   })
 
+  it('drops PATH entries that are not plain absolute paths, since each one is embedded in a shell probe', () => {
+    // #given PATH entries carrying shell metacharacters, quotes, spaces or parent segments
+    const directories = matrixDirectories(
+      {
+        pathEnv: "/usr/bin:/tmp/$(id):/tmp/a;b:/tmp/it's:/tmp/../etc:/tmp/a b:/usr/local/bin",
+        toolCache: '/opt/hostedtoolcache',
+        extra: [],
+      },
+      noFs,
+    )
+
+    // #then only the plain paths remain
+    expect(directories).toEqual(['/usr/bin', '/usr/local/bin', '/opt/hostedtoolcache'])
+  })
+
   it('leaves out a directory the runner cannot write, and one that is missing', () => {
     // #given /usr/bin is not writable and /missing is not a directory
     const directories = matrixDirectories(

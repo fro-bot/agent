@@ -28,7 +28,11 @@ const SAFE_TOKEN = /^[\w.-]+$/
  * hostile environment cannot change what the command does.
  */
 export function safeEnvPath(value: string | undefined, fallback: string): string {
-  return value !== undefined && SAFE_ABSOLUTE_PATH.test(value) && !value.split('/').includes('..') ? value : fallback
+  return value !== undefined && isSafeAbsolutePath(value) ? value : fallback
+}
+
+function isSafeAbsolutePath(value: string): boolean {
+  return SAFE_ABSOLUTE_PATH.test(value) && !value.split('/').includes('..')
 }
 
 /** Same idea for an environment-derived token: word characters, dots and dashes only. */
@@ -296,13 +300,14 @@ export interface MatrixDirectoryDeps {
 }
 
 /**
- * The shared directories the matrix covers: every absolute `PATH` entry, the extra directories, the tool cache and its first
+ * The shared directories the matrix covers: every plain absolute `PATH` entry, the extra directories, the tool cache and its first
  * subdirectory, in that order and without duplicates. Only those the runner can write are returned. A directory the runner
  * cannot write is not part of the threat, and a runner-side control could not show that a block means anything there.
  */
 export function matrixDirectories(input: MatrixDirectoryInput, deps: MatrixDirectoryDeps): readonly string[] {
   const candidates = [
-    ...(input.pathEnv ?? '').split(':').filter(entry => entry.startsWith('/')),
+    // Each entry ends up inside a shell probe, so only plain absolute paths are kept (the same rule as `safeEnvPath`).
+    ...(input.pathEnv ?? '').split(':').filter(isSafeAbsolutePath),
     ...input.extra,
     input.toolCache,
   ]

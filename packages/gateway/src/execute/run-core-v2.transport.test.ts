@@ -1,10 +1,11 @@
 /**
  * The V2 run loop over the real remote client: a data frame the transport cannot parse is a lost frame of unknown type
  * (a truncated `permission.asked` is a request nobody can answer), so it ends the stream through the barrier instead of
- * being skipped and found five minutes later by the inactivity watchdog.
+ * being skipped and found five minutes later by the inactivity watchdog. A frame that grows past the reader's cap without
+ * a delimiter ends the run the same way, once, and is never retried.
  */
 
-import {createRemoteOpenCodeV2Client} from '@fro-bot/runtime'
+import {createRemoteOpenCodeV2Client, V2_EVENT_FRAME_MAX_CHARS} from '@fro-bot/runtime'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
 import {DIRECTORY, failure, ROOT, startRun} from './run-core-v2.fixture.js'
@@ -67,5 +68,38 @@ describe('runOpenCodeCoreV2 over the remote client: an unreadable data frame', (
 
     // #then
     expect(failure(run).message).not.toContain('hunter2')
+  })
+})
+
+describe('runOpenCodeCoreV2 over the remote client: a frame that never ends', () => {
+  // A chunk with no frame delimiter that is already past the reader's cap: the same as a server that never sends one.
+  const oversizedChunk = `data: oversize-marker-${'x'.repeat(V2_EVENT_FRAME_MAX_CHARS)}`
+
+  it('ends the run as stream-ended through the barrier, without reconnecting', async () => {
+    // #given — the stream connects, then delivers a frame that grows past the cap without a delimiter
+    const run = startOverTransport(['data: {"type":"server.connected","data":{}}\n\n', oversizedChunk])
+
+    // #when — far short of the inactivity window
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    // #then — the run fails now and for good: the root is interrupted and confirmed stopped, and the stream is never
+    // opened a second time
+    const error = failure(run)
+    expect(error.kind).toBe('stream-ended')
+    expect(error.quarantined).toBe(false)
+    expect(run.interrupt).toHaveBeenCalledWith(expect.objectContaining({sessionId: ROOT}))
+    expect(run.subscribe).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not carry any of the oversized payload into the error', async () => {
+    // #given
+    const run = startOverTransport(['data: {"type":"server.connected","data":{}}\n\n', oversizedChunk])
+
+    // #when
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    // #then
+    expect(failure(run).message).toContain('larger than the size limit')
+    expect(failure(run).message).not.toContain('oversize-marker')
   })
 })

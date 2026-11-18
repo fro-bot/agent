@@ -65,6 +65,7 @@ export type {
   DrainProgress,
   DrainProgressOptions,
 } from './drain-progress-v2.js'
+export {ensureOpenCodeAvailable} from './ensure-opencode.js'
 export {
   createAgentError,
   createErrorInfo,
@@ -213,7 +214,13 @@ export type {TriggerDirective} from './prompt.js'
 export {materializeReferenceFiles} from './reference-files.js'
 export {createActionOpenCodeV2Client} from './remote-client-action-v2.js'
 export type {ActionOpenCodeV2Client} from './remote-client-action-v2.js'
-export {createRemoteOpenCodeV2Client, V2_HEARTBEAT_FRAME} from './remote-client-v2.js'
+export {
+  createRemoteOpenCodeV2Client,
+  isV2EventFrameTooLargeError,
+  V2_EVENT_FRAME_MAX_CHARS,
+  V2_EVENT_FRAME_TOO_LARGE_ERROR_NAME,
+  V2_HEARTBEAT_FRAME,
+} from './remote-client-v2.js'
 export type {
   RemoteOpenCodeV2Client,
   RemoteOpenCodeV2ClientOptions,
@@ -333,7 +340,7 @@ export type {
   OpenCodeV2Timeouts,
   StartOpenCodeV2ServerOptions,
 } from './server-v2.js'
-export {bootstrapOpenCodeServer, ensureOpenCodeAvailable} from './server.js'
+export {bootstrapOpenCodeServer} from './server.js'
 export type {OpenCodeServerHandle, ShutdownResult} from './server.js'
 export type {SetupAdapter} from './setup-adapter.js'
 export {reconcileShellsOnce} from './shell-jobs-v2.js'

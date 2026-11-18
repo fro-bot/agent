@@ -13,3 +13,17 @@ vulnerability.ignore = true
 
 effectiveUntil = 2027-02-01
 reason = "GHSA-g3hv-75wg-m249: not reachable with untrusted input (lint-time globs from repo config); no 10.x fix; 11.x breaks @actions/glob."
+
+# GHSA-fc5q-39xc-vjpf (CVE-2026-112366): picomatch, no patched release (affects every version through 4.0.7).
+# Reached only through dev tooling (eslint, lint-staged, vitest, tsdown, semantic-release); not bundled in dist/.
+# PackageOverrides cannot be scoped to one advisory, so this mutes every advisory for picomatch 4.0.4
+# until effectiveUntil.
+[[PackageOverrides]]
+name = "picomatch"
+version = "4.0.4"
+ecosystem = "npm"
+
+vulnerability.ignore = true
+
+effectiveUntil = 2027-01-16
+reason = "GHSA-fc5q-39xc-vjpf: dev-only (lint, test and release tooling globs from repo config); no patched release yet."

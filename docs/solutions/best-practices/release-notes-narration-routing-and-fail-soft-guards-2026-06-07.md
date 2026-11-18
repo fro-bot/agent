@@ -224,7 +224,7 @@ Short human-readable summary of the release.
 - [`../logic-errors/release-notes-candidate-validation-must-be-code-span-aware-2026-07-17.md`](../logic-errors/release-notes-candidate-validation-must-be-code-span-aware-2026-07-17.md)
   — the code-span exemption in Rule #4's candidate validation (raw-text scans
   rejected the first live narration for describing the validator itself).
-- [`workspace-executor-opencode-provisioning-best-practices-2026-06-01.md`](./workspace-executor-opencode-provisioning-best-practices-2026-06-01.md)
+- [`workspace-opencode-provisioning-on-v2-2026-11-17.md`](./workspace-opencode-provisioning-on-v2-2026-11-17.md)
   — the cliproxy / model-routing / deploy-time provisioning surface. Same
   "route models through config, distinguish absent vs malformed" axis, but for
   runtime workspace provisioning rather than the release pipeline.
