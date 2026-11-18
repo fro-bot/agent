@@ -65,6 +65,7 @@ export type {
   DrainProgress,
   DrainProgressOptions,
 } from './drain-progress-v2.js'
+export {ensureOpenCodeAvailable} from './ensure-opencode.js'
 export {
   createAgentError,
   createErrorInfo,
@@ -339,7 +340,7 @@ export type {
   OpenCodeV2Timeouts,
   StartOpenCodeV2ServerOptions,
 } from './server-v2.js'
-export {bootstrapOpenCodeServer, ensureOpenCodeAvailable} from './server.js'
+export {bootstrapOpenCodeServer} from './server.js'
 export type {OpenCodeServerHandle, ShutdownResult} from './server.js'
 export type {SetupAdapter} from './setup-adapter.js'
 export {reconcileShellsOnce} from './shell-jobs-v2.js'
