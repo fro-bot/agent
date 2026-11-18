@@ -8,6 +8,9 @@ import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {CacheRestorePhaseResult} from './cache-restore.js'
 import type {ExecutePhaseResult} from './execute.js'
 import type {RoutingPhaseResult} from './routing.js'
+import * as fs from 'node:fs/promises'
+import * as os from 'node:os'
+import * as path from 'node:path'
 import {classifyProviderFailure, createProviderAuthError} from '@fro-bot/runtime'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {formatErrorComment} from '../../features/comments/index.js'
@@ -2176,5 +2179,85 @@ describe('runFinalize knownExecutionVeto gating of brokered push', () => {
     // #then behavior is unchanged: the push still runs
     expect(exitCode).toBe(0)
     expect(mocks.runBrokeredPush).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('runFinalize on a discussion_comment run', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mocks.runBrokeredPush.mockResolvedValue({kind: 'bypass'})
+  })
+
+  it('addresses the reply and the error comment to the same discussion', async () => {
+    // #given real response posting and a discussion run whose trusted context names discussion 9
+    const actual = await vi.importActual<typeof import('../../features/agent/response-post.js')>(
+      '../../features/agent/response-post.js',
+    )
+    mocks.readAndParseResponseFile.mockImplementation(actual.readAndParseResponseFile)
+    mocks.runResponsePost.mockImplementation(actual.runResponsePost)
+    const graphql = vi.fn(async (query: string) =>
+      query.includes('AddDiscussionComment')
+        ? {addDiscussionComment: {comment: {id: 'DC_1', url: 'https://example.com/discussions/9#c1'}}}
+        : {repository: {discussion: {id: 'D_node', comments: {nodes: [], pageInfo: {hasNextPage: false}}}}},
+    )
+    const routing = createRouting({
+      githubClient: {graphql} as unknown as Octokit,
+      triggerResult: {
+        context: {
+          eventType: 'discussion_comment',
+          eventName: 'discussion_comment',
+          author: {login: 'maintainer', association: 'MEMBER', isBot: false},
+          target: {kind: 'discussion', number: 9, title: 'Question', body: null, locked: false},
+          hasMention: true,
+        },
+      } as unknown as TriggerResultProcess,
+      agentContext: {
+        eventName: 'discussion_comment',
+        repo: 'owner/repo',
+        ref: 'refs/heads/main',
+        runId: '123',
+        issueNumber: 9,
+        issueType: null,
+      } as AgentContext,
+    })
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'finalize-discussion-'))
+    const responseFilePath = path.join(dir, 'response.md')
+    await fs.writeFile(responseFilePath, 'Answer for the discussion.', 'utf8')
+
+    try {
+      // #when the reply is delivered
+      const replyExit = await runFinalize(
+        createBootstrap({responseFilePath}),
+        routing,
+        cacheRestore,
+        createExecution(),
+        createMetrics(),
+        Date.now(),
+        createMockLogger(),
+      )
+
+      // #and the same run later fails with no response file
+      const errorExit = await runFinalize(
+        createBootstrap({responseFilePath: path.join(dir, 'missing.md')}),
+        routing,
+        cacheRestore,
+        createExecution({success: false, exitCode: 1, error: 'boom'}),
+        createMetrics(),
+        Date.now(),
+        createMockLogger(),
+      )
+
+      // #then the reply mutation and the error comment both address discussion 9 in owner/repo
+      expect(replyExit).toBe(0)
+      expect(errorExit).toBe(1)
+      expect(graphql).toHaveBeenCalledWith(
+        expect.stringContaining('GetDiscussionId'),
+        expect.objectContaining({owner: 'owner', repo: 'repo', number: 9}),
+      )
+      const [, errorTarget] = mocks.postComment.mock.calls[0] as [unknown, CommentTarget]
+      expect(errorTarget).toEqual({type: 'discussion', number: 9, owner: 'owner', repo: 'repo'})
+    } finally {
+      await fs.rm(dir, {recursive: true, force: true})
+    }
   })
 })

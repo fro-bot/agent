@@ -2382,3 +2382,206 @@ describe('runResponsePost review delivery receipt threading', () => {
     expect(octokit.rest.issues.createComment).toHaveBeenCalledTimes(1)
   })
 })
+
+function makeDiscussionTriggerResult(
+  target: NonNullable<TriggerResultProcess['context']['target']> | null = {
+    kind: 'discussion',
+    number: 9,
+    title: 'Discussion',
+    body: null,
+    locked: false,
+  },
+): TriggerResultProcess {
+  const base = makeTriggerResult('discussion_comment')
+  return {...base, context: {...base.context, target}}
+}
+
+function makeDiscussionAgentContext(overrides?: Partial<AgentContext>): AgentContext {
+  return makeAgentContext({eventName: 'discussion_comment', issueType: null, issueNumber: 9, ...overrides})
+}
+
+describe('runResponsePost on a discussion_comment trigger', () => {
+  let logger: Logger
+  let tempFiles: string[] = []
+
+  beforeEach(() => {
+    logger = createMockLogger()
+    tempFiles = []
+    if (fsMocks.actualReadFile !== undefined) {
+      fsMocks.readFile.mockReset().mockImplementation(fsMocks.actualReadFile)
+    }
+  })
+
+  afterEach(async () => {
+    for (const filePath of tempFiles) {
+      await fs.rm(path.dirname(filePath), {recursive: true, force: true})
+    }
+  })
+
+  const addCommentResult = {
+    addDiscussionComment: {comment: {id: 'DC_1', url: 'https://github.com/owner/repo/discussions/9#c1'}},
+  }
+
+  function makeDiscussionOctokit(addComment: () => Promise<unknown> = async () => addCommentResult) {
+    const octokit = makeOctokit()
+    octokit.graphql.mockImplementation(async (query: string) => {
+      if (query.includes('AddDiscussionComment')) {
+        return addComment()
+      }
+      return {repository: {discussion: {id: 'D_node', comments: {nodes: [], pageInfo: {hasNextPage: false}}}}}
+    })
+    return octokit
+  }
+
+  it('posts a top-level discussion comment through GraphQL and never calls an issue endpoint', async () => {
+    // #given a valid response file on a discussion_comment trigger
+    const filePath = await writeFixture('Answer for the discussion.')
+    tempFiles.push(filePath)
+    const octokit = makeDiscussionOctokit()
+
+    // #when running response-post
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeDiscussionAgentContext(),
+        triggerResult: makeDiscussionTriggerResult(),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+      },
+      logger,
+    )
+
+    // #then the discussion resolved from owner, repo and number receives the comment
+    expect(result).toEqual({delivered: true, kind: 'comment'})
+    expect(octokit.graphql).toHaveBeenCalledWith(
+      expect.stringContaining('GetDiscussionId'),
+      expect.objectContaining({owner: 'owner', repo: 'repo', number: 9}),
+    )
+    expect(octokit.graphql).toHaveBeenCalledWith(
+      expect.stringContaining('AddDiscussionComment'),
+      expect.objectContaining({
+        discussionId: 'D_node',
+        body: expect.stringContaining('Answer for the discussion.') as unknown as string,
+      }),
+    )
+    expect(octokit.rest.issues.createComment).not.toHaveBeenCalled()
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+  })
+
+  it('drops a verdict from the file and posts the body as a discussion comment', async () => {
+    // #given a response file that carries review verdict frontmatter
+    const filePath = await writeFixture('---\nverdict: approve\n---\nBody without frontmatter residue.')
+    tempFiles.push(filePath)
+    const octokit = makeDiscussionOctokit()
+
+    // #when running response-post
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeDiscussionAgentContext(),
+        triggerResult: makeDiscussionTriggerResult(),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+      },
+      logger,
+    )
+
+    // #then the prose is posted as a comment and the drop is logged
+    expect(result).toEqual({delivered: true, kind: 'comment'})
+    const mutationCall = octokit.graphql.mock.calls.find(call => String(call[0]).includes('AddDiscussionComment'))
+    const variables = mutationCall?.[1] as {readonly body: string}
+    expect(variables.body).toContain('Body without frontmatter residue.')
+    expect(variables.body).not.toContain('verdict:')
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+    expect(logger.warning).toHaveBeenCalledWith(
+      'Response-post: dropped verdict on "discussion-comment" surface; posting response body as a comment',
+      {surface: 'discussion-comment'},
+    )
+  })
+
+  it('reports post-failed after three failed writes and sends nothing to an issue endpoint', async () => {
+    // #given a discussion whose add-comment mutation always fails
+    const filePath = await writeFixture('Answer for the discussion.')
+    tempFiles.push(filePath)
+    const octokit = makeDiscussionOctokit(async () => {
+      throw new Error('discussions: write is missing')
+    })
+
+    // #when running response-post
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeDiscussionAgentContext(),
+        triggerResult: makeDiscussionTriggerResult(),
+        botLogin: null,
+        responseFilePath: filePath,
+      },
+      logger,
+    )
+
+    // #then the post fails after three attempts and no issue endpoint is touched
+    expect(result).toEqual({delivered: false, reason: 'post-failed', detail: 'postComment returned null after retries'})
+    const mutationCalls = octokit.graphql.mock.calls.filter(call => String(call[0]).includes('AddDiscussionComment'))
+    expect(mutationCalls).toHaveLength(3)
+    expect(octokit.rest.issues.createComment).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {name: 'no target', target: null},
+    {
+      name: 'an issue target',
+      target: {kind: 'issue' as const, number: 9, title: 'Issue', body: null, locked: false},
+    },
+    {
+      name: 'a pull request target',
+      target: {kind: 'pr' as const, number: 9, title: 'PR', body: null, locked: false},
+    },
+  ])('fails with a missing target and posts nothing when trusted context has $name', async ({target}) => {
+    // #given a discussion surface whose trusted target is not a discussion
+    const filePath = await writeFixture('Answer for the discussion.')
+    tempFiles.push(filePath)
+    const octokit = makeDiscussionOctokit()
+
+    // #when running response-post
+    const result = await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeDiscussionAgentContext({issueType: target?.kind ?? null}),
+        triggerResult: makeDiscussionTriggerResult(target),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+      },
+      logger,
+    )
+
+    // #then nothing is posted and the discussion number is never retargeted
+    expect(result).toMatchObject({delivered: false, reason: 'missing-target-context'})
+    expect(octokit.graphql).not.toHaveBeenCalled()
+    expect(octokit.rest.issues.createComment).not.toHaveBeenCalled()
+  })
+
+  it('takes the discussion number from the trusted target, not the agent context', async () => {
+    // #given an agent context number that disagrees with the trusted discussion target
+    const filePath = await writeFixture('Answer for the discussion.')
+    tempFiles.push(filePath)
+    const octokit = makeDiscussionOctokit()
+
+    // #when running response-post
+    await runResponsePost(
+      {
+        octokit: octokit as unknown as Octokit,
+        agentContext: makeDiscussionAgentContext({issueNumber: 1234}),
+        triggerResult: makeDiscussionTriggerResult(),
+        botLogin: 'fro-bot[bot]',
+        responseFilePath: filePath,
+      },
+      logger,
+    )
+
+    // #then the trusted target's number addresses the discussion
+    expect(octokit.graphql).toHaveBeenCalledWith(
+      expect.stringContaining('GetDiscussionId'),
+      expect.objectContaining({number: 9}),
+    )
+  })
+})

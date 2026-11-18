@@ -2650,7 +2650,80 @@ describe('buildAgentPrompt response delivery gating', () => {
     const surfaces = Object.keys(RESPONSE_SURFACE_POLICIES).sort()
 
     // #then every union member has an explicit entry rather than falling through a default
-    expect(surfaces).toEqual(['issue-comment', 'pr-comment', 'pr-review', 'pr-review-permitted'])
+    expect(surfaces).toEqual(['discussion-comment', 'issue-comment', 'pr-comment', 'pr-review', 'pr-review-permitted'])
+  })
+
+  describe('top-level reply destination', () => {
+    const filePath = '/tmp/fro-bot-response/1-1/nonce123.md'
+
+    function buildDiscussionPrompt(responseDelivery: ResponseDelivery): string {
+      return buildAgentPrompt(
+        {
+          context: createMockContext({
+            eventName: 'discussion_comment',
+            issueNumber: 9,
+            issueTitle: 'How do I configure this?',
+            issueType: null,
+          }),
+          customPrompt: null,
+          cacheStatus: 'hit',
+          triggerContext: createMockTriggerContext({
+            eventType: 'discussion_comment',
+            eventName: 'discussion_comment',
+            target: {kind: 'discussion', number: 9, title: 'How do I configure this?', body: 'Body', locked: false},
+          }),
+          responseMode: 'github',
+          responseDelivery,
+          responseFilePath: responseDelivery === 'file-convention' ? filePath : null,
+          responseSurface: 'discussion-comment',
+        },
+        mockLogger,
+      ).text
+    }
+
+    it('names the discussion and says the Action posts a top-level comment when delivery is file-convention', () => {
+      // #given a discussion run delivered through the response file
+      // #when the prompt is built
+      const prompt = buildDiscussionPrompt('file-convention')
+
+      // #then the discussion is named, the destination is stated, and no review or issue instruction appears
+      expect(prompt).toContain('## Discussion #9')
+      expect(prompt).not.toContain('## Issue #9')
+      expect(prompt).toContain('The Action posts your reply as a top-level comment on this discussion.')
+      expect(prompt).toContain(`**Write to this exact path:** \`${filePath}\``)
+      expect(prompt).not.toContain('<output_contract>')
+      expect(prompt).not.toContain(RESPONSE_FILE_VERDICT_KEY)
+    })
+
+    it('states the review-comment reply is a top-level pull request comment when delivery is file-convention', () => {
+      // #given a review-comment run delivered through the response file
+      // #when the prompt is built
+      const prompt = buildPromptForDelivery('file-convention', filePath, 'pull_request_review_comment', 'pr-comment')
+
+      // #then the destination is stated
+      expect(prompt).toContain(
+        'The Action posts your reply as a top-level comment on this pull request, not as a reply in the review thread.',
+      )
+    })
+
+    it.each(['model-gh', 'none'] as const)('leaves the directive text unchanged under %s delivery', delivery => {
+      // #given discussion and review-comment triggers outside file-convention delivery
+      const discussion = createMockTriggerContext({eventType: 'discussion_comment'})
+      const reviewComment = createMockTriggerContext({
+        eventType: 'pull_request_review_comment',
+        target: {kind: 'pr', number: 42, title: 'PR', body: null, locked: false, path: 'src/a.ts', line: 3},
+      })
+
+      // #when the directives are resolved
+      const discussionDirective = getTriggerDirective(discussion, null, delivery).directive
+      const reviewDirective = getTriggerDirective(reviewComment, null, delivery).directive
+
+      // #then neither mentions the Action posting the reply
+      expect(discussionDirective).toBe(
+        'Respond to the discussion comment above. Post your response as a single comment.',
+      )
+      expect(reviewDirective).toBe('Respond to the review comment.\n\n**File:** `src/a.ts`\n**Line:** 3')
+    })
   })
 
   it.each([

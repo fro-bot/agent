@@ -411,7 +411,21 @@ function deriveSurfaceAndTarget(
   // has already rejected bots and authors outside the configured trusted association set.
   const surface = resolveResponseSurface(agentContext, triggerResult.context)
   const [owner, repo] = agentContext.repo.split('/')
-  if (owner == null || owner.length === 0 || repo == null || repo.length === 0 || agentContext.issueNumber == null) {
+  if (owner == null || owner.length === 0 || repo == null || repo.length === 0) {
+    return {surface, target: null}
+  }
+
+  // A discussion reply is addressed only by the trusted discussion target; it never falls back to an issue number.
+  if (surface === 'discussion-comment') {
+    const trustedTarget = triggerResult.context.target
+    return {
+      surface,
+      target:
+        trustedTarget?.kind === 'discussion' ? {type: 'discussion', number: trustedTarget.number, owner, repo} : null,
+    }
+  }
+
+  if (agentContext.issueNumber == null) {
     return {surface, target: null}
   }
 
