@@ -2387,6 +2387,55 @@ describe('output contract', () => {
   })
 })
 
+function buildHydratedDiscussionPrompt(
+  logger: Logger,
+  responseDelivery: ResponseDelivery,
+  overrides: {
+    readonly bodyTruncated?: boolean
+    readonly commentsTruncated?: boolean
+    readonly total?: number
+  } = {},
+) {
+  return buildAgentPrompt(
+    {
+      context: createMockContext({
+        eventName: 'discussion_comment',
+        issueNumber: 9,
+        issueTitle: 'How do I configure this?',
+        issueType: null,
+        commentBody: 'the triggering comment',
+        hydratedContext: {
+          type: 'discussion',
+          number: 9,
+          title: 'How do I configure this?',
+          body: 'The original question body',
+          bodyTruncated: overrides.bodyTruncated ?? false,
+          author: 'asker',
+          comments: [
+            {id: 'DC_1', author: 'helper', body: 'an earlier answer', createdAt: '2024-01-01T00:00:00Z'},
+            {id: 'DC_2', author: 'asker', body: 'a follow-up', createdAt: '2024-01-02T00:00:00Z'},
+          ],
+          commentsTruncated: overrides.commentsTruncated ?? false,
+          totalComments: overrides.total ?? 2,
+        },
+      }),
+      customPrompt: null,
+      cacheStatus: 'hit',
+      triggerContext: createMockTriggerContext({
+        eventType: 'discussion_comment',
+        eventName: 'discussion_comment',
+        commentBody: 'the triggering comment',
+        target: {kind: 'discussion', number: 9, title: 'How do I configure this?', body: null, locked: false},
+      }),
+      responseMode: 'github',
+      responseDelivery,
+      responseFilePath: responseDelivery === 'file-convention' ? '/tmp/fro-bot-response/1-1/nonce123.md' : null,
+      responseSurface: 'discussion-comment',
+    },
+    logger,
+  )
+}
+
 describe('buildAgentPrompt response delivery gating', () => {
   let mockLogger: Logger
 
@@ -2650,7 +2699,119 @@ describe('buildAgentPrompt response delivery gating', () => {
     const surfaces = Object.keys(RESPONSE_SURFACE_POLICIES).sort()
 
     // #then every union member has an explicit entry rather than falling through a default
-    expect(surfaces).toEqual(['issue-comment', 'pr-comment', 'pr-review', 'pr-review-permitted'])
+    expect(surfaces).toEqual(['discussion-comment', 'issue-comment', 'pr-comment', 'pr-review', 'pr-review-permitted'])
+  })
+
+  describe('top-level reply destination', () => {
+    const filePath = '/tmp/fro-bot-response/1-1/nonce123.md'
+
+    function buildDiscussionPrompt(responseDelivery: ResponseDelivery): string {
+      return buildAgentPrompt(
+        {
+          context: createMockContext({
+            eventName: 'discussion_comment',
+            issueNumber: 9,
+            issueTitle: 'How do I configure this?',
+            issueType: null,
+          }),
+          customPrompt: null,
+          cacheStatus: 'hit',
+          triggerContext: createMockTriggerContext({
+            eventType: 'discussion_comment',
+            eventName: 'discussion_comment',
+            target: {kind: 'discussion', number: 9, title: 'How do I configure this?', body: 'Body', locked: false},
+          }),
+          responseMode: 'github',
+          responseDelivery,
+          responseFilePath: responseDelivery === 'file-convention' ? filePath : null,
+          responseSurface: 'discussion-comment',
+        },
+        mockLogger,
+      ).text
+    }
+
+    it('names the discussion and says the Action posts a top-level comment when delivery is file-convention', () => {
+      // #given a discussion run delivered through the response file
+      // #when the prompt is built
+      const prompt = buildDiscussionPrompt('file-convention')
+
+      // #then the discussion is named, the destination is stated, and no review or issue instruction appears
+      expect(prompt).toContain('## Discussion #9')
+      expect(prompt).not.toContain('## Issue #9')
+      expect(prompt).toContain('The Action posts your reply as a top-level comment on this discussion.')
+      expect(prompt).toContain(`**Write to this exact path:** \`${filePath}\``)
+      expect(prompt).not.toContain('<output_contract>')
+      expect(prompt).not.toContain(RESPONSE_FILE_VERDICT_KEY)
+    })
+
+    it('states the review-comment reply is a top-level pull request comment when delivery is file-convention', () => {
+      // #given a review-comment run delivered through the response file
+      // #when the prompt is built
+      const prompt = buildPromptForDelivery('file-convention', filePath, 'pull_request_review_comment', 'pr-comment')
+
+      // #then the destination is stated
+      expect(prompt).toContain(
+        'The Action posts your reply as a top-level comment on this pull request, not as a reply in the review thread.',
+      )
+    })
+
+    describe('hydrated discussion context', () => {
+      it.each(['file-convention', 'model-gh'] as const)(
+        'carries the discussion body and prior comments as attachments under %s delivery',
+        responseDelivery => {
+          // #given a discussion run with hydrated context
+          // #when the prompt is built
+          const result = buildHydratedDiscussionPrompt(mockLogger, responseDelivery)
+
+          // #then the discussion is described inline, its untrusted text is attached, and the trigger stays separate
+          expect(result.text).toContain('<discussion>')
+          expect(result.text).toContain('## Discussion #9')
+          expect(result.text).toContain('- **Body:** @discussion-description.txt')
+          expect(result.text).toContain('@discussion-comment-001-helper.txt')
+          expect(result.text).toContain('### Comments (2)')
+          expect(result.text).not.toContain('The original question body')
+          expect(result.text).not.toContain('an earlier answer')
+          const files = Object.fromEntries(result.referenceFiles.map(f => [f.filename, f.content]))
+          expect(files['discussion-description.txt']).toBe('The original question body')
+          expect(files['discussion-comment-001-helper.txt']).toBe('an earlier answer')
+          expect(files['discussion-comment-002-asker.txt']).toBe('a follow-up')
+          expect(files['trigger-comment.txt']).toBe('the triggering comment')
+        },
+      )
+
+      it('states when the body and comments were truncated', () => {
+        // #given a hydrated discussion whose body and comments were cut to the budget
+        // #when the prompt is built
+        const result = buildHydratedDiscussionPrompt(mockLogger, 'file-convention', {
+          bodyTruncated: true,
+          commentsTruncated: true,
+          total: 7,
+        })
+
+        // #then the prompt says so, with the full comment count
+        expect(result.text).toContain('*Note: Body was truncated due to size limits.*')
+        expect(result.text).toContain('### Comments (2 of 7)')
+      })
+    })
+
+    it.each(['model-gh', 'none'] as const)('leaves the directive text unchanged under %s delivery', delivery => {
+      // #given discussion and review-comment triggers outside file-convention delivery
+      const discussion = createMockTriggerContext({eventType: 'discussion_comment'})
+      const reviewComment = createMockTriggerContext({
+        eventType: 'pull_request_review_comment',
+        target: {kind: 'pr', number: 42, title: 'PR', body: null, locked: false, path: 'src/a.ts', line: 3},
+      })
+
+      // #when the directives are resolved
+      const discussionDirective = getTriggerDirective(discussion, null, delivery).directive
+      const reviewDirective = getTriggerDirective(reviewComment, null, delivery).directive
+
+      // #then neither mentions the Action posting the reply
+      expect(discussionDirective).toBe(
+        'Respond to the discussion comment above. Post your response as a single comment.',
+      )
+      expect(reviewDirective).toBe('Respond to the review comment.\n\n**File:** `src/a.ts`\n**Line:** 3')
+    })
   })
 
   it.each([

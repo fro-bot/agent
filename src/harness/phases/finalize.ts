@@ -14,7 +14,7 @@ import process from 'node:process'
 import * as core from '@actions/core'
 import {createErrorInfo, createProviderAuthError, createQuotaExceededError} from '@fro-bot/runtime'
 import {readAndParseResponseFile, runResponsePost} from '../../features/agent/response-post.js'
-import {formatErrorComment, postComment} from '../../features/comments/index.js'
+import {formatErrorComment, postComment, withBotMarker} from '../../features/comments/index.js'
 import {createBrokeredPushAllowlist} from '../../features/delegated/brokered-push-validation.js'
 import {runBrokeredPush} from '../../features/delegated/brokered-push.js'
 import {writeJobSummary} from '../../features/observability/index.js'
@@ -156,7 +156,7 @@ function formatBrokeredPushFooter(outcome: Extract<BrokeredPushOutcome, {readonl
   ].join('\n')
 }
 
-/** Post a formatted error comment to the resolved target, if any. Never throws. */
+/** Post a formatted error comment, marked as the Action's own, to the resolved target, if any. Never throws. */
 async function postErrorComment(
   routing: RoutingPhaseResult,
   commentTarget: CommentTarget,
@@ -164,7 +164,12 @@ async function postErrorComment(
   metrics: MetricsCollector,
   logger: Logger,
 ): Promise<boolean> {
-  const commentResult = await postComment(routing.githubClient, commentTarget, {body: errorCommentBody}, logger)
+  const commentResult = await postComment(
+    routing.githubClient,
+    commentTarget,
+    {body: withBotMarker(errorCommentBody)},
+    logger,
+  )
 
   if (commentResult == null) {
     logger.warning('Failed to post LLM error comment')

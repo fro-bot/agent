@@ -48,24 +48,36 @@ describe('resolveResponseDelivery', () => {
     expect(decision).toStrictEqual({delivery: 'none', credential: 'provision'})
   })
 
-  it('defaults an unknown event name to the safe model-gh/provision behavior', () => {
-    // #given an unrecognized event name with github response mode
-    // #when resolving delivery
-    const decision = resolveResponseDelivery('push', 'github')
-
-    // #then it falls back to today's behavior of provisioning the credential
-    expect(decision).toStrictEqual({delivery: 'model-gh', credential: 'provision'})
-  })
-
-  it.each(['pull_request_review_comment', 'discussion_comment'] as const)(
-    'provisions the credential for the deferred surface %s',
+  it.each([
+    'pull_request_review_comment',
+    'discussion_comment',
+    'discussion',
+    'push',
+    'merge_group',
+    'Schedule',
+    'WORKFLOW_DISPATCH',
+    '',
+  ] as const)(
+    'delivers via file-convention and withholds the credential for the non-allowlisted name %j',
     eventName => {
-      // #given a deferred surface that still uses gh directly
-      // #when resolving delivery
+      // #given an event name outside the provisioning allowlist, known or not
+      // #when resolving delivery with github response mode
       const decision = resolveResponseDelivery(eventName, 'github')
 
-      // #then the credential is provisioned, not withheld
-      expect(decision.credential).toBe('provision')
+      // #then delivery goes through the file convention and the credential is withheld
+      expect(decision).toStrictEqual({delivery: 'file-convention', credential: 'withhold'})
+    },
+  )
+
+  it.each(['pull_request_review_comment', 'discussion_comment', 'push', ''] as const)(
+    'selects no delivery and still withholds the credential for the non-allowlisted name %j with responseMode none',
+    eventName => {
+      // #given a non-allowlisted event name with response mode none
+      // #when resolving delivery
+      const decision = resolveResponseDelivery(eventName, 'none')
+
+      // #then nothing is delivered but the credential stays withheld
+      expect(decision).toStrictEqual({delivery: 'none', credential: 'withhold'})
     },
   )
 })

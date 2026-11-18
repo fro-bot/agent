@@ -1,7 +1,7 @@
 /**
  * Caller-provided MCP servers (`opencode-config` `mcp`) for an OpenCode V2 Action run (fro-bot/agent#1931).
  *
- * **Credential-withheld triggers (`pull_request`, `issue_comment`, `issues`): only static local servers run.** A server
+ * **Credential-withheld runs (every trigger except `schedule` and `workflow_dispatch`): only static local servers run.** A server
  * is kept only when its `type` is the literal `"local"`, it parses, and no `{file:` or `{env:` opening appears anywhere in
  * its original definition: its name, every known field and every nested or unknown key and string. Every other server is
  * dropped (all `remote` servers, any server with a reference, any malformed entry), and the `mcp` key goes when none is

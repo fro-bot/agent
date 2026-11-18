@@ -21,6 +21,7 @@ export function resolveResponseSurface(
   triggerContext: ResponseSurfaceTriggerContext | null | undefined,
 ): ResponseSurface {
   if (triggerContext?.eventType === 'pull_request') return 'pr-review'
+  if (triggerContext?.eventType === 'discussion_comment') return 'discussion-comment'
   // Routing is the primary authorization boundary; repeat its comment checks here so this resolver fails closed.
   const author = triggerContext?.author
   if (

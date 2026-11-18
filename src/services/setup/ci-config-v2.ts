@@ -61,8 +61,8 @@ export interface CIConfigV2Inputs {
   readonly proxiedProviders?: Readonly<Record<string, {readonly baseURL: string; readonly apiKey: string}>>
   /**
    * The run's credential disposition (`resolveResponseDelivery`). Required, so a caller cannot omit it into the
-   * permissive reading. On `withhold` (`pull_request`, `issue_comment`, `issues`) untrusted text drives the model, so
-   * the operator's `mcp` is cut to its static local servers (`applyOperatorMcpV2`).
+   * permissive reading. On `withhold` (every trigger except `schedule` and `workflow_dispatch`) untrusted text drives
+   * the model, so the operator's `mcp` is cut to its static local servers (`applyOperatorMcpV2`).
    */
   readonly credential: CredentialDisposition
 }
@@ -243,7 +243,7 @@ export function buildCIConfigV2(inputs: CIConfigV2Inputs, logger: Logger): Resul
     // inspects the operator's input alone. The message names the rule, never a value.
     if (inputs.credential === 'withhold' && containsEnvReference(parsed)) {
       return err(
-        'opencode-config must not contain {env:} references on credential-withheld triggers (pull_request, issue_comment, issues): the server splices an environment value into the config text before it parses it',
+        'opencode-config must not contain {env:} references on credential-withheld runs (every trigger except schedule and workflow_dispatch): the server splices an environment value into the config text before it parses it',
       )
     }
     operator = stripOperatorPermissions(parsed, logger)

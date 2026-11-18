@@ -7,7 +7,7 @@ import type {SandboxLifecycle} from './sandbox-lifecycle.js'
 import * as path from 'node:path'
 import process from 'node:process'
 import * as core from '@actions/core'
-import {DB_V2_MAIN_BASENAME, resolveResponseDelivery} from '@fro-bot/runtime'
+import {DB_V2_MAIN_BASENAME} from '@fro-bot/runtime'
 import {
   buildCacheKeyComponents,
   checkpointDatabase,
@@ -183,9 +183,9 @@ async function startV2Server(
     dbPath: path.join(path.dirname(storagePath), DB_V2_MAIN_BASENAME),
     authPath: getOpenCodeAuthPath(),
     env: process.env,
-    // Same classification `runBootstrap` resolved from `github.context.eventName` (the same variable). It decides which
-    // caller MCP servers the config keeps: a withheld run is driven by untrusted text.
-    credential: resolveResponseDelivery(process.env.GITHUB_EVENT_NAME ?? '', inputs.responseMode).credential,
+    // The disposition `runBootstrap` decided. It decides which caller MCP servers the config keeps: a withheld run is
+    // driven by untrusted text.
+    credential: bootstrap.credential,
     // Decided after routing (`runRepoSkills`): null unless the input is on and the trust predicate admitted this run.
     repoSkills,
     runId: getGitHubRunId(),

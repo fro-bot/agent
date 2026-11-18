@@ -16,7 +16,6 @@ const mocks = vi.hoisted(() => ({
   readResponseFile: vi.fn(),
   executeOpenCodeV2: vi.fn<typeof executeOpenCodeV2>(),
   removeResponseFile: vi.fn(),
-  resolveResponseDelivery: vi.fn(() => ({delivery: 'file-convention', credential: 'withhold'})),
   resolveOutputMode: vi.fn(),
   saveState: vi.fn(),
   getInput: vi.fn(),
@@ -51,7 +50,6 @@ vi.mock('@fro-bot/runtime', async importOriginal => {
     // Routed onto the readFile mock so these tests keep exercising recovery; the real no-follow refusals are tested in
     // response-read-safety.test.ts.
     readTextNoFollow: async (file: string): Promise<string> => mocks.readResponseFile(file, 'utf8') as Promise<string>,
-    resolveResponseDelivery: mocks.resolveResponseDelivery,
   }
 })
 
@@ -98,7 +96,7 @@ function createAgentResult(overrides: Partial<AgentResult> = {}): AgentResult {
 
 function createBootstrap(
   timeoutMs: number,
-  overrides: Partial<Pick<BootstrapPhaseResult, 'delivery' | 'responseFilePath'>> = {},
+  overrides: Partial<Pick<BootstrapPhaseResult, 'credential' | 'delivery' | 'responseFilePath'>> = {},
 ): BootstrapPhaseResult {
   return {
     inputs: {
@@ -129,6 +127,7 @@ function createBootstrap(
     logger: mocks.logger,
     opencodeResult: {path: 'opencode', version: '1.0.0'},
     delivery: overrides.delivery ?? 'model-gh',
+    credential: overrides.credential ?? 'withhold',
     responseFilePath: overrides.responseFilePath ?? null,
     responseFilePathCandidates: null,
     trustedHeadSha: '',
@@ -232,7 +231,6 @@ describe('runExecute overflow recovery', () => {
     mocks.executeOpenCodeV2.mockReset()
     mocks.readResponseFile.mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'}))
     mocks.parseResponseFile.mockReset()
-    mocks.resolveResponseDelivery.mockReturnValue({delivery: 'file-convention', credential: 'withhold'})
     mocks.resolveOutputMode.mockReturnValue('branch-pr')
     mocks.getInput.mockReturnValue('branch-pr')
     mocks.updateSession.mockResolvedValue({success: true, data: undefined})
@@ -708,23 +706,64 @@ describe('runExecute overflow recovery', () => {
       llmError: null,
     })
     mocks.executeOpenCodeV2.mockResolvedValueOnce(overflowResult).mockResolvedValueOnce(recoveredResult)
-    mocks.resolveResponseDelivery.mockReturnValue({delivery: 'file-convention', credential: 'provision'})
 
-    // #when the execute phase runs
+    // #when the execute phase runs for a bootstrap that provisioned the credential on a pull_request routing event
     const result = await runExecute(
-      createBootstrap(1_000, {delivery: 'file-convention', responseFilePath: '/fixture/fro-bot-response.md'}),
+      createBootstrap(1_000, {
+        delivery: 'file-convention',
+        credential: 'provision',
+        responseFilePath: '/fixture/fro-bot-response.md',
+      }),
       createRouting(),
       createCacheRestore(),
       createSessionPrep(),
       createMetrics(),
     )
 
-    // #then credential provisioning prevents a fresh recovery attempt
+    // #then the bootstrap disposition, not the routing event name, prevents a fresh recovery attempt
     expect(mocks.executeOpenCodeV2).toHaveBeenCalledOnce()
     expect(mocks.updateSession).not.toHaveBeenCalled()
     expect(mocks.searchSessions).not.toHaveBeenCalled()
-    expect(mocks.resolveResponseDelivery).toHaveBeenCalledOnce()
     expect(result.commentsPosted).toBe(0)
+  })
+
+  it('recovers an overflow for a bootstrap that withheld the credential, whatever the routing event name is', async () => {
+    // #given the bootstrap withheld the credential and routing reports an event name that would provision it
+    const recoveredResult = createAgentResult({
+      success: true,
+      exitCode: 0,
+      error: null,
+      sessionId: 'recovered-session',
+      llmError: null,
+    })
+    mocks.executeOpenCodeV2.mockResolvedValueOnce(createAgentResult()).mockResolvedValueOnce(recoveredResult)
+    const baseRouting = createRouting()
+    const routing: RoutingPhaseResult = {
+      ...baseRouting,
+      triggerResult: {
+        ...baseRouting.triggerResult,
+        context: {...baseRouting.triggerResult.context, eventType: 'workflow_dispatch', eventName: 'workflow_dispatch'},
+      },
+    }
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValueOnce(1_000).mockReturnValueOnce(1_100).mockReturnValue(1_100)
+
+    // #when the execute phase runs
+    let result: Awaited<ReturnType<typeof runExecute>>
+    try {
+      result = await runExecute(
+        createBootstrap(1_000, {credential: 'withhold'}),
+        routing,
+        createCacheRestore(),
+        createSessionPrep(),
+        createMetrics(),
+      )
+    } finally {
+      nowSpy.mockRestore()
+    }
+
+    // #then the overflowed attempt is replayed because the bootstrap disposition allows it
+    expect(mocks.executeOpenCodeV2).toHaveBeenCalledTimes(2)
+    expect(result.sessionId).toBe('recovered-session')
   })
 
   it('does not recover non-context-overflow terminal errors', async () => {
@@ -897,7 +936,6 @@ describe('runExecute brokered push prompt flag', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mocks.executeOpenCodeV2.mockReset()
-    mocks.resolveResponseDelivery.mockReturnValue({delivery: 'file-convention', credential: 'withhold'})
     mocks.resolveOutputMode.mockReturnValue('branch-pr')
     mocks.getInput.mockReturnValue('branch-pr')
     mocks.searchSessions.mockResolvedValue({success: true, data: []})

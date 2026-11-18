@@ -3,9 +3,11 @@ import type {TriggerConfig} from './types.js'
 import {beforeEach, describe, expect, it} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {
+  createDiscussionCommentCreatedEvent,
   createIssueCommentCreatedEvent,
   createIssuesOpenedEvent,
   createPullRequestOpenedEvent,
+  createPullRequestReviewCommentCreatedEvent,
 } from './__fixtures__/payloads.js'
 import {checkSkipConditions, extractCommand, hasBotMention, routeEvent} from './router.js'
 import {createMockGitHubContext} from './test-helpers.js'
@@ -1636,6 +1638,74 @@ describe('routeEvent review-skip-label integration', () => {
     const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot', reviewSkipLabel: 'skip-agent-review'})
 
     // #then issue-triage routing is unaffected — it processes normally
+    expect(result.shouldProcess).toBe(true)
+  })
+})
+
+describe('routeEvent skips comments that carry the Action post marker', () => {
+  let logger: Logger
+
+  beforeEach(() => {
+    logger = createMockLogger()
+  })
+
+  const MARKER = '<!-- fro-bot-agent -->'
+
+  const commentEvents = [
+    [
+      'issue_comment',
+      (authorLogin: string, commentBody: string) =>
+        createIssueCommentCreatedEvent({authorLogin, authorAssociation: 'OWNER', commentBody}),
+    ],
+    [
+      'discussion_comment',
+      (authorLogin: string, commentBody: string) =>
+        createDiscussionCommentCreatedEvent({authorLogin, authorAssociation: 'OWNER', commentBody}),
+    ],
+    [
+      'pull_request_review_comment',
+      (authorLogin: string, commentBody: string) =>
+        createPullRequestReviewCommentCreatedEvent({authorLogin, authorAssociation: 'OWNER', commentBody}),
+    ],
+  ] as const
+
+  const marked = `@fro-bot see the summary\n${MARKER}`
+  const unmarked = '@fro-bot see the summary'
+
+  it.each(commentEvents)('skips a marked %s from an OWNER with a mention', (eventName, make) => {
+    // #given a marked comment that mentions the bot, from an OWNER who is not a [bot] account
+    const ghContext = createMockGitHubContext(eventName, make('some-pat-user', marked))
+
+    // #when routing the event
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot'})
+
+    // #then it skips for the Action's own post, not for authorization or mention
+    expect(result.context.author?.isBot).toBe(false)
+    expect(result.shouldProcess).toBe(false)
+    expect(result.shouldProcess === false && result.skipReason).toBe('own_posted_comment')
+  })
+
+  it.each(commentEvents)('skips a marked %s whatever the stored login is', (eventName, make) => {
+    // #given a marked comment and each stored-login state: unknown, empty and the lookup's fallback value
+    const ghContext = createMockGitHubContext(eventName, make('some-pat-user', marked))
+
+    for (const botLogin of [null, '', 'fro-bot[bot]']) {
+      // #when routing the event
+      const result = routeEvent(ghContext, logger, {botLogin, requireMention: false})
+
+      // #then it skips for the Action's own post
+      expect(result.shouldProcess === false && result.skipReason).toBe('own_posted_comment')
+    }
+  })
+
+  it.each(commentEvents)('routes an unmarked %s from the Action login normally', (eventName, make) => {
+    // #given a person using the Action's token who mentions the bot, with no marker in the body
+    const ghContext = createMockGitHubContext(eventName, make('fro-bot', unmarked))
+
+    // #when routing the event
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot'})
+
+    // #then the mention is processed
     expect(result.shouldProcess).toBe(true)
   })
 })

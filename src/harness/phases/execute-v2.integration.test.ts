@@ -379,6 +379,7 @@ async function executePhase(
       logger: createMockLogger(),
       opencodeResult: {path: BINARY as string, version: pin.version},
       delivery: 'model-gh',
+      credential: 'provision',
       responseFilePath: null,
     } as unknown as BootstrapPhaseResult,
     {
@@ -666,6 +667,7 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
         logger,
         opencodeResult: {path: BINARY as string, version: pin.version},
         delivery: 'model-gh',
+        credential: 'provision',
         responseFilePath: null,
       } as unknown as BootstrapPhaseResult,
       {

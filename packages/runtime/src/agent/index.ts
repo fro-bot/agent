@@ -385,6 +385,7 @@ export type {
   ContextBudget,
   DiffContext,
   DiffFileSummary,
+  DiscussionContext,
   EnsureOpenCodeResult,
   EventType,
   ExecutionConfig,

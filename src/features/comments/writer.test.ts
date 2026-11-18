@@ -4,13 +4,32 @@ import {beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMockOctokit} from '../../services/github/test-helpers.js'
 import {BOT_COMMENT_MARKER} from '../../services/github/types.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
-import {isBotComment, postComment} from './writer.js'
+import {isBotComment, postComment, withBotMarker} from './writer.js'
 
 describe('comments/writer', () => {
   let logger: Logger
 
   beforeEach(() => {
     logger = createMockLogger()
+  })
+
+  describe('withBotMarker', () => {
+    it('appends the marker to an unmarked body', () => {
+      // #given / #when
+      const result = withBotMarker('Some response')
+
+      // #then the marker follows the body and the result reads as a bot comment
+      expect(result).toBe(`Some response\n\n${BOT_COMMENT_MARKER}`)
+      expect(isBotComment(result)).toBe(true)
+    })
+
+    it('leaves a body that already carries the marker unchanged', () => {
+      // #given
+      const body = `Some response\n${BOT_COMMENT_MARKER}`
+
+      // #when / #then
+      expect(withBotMarker(body)).toBe(body)
+    })
   })
 
   describe('isBotComment', () => {

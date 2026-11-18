@@ -19,6 +19,11 @@ export function isBotComment(body: string): boolean {
   return body.includes(BOT_COMMENT_MARKER)
 }
 
+/** Append the bot marker unless the body already carries it. */
+export function withBotMarker(body: string): string {
+  return body.includes(BOT_COMMENT_MARKER) ? body : `${body}\n\n${BOT_COMMENT_MARKER}`
+}
+
 /**
  * Create new comment on issue or PR.
  * Uses REST API (issues.createComment works for both).

@@ -209,7 +209,9 @@ export async function runSetup(
       // the write token to every later step in the caller's job (#2156).
       logger.info('GitHub CLI configured')
     } else {
-      logger.info('GitHub CLI credential withheld from child (affected trigger)')
+      logger.info(
+        `The model does not receive the GitHub credential on the ${process.env.GITHUB_EVENT_NAME ?? 'unknown'} event`,
+      )
     }
 
     await configureGitIdentity(octokit, ghResult.botLogin, logger, execAdapter)

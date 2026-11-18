@@ -1,6 +1,6 @@
 import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
-import type {IssueGraphQLResponse, PullRequestGraphQLResponse} from './types.js'
+import type {DiscussionGraphQLResponse, IssueGraphQLResponse, PullRequestGraphQLResponse} from './types.js'
 import {toErrorMessage} from '../../shared/errors.js'
 
 export const ISSUE_QUERY = `
@@ -28,6 +28,28 @@ export const ISSUE_QUERY = `
             author { login }
             authorAssociation
             isMinimized
+          }
+        }
+      }
+    }
+  }
+`
+
+export const DISCUSSION_QUERY = `
+  query GetDiscussion($owner: String!, $repo: String!, $number: Int!, $maxComments: Int!) {
+    repository(owner: $owner, name: $repo) {
+      discussion(number: $number) {
+        number
+        title
+        body
+        author { login }
+        comments(last: $maxComments) {
+          totalCount
+          nodes {
+            id
+            body
+            createdAt
+            author { login }
           }
         }
       }
@@ -144,6 +166,27 @@ export async function executeIssueQuery(
     return result
   } catch (error) {
     logger.warning('GraphQL issue query failed', {
+      owner,
+      repo,
+      number,
+      error: toErrorMessage(error),
+    })
+    return null
+  }
+}
+
+export async function executeDiscussionQuery(
+  client: Octokit,
+  owner: string,
+  repo: string,
+  number: number,
+  maxComments: number,
+  logger: Logger,
+): Promise<DiscussionGraphQLResponse | null> {
+  try {
+    return await client.graphql<DiscussionGraphQLResponse>(DISCUSSION_QUERY, {owner, repo, number, maxComments})
+  } catch (error) {
+    logger.warning('GraphQL discussion query failed', {
       owner,
       repo,
       number,

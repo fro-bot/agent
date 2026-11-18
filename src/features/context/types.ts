@@ -155,9 +155,9 @@ export interface PullRequestContext {
 }
 
 /**
- * Union type for hydrated context (issue or PR).
+ * Union type for hydrated context (issue, PR or discussion).
  */
-export type {HydratedContext} from '@fro-bot/runtime'
+export type {DiscussionContext, HydratedContext} from '@fro-bot/runtime'
 
 /**
  * Result of truncating a body string.
@@ -194,6 +194,29 @@ export interface IssueGraphQLResponse {
           readonly author: {readonly login: string} | null
           readonly authorAssociation: string
           readonly isMinimized: boolean
+        }[]
+      }
+    } | null
+  }
+}
+
+/**
+ * GraphQL response types for discussion query.
+ */
+export interface DiscussionGraphQLResponse {
+  readonly repository: {
+    readonly discussion: {
+      readonly number: number
+      readonly title: string
+      readonly body: string
+      readonly author: {readonly login: string} | null
+      readonly comments: {
+        readonly totalCount: number
+        readonly nodes: readonly {
+          readonly id: string
+          readonly body: string
+          readonly createdAt: string
+          readonly author: {readonly login: string} | null
         }[]
       }
     } | null

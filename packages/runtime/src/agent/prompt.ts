@@ -67,7 +67,12 @@ export function getTriggerDirective(
 
     case 'discussion_comment':
       return {
-        directive: 'Respond to the discussion comment above. Post your response as a single comment.',
+        directive: [
+          'Respond to the discussion comment above. Post your response as a single comment.',
+          ...(responseDelivery === 'file-convention'
+            ? ['The Action posts your reply as a top-level comment on this discussion.']
+            : []),
+        ].join(' '),
         appendMode: true,
       }
 
@@ -88,7 +93,7 @@ export function getTriggerDirective(
       return {directive: buildPullRequestDirective(responseDelivery), appendMode: true}
 
     case 'pull_request_review_comment':
-      return {directive: buildReviewCommentDirective(context), appendMode: true}
+      return {directive: buildReviewCommentDirective(context, responseDelivery), appendMode: true}
 
     case 'schedule':
     case 'workflow_dispatch':
@@ -129,7 +134,7 @@ function buildPullRequestDirective(responseDelivery: ResponseDelivery): string {
   ].join('\n')
 }
 
-function buildReviewCommentDirective(context: TriggerContext): string {
+function buildReviewCommentDirective(context: TriggerContext, responseDelivery: ResponseDelivery): string {
   const target = context.target
   const lines: string[] = ['Respond to the review comment.', '']
 
@@ -144,6 +149,12 @@ function buildReviewCommentDirective(context: TriggerContext): string {
   }
   if (target?.diffHunk != null && target.diffHunk.length > 0) {
     lines.push('', '**Diff Context:**', '```diff', target.diffHunk, '```')
+  }
+  if (responseDelivery === 'file-convention') {
+    lines.push(
+      '',
+      'The Action posts your reply as a top-level comment on this pull request, not as a reply in the review thread.',
+    )
   }
 
   return lines.join('\n')
@@ -375,7 +386,7 @@ export function buildAgentPrompt(options: PromptOptions, logger: Logger): Prompt
     }
     parts.push(
       wrapXml(
-        context.hydratedContext.type === 'pull_request' ? 'pull_request' : 'issue',
+        hydratedContextTag(context.hydratedContext),
         buildHydratedContextSection(context.hydratedContext, extracted, context.diffContext),
       ),
     )
@@ -387,13 +398,14 @@ export function buildAgentPrompt(options: PromptOptions, logger: Logger): Prompt
       ),
     )
   } else if (context.issueNumber != null) {
-    const typeLabel = context.issueType === 'pr' ? 'Pull Request' : 'Issue'
+    const isDiscussion = triggerCommentEvent === 'discussion_comment'
+    const typeLabel = context.issueType === 'pr' ? 'Pull Request' : isDiscussion ? 'Discussion' : 'Issue'
     parts.push(
       wrapXml(
         context.issueType === 'pr' ? 'pull_request' : 'issue',
         `## ${typeLabel} #${context.issueNumber}
 - **Title:** ${context.issueTitle ?? 'N/A'}
-- **Type:** ${context.issueType ?? 'unknown'}
+- **Type:** ${context.issueType ?? (isDiscussion ? 'discussion' : 'unknown')}
 `,
       ),
     )
@@ -527,12 +539,23 @@ ${trimmedCustomPrompt}`,
  * Extract all external (user-authored) content from hydrated context into reference files.
  * Returns only non-empty files.
  */
+function hydratedContextTag(context: HydratedContext): 'discussion' | 'issue' | 'pull_request' {
+  switch (context.type) {
+    case 'pull_request':
+      return 'pull_request'
+    case 'discussion':
+      return 'discussion'
+    case 'issue':
+      return 'issue'
+  }
+}
+
 function extractExternalContent(context: HydratedContext): ReferenceFile[] {
   const files: ReferenceFile[] = []
   const body = cleanMarkdownBody(context.body).trim()
 
   if (body.length > 0) {
-    const filename = context.type === 'pull_request' ? 'pr-description.txt' : 'issue-description.txt'
+    const filename = `${attachmentPrefix(context)}-description.txt`
     files.push({filename, content: body})
   }
 
@@ -551,7 +574,7 @@ function extractExternalContent(context: HydratedContext): ReferenceFile[] {
   }
 
   if (context.comments.length > 0) {
-    const prefix = context.type === 'pull_request' ? 'pr-comment' : 'issue-comment'
+    const prefix = `${attachmentPrefix(context)}-comment`
     for (const [index, comment] of context.comments.entries()) {
       files.push({
         filename: buildAttachmentFilename(prefix, index + 1, comment.author),
@@ -679,6 +702,36 @@ function buildHydratedContextSection(
         lines.push(`- **Body:** @${commentFilename}`)
       }
     }
+  } else if (context.type === 'discussion') {
+    lines.push(`## Discussion #${context.number}`)
+    lines.push(`- **Title:** ${context.title}`)
+    lines.push(`- **Author:** ${context.author ?? 'unknown'}`)
+
+    if (fileMap.has('discussion-description.txt')) {
+      lines.push(`- **Body:** @discussion-description.txt`)
+    }
+    if (context.bodyTruncated) {
+      lines.push('*Note: Body was truncated due to size limits.*')
+    }
+
+    lines.push('')
+    lines.push(
+      `### Comments (${context.comments.length}${context.commentsTruncated ? ` of ${context.totalComments}` : ''})`,
+    )
+    if (context.comments.length === 0) {
+      lines.push('[none]')
+    } else {
+      for (const [index, comment] of context.comments.entries()) {
+        if (index > 0) {
+          lines.push('')
+        }
+
+        const commentFilename = buildAttachmentFilename('discussion-comment', index + 1, comment.author)
+        lines.push(`- **Author:** ${comment.author ?? 'unknown'}`)
+        lines.push(`- **Date:** ${comment.createdAt}`)
+        lines.push(`- **Body:** @${commentFilename}`)
+      }
+    }
   } else {
     lines.push(`## Issue #${context.number}`)
     lines.push(`- **Title:** ${context.title}`)
@@ -721,6 +774,17 @@ function buildHydratedContextSection(
   }
 
   return lines.join('\n')
+}
+
+function attachmentPrefix(context: HydratedContext): 'discussion' | 'issue' | 'pr' {
+  switch (context.type) {
+    case 'pull_request':
+      return 'pr'
+    case 'discussion':
+      return 'discussion'
+    case 'issue':
+      return 'issue'
+  }
 }
 
 function buildAttachmentFilename(prefix: string, index: number, author: string | null): string {
