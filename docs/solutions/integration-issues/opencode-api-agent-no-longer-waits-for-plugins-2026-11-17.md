@@ -83,6 +83,6 @@ Upstream restored the plugin wait only for the model, provider, generate, voice 
 
 ## Related Issues
 
-- [Systematic plugin install stalls OpenCode bootstrap](./systematic-plugin-install-stalls-opencode-bootstrap-2026-09-04.md): an earlier case of a listening server that was not ready. Its statement that every request queues behind plugin setup describes V1 and V2 up to 2.2.6.
+- [A plugin install at server start stalls the first request](./plugin-install-at-server-start-stalls-first-request-2026-11-17.md): why plugins are installed at setup time, and the order of the waits that end in this plugin gate.
 - [Verify behavior, not signal](../workflow-issues/verify-behavior-not-signal-2026-08-23.md): a successful response proves a response, not the state behind it.
 - #2174, #2182, #2153, #2197.
