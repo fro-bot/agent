@@ -1250,6 +1250,13 @@ jobs:
           app-id: ${{ secrets.APPLICATION_ID }}
           private-key: ${{ secrets.APPLICATION_PRIVATE_KEY }}
           owner: ${{ github.repository_owner}}
+          repositories: ${{ github.event.repository.name }}
+          # contents: fetch the `release` branch and tags; push and force-with-lease the `next` branch.
+          # pull-requests: list, create and edit the release PR.
+          # workflows: `next` carries main's `.github/workflows` changes merged in.
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
       - id: get-user-id
         name: Get GitHub App User ID and Setup Git user
         env:
