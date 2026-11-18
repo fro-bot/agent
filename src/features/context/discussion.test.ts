@@ -6,23 +6,22 @@ import {hydrateDiscussionContext} from './discussion.js'
 import {createFailingMockOctokit, createMockLogger, createMockOctokit} from './test-helpers.js'
 import {DEFAULT_CONTEXT_BUDGET} from './types.js'
 
-function discussionResponse(body: string, commentCount: number, hasNextPage = false) {
+function discussionResponse(body: string, returned: number, totalCount = returned) {
   return {
     repository: {
       discussion: {
-        id: 'D_node',
+        number: 9,
         title: 'How do I configure this?',
         body,
         author: {login: 'asker'},
         comments: {
-          nodes: Array.from({length: commentCount}, (_, index) => ({
+          totalCount,
+          nodes: Array.from({length: returned}, (_, index) => ({
             id: `DC_${String(index + 1)}`,
             body: `comment ${String(index + 1)}`,
             author: {login: `user${String(index + 1)}`},
             createdAt: '2024-01-01T00:00:00Z',
-            updatedAt: '2024-01-01T00:00:00Z',
           })),
-          pageInfo: {hasNextPage, endCursor: null},
         },
       },
     },
@@ -73,18 +72,46 @@ describe('hydrateDiscussionContext', () => {
     expect(new TextEncoder().encode(result?.body ?? '').length).toBeLessThanOrEqual(64)
   })
 
-  it('keeps only the most recent comments within the budget and reports the true total', async () => {
-    // #given more comments than the budget allows
+  it('asks for the budgeted number of newest comments in one request', async () => {
+    // #given a budget of three comments
     const budget: ContextBudget = {...DEFAULT_CONTEXT_BUDGET, maxComments: 3}
-    const octokit = createMockOctokit(discussionResponse('Question', 5))
+    const octokit = createMockOctokit(discussionResponse('Question', 3, 3))
+
+    // #when hydrating
+    await hydrateDiscussionContext(octokit, 'owner', 'repo', 9, budget, logger)
+
+    // #then one query asked for the last three comments
+    expect(octokit.graphql).toHaveBeenCalledTimes(1)
+    expect(octokit.graphql).toHaveBeenCalledWith(
+      expect.stringContaining('comments(last: $maxComments)'),
+      expect.objectContaining({owner: 'owner', repo: 'repo', number: 9, maxComments: 3}),
+    )
+  })
+
+  it('takes the total and the truncated flag from totalCount', async () => {
+    // #given the server returned the last three of seven comments
+    const budget: ContextBudget = {...DEFAULT_CONTEXT_BUDGET, maxComments: 3}
+    const octokit = createMockOctokit(discussionResponse('Question', 3, 7))
 
     // #when hydrating
     const result = await hydrateDiscussionContext(octokit, 'owner', 'repo', 9, budget, logger)
 
-    // #then the last three are kept, flagged as truncated, with the full count
-    expect(result?.comments.map(c => c.body)).toEqual(['comment 3', 'comment 4', 'comment 5'])
+    // #then the total is the server's count and the comments are flagged as truncated
+    expect(result?.totalComments).toBe(7)
     expect(result?.commentsTruncated).toBe(true)
-    expect(result?.totalComments).toBe(5)
+    expect(result?.comments).toHaveLength(3)
+  })
+
+  it('does not flag truncation when every comment was returned', async () => {
+    // #given a discussion whose comments all fit
+    const octokit = createMockOctokit(discussionResponse('Question', 2, 2))
+
+    // #when hydrating
+    const result = await hydrateDiscussionContext(octokit, 'owner', 'repo', 9, DEFAULT_CONTEXT_BUDGET, logger)
+
+    // #then nothing is flagged
+    expect(result?.commentsTruncated).toBe(false)
+    expect(result?.totalComments).toBe(2)
   })
 
   it('returns null when the discussion is not found', async () => {

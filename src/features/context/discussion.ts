@@ -1,12 +1,12 @@
 import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
 import type {ContextBudget, DiscussionContext} from './types.js'
-import {readThread} from '../comments/reader.js'
 import {truncateBody} from './budget.js'
+import {executeDiscussionQuery} from './graphql.js'
 
 /**
- * Reads a discussion's body and top-level comments with the Action's own client, bounded like issue context.
- * Returns null when the thread cannot be read; the reader logs the cause.
+ * Reads a discussion's body and its newest top-level comments with the Action's own client, bounded like issue
+ * context. Returns null when the query fails or the discussion is not found.
  */
 export async function hydrateDiscussionContext(
   client: Octokit,
@@ -16,23 +16,34 @@ export async function hydrateDiscussionContext(
   budget: ContextBudget,
   logger: Logger,
 ): Promise<DiscussionContext | null> {
-  const thread = await readThread(client, {type: 'discussion', number, owner, repo}, null, logger)
-  if (thread == null) {
+  const response = await executeDiscussionQuery(client, owner, repo, number, budget.maxComments, logger)
+  if (response == null) {
     return null
   }
 
-  const bodyResult = truncateBody(thread.body, budget.maxBodyBytes)
-  const limitedComments = thread.comments.slice(Math.max(0, thread.comments.length - budget.maxComments))
+  const discussion = response.repository.discussion
+  if (discussion == null) {
+    logger.debug('Discussion not found', {owner, repo, number})
+    return null
+  }
+
+  const bodyResult = truncateBody(discussion.body, budget.maxBodyBytes)
+  const comments = discussion.comments.nodes.map(c => ({
+    id: c.id,
+    author: c.author?.login ?? null,
+    body: c.body,
+    createdAt: c.createdAt,
+  }))
 
   return {
     type: 'discussion',
-    number: thread.number,
-    title: thread.title,
+    number: discussion.number,
+    title: discussion.title,
     body: bodyResult.text,
     bodyTruncated: bodyResult.truncated,
-    author: thread.author === 'unknown' ? null : thread.author,
-    comments: limitedComments.map(c => ({id: String(c.id), author: c.author, body: c.body, createdAt: c.createdAt})),
-    commentsTruncated: thread.comments.length > limitedComments.length,
-    totalComments: thread.comments.length,
+    author: discussion.author?.login ?? null,
+    comments,
+    commentsTruncated: discussion.comments.totalCount > comments.length,
+    totalComments: discussion.comments.totalCount,
   }
 }

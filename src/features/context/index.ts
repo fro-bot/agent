@@ -4,7 +4,14 @@ export {hydrateDiscussionContext} from './discussion.js'
 
 export {fallbackIssueContext, fallbackPullRequestContext} from './fallback.js'
 
-export {executeIssueQuery, executePullRequestQuery, ISSUE_QUERY, PULL_REQUEST_QUERY} from './graphql.js'
+export {
+  DISCUSSION_QUERY,
+  executeDiscussionQuery,
+  executeIssueQuery,
+  executePullRequestQuery,
+  ISSUE_QUERY,
+  PULL_REQUEST_QUERY,
+} from './graphql.js'
 
 export {hydrateIssueContext} from './issue.js'
 
@@ -20,6 +27,7 @@ export type {
   ContextReview,
   ContextReviewComment,
   DiscussionContext,
+  DiscussionGraphQLResponse,
   HydratedContext,
   IssueContext,
   IssueGraphQLResponse,

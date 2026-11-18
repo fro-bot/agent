@@ -201,6 +201,29 @@ export interface IssueGraphQLResponse {
 }
 
 /**
+ * GraphQL response types for discussion query.
+ */
+export interface DiscussionGraphQLResponse {
+  readonly repository: {
+    readonly discussion: {
+      readonly number: number
+      readonly title: string
+      readonly body: string
+      readonly author: {readonly login: string} | null
+      readonly comments: {
+        readonly totalCount: number
+        readonly nodes: readonly {
+          readonly id: string
+          readonly body: string
+          readonly createdAt: string
+          readonly author: {readonly login: string} | null
+        }[]
+      }
+    } | null
+  }
+}
+
+/**
  * GraphQL response types for pull request query.
  */
 export interface PullRequestGraphQLResponse {

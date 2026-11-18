@@ -27,7 +27,7 @@ hydrateIssueContext() / hydratePullRequestContext()
 | **Types**        | `types.ts`        | Type definitions, budget constraints (279 L)       |
 | **GraphQL**      | `graphql.ts`      | GraphQL queries and execution (batched) (186 L)    |
 | **Issue**        | `issue.ts`        | Issue context hydration logic (66 L)               |
-| **Discussion**   | `discussion.ts`   | Discussion context hydration via `readThread`      |
+| **Discussion**   | `discussion.ts`   | Discussion context hydration (one query)           |
 | **Pull Request** | `pull-request.ts` | PR context hydration (requested reviewers) (142 L) |
 | **Fallback**     | `fallback.ts`     | REST API fallback (188 L)                          |
 | **Budget**       | `budget.ts`       | Truncation, size estimation, prompt format (195 L) |
@@ -36,7 +36,7 @@ hydrateIssueContext() / hydratePullRequestContext()
 
 - `hydrateIssueContext(...)`: Primary entry for issues (GraphQL)
 - `hydratePullRequestContext(...)`: Primary entry for PRs (GraphQL, includes requested reviewers)
-- `hydrateDiscussionContext(...)`: Discussion body and top-level comments through the comments reader (GraphQL), bounded like issue context; no REST fallback, `null` on any failure
+- `hydrateDiscussionContext(...)`: Discussion body and newest top-level comments in one GraphQL query (`DISCUSSION_QUERY`, `comments(last:)` plus `totalCount`), bounded like issue context; no REST fallback, `null` on any failure
 - `fallbackIssueContext(...)`: REST fallback for issues
 - `fallbackPullRequestContext(...)`: REST fallback for PRs (full parity with GraphQL)
 - `formatContextForPrompt(context)`: Converts hydrated context to Markdown

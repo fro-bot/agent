@@ -263,7 +263,7 @@ describe('collectAgentContext', () => {
       const graphql = vi.fn().mockResolvedValue({
         repository: {
           discussion: {
-            id: 'D_node',
+            number: 9,
             title: 'Question',
             body: 'The original question',
             author: {login: 'asker'},
@@ -274,10 +274,9 @@ describe('collectAgentContext', () => {
                   body: 'an earlier answer',
                   author: {login: 'helper'},
                   createdAt: '2024-01-01T00:00:00Z',
-                  updatedAt: '2024-01-01T00:00:00Z',
                 },
               ],
-              pageInfo: {hasNextPage: false, endCursor: null},
+              totalCount: 1,
             },
           },
         },
@@ -302,7 +301,7 @@ describe('collectAgentContext', () => {
         comments: [{author: 'helper', body: 'an earlier answer'}],
       })
       expect(graphql).toHaveBeenCalledWith(
-        expect.stringContaining('discussion(number: $number)'),
+        expect.stringContaining('comments(last: $maxComments)'),
         expect.objectContaining({owner: 'test-owner', repo: 'test-repo', number: 9}),
       )
     })
