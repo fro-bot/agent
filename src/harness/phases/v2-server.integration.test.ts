@@ -47,6 +47,7 @@ import pin from '../../../packages/runtime/src/shared/opencode-v2-pin.json'
 import {createExecAdapter} from '../../services/setup/adapters.js'
 import {installPluginsV2, resolvePluginSpecsV2} from '../../services/setup/plugin-install-v2.js'
 import {
+  DEFAULT_REPO_SKILLS_LIMITS,
   OPENCODE_BUILTIN_SKILL_IDS,
   parseFrontmatterName,
   stageDefaultBranchSkills,
@@ -1141,19 +1142,53 @@ describe.skipIf(!hasBinary)('repo skills against the real stock binary (fro-bot/
     300_000,
   )
 
-  it('loads no repo skills, and leaves nothing staged, when the default branch tree is over the staging budget', async () => {
-    // #given a default branch whose skills tree has more entries than the budget allows
+  it('drops a skill that is over the staging budget on its own and still loads the others', async () => {
+    // #given a default branch with a small skill and a `bulk` skill of one entry more than the per-skill budget allows
     const box = newBox()
-    plant(path.join(box.repo, '.agents', 'skills', 'probe', 'SKILL.md'), skillFile('probe', 'PROBE'))
-    for (let index = 0; index <= 1000; index += 1) {
+    plant(path.join(box.repo, '.agents', 'skills', 'probe', 'SKILL.md'), skillFile('probe', 'PROBE-BODY'))
+    for (let index = 0; index <= DEFAULT_REPO_SKILLS_LIMITS.maxSourceEntries; index += 1) {
       plant(path.join(box.repo, '.agents', 'skills', 'bulk', `f${index}.md`), 'x\n')
     }
     publishDefaultBranch(box)
 
+    // #when a trusted run stages and the real server starts with the result
+    const source = await stage(box, SCHEDULE)
+
+    // #then staging returns a source (the oversized skill does not refuse the whole tree) holding only the small skill
+    expect(source).not.toBeNull()
+    const staged = source as RepoSkillsSource
+    expect(readdirSync(staged.sourceDir)).toEqual(['probe'])
+    const {handle} = await startServer(box, {repoSkills: staged})
+    const listed = await listSkills(handle)
+
+    // #and the server lists `probe` with its content, and does not list `bulk`
+    expect(listed.find(skill => skill.id === 'probe')?.content).toContain('PROBE-BODY')
+    expect(listed.map(skill => skill.id)).not.toContain('bulk')
+
+    // #and no file of `bulk` exists anywhere under the staging root, before or after admission copied what it kept
+    expect(readdirSync(staged.stagingRoot, {recursive: true}).filter(entry => String(entry).includes('bulk'))).toEqual(
+      [],
+    )
+  }, 300_000)
+
+  it('loads no repo skills, and leaves nothing staged, when the skills tree holds a submodule', async () => {
+    // #given a default branch whose skills tree holds a good skill and a submodule entry (a gitlink: no blob to write)
+    const box = newBox()
+    plant(path.join(box.repo, '.agents', 'skills', 'probe', 'SKILL.md'), skillFile('probe', 'PROBE-BODY'))
+    const nested = path.join(box.repo, '.agents', 'skills', 'sub')
+    mkdirSync(nested, {recursive: true})
+    gitIn(nested, 'init', '-q')
+    gitIn(nested, 'commit', '-q', '--allow-empty', '-m', 'nested')
+    publishDefaultBranch(box)
+    // Guard the fixture: the committed tree really has a gitlink, or the null below proves nothing.
+    expect(execFileSync('git', ['ls-tree', 'HEAD', '.agents/skills/sub'], {cwd: box.repo, encoding: 'utf8'})).toContain(
+      '160000 commit',
+    )
+
     // #when a trusted run stages
     const source = await stage(box, SCHEDULE)
 
-    // #then it is refused before extraction: no source, and no staging directory left under RUNNER_TEMP
+    // #then the whole source is refused, not just the submodule: no source, and no staging directory left under RUNNER_TEMP
     expect(source).toBeNull()
     const runnerTemp = box.env.RUNNER_TEMP as string
     expect(readdirSync(runnerTemp).filter(entry => entry.startsWith('fro-bot-repo-skills-'))).toEqual([])
