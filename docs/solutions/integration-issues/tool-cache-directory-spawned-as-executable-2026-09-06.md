@@ -126,7 +126,7 @@ Reintroducing either defect fails these; a path-string assertion passes.
 
 ## Related Issues
 
-- [`systematic-plugin-install-stalls-opencode-bootstrap-2026-09-04.md`](systematic-plugin-install-stalls-opencode-bootstrap-2026-09-04.md) — why the setup-time plugin pre-install exists at all (issue #1536). This defect disabled that pre-install, so every run fell back to the 181–370s stall it was built to avoid.
+- [`plugin-install-at-server-start-stalls-first-request-2026-11-17.md`](plugin-install-at-server-start-stalls-first-request-2026-11-17.md) — why the setup-time plugin pre-install exists at all (issue #1536). This defect disabled that pre-install, so every run fell back to the 181–370s stall it was built to avoid.
 - [`../performance-issues/tool-binary-caching-ephemeral-runners.md`](../performance-issues/tool-binary-caching-ephemeral-runners.md) — the tools-cache design whose save step was being skipped.
 - [`../best-practices/versioned-tool-config-plugin-pattern-2026-03-29.md`](../best-practices/versioned-tool-config-plugin-pattern-2026-03-29.md) — the config-declared plugin provisioning pattern this install path implements.
 - PRs #1561 (introduced), #1563 (resolver), #1565 (`OPENCODE_PATH` split, naming, tests).

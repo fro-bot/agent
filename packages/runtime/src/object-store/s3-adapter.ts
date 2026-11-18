@@ -16,14 +16,8 @@ import {toErrorMessage} from '../shared/errors.js'
 import {openVerifiedReadStream} from '../shared/safe-read.js'
 import {err, ok} from '../shared/types.js'
 import {getEffectiveEncryption} from './encryption.js'
+import {sanitizeS3ErrorMessage} from './sanitize-s3-error.js'
 import {createObjectStoreOperationError, type ObjectStoreAdapter, type ObjectStoreConfig} from './types.js'
-
-function sanitizeS3ErrorMessage(message: string): string {
-  return message
-    .replaceAll(/X-Amz-[A-Za-z0-9-]+=[^&\s]+/g, 'X-Amz-REDACTED=[REDACTED]')
-    .replaceAll(/Authorization([:=]\s*)(Bearer\s+)?[^,\s]+/gi, 'Authorization$1$2[REDACTED]')
-    .slice(0, 500)
-}
 
 function logS3Error(logger: Logger, operation: string, error: unknown): Error {
   const errorCode = typeof error === 'object' && error != null && 'Code' in error ? String(error.Code) : undefined

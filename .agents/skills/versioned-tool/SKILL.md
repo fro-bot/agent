@@ -43,7 +43,7 @@ The invariant flow is: `constants.ts` → installer import → input fallback (i
 Before editing, inspect the nearest existing implementation:
 
 - `src/services/setup/opencode.ts` — supports `latest` resolution + fallback
-- `src/services/setup/systematic-plugin.ts` — installs a plugin package through the OpenCode CLI at the pinned version
+- `src/services/setup/plugin-install-v2.ts` — installs a plugin package through the OpenCode CLI at the pinned version
 
 **If this skill conflicts with the current repo, follow the repo and update this skill afterward.**
 

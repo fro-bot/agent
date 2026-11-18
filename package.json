@@ -49,7 +49,7 @@
     "conventional-changelog-writer": ">=9",
     "fast-uri": ">=4.2.3",
     "fast-xml-builder": ">=1.1.7",
-    "fast-xml-parser": ">=5.10.1",
+    "fast-xml-parser": ">=5.12.0",
     "flatted": "3.4.4",
     "handlebars": ">=4.7.9",
     "ip-address": ">=10.7.4",

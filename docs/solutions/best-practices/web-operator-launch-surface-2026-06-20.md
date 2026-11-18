@@ -1,5 +1,5 @@
 ---
-title: 'Web operator launch surface: fire-and-return, server-owned resolution, denylist-before-authz on a write route'
+title: "Web operator launch surface: fire-and-return, server-owned resolution, denylist-before-authz on a write route"
 date: 2026-06-20
 last_updated: 2026-09-19
 category: best-practices
@@ -28,7 +28,7 @@ tags:
 
 # Web operator launch surface: fire-and-return, server-owned resolution, denylist-before-authz on a write route
 
-> **Superseded in part.** The token-based authorization in this doc is replaced. Sessions no longer hold a GitHub OAuth token, so `checkRepoAuthz` and the per-repo GitHub authz fan-out no longer exist. Every route that names a repository, reads and writes alike, uses one bindings-only predicate, `resolveRepoAccess`: the repository is bound and not denylisted. A write route no longer tracks the operator's GitHub rights, and dispatch and launch act on GitHub as the Fro Bot GitHub App installation. See [Allowlist and repository access](../../wiki/Operator%20Web%20Control%20Surface.md#allowlist-and-repository-access-webauthallowlistts-weboperatorroute-helpersts). The fire-and-return, idempotency, no-oracle, enumeration-order and approval-transport guidance below still applies.
+> **Superseded in part.** The token-based authorization in this doc is replaced. Sessions no longer hold a GitHub OAuth token, so `checkRepoAuthz` and the per-repo GitHub authz fan-out no longer exist. Every route that names a repository, reads and writes alike, uses one bindings-only predicate, `resolveRepoAccess`: the repository is bound and not denylisted. A write route no longer tracks the operator's GitHub rights, and dispatch and launch act on GitHub as the Fro Bot GitHub App installation. See [Allowlist and repository access](../../wiki/Operator%20Web%20Control%20Surface.md#allowlist-and-repository-access-webauthallowlistts-weboperatorroute-helpersts). The fire-and-return, idempotency, no-oracle and enumeration-order guidance below still applies. The approval transport in section 3 no longer auto-denies: web launches answer approvals through the shared registry.
 
 ## Context
 
@@ -36,7 +36,7 @@ The gateway operator web surface gained the ability to **launch** work from the 
 
 This is the **write** counterpart to [authenticated-sse-run-observation](authenticated-sse-run-observation-2026-06-20.md) (the read/observe transport) — same operator surface, same no-oracle and redaction-before-authz discipline, different shape (fire-and-return vs long-lived stream). It is the second transport built on the [gateway-control-surface-spine](gateway-control-surface-spine-2026-06-15.md) seam, which explicitly anticipated exactly these additive inputs.
 
-Several patterns below were load-bearing safety properties, not conveniences: without the auto-deny approval transport a web launch would deadlock its repo's lock for ~13 minutes; without the empty-string `runId` guard the additive seam would silently corrupt run ids. They are written down so the next transport gets them for free.
+Several patterns below were load-bearing safety properties, not conveniences: without a surface-specific approval transport a web launch would fall through to Discord and hold its repo's lock until the approval deadline (at most 13 minutes); without the empty-string `runId` guard the additive seam would silently corrupt run ids. They are written down so the next transport gets them for free.
 
 ## Guidance
 
@@ -48,10 +48,15 @@ The snippet below is the fire-and-return tail only. In the real route the run id
 
 ```ts
 const request = {
-  promptText: promptField, runId, channelId: `web:${owner}/${repo}`,
-  surface: 'web' as const, binding, requester: operatorIdentity,
-  statusSink: createWebStatusSink(), replySink: createWebReplySink(),
-  createApprovalOnPending: createWebAutoDenyApproval(deps.logger),
+  promptText: promptField,
+  runId,
+  channelId: `web:${owner}/${repo}`,
+  surface: "web" as const,
+  binding,
+  requester: operatorIdentity,
+  statusSink: createWebStatusSink(),
+  replySink: createWebReplySink(),
+  createApprovalOnPending: createWebApprovalOnPending({observeApproval, logger: deps.logger}),
   promptBuilder: buildWebPrompt,
 }
 // Admission is awaited (fast, bounded); the run itself is NOT awaited —
@@ -79,37 +84,23 @@ The client names a repo as an `owner/repo` string; the server resolves it via `g
 
 ```ts
 const bindingResult = await deps.bindingsLookup.getBindingByRepo(owner, repo) // server-owned
-if (bindingResult.success === false || bindingResult.data === null) return c.json({error: 'not-found'}, 404)
+if (bindingResult.success === false || bindingResult.data === null) return c.json({error: "not-found"}, 404)
 const binding = bindingResult.data
 
-if (deps.isRepoDenied(bindingToRepoKey(binding)) === true) return notFoundResponse(c)        // redaction
+if (deps.isRepoDenied(bindingToRepoKey(binding)) === true) return notFoundResponse(c) // redaction
 const authzResult = await checkRepoAuthz(githubUserId, owner, repo, token, deps.repoAuthzDeps) // then authz
 if (authzResult.authorized === false) return notFoundResponse(c)
 ```
 
-This is the same discipline as the SSE route, applied to a write surface. The distinction: a write route may return a differentiated `4xx/5xx` for failures that depend on nothing server-owned or that come *after* acceptance (a bad body, an oversize or empty prompt, an over-cap rate limit), but the *pre-launch* gates must collapse to a single generic rejection to avoid a pre-launch oracle.
+This is the same discipline as the SSE route, applied to a write surface. The distinction: a write route may return a differentiated `4xx/5xx` for failures that depend on nothing server-owned or that come _after_ acceptance (a bad body, an oversize or empty prompt, an over-cap rate limit), but the _pre-launch_ gates must collapse to a single generic rejection to avoid a pre-launch oracle.
 
-### 3. Auto-deny approval transport to avoid a lock-deadlock
+### 3. Surface-specific approval transport
 
-A web launch has no interactive approval UX. If the engine falls through to its default Discord approval transport, it `postReply`s to a thread that does not exist for a web run **and holds the per-repo lock until the ~13-minute approval deadline — blocking every other run in that repo, web and Discord.** The fix is to supply a `createApprovalOnPending` that auto-denies every permission request immediately (`'reject'`, fire-and-forget, best-effort log), so the engine never selects the Discord transport.
+A web launch must not fall through to the engine's default Discord approval transport: that posts to a thread that does not exist for a web run and holds the per-repo lock until the approval deadline, blocking every other run in that repo, web and Discord. The web launch supplies `createWebApprovalOnPending` (`packages/gateway/src/web/operator/web-approval.ts`). Per request it registers the entry in the shared approval registry first, keyed to the run (`approvalScopeId: ctx.runId`, `runId: ctx.runId`), then announces it over SSE. The operator settles it through `POST /operator/runs/:runId/approvals/:requestId/decision` (`packages/gateway/src/web/operator/decision-route.ts`), which calls `registry.handleDecision` with the authenticated operator as actor. An unanswered request settles fail-closed at its deadline.
 
-```ts
-export function createWebAutoDenyApproval(logger?: OperatorLogger) {
-  return (ctx: ApprovalTransportContext) => (req: PermissionRequest): void => {
-    const postReply = ctx.postReplyFactory(req.sessionID)
-    void postReply(req.requestID, ctx.directory, 'reject').catch((error: unknown) =>
-      logger?.warn(
-        {runId: ctx.runId, repo: ctx.repo, err: error instanceof Error ? error.message : String(error)},
-        'web-approval: auto-deny postReply failed (best-effort; coordinator deadline will settle fail-closed)',
-      ),
-    )
-  }
-}
-```
+Implication for callers: a web-launched run can wait on an approval, and that wait holds the repo lock like any pending approval. The wait is answerable and bounded by the approval deadline, which is at most 13 minutes.
 
-Implication for callers: a web-launched run can only complete work that needs **no** tool approval until a real interactive web approval transport ships. This is the right v1 posture — fail fast, never deadlock — and the deferred replacement is tracked, not forgotten.
-
-**This pattern does not generalize across surfaces (added 2026-09-19).** Auto-denying every request is correct here for one reason: a web launch has no interactive approver, so nothing is lost by refusing. On a surface that *does* have a human approver — the Discord gateway, where a person can answer in the bound thread — answering on their behalf both discards a real approval path and crosses the ownership boundary that keeps one run's approval out of another run's thread.
+**This pattern does not generalize across surfaces (added 2026-09-19).** Auto-denying every request is correct only where no one can answer. The web launch has an operator who can answer, so it relays the decision. On a surface that _does_ have a human approver — the Discord gateway, where a person can answer in the bound thread — answering on their behalf both discards a real approval path and crosses the ownership boundary that keeps one run's approval out of another run's thread.
 
 The distinction is who can answer, not whether answering is convenient. Before reusing this transport, confirm the target surface has no approver and owns its own server. The Action satisfies both (its own loopback server, no interactive path in CI) and answers everything; the gateway satisfies neither and must not. See `docs/solutions/integration-issues/permission-ask-dropped-by-ownership-filter-2026-09-19.md`, where the opposite mistake — filtering asks on a surface that had to answer them — hung runs until their deadline.
 
@@ -134,7 +125,7 @@ A repo list must not let an allowed operator enumerate unrelated repositories, a
 
 ```ts
 const result = await deps.listBindings()
-if (result.success === false) return c.json({error: 'unavailable'}, 503)
+if (result.success === false) return c.json({error: "unavailable"}, 503)
 const allowed = filterDeniedRecords(result.data, bindingToRepoKey, deps.isRepoDenied)
 const seenRepos = new Set<string>()
 const unique = allowed.filter(binding => {
@@ -175,8 +166,8 @@ Every denylist check across the operator routes and the redaction gate derives t
 ```ts
 export function bindingToRepoKey(binding: {readonly databaseId?: number; readonly nodeId?: string}): RepoKey {
   return {
-    databaseId: typeof binding.databaseId === 'number' ? binding.databaseId : null,
-    nodeId: typeof binding.nodeId === 'string' ? binding.nodeId : null,
+    databaseId: typeof binding.databaseId === "number" ? binding.databaseId : null,
+    nodeId: typeof binding.nodeId === "string" ? binding.nodeId : null,
   }
 }
 ```
@@ -185,13 +176,13 @@ This applies the [centralize-s3-key-identity-construction](centralize-s3-key-ide
 
 ## Why This Matters
 
-The auto-deny transport (rule 3) and the fire-and-return runId ownership (rule 1) are the two properties that make a browser-driven launch surface safe and live: one prevents a repo-wide lock-deadlock, the other prevents an HTTP connection hanging for the whole run. The server-owned resolution + denylist-before-authz (rules 2, 5) close the pre-launch oracle on a write route, the additive seams (rule 4) keep the Discord transport byte-identical (a real regression risk on shared engine code), and the per-operator idempotency namespace (rule 6) stops cross-operator suppression. Several of these would have shipped wrong without the discipline — the empty-string `runId` and the Discord-fallthrough lock-deadlock were both caught because the patterns were applied deliberately.
+The surface-specific approval transport (rule 3) and the fire-and-return runId ownership (rule 1) are the two properties that make a browser-driven launch surface safe and live: one prevents a repo-wide lock-deadlock, the other prevents an HTTP connection hanging for the whole run. The server-owned resolution + denylist-before-authz (rules 2, 5) close the pre-launch oracle on a write route, the additive seams (rule 4) keep the Discord transport byte-identical (a real regression risk on shared engine code), and the per-operator idempotency namespace (rule 6) stops cross-operator suppression. Several of these would have shipped wrong without the discipline — the empty-string `runId` and the Discord-fallthrough lock-deadlock were both caught because the patterns were applied deliberately.
 
 ## When to Apply
 
 - Adding any non-Discord transport (web, CLI, API) that drives `launchWork`: own the runId, register before firing, never await, supply the three seams (or inherit Discord defaults — not what a new transport wants).
 - Any write route where redaction must run before an external authz call and pre-acceptance denials must be indistinguishable.
-- A surface with no human approval channel: auto-deny tool approvals rather than fall through to a transport that holds the lock.
+- A surface with no human approval channel (CI, a headless launch): auto-deny tool approvals rather than fall through to a transport that holds the lock. A surface with an operator who can answer gets its own answer transport (section 3).
 - Scoped per-operator enumeration: reuse the `listBindings → filterDeniedRecords → dedup by owner/repo → hard cap → per-repo authz → closed DTO` sequence and rate-limit per operator.
 - Any new denylist check: route through `bindingToRepoKey` rather than re-extracting the fields.
 
@@ -209,7 +200,7 @@ if (idempotencyKey !== undefined) {
 **Reject a non-plain-object body** (`typeof [] === 'object'`, so the array check is required before treating the body as a record):
 
 ```ts
-if (body === null || typeof body !== 'object' || Array.isArray(body)) return c.json({error: 'bad request'}, 400)
+if (body === null || typeof body !== "object" || Array.isArray(body)) return c.json({error: "bad request"}, 400)
 ```
 
 ## Related

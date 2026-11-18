@@ -31,7 +31,7 @@ Combine three mechanisms, each covering a different failure mode:
 
 1. **`AbortSignal` into the operations that can observe it** (octokit `{request:{signal}}`) — so network stalls cancel _promptly_, not just at the deadline.
 2. **`Promise.race` against a wall-clock timeout** for the operations that can't be cancelled (the subprocess) — so a stalled child can't keep the awaiting code pending past the budget. The race bounds the **await**, letting control return with a fail-loud outcome.
-3. **A process-level hard exit** as the true ceiling — the losing `Promise.race` branch is _abandoned_, not killed; a hung child keeps running. Rely on the entrypoint's `process.exit(exitCode)` to terminate the whole process (and its children) once the run resolves.
+3. **A process-level hard exit** as the true ceiling — the losing `Promise.race` branch is _abandoned_, not killed; a hung child keeps running. Rely on the entrypoint's `process.exit(exitCode)` to terminate the Node process once the run resolves. That does not reach children that outlive it: a child launched through `sudo`, or one that changed session, keeps running after its parent exits. See [Stop a sudo-launched process tree by mount-namespace membership](./stop-sudo-launched-tree-by-mount-namespace-2026-11-17.md).
 
 ```ts
 const controller = new AbortController()

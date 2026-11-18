@@ -29,15 +29,15 @@ tags: [permission-asked, sse, subagent, deadlock, ownership-ledger, silent-hang]
 - The log contains the `permission.asked` event on a child session id, and nothing answering it.
 - Runs with no subagents pass normally, which makes the failure look flaky rather than structural.
 
-The observable shape is the important part: *an event arrives, nothing follows it, and the run ends by clock*.
+The observable shape is the important part: _an event arrives, nothing follows it, and the run ends by clock_.
 
 ## What Didn't Work
 
 **Provider credential exhaustion.** Plausible because the stream handler has real auth and quota classification paths (`src/features/agent/streaming.ts:974-1102`), and because a genuine credential-cooldown incident had produced similar-looking stalls days earlier. Ruled out: this incident never reached a classification branch. The last thing in the log was an unanswered ask, not a provider error.
 
-**Test-file churn inflating the prompt.** Plausible because the run that first showed the hang had added a large fixture file, and the execution path builds the prompt and materializes reference files before the stream opens. Ruled out by measurement: prompt sizes were within ~1KB across fast and hung runs, and the *successful* run had done strictly more work — more sessions, more stream calls — than the hung one.
+**Test-file churn inflating the prompt.** Plausible because the run that first showed the hang had added a large fixture file, and the execution path builds the prompt and materializes reference files before the stream opens. Ruled out by measurement: prompt sizes were within ~1KB across fast and hung runs, and the _successful_ run had done strictly more work — more sessions, more stream calls — than the hung one.
 
-Both hypotheses shared a flaw worth naming: they explained why a run might be *slow*, and the actual failure was a run that was *stopped*, waiting on something that would never arrive.
+Both hypotheses shared a flaw worth naming: they explained why a run might be _slow_, and the actual failure was a run that was _stopped_, waiting on something that would never arrive.
 
 ## Solution
 
@@ -65,30 +65,30 @@ void onPermissionAsked(request).catch(error => {
 })
 ```
 
-The responder (`src/features/agent/execution.ts:46-94`) carries its own bounded timeout and bounded retry, and checks `response.error` explicitly — this SDK reports transport failures in a field rather than by throwing, so an unchecked call looks successful when it is not.
+The responder (`replyToPermissionAskV2` in `src/features/agent/execution-v2.ts`, passed as `onPermissionAsked` to `sendPromptToSessionV2`) carries its own bounded timeout and bounded retry, and checks `reply.success` explicitly — this client reports transport failures in a result rather than by throwing, so an unchecked call looks successful when it is not.
 
 ## Why This Works
 
-Answering every ask is correct **here** because of a specific deployment property, and the code says so at `src/features/agent/streaming.ts:652-658`: this Action starts its own loopback OpenCode server per run and wires an unconditional-reject responder to it. Every well-formed ask on that subscription belongs to this run's own process tree. There is no interactive approval path in CI, so an unanswered ask has no way to resolve except by deadline.
+Answering every ask is correct **here** because of a specific deployment property, and the code says so in the `permission_asked` branch of `src/features/agent/streaming-v2.ts`: this Action starts its own loopback OpenCode server per run and wires an unconditional-reject responder to it. Every well-formed ask on that subscription belongs to this run's own process tree. There is no interactive approval path in CI, so an unanswered ask has no way to resolve except by deadline.
 
 **The same change is wrong on the gateway surface.** The Discord gateway has a real human-answerable approval path and an ownership boundary that deliberately stops one run's approval crossing into another run's thread. Answering everything there would be a cross-run approval leak. That gap is tracked separately and left unfixed on purpose — it needs an ownership-boundary-safe answer path, not this fix ported across.
 
 ## Prevention
 
-**The rule:** an ownership or relevance filter is for notifications. A request the remote side is *blocking on* needs a reply path keyed to the request, not a membership test that can silently drop it. If a filter can skip a blocking request, skipping is not "ignore" — it is "hang".
+**The rule:** an ownership or relevance filter is for notifications. A request the remote side is _blocking on_ needs a reply path keyed to the request, not a membership test that can silently drop it. If a filter can skip a blocking request, skipping is not "ignore" — it is "hang".
 
 Concretely:
 
 - Before filtering an event class, ask whether anything waits on the answer. If yes, the filter is a deadlock unless every skipped case has another responder.
 - Log a warning whenever a blocking request is skipped. Silence was what made this cost three review rounds; a single "skipped an ask we do not own" line would have named it immediately.
-- Test it directly: inject a child-session `permission.asked` *before* the session is adopted into the ownership ledger, and assert the responder still fires. That test fails against the old code.
+- Test it directly: inject a child-session `permission.asked` _before_ the session is adopted into the ownership ledger, and assert the responder still fires. That test fails against the old code.
 - When a run dies by clock with no error, look for the last event that expected a response. A hang is usually an unanswered request, not slow work.
 
-Anchor points: `src/features/agent/streaming.ts:643-725`, `src/features/agent/execution.ts:46-94` (the bounded responder), `:283-284` (the `PermissionAskedResponder` wiring), `:318` (where it is threaded into the stream call).
+Anchor points: the `permission_asked` branch and the `onPermissionAsked` option in `src/features/agent/streaming-v2.ts`; `replyToPermissionAskV2` in `src/features/agent/execution-v2.ts` (the bounded responder), wired in as `onPermissionAsked` where `executeOpenCodeV2` calls `sendPromptToSessionV2`, which threads it into the stream call (`src/features/agent/prompt-sender-v2.ts`).
 
 ## Related Issues
 
-- `docs/solutions/best-practices/web-operator-launch-surface-2026-06-20.md` — auto-deny on a surface with no interactive approver. Same reasoning, different surface; read together for why auto-deny does not generalize across surfaces.
+- `docs/solutions/best-practices/web-operator-launch-surface-2026-06-20.md` — the web launch surface's approval transport. It answers through the shared registry because an operator is present; read together for why auto-deny fits only a surface with no approver.
 - `docs/solutions/logic-errors/injected-deny-blocks-own-delivery-path-2026-07-13.md` — a permission rule blocking the harness's own path. Closest prior instance of a safety control applied at the wrong boundary.
 - `docs/solutions/best-practices/extract-timer-primitive-keep-policy-per-surface-2026-07-13.md` — per-surface policy over shared mechanism, the principle that makes the gateway carve-out correct rather than inconsistent.
 - Shipped in PR #1629.

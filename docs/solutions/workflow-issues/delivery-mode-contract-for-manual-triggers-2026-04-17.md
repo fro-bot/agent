@@ -29,7 +29,7 @@ tags:
 
 ## Context
 
-Fro Bot's `schedule` and `workflow_dispatch` triggers had no delivery contract. The action exposed `prompt` but nothing that told the runtime *how* the caller wanted file changes delivered. Meanwhile setup gave the runtime authenticated `gh` access plus a configured git identity, so when the model decided to "deliver" changes, Systematic's git skills (or raw `git`/`gh` commands) could legitimately produce a branch + push + PR flow. That silently broke the caller pattern: **agent edits checkout → workflow diffs and commits**.
+Fro Bot's `schedule` and `workflow_dispatch` triggers had no delivery contract. The action exposed `prompt` but nothing that told the runtime _how_ the caller wanted file changes delivered. Meanwhile setup gave the runtime authenticated `gh` access plus a configured git identity, so when the model decided to "deliver" changes, Systematic's git skills (or raw `git`/`gh` commands) could legitimately produce a branch + push + PR flow. That silently broke the caller pattern: **agent edits checkout → workflow diffs and commits**.
 
 The trigger was [issue #511](https://github.com/fro-bot/agent/issues/511): a wiki-update workflow on the Sunday `schedule` cron silently pushed to a side branch instead of leaving edits in the working directory for the workflow to diff and commit. The deeper cause wasn't a single skill misbehaving — it was that the harness never stated which delivery contract applied for manual runs, so the runtime was free to choose branch/PR delivery whenever it seemed useful.
 
@@ -41,56 +41,45 @@ The fix in [PR #517](https://github.com/fro-bot/agent/pull/517) establishes a si
 
 ### 1. Public action input + advisory output for the contract
 
-`action.yaml` defines the caller-controlled surface. The output is explicitly **advisory** — it reflects the requested contract, not observed delivery behavior:
+`action.yaml` defines the caller-controlled surface. The output reports the resolved contract, not observed delivery behavior:
 
 ```yaml
 inputs:
   output-mode:
     description: >-
-      Requested delivery mode for schedule/workflow_dispatch runs only. Values:
-      auto, working-dir, branch-pr. Default: auto. Advisory only: reflects the
-      requested/resolved contract, not observed delivery behavior.
+      Requested delivery mode for schedule/workflow_dispatch runs only. Values: auto, working-dir, branch-pr. When omitted, the public auto compatibility mode is used. Manual auto requests always resolve to working-dir; use branch-pr explicitly when branch/PR delivery is required.
     required: false
-    default: auto
 
 outputs:
   resolved-output-mode:
     description: >-
-      Resolved delivery mode for this run (working-dir, branch-pr, or empty
-      string for non-applicable / skipped runs).
+      Resolved delivery mode for this run (working-dir, branch-pr, or empty string).
 ```
 
 ### 2. Centralized resolver with exhaustive `EventType` switch
 
-`src/features/agent/output-mode.ts` owns all mode resolution logic. Every trigger type is enumerated; new trigger types fail compilation until their delivery semantics are declared:
+`packages/runtime/src/agent/output-mode.ts` owns all mode resolution logic (`src/features/agent/output-mode.ts` re-exports it). Every trigger type is enumerated; new trigger types fail compilation until their delivery semantics are declared:
 
 ```ts
-const BRANCH_PR_PHRASES = [
-  'pull request', 'open a pr', 'create a pr', 'create pr',
-  'gh pr ', 'push to origin', 'git push', 'auto-merge',
-  'create branch', 'update branch', 'branch workflow',
-] as const
-
-export function resolveOutputMode(
-  eventType: EventType,
-  prompt: string | null,
-  configuredMode: OutputMode,
-): ResolvedOutputMode | null {
+export function resolveOutputMode(eventType: EventType, configuredMode: OutputMode): ResolvedOutputMode | null {
   switch (eventType) {
-    case 'discussion_comment':
-    case 'issue_comment':
-    case 'issues':
-    case 'pull_request':
-    case 'pull_request_review_comment':
-    case 'unsupported':
-      return null  // Non-manual triggers: contract does not apply
+    case "discussion_comment":
+    case "issue_comment":
+    case "issues":
+    case "pull_request":
+    case "pull_request_review_comment":
+    case "unsupported":
+      return null // Non-manual triggers: contract does not apply
 
-    case 'schedule':
-    case 'workflow_dispatch':
+    case "schedule":
+    case "workflow_dispatch":
       switch (configuredMode) {
-        case 'working-dir': return 'working-dir'
-        case 'branch-pr':   return 'branch-pr'
-        case 'auto':        return resolveAutoMode(prompt)
+        case "working-dir":
+          return "working-dir"
+        case "branch-pr":
+          return "branch-pr"
+        case "auto":
+          return "working-dir" // prompts are never authoritative for the mode
         default: {
           // Compile-time exhaustiveness check
           const exhaustiveModeCheck: never = configuredMode
@@ -106,26 +95,26 @@ export function resolveOutputMode(
 }
 ```
 
-The `auto` mode resolves to `branch-pr` only when the prompt contains explicit delivery language from a frozen phrase list; otherwise `working-dir`. The phrase list is intentionally narrow — it catches unambiguous cases without trying to be a semantic classifier.
+The `auto` mode always resolves to `working-dir`. It does not read the prompt: the resolver treats prompts as never authoritative for the mode. Only an explicit `branch-pr` requests branch/PR delivery.
 
 ### 3. Prompt-side preamble with positive-action framing
 
-`src/features/agent/prompt.ts` injects the delivery contract inside `<task>` **before** the `## Task` heading. `buildTaskSection()` calls an internal `buildDeliveryModePreamble()` helper that uses positive-action framing — `Available actions:` / `Forbidden actions:` lists rather than a "Do NOT" wall (see [Why This Matters](#why-this-matters)):
+`packages/runtime/src/agent/prompt.ts` (re-exported by `src/features/agent/prompt.ts`) injects the delivery contract inside `<task>` **before** the `## Task` heading. `buildTaskSection()` calls an internal `buildDeliveryModePreamble()` helper that uses positive-action framing — `Available actions:` / `Forbidden actions:` lists rather than a "Do NOT" wall (see [Why This Matters](#why-this-matters)):
 
 ```ts
 // Internal helper called by buildTaskSection() for schedule/workflow_dispatch triggers.
-function buildDeliveryModePreamble(resolvedMode: ResolvedOutputMode): string {
-  if (resolvedMode === 'working-dir') {
+function buildDeliveryModePreamble(resolvedMode: ResolvedOutputMode, nonPosting: boolean): string {
+  if (resolvedMode === "working-dir") {
     return [
-      '## Delivery Mode',
-      '- **Resolved output mode:** `working-dir`',
-      '- Write all requested file changes directly in the checked-out working tree.',
-      '- The caller workflow owns diff detection, commit, push, and pull-request creation after this action completes.',
-      '- Available actions: read files, edit files, create files in the working tree, run shell commands that do not deliver code. GitHub operations the task explicitly requires (for example issues, comments, or reports) are also permitted.',
-      '- Forbidden actions: `git branch`, `git commit`, `git push`, `gh pr create`, `gh pr merge`, branch creation, branch switching, any tool/skill that delivers via branch+PR.',
-      '- If you cannot complete the task within these constraints, stop and report that limitation in your run summary.',
-      '',
-    ].join('\n')
+      "## Delivery Mode",
+      "- **Resolved output mode:** `working-dir`",
+      "- Write all requested file changes directly in the checked-out working tree.",
+      "- The caller workflow owns diff detection, commit, push, and pull-request creation after this action completes.",
+      "- Available actions: read files, edit files, create files in the working tree, run shell commands that do not deliver code. GitHub operations the task explicitly requires (for example issues, comments, or reports) are also permitted.",
+      "- Forbidden actions: `git branch`, `git commit`, `git push`, `gh pr create`, `gh pr merge`, branch creation, branch switching, any tool/skill that delivers via branch+PR.",
+      "- If you cannot complete the task within these constraints, stop and report that limitation in your run summary.",
+      "",
+    ].join("\n")
   }
   // branch-pr preamble: mirror shape, invert allowed/forbidden
 }
@@ -143,7 +132,7 @@ This matters because duplicating priority claims in multiple sections weakens bo
 
 ### 5. Caller wiring via explicit YAML expression
 
-Known internal workflows opt into specific modes explicitly rather than relying on the heuristic. `.github/workflows/fro-bot.yaml`:
+Known internal workflows opt into specific modes explicitly rather than relying on `auto`. `.github/workflows/fro-bot.yaml`:
 
 ```yaml
 output-mode: >-
@@ -154,17 +143,17 @@ output-mode: >-
   }}
 ```
 
-Wiki paths get `branch-pr` because the wiki workflow needs PR delivery. Daily Maintenance Report and ad-hoc dispatches use `auto`, which the resolver maps to `working-dir` against the current `SCHEDULE_PROMPT` text. **The decoupling matters:** if `WIKI_PROMPT` text changes someday and accidentally drops the word "PR," the wiring still says `branch-pr`. Heuristic-only resolution would silently flip behavior; explicit wiring won't.
+Wiki paths get `branch-pr` because the wiki workflow needs PR delivery. Daily Maintenance Report and ad-hoc dispatches use `auto`, which always resolves to `working-dir`. **The decoupling matters:** prompt wording cannot change the mode, so explicit wiring is the only path to `branch-pr`.
 
 ### 6. Observability via action output and job summary
 
 `src/harness/phases/finalize.ts` emits the resolved mode to action outputs and the job summary's main metadata table includes an `Output Mode` row (always rendered; `N/A` for non-manual triggers). Operators can check the resolved value before blaming the model when delivery looks wrong.
 
-Four short-circuit paths (bootstrap fail, routing skip, dedup skip, unhandled exception) explicitly emit `''` for `resolved-output-mode` so downstream workflow steps that gate on the value never see `undefined`.
+Seven short-circuit paths in `src/harness/run.ts` (bootstrap fail, routing skip, dedup skip, coordination lock held, coordination lock unavailable, cache-restore fail, unhandled exception before finalization) explicitly emit `''` for `resolved-output-mode` so downstream workflow steps that gate on the value never see `undefined`.
 
 ## Why This Matters
 
-**Prompt control is a soft guardrail.** Anthropic's published metrics show ~1.9% Claude constitution-violation rate. Published prompt-injection research shows 60-90% adversarial bypass rates. The delivery contract pattern guards against *accidental* misuse — a model defaulting to branch/PR delivery when the caller expected checkout edits — not adversarial misuse. Callers needing hard guarantees should rely on token scope (don't grant `contents:write`) or post-run git invariant checks, not on the preamble alone.
+**Prompt control is a soft guardrail.** Anthropic's published metrics show ~1.9% Claude constitution-violation rate. Published prompt-injection research shows 60-90% adversarial bypass rates. The delivery contract pattern guards against _accidental_ misuse — a model defaulting to branch/PR delivery when the caller expected checkout edits — not adversarial misuse. Callers needing hard guarantees should rely on token scope (don't grant `contents:write`) or post-run git invariant checks, not on the preamble alone.
 
 **Without a contract, behavior is non-deterministic.** Model defaults plus skill-layer behavior decide delivery semantics. "What does the model feel like doing today" determines whether your CI run silently produces side branches or edits in place. That's not acceptable for autonomous workflows that run without conversation context.
 
@@ -194,7 +183,7 @@ Four short-circuit paths (bootstrap fail, routing skip, dedup skip, unhandled ex
 # Wiki workflow relied on prompt wording alone.
 - uses: fro-bot/agent@v0.40
   with:
-    prompt: ${{ env.WIKI_PROMPT }}  # Contains "create a PR" but no explicit contract
+    prompt: ${{ env.WIKI_PROMPT }} # Contains "create a PR" but no explicit contract
 ```
 
 The model could choose to edit files in place OR push a side branch, depending on which Systematic git skill loaded and what the model felt like doing. Issue #511 reported the same shape: a `workflow_dispatch` prompt that asked for in-place file edits silently produced a side-branch PR.
@@ -218,12 +207,14 @@ The prompt artifact now shows:
 
 ```markdown
 ## Delivery Mode
+
 - **Resolved output mode:** `branch-pr`
 - Deliver the result through a branch/commit/push/pull-request workflow.
 - Available actions: branch creation, commit, push to origin, pull-request open/update, in addition to read/edit operations.
 - Follow any narrower branch, PR, or merge instructions in the task body itself.
 
 ## Task
+
 [task body...]
 ```
 
@@ -233,7 +224,7 @@ The prompt artifact now shows:
 # DMR workflow: agent edits checkout, workflow diffs and commits.
 - uses: fro-bot/agent@v0.40
   with:
-    prompt: ${{ env.SCHEDULE_PROMPT }}  # No branch/PR phrases → resolves to working-dir
+    prompt: ${{ env.SCHEDULE_PROMPT }} # auto always resolves to working-dir
     # output-mode: auto (default — no need to set explicitly)
 ```
 
@@ -241,6 +232,7 @@ The prompt artifact shows:
 
 ```markdown
 ## Delivery Mode
+
 - **Resolved output mode:** `working-dir`
 - Write all requested file changes directly in the checked-out working tree.
 - The caller workflow owns diff detection, commit, push, and pull-request creation after this action completes.
@@ -250,16 +242,17 @@ The prompt artifact shows:
 In a non-posting run (`response-mode: none`), the GitHub-operations sentence is replaced by `This run is non-posting: do not create GitHub comments, issues, or reports.`, matching the `<agent_context>` rule.
 
 ## Task
+
 [task body...]
 ```
 
 The job summary's metadata table includes:
 
-| Property    | Value          |
-| ----------- | -------------- |
-| Agent       | build          |
-| Output Mode | working-dir    |
-| ...         | ...            |
+| Property    | Value       |
+| ----------- | ----------- |
+| Agent       | build       |
+| Output Mode | working-dir |
+| ...         | ...         |
 
 If delivery later looks wrong, the operator's first triage step is "what does `Output Mode` show?" rather than "what did the model decide today?"
 
@@ -271,7 +264,7 @@ If delivery later looks wrong, the operator's first triage step is "what does `O
 - [PR #465](https://github.com/fro-bot/agent/pull/465) — established the `<harness_rules>` authority hierarchy that this fix defers to
 - `docs/plans/2026-04-07-001-refactor-prompt-xml-architecture-plan.md` — XML-tagged prompt architecture plan
 - `docs/plans/2026-04-13-001-feat-compounding-wiki-plan.md` — wiki workflow that became the first explicit `branch-pr` caller
-- `src/features/agent/output-mode.ts` — resolver implementation
-- `src/features/agent/prompt.ts` — `buildTaskSection()` Delivery Mode preamble injection
-- `src/features/agent/prompt-thread.ts` — `<harness_rules>` operator-level rule line
+- `packages/runtime/src/agent/output-mode.ts` — resolver implementation
+- `packages/runtime/src/agent/prompt.ts` — `buildTaskSection()` Delivery Mode preamble injection
+- `packages/runtime/src/agent/prompt-thread.ts` — `<harness_rules>` operator-level rule line
 - `.github/workflows/fro-bot.yaml` — wiki workflow wiring example

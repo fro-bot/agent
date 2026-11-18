@@ -10,6 +10,9 @@ import {
 } from './event-v2.fixtures.js'
 import {
   createRemoteOpenCodeV2Client,
+  isV2EventFrameTooLargeError,
+  V2_EVENT_FRAME_MAX_CHARS,
+  V2_EVENT_FRAME_TOO_LARGE_ERROR_NAME,
   V2_HEARTBEAT_FRAME,
   V2_INBOX_ITEM_META_CAP,
   V2_INBOX_SYNTHETIC_SOURCES,
@@ -62,6 +65,72 @@ function sseResponse(chunks: readonly string[], status = 200): Response {
 }
 
 const AUTH = {authorization: 'Bearer secret-token'}
+
+const MIB = 1024 * 1024
+
+/** Slices `text` into chunks of at most `size` characters. */
+function chunked(text: string, size: number): string[] {
+  const chunks: string[] = []
+  for (let start = 0; start < text.length; start += size) chunks.push(text.slice(start, start + size))
+  return chunks
+}
+
+/** A data block (no delimiter) whose length is exactly `length` characters. */
+function dataBlockOfLength(length: number): string {
+  const prefix = 'data: {"type":"big","data":"'
+  const suffix = '"}'
+  return `${prefix}${'x'.repeat(length - prefix.length - suffix.length)}${suffix}`
+}
+
+/** Reads a finished event stream to its end. */
+async function readAllFrames(chunks: readonly string[]): Promise<unknown[]> {
+  const client = createRemoteOpenCodeV2Client({baseUrl: 'http://w', fetch: makeFetch(() => sseResponse(chunks)).fetch})
+  const result = await client.subscribeEvents({directory: '/d'})
+  if (!result.success) throw new Error('expected a stream')
+  const frames: unknown[] = []
+  for await (const frame of result.data) frames.push(frame)
+  return frames
+}
+
+/** What a promise rejected with, or `undefined` if it resolved. */
+async function rejection(promise: Promise<unknown>): Promise<unknown> {
+  try {
+    await promise
+    return undefined
+  } catch (error) {
+    return error
+  }
+}
+
+/**
+ * An event stream that never sends a delimiter: one chunk per pull, recording what was pulled. It stays open as long as
+ * the reader keeps pulling, but closes itself well past the cap so a reader without the guard ends the test quickly
+ * instead of eating memory without end.
+ */
+function endlessStreamFetch(chunk: string): {
+  readonly fetch: typeof fetch
+  readonly stats: {pulledChars: number; cancelled: boolean}
+} {
+  const stats = {pulledChars: 0, cancelled: false}
+  const encoder = new TextEncoder()
+  const impl = async (): Promise<Response> => {
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        if (stats.pulledChars > 2 * V2_EVENT_FRAME_MAX_CHARS) {
+          controller.close()
+          return
+        }
+        stats.pulledChars += chunk.length
+        controller.enqueue(encoder.encode(chunk))
+      },
+      cancel() {
+        stats.cancelled = true
+      },
+    })
+    return new Response(body, {status: 200, headers: {'content-type': 'text/event-stream'}})
+  }
+  return {fetch: impl, stats}
+}
 
 describe('createRemoteOpenCodeV2Client', () => {
   it('creates a session at the given location and returns its id', async () => {
@@ -438,6 +507,107 @@ describe('createRemoteOpenCodeV2Client', () => {
       await expect(reading).rejects.toThrow('could not be parsed')
       await expect(reading).rejects.not.toThrow('sec')
       expect(frames).toEqual([{type: 'x'}])
+    })
+
+    describe('frame size cap', () => {
+      it('parses a frame exactly at the cap, delivered over many chunks', async () => {
+        // #given — a block of exactly the cap, then its delimiter in a later chunk
+        const wire = `${dataBlockOfLength(V2_EVENT_FRAME_MAX_CHARS)}\n\n`
+
+        // #when
+        const frames = await readAllFrames(chunked(wire, MIB))
+
+        // #then
+        expect(frames).toHaveLength(1)
+        expect(frames[0]).toMatchObject({type: 'big'})
+      })
+
+      it('parses a frame at the cap whose delimiter is split across chunks', async () => {
+        // #given — the first newline of the delimiter already sits in the buffer when the cap is checked
+        const block = dataBlockOfLength(V2_EVENT_FRAME_MAX_CHARS)
+
+        // #when
+        const frames = await readAllFrames([...chunked(block, MIB), '\n', '\n'])
+
+        // #then
+        expect(frames).toHaveLength(1)
+      })
+
+      it('reads a multi-chunk CRLF frame well under the cap', async () => {
+        // #given
+        const wire = `${dataBlockOfLength(MIB)}\r\n\r\ndata: {"type":"next"}\r\n\r\n`
+
+        // #when
+        const frames = await readAllFrames(chunked(wire, 64 * 1024 + 1))
+
+        // #then
+        expect(frames).toHaveLength(2)
+        expect(frames[1]).toEqual({type: 'next'})
+      })
+
+      it('ends the stream with the typed error for a complete frame one character over the cap', async () => {
+        // #given — a valid frame that would parse fine, were it not too large; the frame before it is delivered
+        const wire = `data: {"type":"x"}\n\n${dataBlockOfLength(V2_EVENT_FRAME_MAX_CHARS + 1)}\n\n`
+        const client = createRemoteOpenCodeV2Client({
+          baseUrl: 'http://w',
+          fetch: makeFetch(() => sseResponse(chunked(wire, 8 * MIB))).fetch,
+        })
+        const result = await client.subscribeEvents({directory: '/d'})
+        if (!result.success) throw new Error('expected a stream')
+
+        // #when
+        const frames: unknown[] = []
+        const reading = (async () => {
+          for await (const frame of result.data) frames.push(frame)
+        })()
+
+        // #then
+        const error = await rejection(reading)
+        expect(isV2EventFrameTooLargeError(error)).toBe(true)
+        expect(frames).toEqual([{type: 'x'}])
+      })
+
+      it('accepts a chunk holding many small frames whose total is over the cap', async () => {
+        // #given — the cap bounds one pending frame, not what one transport chunk may carry
+        const frame = `data: {"type":"s","data":"${'z'.repeat(1000)}"}\n\n`
+        const count = Math.ceil(V2_EVENT_FRAME_MAX_CHARS / frame.length) + 10
+
+        // #when
+        const frames = await readAllFrames([frame.repeat(count)])
+
+        // #then
+        expect(frames).toHaveLength(count)
+      })
+
+      it('fails closed on a stream that never sends a delimiter, with bounded reads and the reader cancelled', async () => {
+        // #given — an endless stream whose marker must never reach the error
+        const chunk = `data: secret-marker-${'a'.repeat(MIB)}`
+        const {fetch: endless, stats} = endlessStreamFetch(chunk)
+        const client = createRemoteOpenCodeV2Client({baseUrl: 'http://w', fetch: endless})
+        const result = await client.subscribeEvents({directory: '/d'})
+        if (!result.success) throw new Error('expected a stream')
+
+        // #when
+        const reading = (async () => {
+          for await (const frame of result.data) expect(frame).toBeUndefined()
+        })()
+
+        // #then — it rejects with the typed, payload-free error instead of reading on
+        const error = await rejection(reading)
+        if (!(error instanceof Error)) throw new Error('expected the stream to fail')
+        expect(isV2EventFrameTooLargeError(error)).toBe(true)
+        expect(error.name).toBe(V2_EVENT_FRAME_TOO_LARGE_ERROR_NAME)
+        expect(error.message).not.toContain('secret-marker')
+        // Pulling stopped within a few chunks of the cap (the stream's own read-ahead included): bounded memory.
+        expect(stats.pulledChars).toBeLessThanOrEqual(V2_EVENT_FRAME_MAX_CHARS + 3 * chunk.length)
+        expect(stats.cancelled).toBe(true)
+      })
+
+      it('is not mistaken for any other failure by the guard', () => {
+        // #given / #when / #then
+        expect(isV2EventFrameTooLargeError(new Error('other'))).toBe(false)
+        expect(isV2EventFrameTooLargeError('nope')).toBe(false)
+      })
     })
 
     it('fails a subscription the proxy rejects, as auth', async () => {

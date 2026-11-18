@@ -78,6 +78,39 @@ export const V2_HEARTBEAT_FRAME = {type: 'server.heartbeat'} as const
  */
 const V2_UNREADABLE_FRAME_MESSAGE = 'OpenCode V2 event stream carried a data frame that could not be parsed'
 
+/**
+ * The most characters (UTF-16 code units, which never exceed the wire bytes they came from) one pending event frame may
+ * hold while the reader waits for its blank-line delimiter. Without a ceiling, a server that never sends the delimiter
+ * grows the reader's buffer until the process dies, and the reader runs inside the shared gateway process.
+ *
+ * Sized from the largest legitimate frame, not a guess: a tool result may carry an image or PDF as a base64 `data:` URL
+ * inside the frame (`tool/read.ts` in OpenCode), and OpenCode's own attachment ceiling is 10 MiB (`ATTACH_FILE_MAX_BYTES`
+ * in `cli/cmd/run.ts`), which is about 13.4 MiB of base64. Text tool output is truncated at 50 KiB, so only attachments
+ * come near. 32 MiB leaves that frame more than 2x headroom and caps a pending frame near 32 to 64 MiB of heap. A frame
+ * past it fails the run, as an unreadable frame does.
+ *
+ * It bounds one frame, not one chunk: a chunk of many small valid frames is read frame by frame and is not rejected.
+ */
+export const V2_EVENT_FRAME_MAX_CHARS = 32 * 1024 * 1024
+
+/** `name` of the error the event stream throws for a frame over `V2_EVENT_FRAME_MAX_CHARS`. */
+export const V2_EVENT_FRAME_TOO_LARGE_ERROR_NAME = 'V2EventFrameTooLargeError'
+
+/**
+ * The event stream's failure for a frame over `V2_EVENT_FRAME_MAX_CHARS`, pending or complete. The message is fixed and
+ * carries nothing from the stream. The stream ends here and the consumer treats it as a lost connection: it is final,
+ * not a cue to reconnect, because a server that sent one oversized frame will send it again.
+ */
+function createEventFrameTooLargeError(): Error {
+  const error = new Error('OpenCode V2 event stream carried a frame larger than the size limit')
+  error.name = V2_EVENT_FRAME_TOO_LARGE_ERROR_NAME
+  return error
+}
+
+export function isV2EventFrameTooLargeError(error: unknown): error is Error {
+  return error instanceof Error && error.name === V2_EVENT_FRAME_TOO_LARGE_ERROR_NAME
+}
+
 export interface RemoteOpenCodeV2ClientOptions {
   /** Base URL of the proxy (no trailing path). */
   readonly baseUrl: string
@@ -209,7 +242,12 @@ export interface RemoteOpenCodeV2Client {
     readonly sessionId: string
     readonly signal?: AbortSignal
   }) => Promise<Result<{readonly interrupted: boolean}, V2CallError>>
-  /** Resolves once the response headers arrive. The first frame the stream yields is `server.connected`. */
+  /**
+   * Resolves once the response headers arrive; the first frame the stream yields is `server.connected` (the server
+   * registers the subscriber before it emits it). `directory` rides in `x-opencode-directory` but does not scope the
+   * stream: it carries the events of every location, so consumers filter by session. Nothing is replayed to a late or
+   * reconnecting subscriber, whatever `Last-Event-ID` says.
+   */
   readonly subscribeEvents: (input: {
     readonly directory: string
     readonly signal?: AbortSignal
@@ -351,12 +389,17 @@ async function* readFrames(response: Response, signal: AbortSignal | undefined):
       buffer += text.replaceAll('\r\n', '\n').replaceAll('\r', '\n')
       let boundary = buffer.indexOf('\n\n')
       while (boundary >= 0) {
+        // A complete frame is measured before it is parsed: an oversized one is never handed to `JSON.parse`.
+        if (boundary > V2_EVENT_FRAME_MAX_CHARS) throw createEventFrameTooLargeError()
         const block = buffer.slice(0, boundary)
         buffer = buffer.slice(boundary + 2)
         const frame = readBlock(block)
         if (frame !== null) yield frame
         boundary = buffer.indexOf('\n\n')
       }
+      // What is left has no delimiter yet. A trailing newline may be the first half of one, so it is not counted.
+      if (buffer.length - (buffer.endsWith('\n') ? 1 : 0) > V2_EVENT_FRAME_MAX_CHARS)
+        throw createEventFrameTooLargeError()
       if (chunk.done) break
     }
   } catch (error) {
