@@ -51,7 +51,7 @@
 - `draft_pr`: PR is in draft mode (skipped by default).
 - `issue_locked`: Target issue or pull request is locked.
 - `no_mention`: Missing `@fro-bot` mention in `issues.edited` or required comment events.
-- `own_login_comment`: Comment authored by the Action's own login (compared case-insensitively; a PAT login has no `[bot]` suffix). Not applied when the login is unknown.
+- `own_posted_comment`: Comment the Action itself posted: the body carries `BOT_COMMENT_MARKER` and the author is the Action's login (case-insensitive, trailing `[bot]` ignored on either side). An unmarked comment from the same login, or an unknown login, is not skipped.
 - `prompt_required`: `schedule` or `dispatch` events missing prompt input.
 - `self_comment`: Bot responding to its own comment (loop protection).
 - `unauthorized_author`: Author not `OWNER`, `MEMBER`, or `COLLABORATOR`.

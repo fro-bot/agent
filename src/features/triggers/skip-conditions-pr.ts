@@ -1,6 +1,6 @@
 import type {SkipCheckResult} from './skip-conditions-types.js'
 import type {TriggerConfig, TriggerContext} from './types.js'
-import {isActionLogin, isAuthorizedAssociation} from './author-utils.js'
+import {isActionPostedComment, isAuthorizedAssociation} from './author-utils.js'
 
 const PR_SUPPORTED_ACTIONS = ['opened', 'synchronize', 'reopened', 'ready_for_review', 'review_requested'] as const
 
@@ -134,11 +134,11 @@ export function checkPRReviewCommentSkipConditions(context: TriggerContext, conf
       message: `Review comments from bots (${context.author.login}) are not processed`,
     }
   }
-  if (context.author != null && isActionLogin(context.author.login, config.botLogin)) {
+  if (context.author != null && isActionPostedComment(context.author.login, context.commentBody, config.botLogin)) {
     return {
       shouldSkip: true,
-      reason: 'own_login_comment',
-      message: `Review comments from the Action's own login (${context.author.login}) are not processed`,
+      reason: 'own_posted_comment',
+      message: `Review comments posted by the Action (${context.author.login}) are not processed`,
     }
   }
   if (context.author != null && !isAuthorizedAssociation(context.author.association, config.allowedAssociations)) {

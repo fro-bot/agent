@@ -112,7 +112,7 @@ export const SKIP_REASONS = [
   'draft_pr',
   'issue_locked',
   'no_mention',
-  'own_login_comment',
+  'own_posted_comment',
   'prompt_required',
   'review_skip_label',
   'self_comment',
