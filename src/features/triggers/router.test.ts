@@ -3,9 +3,11 @@ import type {TriggerConfig} from './types.js'
 import {beforeEach, describe, expect, it} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {
+  createDiscussionCommentCreatedEvent,
   createIssueCommentCreatedEvent,
   createIssuesOpenedEvent,
   createPullRequestOpenedEvent,
+  createPullRequestReviewCommentCreatedEvent,
 } from './__fixtures__/payloads.js'
 import {checkSkipConditions, extractCommand, hasBotMention, routeEvent} from './router.js'
 import {createMockGitHubContext} from './test-helpers.js'
@@ -1636,6 +1638,93 @@ describe('routeEvent review-skip-label integration', () => {
     const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot', reviewSkipLabel: 'skip-agent-review'})
 
     // #then issue-triage routing is unaffected — it processes normally
+    expect(result.shouldProcess).toBe(true)
+  })
+})
+
+describe('routeEvent skips comments written by the Action login', () => {
+  let logger: Logger
+
+  beforeEach(() => {
+    logger = createMockLogger()
+  })
+
+  // A PAT-backed Action posts as a plain user: the login has no [bot] suffix, so isBot is false.
+  const commentEvents = [
+    [
+      'issue_comment',
+      (authorLogin: string) =>
+        createIssueCommentCreatedEvent({authorLogin, authorAssociation: 'OWNER', commentBody: '@fro-bot help'}),
+    ],
+    [
+      'discussion_comment',
+      (authorLogin: string) =>
+        createDiscussionCommentCreatedEvent({authorLogin, authorAssociation: 'OWNER', commentBody: '@fro-bot help'}),
+    ],
+    [
+      'pull_request_review_comment',
+      (authorLogin: string) =>
+        createPullRequestReviewCommentCreatedEvent({
+          authorLogin,
+          authorAssociation: 'OWNER',
+          commentBody: '@fro-bot help',
+        }),
+    ],
+  ] as const
+
+  it.each(commentEvents)(
+    'skips a %s whose author is the Action login, though it has no [bot] suffix',
+    (eventName, make) => {
+      // #given a mention from an OWNER whose login equals the Action's login
+      const ghContext = createMockGitHubContext(eventName, make('fro-bot'))
+
+      // #when routing the event
+      const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot'})
+
+      // #then it skips for the Action's own comment, not for authorization or mention
+      expect(result.context.author?.isBot).toBe(false)
+      expect(result.shouldProcess).toBe(false)
+      expect(result.shouldProcess === false && result.skipReason).toBe('own_login_comment')
+    },
+  )
+
+  it.each(commentEvents)('does not skip a %s from a different login', (eventName, make) => {
+    // #given the same mention from another OWNER
+    const ghContext = createMockGitHubContext(eventName, make('maintainer'))
+
+    // #when routing the event
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot'})
+
+    // #then it is processed
+    expect(result.shouldProcess).toBe(true)
+  })
+
+  it.each(commentEvents)('compares logins case-insensitively for a %s', (eventName, make) => {
+    // #given an author whose login differs from the Action login only by case
+    const ghContext = createMockGitHubContext(eventName, make('Fro-Bot'))
+
+    // #when routing the event
+    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot'})
+
+    // #then it skips for the Action's own comment
+    expect(result.shouldProcess === false && result.skipReason).toBe('own_login_comment')
+  })
+
+  it.each([null, ''] as const)('does not skip on login when the Action login is %j', botLogin => {
+    // #given an unknown Action login and a mention from an OWNER
+    const ghContext = createMockGitHubContext(
+      'issue_comment',
+      createIssueCommentCreatedEvent({
+        authorLogin: 'fro-bot',
+        authorAssociation: 'OWNER',
+        commentBody: '@fro-bot help',
+      }),
+    )
+
+    // #when routing the event
+    const result = routeEvent(ghContext, logger, {botLogin, requireMention: false})
+
+    // #then this check does not skip; the [bot] suffix check and the workflow filter still apply
     expect(result.shouldProcess).toBe(true)
   })
 })
