@@ -88,4 +88,4 @@ The server and the session now agree on which filesystem root the agent can insp
 
 `process.chdir` is global to the worker process. The eval runner accepts this and warns when it cannot confirm it is running in isolation; a properly isolated runner is the durable fix.
 
-Related: [workspace executor OpenCode provisioning](../best-practices/workspace-executor-opencode-provisioning-best-practices-2026-06-01.md) covers the surrounding server-lifecycle conventions.
+Related: [workspace executor OpenCode provisioning](../best-practices/workspace-opencode-provisioning-on-v2-2026-11-17.md) covers the surrounding server-lifecycle conventions.

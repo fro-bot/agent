@@ -36,7 +36,7 @@ workspace → sandbox-net (internal:true) → mitmproxy → egress-net → inter
 
 `sandbox-net internal:true` is the primary boundary — a network with no gateway. The topology guard (`deploy/validate-stack.sh`, `check_compose_topology`, run in the `workspace-smoke` CI job) is defense-in-depth: it rejects any compose key that could re-introduce a path around mitmproxy. Any overlooked key collapses the whole containment model — a TUN device + `NET_ADMIN` builds a tunnel; `pid: host` + a capability enables `nsenter` into host namespaces; `device_cgroup_rules` + `mknod` recreates `/dev/net/tun` even when the device mapping is blocked.
 
-A hardening arc across three PRs (#899/#909, #908/#911, #910/#914) extended the guard from the network-attachment checks to the full escape surface (Invariants 1b–1m). Security-weighted `ce:review` on that arc caught **9 real bypasses** of the naive checks before they shipped — each one would have shipped as *false security*.
+A hardening arc across three PRs (#899/#909, #908/#911, #910/#914) extended the guard from the network-attachment checks to the full escape surface (Invariants 1b–1m). Security-weighted `ce:review` on that arc caught **9 real bypasses** of the naive checks before they shipped — each one would have shipped as _false security_.
 
 ## Guidance
 
@@ -45,7 +45,7 @@ A hardening arc across three PRs (#899/#909, #908/#911, #910/#914) extended the 
 `docker compose config --format json` normalizes the file into specific shapes that differ from authored YAML, and the guard also has a raw-YAML fallback (for CI without Docker). The same logical key takes different shapes in each path:
 
 | Key | compose-config shape | raw-YAML shape |
-|-----|----------------------|----------------|
+| --- | --- | --- |
 | `extra_hosts` | list of `"name=value"` | list of `"name:value"`, dict, or scalar |
 | `devices` | list of dicts `{source,target,permissions}` | list of `"host:container[:perms]"` or scalar |
 | `cap_add` | list (`CAP_` prefix + case preserved) | list or scalar |
@@ -59,7 +59,7 @@ Write every check `isinstance`-branched and handle every shape in both paths. Do
 
 Compose silently drops unknown keys as schema errors, so a guard over an invalid key is dead code: the file passes because the key is gone from the normalized config, and the developer assumes protection. The arc hit this exactly — three reviewers proposed guarding `pid_mode: host`, but `docker compose config` **rejects** `pid_mode` (`additional properties 'pid_mode' not allowed`); the valid key is `pid`. Guarding `pid_mode` would always read `None` and never fire.
 
-Verification technique: write a negative test with the *real* key, run it through `docker compose config`, and confirm the guard fires. The test that *should* fail but silently passes is the bug.
+Verification technique: write a negative test with the _real_ key, run it through `docker compose config`, and confirm the guard fires. The test that _should_ fail but silently passes is the bug.
 
 ### 3. Normalize capability names AND ban supersets
 
@@ -99,17 +99,17 @@ This rejects the prefixed `seccomp:unconfined`/`apparmor:unconfined` forms and c
 
 A guard over a normalized config is only as good as the negative tests for the **equivalence classes** the normalizer creates. Review must enumerate every shape, not just the canonical form. The arc's caught bypasses, each now locked by a named test:
 
-| Bypass | Fix |
-|--------|-----|
-| `cap_add: [CAP_NET_ADMIN]` / `[cap_net_admin]` | strip `CAP_` + uppercase |
-| `cap_add: NET_ADMIN` (scalar) | wrap scalar → 1-element list |
-| `cap_add: [ALL]` / `[CAP_ALL]` | add `ALL` to banned set |
-| `cap_add: SYS_MODULE` / `SYS_ADMIN` | add to banned set (kernel-module load / nsenter escape) |
-| `devices: ["//dev/net/tun"]` / `["/dev/./net/tun"]` | leading-slash collapse + `os.path.normpath` |
-| `extra_hosts: {h: host-gateway}` (dict) | dict branch via `.values()` |
-| `sysctls: ["net.ipv6.conf.all.forwarding=1"]` (list) | list→dict branch + IPv6 regex |
-| `net.ipv4.conf.all.forwarding=1` | kernel-alias regex alongside the global flag |
-| `security_opt: ["seccomp=/profile.json"]` | reject any non-`default` seccomp/apparmor |
+| Bypass                                               | Fix                                                     |
+| ---------------------------------------------------- | ------------------------------------------------------- |
+| `cap_add: [CAP_NET_ADMIN]` / `[cap_net_admin]`       | strip `CAP_` + uppercase                                |
+| `cap_add: NET_ADMIN` (scalar)                        | wrap scalar → 1-element list                            |
+| `cap_add: [ALL]` / `[CAP_ALL]`                       | add `ALL` to banned set                                 |
+| `cap_add: SYS_MODULE` / `SYS_ADMIN`                  | add to banned set (kernel-module load / nsenter escape) |
+| `devices: ["//dev/net/tun"]` / `["/dev/./net/tun"]`  | leading-slash collapse + `os.path.normpath`             |
+| `extra_hosts: {h: host-gateway}` (dict)              | dict branch via `.values()`                             |
+| `sysctls: ["net.ipv6.conf.all.forwarding=1"]` (list) | list→dict branch + IPv6 regex                           |
+| `net.ipv4.conf.all.forwarding=1`                     | kernel-alias regex alongside the global flag            |
+| `security_opt: ["seccomp=/profile.json"]`            | reject any non-`default` seccomp/apparmor               |
 
 Disproved false-positive: `pid_mode: host` — an invalid compose key, inert, not a bypass (see rule 2).
 
@@ -123,7 +123,7 @@ Any denylist/allowlist guard over a declarative config that a tool **normalizes 
 
 ## Related
 
-- `docs/solutions/best-practices/workspace-executor-opencode-provisioning-best-practices-2026-06-01.md` — adjacent workspace/deploy hardening (config/auth provisioning, different failure class)
+- `docs/solutions/best-practices/workspace-opencode-provisioning-on-v2-2026-11-17.md` — adjacent workspace/deploy hardening (config/auth provisioning, different failure class)
 - `docs/solutions/build-errors/gateway-docker-runtime-resolution-crash-loop-2026-05-31.md` — sibling Docker/deploy image-safety
 - `docs/solutions/best-practices/cross-libc-build-and-release-safety-2026-06-14.md` — same deploy surface, build/release verification
 - Source: `deploy/validate-stack.sh` (Invariants 1b–1m), `deploy/validate-stack.test.sh`

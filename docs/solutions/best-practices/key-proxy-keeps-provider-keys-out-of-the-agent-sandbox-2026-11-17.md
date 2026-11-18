@@ -79,4 +79,4 @@ A good run logs `Key proxy started`, `Key proxy probe passed` and, at the end, `
 
 - [Isolate a CI credential via an OIDC broker](../workflow-issues/isolate-ci-credential-via-oidc-broker-2026-07-01.md): credential minimization, for a child that must hold a credential. The proxy is the other option, for a child that needs authenticated access but not the key.
 - [Sequential steps in one GitHub Actions job are not a security boundary](./same-job-phase-split-not-a-security-boundary-2026-07-04.md): why file modes and step order do not isolate credentials.
-- [Workspace executor OpenCode provisioning](./workspace-executor-opencode-provisioning-best-practices-2026-06-01.md): credential files in the workspace container, where same-user code can read a `0600` file.
+- [Workspace OpenCode provisioning on V2](./workspace-opencode-provisioning-on-v2-2026-11-17.md): the workspace container's key path, where tools run as the server's user and can read the spawn database that holds the key.
