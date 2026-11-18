@@ -1225,7 +1225,7 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Dependency Review
-        uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        uses: actions/dependency-review-action@bbc44d14a204704ccc493733616cd1e93a0321ec # v5.0.1
 
   release:
     concurrency:
@@ -1245,7 +1245,7 @@ jobs:
     steps:
       - id: get-app-token
         name: Get GitHub App Installation Token
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         with:
           app-id: ${{ secrets.APPLICATION_ID }}
           private-key: ${{ secrets.APPLICATION_PRIVATE_KEY }}
