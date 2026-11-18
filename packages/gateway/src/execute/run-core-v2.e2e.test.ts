@@ -917,14 +917,22 @@ async function captureBackgroundChildLifecycle(): Promise<BackgroundChildCapture
 
   const rootSucceeded = (): number =>
     frames.filter(frame => frame.type === 'session.execution.succeeded' && frame.data?.sessionID === rootId).length
-  const until = async (predicate: () => boolean, timeoutMs: number): Promise<void> => {
+  // A timeout is a failed capture, never a quiet pass: say what was waited for and which frames had arrived.
+  const until = async (predicate: () => boolean, timeoutMs: number, waitedFor: string): Promise<void> => {
     const deadline = Date.now() + timeoutMs
-    while (!predicate() && Date.now() < deadline) await sleep(50)
+    while (!predicate()) {
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `timed out after ${timeoutMs} ms waiting for ${waitedFor}; frames so far: ${frames.map(frame => frame.type).join(',')}`,
+        )
+      }
+      await sleep(50)
+    }
   }
 
   // The root's first execution ends after about half a second; the child sleeps 8 s, so the next 4 s are the window in
   // which the root is idle and its only activity is the background child.
-  await until(() => rootSucceeded() >= 1, 20_000)
+  await until(() => rootSucceeded() >= 1, 20_000, "the root's first execution to succeed")
   const whileChildRuns: ActiveSample[] = []
   const windowEnd = Date.now() + 4000
   while (Date.now() < windowEnd) {
@@ -933,8 +941,8 @@ async function captureBackgroundChildLifecycle(): Promise<BackgroundChildCapture
     })
     await sleep(100)
   }
-  // The child's completion wakes the root a second time.
-  await until(() => rootSucceeded() >= 2, 40_000)
+  // The child's completion wakes the root a second time, and that execution must complete before the capture closes.
+  await until(() => rootSucceeded() >= 2, 40_000, "the root's second execution (the child's wake) to succeed")
   const messages = await fetch(`${stock.baseUrl}/api/session/${rootId}/message`, {
     headers: {authorization: stock.authorization},
   })
@@ -989,6 +997,8 @@ describe.skipIf(!hasBinary)('one background-child lifecycle on the real server (
       },
     })
     expect(notice.data?.item?.payload?.text).toContain(`<subagent sessionID="${capture.childId}" state="completed"`)
+    // #and the notice carries the child's scripted result, not only the completed-child envelope
+    expect(notice.data?.item?.payload?.text).toContain(SUBAGENT_DONE_TEXT)
     // #and the frame carries no `location` (unlike the user-prompt items), and has the same item and payload keys as the
     // derived fixture `SUBAGENT_NOTICE_ENQUEUED_FRAME`
     expect(notice.location).toBeUndefined()
@@ -1007,6 +1017,7 @@ describe.skipIf(!hasBinary)('one background-child lifecycle on the real server (
     })
 
     // #and it was delivered once, after it was enqueued, and woke the root: a second execution of the root started
+    // and ran to success
     const inboxId = notice.data?.inboxID
     const delivered = capture.frames.filter(
       frame => frame.type === 'session.inbox.delivered' && frame.data?.inboxID === inboxId,
@@ -1019,6 +1030,11 @@ describe.skipIf(!hasBinary)('one background-child lifecycle on the real server (
     )
     expect(rootStarts).toHaveLength(2)
     expect(order(rootStarts[1] as WireFrame)).toBeGreaterThan(order(notice))
+    const rootSucceededFrames = capture.frames.filter(
+      frame => frame.type === 'session.execution.succeeded' && frame.data?.sessionID === capture.rootId,
+    )
+    expect(rootSucceededFrames).toHaveLength(2)
+    expect(order(rootSucceededFrames[1] as WireFrame)).toBeGreaterThan(order(rootStarts[1] as WireFrame))
 
     // #and the live stream carries no separate `session.synthetic` frame for it
     expect(capture.frames.filter(frame => frame.type === 'session.synthetic')).toEqual([])

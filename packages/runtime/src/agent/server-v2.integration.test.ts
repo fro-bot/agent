@@ -174,6 +174,27 @@ async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<boo
 const sandboxes: Sandbox[] = []
 const handles: OpenCodeV2ServerHandle[] = []
 const providers: HeldProvider[] = []
+const openStreams: OpenStream[] = []
+
+// File-scope teardown: it runs after every suite in this file, so it also covers the resources a later suite creates
+// (a describe-level `afterAll` runs when that describe ends, before a sibling's `beforeAll`). Every resource registers
+// itself in the arrays above the moment it exists, so a setup that fails part-way is cleaned up too. One failing step
+// must not skip the rest, so each runs on its own and the first failure is rethrown at the end.
+afterAll(async () => {
+  const failures: unknown[] = []
+  const attempt = async (step: () => unknown): Promise<void> => {
+    try {
+      await step()
+    } catch (error) {
+      failures.push(error)
+    }
+  }
+  for (const stream of openStreams) await attempt(() => stream.abort.abort())
+  for (const handle of handles) await attempt(async () => handle.shutdown())
+  for (const provider of providers) await attempt(async () => provider.stop())
+  for (const box of sandboxes) await attempt(() => rmSync(box.root, {recursive: true, force: true}))
+  if (failures.length > 0) throw failures[0]
+}, 60_000)
 
 async function boot(sandbox: Sandbox, overrides: Partial<StartOpenCodeV2ServerOptions> = {}) {
   const result = await startOpenCodeV2Server(
@@ -230,12 +251,6 @@ async function startHeldTurn(box: Sandbox, overrides: Partial<StartOpenCodeV2Ser
 describe.skipIf(!hasBinary)('startOpenCodeV2Server against the real stock binary', () => {
   beforeAll(() => {
     assertPinnedBinary()
-  })
-
-  afterAll(async () => {
-    for (const handle of handles) await handle.shutdown()
-    for (const provider of providers) await provider.stop()
-    for (const sandbox of sandboxes) rmSync(sandbox.root, {recursive: true, force: true})
   })
 
   it('spawns, enforces Basic auth, passes readiness and the plugin gate with no expected plugins', async () => {
@@ -457,7 +472,6 @@ function assertPinnedBinary(): void {
 }
 
 describe.skipIf(!hasBinary)('GET /api/event against the real stock binary (fro-bot/agent#2191)', () => {
-  const streams: OpenStream[] = []
   let box: Sandbox
   let handle: OpenCodeV2ServerHandle
   let held: HeldProvider
@@ -470,7 +484,7 @@ describe.skipIf(!hasBinary)('GET /api/event against the real stock binary (fro-b
     const subscribed = await client.subscribeEvents({directory, signal: signal.signal})
     if (!subscribed.success) throw new Error(`subscribeEvents failed: ${subscribed.error.kind}`)
     const stream = {iterator: subscribed.data[Symbol.asyncIterator](), seen: [] as WireFrame[], abort: signal}
-    streams.push(stream)
+    openStreams.push(stream)
     return stream
   }
 
@@ -483,10 +497,6 @@ describe.skipIf(!hasBinary)('GET /api/event against the real stock binary (fro-b
     if (!started.success) throw new Error(`start failed: ${started.error.kind}`)
     handle = started.data
   }, 120_000)
-
-  afterAll(() => {
-    for (const stream of streams) stream.abort.abort()
-  })
 
   it('a1: the first frame of every subscription is server.connected, also while a turn is running', async () => {
     // #given a turn held open on the server, so events are flowing while subscriptions open
@@ -579,44 +589,28 @@ describe.skipIf(!hasBinary)('GET /api/event against the real stock binary (fro-b
     }
   })
 
-  it('a4: a first prompt at a fresh location is not admitted until its request returns; an interrupt sent meanwhile is a no-op', async () => {
+  it('a4: once the prompt request has returned, the session is listed running, its wait stays pending and an interrupt takes effect', async () => {
+    // What happens while the request is in flight is not pinned: on 2.3.0 a first prompt at a fresh location is not yet
+    // listed for ~150 ms and an interrupt sent then finds nothing, but the stock binary offers no barrier to sample that
+    // window against, so it is an observation (see `run-core-v2.ts`) and not an assertion. Only the state after the
+    // request has returned is deterministic.
     for (let attempt = 0; attempt < 3; attempt++) {
-      // #given a session at a location the server has not run a prompt in yet
+      // #given a session at a location the server has not run a prompt in yet (the first-prompt path)
       const fresh = sandbox()
       const sessionId = await createSessionAt(handle, fresh.repo)
-      const active = async (): Promise<Record<string, {type: string}>> =>
-        ((await json(handle, '/api/session/active')) as {data: Record<string, {type: string}>}).data
 
-      // #when the prompt is sent and, without waiting for it, the session is interrupted and the active list read
-      let returned = false
-      const isReturned = (): boolean => returned
-      const prompt = handle
-        .fetch(`/api/session/${sessionId}/prompt`, {
-          method: 'POST',
-          headers: {'content-type': 'application/json', 'x-opencode-directory': fresh.repo},
-          body: JSON.stringify({text: 'go'}),
-        })
-        .finally(() => {
-          returned = true
-        })
-      const early = (await json(handle, `/api/session/${sessionId}/interrupt`, {method: 'POST'})) as {
-        interrupted: boolean
-      }
-      const listedBeforeReturn: boolean[] = []
-      while (!isReturned()) {
-        listedBeforeReturn.push(sessionId in (await active()))
-        await new Promise(resolve => setTimeout(resolve, 5))
-      }
+      // #when the prompt request has returned
+      const prompt = await handle.fetch(`/api/session/${sessionId}/prompt`, {
+        method: 'POST',
+        headers: {'content-type': 'application/json', 'x-opencode-directory': fresh.repo},
+        body: JSON.stringify({text: 'go'}),
+      })
+      expect(prompt.status).toBeLessThan(300)
 
-      // #then the early interrupt found nothing to interrupt (so a reply of false is not a stop), the session was not
-      // listed during the first reads while the request was in flight (the window is ~150 ms; a read that straddles the
-      // moment admission completes may see it, so only the early reads count), and it is listed once the request returned
-      expect((await prompt).status).toBeLessThan(300)
-      expect(early).toEqual({interrupted: false})
-      expect(listedBeforeReturn.length).toBeGreaterThanOrEqual(3)
-      expect(listedBeforeReturn.slice(0, 3)).toEqual([false, false, false])
-      expect((await active())[sessionId]).toEqual({type: 'running'})
-      // #and the session-wait route no longer answers at once (an early 204 is what "not admitted yet" looked like)
+      // #then the session is listed running
+      const active = ((await json(handle, '/api/session/active')) as {data: Record<string, {type: string}>}).data
+      expect(active[sessionId]).toEqual({type: 'running'})
+      // #and the session-wait route does not answer at once (an early 204 is what "not admitted yet" looked like)
       const waiting = new AbortController()
       const waitAnswer = handle
         .fetch(`/api/experimental/session/${sessionId}/wait`, {method: 'POST', signal: waiting.signal})
@@ -626,7 +620,7 @@ describe.skipIf(!hasBinary)('GET /api/event against the real stock binary (fro-b
         await Promise.race([waitAnswer, new Promise<'pending'>(resolve => setTimeout(resolve, 300, 'pending'))]),
       ).toBe('pending')
       waiting.abort()
-      // #and an interrupt after the return takes effect
+      // #and an interrupt takes effect
       expect(await json(handle, `/api/session/${sessionId}/interrupt`, {method: 'POST'})).toEqual({interrupted: true})
     }
   })
