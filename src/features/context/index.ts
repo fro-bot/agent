@@ -1,5 +1,7 @@
 export {estimateContextSize, exceedsBudget, formatContextForPrompt, truncateBody} from './budget.js'
 
+export {hydrateDiscussionContext} from './discussion.js'
+
 export {fallbackIssueContext, fallbackPullRequestContext} from './fallback.js'
 
 export {executeIssueQuery, executePullRequestQuery, ISSUE_QUERY, PULL_REQUEST_QUERY} from './graphql.js'
@@ -17,6 +19,7 @@ export type {
   ContextLabel,
   ContextReview,
   ContextReviewComment,
+  DiscussionContext,
   HydratedContext,
   IssueContext,
   IssueGraphQLResponse,

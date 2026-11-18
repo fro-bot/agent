@@ -13,6 +13,7 @@ import {
   DEFAULT_CONTEXT_BUDGET,
   fallbackIssueContext,
   fallbackPullRequestContext,
+  hydrateDiscussionContext,
   hydrateIssueContext,
   hydratePullRequestContext,
 } from '../context/index.js'
@@ -50,7 +51,18 @@ export async function collectAgentContext(options: CollectAgentContextOptions): 
 
   const diffContext = await collectDiffContext(triggerContext, octokit, repo, logger)
 
-  const hydratedContext = await hydrateContext(octokit, repoInfo.owner, repoInfo.repo, issueNumber, issueType, logger)
+  // Discussions have no REST fallback: a failed read leaves hydratedContext null and the run proceeds on the event's facts.
+  const hydratedContext =
+    target?.kind === 'discussion'
+      ? await hydrateDiscussionContext(
+          octokit,
+          repoInfo.owner,
+          repoInfo.repo,
+          target.number,
+          DEFAULT_CONTEXT_BUDGET,
+          logger,
+        )
+      : await hydrateContext(octokit, repoInfo.owner, repoInfo.repo, issueNumber, issueType, logger)
 
   const prContext = hydratedContext?.type === 'pull_request' ? hydratedContext : null
   const authorAssociation = prContext?.authorAssociation ?? null

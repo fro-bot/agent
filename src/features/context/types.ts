@@ -155,9 +155,9 @@ export interface PullRequestContext {
 }
 
 /**
- * Union type for hydrated context (issue or PR).
+ * Union type for hydrated context (issue, PR or discussion).
  */
-export type {HydratedContext} from '@fro-bot/runtime'
+export type {DiscussionContext, HydratedContext} from '@fro-bot/runtime'
 
 /**
  * Result of truncating a body string.
