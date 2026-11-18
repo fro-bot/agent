@@ -72,6 +72,7 @@ function createBootstrap(overrides: Partial<BootstrapPhaseResult> = {}): Bootstr
     logger: createMockLogger(),
     opencodeResult: {version: '1.0.0'} as BootstrapPhaseResult['opencodeResult'],
     delivery: 'file-convention',
+    credential: 'withhold',
     responseFilePath: '/fixture/fro-bot-response.md',
     responseFilePathCandidates: null,
     trustedHeadSha: '',

@@ -8,95 +8,41 @@ export interface ResponseDeliveryDecision {
   readonly credential: CredentialDisposition
 }
 
-type EventClassification = 'affected' | 'autonomous' | 'deferred-or-unknown'
-
 /**
- * Classifies a raw GitHub event name along the credential-sensitivity axis.
+ * Only `schedule` and `workflow_dispatch` provision the GitHub credential: the model there reads text the caller wrote
+ * or scheduled. Every other raw event name, known or not, reads text anyone can write, so the credential is withheld
+ * from the model and the reply is delivered through the response file. The default denies; a new or unrecognized event
+ * name withholds.
  *
- * `affected` triggers (pull_request, issue_comment, issues) require the
- * response to be delivered through the file-convention path instead of the
- * model calling `gh` directly, so the GitHub credential must be withheld from
- * the agent regardless of responseMode.
- *
- * `autonomous` triggers (workflow_dispatch, schedule) provision the credential
- * to the model so it can open branches and PRs itself.
- *
- * Everything else — including the deferred surfaces
- * (pull_request_review_comment, discussion_comment) and any unrecognized
- * event name — defaults to `deferred-or-unknown`, which resolves to
- * `provision`/`model-gh`.
- *
- * Withholding keeps the token out of the agent's env and gh config; on its own it is
- * not an OS boundary, since the agent can read the action's environ on Linux. The
- * `isolate-agent` input runs the agent as a separate user to provide one (#2135).
+ * Withholding keeps the token out of the agent's env and gh config; on its own it is not an OS boundary, since the
+ * agent can read the action's environ on Linux. The `isolate-agent` input runs the agent as a separate user to provide
+ * one (#2135).
  */
-function classifyEvent(eventName: string): EventClassification {
+function provisionsCredential(eventName: string): boolean {
   switch (eventName) {
-    case 'pull_request':
-    case 'issue_comment':
-    case 'issues':
-      return 'affected'
-
-    case 'workflow_dispatch':
     case 'schedule':
-      return 'autonomous'
+    case 'workflow_dispatch':
+      return true
 
     default:
-      return 'deferred-or-unknown'
+      return false
   }
 }
 
 /**
- * Resolves the response delivery mechanism and credential disposition for a
- * GitHub event, independently, along two axes:
+ * Resolves the credential disposition and the response delivery mechanism for a raw GitHub event name.
  *
- * - `credential` depends only on whether the trigger is one of the affected
- *   triggers (pull_request, issue_comment, issues); responseMode never
- *   changes this. Even when nothing will be delivered (responseMode 'none'),
- *   the credential stays withheld for affected triggers.
- * - `delivery` depends on responseMode first (a 'none' responseMode always
- *   yields 'none' delivery, regardless of trigger), then on whether the
- *   trigger is affected (file-convention) or not (model-gh).
+ * - `credential` depends only on the event name; `responseMode` never changes it, so a withheld trigger stays withheld
+ *   when nothing will be delivered.
+ * - `delivery` is `none` whenever `responseMode` is `none`; otherwise `model-gh` when the credential is provisioned and
+ *   `file-convention` when it is withheld.
  */
-function assertNever(value: never): never {
-  throw new Error(`Unexpected value: ${String(value)}`)
-}
-
-function resolveCredential(classification: EventClassification): CredentialDisposition {
-  switch (classification) {
-    case 'affected':
-      return 'withhold'
-
-    case 'autonomous':
-    case 'deferred-or-unknown':
-      return 'provision'
-
-    default:
-      return assertNever(classification)
-  }
-}
-
-function resolveDelivery(classification: EventClassification): ResponseDelivery {
-  switch (classification) {
-    case 'affected':
-      return 'file-convention'
-
-    case 'autonomous':
-    case 'deferred-or-unknown':
-      return 'model-gh'
-
-    default:
-      return assertNever(classification)
-  }
-}
-
 export function resolveResponseDelivery(eventName: string, responseMode: ResponseMode): ResponseDeliveryDecision {
-  const classification = classifyEvent(eventName)
-  const credential = resolveCredential(classification)
+  const credential: CredentialDisposition = provisionsCredential(eventName) ? 'provision' : 'withhold'
 
   if (responseMode === 'none') {
     return {delivery: 'none', credential}
   }
 
-  return {delivery: resolveDelivery(classification), credential}
+  return {delivery: credential === 'provision' ? 'model-gh' : 'file-convention', credential}
 }

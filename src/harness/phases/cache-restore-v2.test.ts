@@ -80,12 +80,17 @@ function inputs(overrides: Partial<ActionInputs> = {}): ActionInputs {
   }
 }
 
-function bootstrap(version: string, overrides: Partial<ActionInputs> = {}): BootstrapPhaseResult {
+function bootstrap(
+  version: string,
+  overrides: Partial<ActionInputs> = {},
+  credential: BootstrapPhaseResult['credential'] = 'provision',
+): BootstrapPhaseResult {
   return {
     inputs: inputs(overrides),
     logger: createMockLogger(),
     opencodeResult: {path: '/opt/opencode', version},
     delivery: 'model-gh',
+    credential,
     responseFilePath: null,
     responseFilePathCandidates: null,
     trustedHeadSha: '',
@@ -179,23 +184,23 @@ describe('runCacheRestore on OpenCode V2', () => {
   })
 
   it.each([
-    ['pull_request', 'withhold'],
-    ['issue_comment', 'withhold'],
-    ['issues', 'withhold'],
-    ['workflow_dispatch', 'provision'],
-    ['schedule', 'provision'],
-  ])('tells the V2 start the credential disposition of %s: %s', async (eventName, credential) => {
-    // #given
-    vi.stubEnv('GITHUB_EVENT_NAME', eventName)
-    mocks.startActionOpenCodeV2.mockResolvedValue({success: true, data: v2Handle().handle})
-    const {runCacheRestore} = await import('./cache-restore.js')
+    ['withhold', 'schedule'],
+    ['provision', 'issue_comment'],
+  ] as const)(
+    'tells the V2 start the bootstrap credential disposition %s, whatever GITHUB_EVENT_NAME holds',
+    async (credential, contradictingEventName) => {
+      // #given a bootstrap result whose disposition disagrees with the event name in the environment
+      vi.stubEnv('GITHUB_EVENT_NAME', contradictingEventName)
+      mocks.startActionOpenCodeV2.mockResolvedValue({success: true, data: v2Handle().handle})
+      const {runCacheRestore} = await import('./cache-restore.js')
 
-    // #when
-    await runCacheRestore(bootstrap(V2_VERSION), createMetricsCollector())
+      // #when restoring
+      await runCacheRestore(bootstrap(V2_VERSION, {}, credential), createMetricsCollector())
 
-    // #then
-    expect(mocks.startActionOpenCodeV2.mock.calls[0]?.[0]).toMatchObject({credential})
-  })
+      // #then the V2 start received the bootstrap disposition, not one resolved from the environment
+      expect(mocks.startActionOpenCodeV2.mock.calls[0]?.[0]).toMatchObject({credential})
+    },
+  )
 
   it('repairs the restored database before the spawn, exactly as V1 does', async () => {
     // #given a restore hit whose log needed a checkpoint
