@@ -21,6 +21,7 @@ findBotComment(thread, botLogin) // Find most recent bot comment
 // Writing comments
 postComment(client, target, options, logger) // Create or update comment
 isBotComment(body) // Check if body has BOT_COMMENT_MARKER
+withBotMarker(body) // Append BOT_COMMENT_MARKER unless present (replies and error comments)
 
 // Error formatting
 formatErrorComment(error) // Format error as markdown

@@ -13,7 +13,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import {classifyProviderFailure, createProviderAuthError} from '@fro-bot/runtime'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
-import {formatErrorComment} from '../../features/comments/index.js'
+import {BOT_COMMENT_MARKER, formatErrorComment} from '../../features/comments/index.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 
 type RunBrokeredPushMock = (params: BrokeredPushParams) => Promise<BrokeredPushOutcome>
@@ -407,7 +407,7 @@ describe('runFinalize file-convention delivery', () => {
     const [, target, options] = mocks.postComment.mock.calls[0] as [unknown, CommentTarget, {body: string}]
     expect(target).toEqual({type: 'issue', number: 1, owner: 'owner', repo: 'repo'})
     expect(options.body).toBe(
-      'The agent execution failed before it could write a response artifact, so no response was delivered.',
+      `The agent execution failed before it could write a response artifact, so no response was delivered.\n\n${BOT_COMMENT_MARKER}`,
     )
     expect(options.body).not.toContain('ENOENT')
   })
@@ -974,6 +974,7 @@ describe('runFinalize file-convention delivery', () => {
     expect(mocks.postComment).toHaveBeenCalledTimes(1)
     const [, , errorOptions] = mocks.postComment.mock.calls[0] as [unknown, CommentTarget, {readonly body: string}]
     expect(errorOptions.body).toContain('Brokered push failure (moved-head)')
+    expect(errorOptions.body).toContain(BOT_COMMENT_MARKER)
     expect(errorOptions.body).not.toContain('Offending paths')
     expect(errorOptions.body).not.toContain('head SHA changed')
     expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('head SHA changed'))
@@ -1514,7 +1515,7 @@ describe('runFinalize non-file-convention delivery', () => {
     expect(mocks.postComment).toHaveBeenCalledTimes(1)
     const [, target, options] = mocks.postComment.mock.calls[0] as [unknown, CommentTarget, {body: string}]
     expect(target).toEqual({type: 'issue', number: 1, owner: 'owner', repo: 'repo'})
-    expect(options.body).toBe(formatErrorComment(llmError))
+    expect(options.body).toBe(`${formatErrorComment(llmError)}\n\n${BOT_COMMENT_MARKER}`)
     expect(mocks.setFailed).not.toHaveBeenCalled()
   })
 })
@@ -1606,7 +1607,7 @@ describe('runFinalize provider_auth_error handling', () => {
       expect(mocks.postComment).toHaveBeenCalledTimes(1)
       const [, target, options] = mocks.postComment.mock.calls[0] as [unknown, CommentTarget, {body: string}]
       expect(target).toEqual(expectedTarget)
-      expect(options.body).toBe(formatErrorComment(createProviderAuthError()))
+      expect(options.body).toBe(`${formatErrorComment(createProviderAuthError())}\n\n${BOT_COMMENT_MARKER}`)
       expect(options.body).not.toContain('response artifact')
       expect(mocks.setFailed).toHaveBeenCalledTimes(1)
       const [failedMessage] = mocks.setFailed.mock.calls[0] as [string]
@@ -1650,7 +1651,7 @@ describe('runFinalize provider_auth_error handling', () => {
     expect(mocks.postComment).toHaveBeenCalledTimes(1)
     const [, target, options] = mocks.postComment.mock.calls[0] as [unknown, CommentTarget, {body: string}]
     expect(target).toEqual({type: 'pr', number: 7, owner: 'trusted-owner', repo: 'trusted-repo'})
-    expect(options.body).toBe(formatErrorComment(createProviderAuthError()))
+    expect(options.body).toBe(`${formatErrorComment(createProviderAuthError())}\n\n${BOT_COMMENT_MARKER}`)
     expect(mocks.setFailed).toHaveBeenCalledTimes(1)
     const [failedMessage] = mocks.setFailed.mock.calls[0] as [string]
     assertNoProviderAuthSentinelLeak(options.body)
@@ -1845,6 +1846,7 @@ describe('runFinalize quota_exceeded llmError handling', () => {
     const [failedMessage] = mocks.setFailed.mock.calls[0] as [string]
     assertNoSentinelLeak(options.body)
     assertNoSentinelLeak(failedMessage)
+    expect(options.body).toContain(BOT_COMMENT_MARKER)
     expect(options.body).toContain('Provider quota exceeded')
     expect(options.body).toContain(RESET_TIME.toISOString())
     expect(failedMessage).toContain('provider quota exceeded')

@@ -134,11 +134,11 @@ export function checkPRReviewCommentSkipConditions(context: TriggerContext, conf
       message: `Review comments from bots (${context.author.login}) are not processed`,
     }
   }
-  if (context.author != null && isActionPostedComment(context.author.login, context.commentBody, config.botLogin)) {
+  if (isActionPostedComment(context.commentBody)) {
     return {
       shouldSkip: true,
       reason: 'own_posted_comment',
-      message: `Review comments posted by the Action (${context.author.login}) are not processed`,
+      message: 'Review comments posted by the Action are not processed',
     }
   }
   if (context.author != null && !isAuthorizedAssociation(context.author.association, config.allowedAssociations)) {

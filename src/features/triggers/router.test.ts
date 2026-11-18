@@ -1642,7 +1642,7 @@ describe('routeEvent review-skip-label integration', () => {
   })
 })
 
-describe('routeEvent skips comments the Action itself posted', () => {
+describe('routeEvent skips comments that carry the Action post marker', () => {
   let logger: Logger
 
   beforeEach(() => {
@@ -1651,7 +1651,6 @@ describe('routeEvent skips comments the Action itself posted', () => {
 
   const MARKER = '<!-- fro-bot-agent -->'
 
-  // A PAT-backed Action posts as a plain user: the login has no [bot] suffix, so isBot is false.
   const commentEvents = [
     [
       'issue_comment',
@@ -1673,9 +1672,9 @@ describe('routeEvent skips comments the Action itself posted', () => {
   const marked = `@fro-bot see the summary\n${MARKER}`
   const unmarked = '@fro-bot see the summary'
 
-  it.each(commentEvents)('skips a marked %s written by the Action login without a [bot] suffix', (eventName, make) => {
-    // #given a marked comment with a mention from an OWNER whose login is the Action's login
-    const ghContext = createMockGitHubContext(eventName, make('fro-bot', marked))
+  it.each(commentEvents)('skips a marked %s from an OWNER with a mention', (eventName, make) => {
+    // #given a marked comment that mentions the bot, from an OWNER who is not a [bot] account
+    const ghContext = createMockGitHubContext(eventName, make('some-pat-user', marked))
 
     // #when routing the event
     const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot'})
@@ -1686,7 +1685,20 @@ describe('routeEvent skips comments the Action itself posted', () => {
     expect(result.shouldProcess === false && result.skipReason).toBe('own_posted_comment')
   })
 
-  it.each(commentEvents)('routes an unmarked %s from the same login normally', (eventName, make) => {
+  it.each(commentEvents)('skips a marked %s whatever the stored login is', (eventName, make) => {
+    // #given a marked comment and each stored-login state: unknown, empty and the lookup's fallback value
+    const ghContext = createMockGitHubContext(eventName, make('some-pat-user', marked))
+
+    for (const botLogin of [null, '', 'fro-bot[bot]']) {
+      // #when routing the event
+      const result = routeEvent(ghContext, logger, {botLogin, requireMention: false})
+
+      // #then it skips for the Action's own post
+      expect(result.shouldProcess === false && result.skipReason).toBe('own_posted_comment')
+    }
+  })
+
+  it.each(commentEvents)('routes an unmarked %s from the Action login normally', (eventName, make) => {
     // #given a person using the Action's token who mentions the bot, with no marker in the body
     const ghContext = createMockGitHubContext(eventName, make('fro-bot', unmarked))
 
@@ -1694,57 +1706,6 @@ describe('routeEvent skips comments the Action itself posted', () => {
     const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot'})
 
     // #then the mention is processed
-    expect(result.shouldProcess).toBe(true)
-  })
-
-  it.each(commentEvents)('ignores a [bot] suffix on the stored login for a marked %s', (eventName, make) => {
-    // #given a stored login with the suffix and a marked comment from the unsuffixed login
-    const ghContext = createMockGitHubContext(eventName, make('fro-bot', marked))
-
-    // #when routing the event
-    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot[bot]'})
-
-    // #then it skips for the Action's own post
-    expect(result.shouldProcess === false && result.skipReason).toBe('own_posted_comment')
-  })
-
-  it.each(commentEvents)('ignores case when comparing logins for a marked %s', (eventName, make) => {
-    // #given a marked comment whose author login differs from the stored login only by case
-    const ghContext = createMockGitHubContext(eventName, make('Fro-Bot', marked))
-
-    // #when routing the event
-    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot'})
-
-    // #then it skips for the Action's own post
-    expect(result.shouldProcess === false && result.skipReason).toBe('own_posted_comment')
-  })
-
-  it.each(commentEvents)('does not skip a marked %s from a different user', (eventName, make) => {
-    // #given a marker copied into a comment by another OWNER
-    const ghContext = createMockGitHubContext(eventName, make('maintainer', marked))
-
-    // #when routing the event
-    const result = routeEvent(ghContext, logger, {botLogin: 'fro-bot'})
-
-    // #then this check does not skip it
-    expect(result.shouldProcess).toBe(true)
-  })
-
-  it.each([null, ''] as const)('does not skip a marked comment when the Action login is %j', botLogin => {
-    // #given an unknown Action login and a marked comment
-    const ghContext = createMockGitHubContext(
-      'issue_comment',
-      createIssueCommentCreatedEvent({
-        authorLogin: 'fro-bot',
-        authorAssociation: 'OWNER',
-        commentBody: marked,
-      }),
-    )
-
-    // #when routing the event
-    const result = routeEvent(ghContext, logger, {botLogin, requireMention: false})
-
-    // #then this check does not skip; the [bot] suffix check and the workflow filter still apply
     expect(result.shouldProcess).toBe(true)
   })
 })

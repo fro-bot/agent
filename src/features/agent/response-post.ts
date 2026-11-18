@@ -14,9 +14,9 @@
 import type {AgentContext, ParsedResponse, ResponseFilePathCandidates, ResponseSurface} from '@fro-bot/runtime'
 import type {TriggerResultProcess} from '../../features/triggers/types.js'
 import type {ReviewDeliveryReceiptOperations} from '../../services/github/review-delivery-receipt.js'
+import type {CommentTarget, Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
 import type {ReviewEvent} from '../reviews/types.js'
-
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
 import process from 'node:process'
@@ -26,10 +26,9 @@ import {
   RESPONSE_FILE_VERDICT_REJECTION_REASONS,
   RESPONSE_SURFACE_POLICIES,
 } from '@fro-bot/runtime'
-import {BOT_COMMENT_MARKER, type CommentTarget, type Octokit} from '../../services/github/types.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {readThread} from '../comments/reader.js'
-import {postComment} from '../comments/writer.js'
+import {postComment, withBotMarker} from '../comments/writer.js'
 import {checkForkOrSelfGuard, submitReviewWithHeadGuard} from '../reviews/review-guards.js'
 import {resolveReviewedHeadSha} from '../reviews/reviewed-head.js'
 import {resolveResponseSurface} from './response-file.js'
@@ -337,10 +336,6 @@ export async function readAndParseResponseFile(
   return {success: true, data: {parsed: parsed.data, surface, recoveredFromFallback, actualResponseFilePath}}
 }
 
-function withMarker(body: string): string {
-  return body.includes(BOT_COMMENT_MARKER) ? body : `${body}\n\n${BOT_COMMENT_MARKER}`
-}
-
 function bodyWithoutFrontmatter(raw: string): string | null {
   const delimiter = '---'
   if (raw.startsWith(delimiter) === false) return null
@@ -533,7 +528,7 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
     })
   }
 
-  const body = withMarker(appendDeliveryFooter(parsed.body, deliveryFooter))
+  const body = withBotMarker(appendDeliveryFooter(parsed.body, deliveryFooter))
 
   if (parsed.verdict == null) {
     // A pull_request trigger's surface is always 'pr-review' and requires a
@@ -549,7 +544,7 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
 
     // A mention on a PR is review-permitted, not review-required. Its no-verdict
     // response intentionally falls through to the normal comment delivery path.
-    const commentBody = withMarker(appendDeliveryFooter(parsed.body, deliveryFooter))
+    const commentBody = withBotMarker(appendDeliveryFooter(parsed.body, deliveryFooter))
     const posted = await postCommentWithRetry(octokit, target, withRunMarker(commentBody), botLogin, logger)
     if (posted === false) {
       return failure('post-failed', 'postComment returned null after retries')
@@ -565,7 +560,7 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
         surface,
         reason: 'missing-target-context',
       })
-      const commentBody = withMarker(appendDeliveryFooter(parsed.body, deliveryFooter))
+      const commentBody = withBotMarker(appendDeliveryFooter(parsed.body, deliveryFooter))
       const posted = await postCommentWithRetry(octokit, target, withRunMarker(commentBody), botLogin, logger)
       if (posted === false) {
         return failure('post-failed', 'postComment returned null after retries')
@@ -603,7 +598,7 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
   // no additional text, and this qualification never touches ordinary comment delivery.
   const reviewSubmitBody =
     knownExecutionVeto === true && parsed.verdict === 'approve'
-      ? withMarker(appendDeliveryFooter(qualifyForKnownExecutionVeto(parsed.body), deliveryFooter))
+      ? withBotMarker(appendDeliveryFooter(qualifyForKnownExecutionVeto(parsed.body), deliveryFooter))
       : body
 
   // The head the agent was handed, captured before execution. Fail closed when it is unknown:
@@ -642,7 +637,7 @@ export async function runResponsePost(params: RunResponsePostParams, logger: Log
         prNumber: target.number,
         surface,
       })
-      const commentBody = withMarker(appendDeliveryFooter(parsed.body, deliveryFooter))
+      const commentBody = withBotMarker(appendDeliveryFooter(parsed.body, deliveryFooter))
       const posted = await postCommentWithRetry(octokit, target, withRunMarker(commentBody), botLogin, logger)
       if (posted === false) {
         return failure('post-failed', 'postComment returned null after retries')
