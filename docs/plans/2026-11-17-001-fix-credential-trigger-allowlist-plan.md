@@ -31,7 +31,8 @@ This plan turns the table into an allowlist: only `schedule` and `workflow_dispa
 - R7. The model is told where its reply lands on discussion and review-comment runs.
 - R8. Every document and message that names the withheld trigger list states the new rule.
 - R9. The breaking change ships with a migration note that names each loss and each new refusal.
-- R10. A comment written by the Action's own identity does not start a run, whether or not that identity is a bot account.
+- R10. A comment the Action itself posted does not start a run, whether or not its identity is a bot account. A person who runs the Action with their own token can still mention it.
+- R11. A withheld discussion run reads the discussion body and its comments, bounded like issue context, with the Action's own client.
 
 ## Scope Boundaries
 
@@ -145,7 +146,7 @@ The two `reuse` rows are idioms to follow, not code to call.
 - **No issue fallback for a discussion reply.** If the trusted context does not identify a discussion, the post fails as a missing target. It never retargets.
 - **Top-level replies.** The normalized event carries no node ids, and no document promises threading. The prompt tells the model where the reply lands.
 - **One pull request.** The discussion surface cannot be exercised in production until the flip, because discussion runs are model-delivered until then. Shipping both together removes the release-order dependency.
-- **Skip the Action's own comments by login.** The self-trigger guard today is the `[bot]` suffix. Under a PAT the Action's login has no such suffix, and the Action now posts model-written text on two more surfaces. Routing skips a comment whose author is the Action's own login.
+- **Skip only comments the Action itself posted.** The self-trigger guard today is the `[bot]` suffix. Under a PAT the Action's login has no such suffix, and the Action now posts model-written text on two more surfaces. Matching the login alone would also skip every comment from a person whose own token runs the Action, and does nothing when the login lookup falls back to `fro-bot[bot]`. Routing skips a comment only when its body carries `BOT_COMMENT_MARKER` and its author is the Action's login, ignoring case and a trailing `[bot]`.
 - **Bootstrap order stays.** The preflight, the `{env:}` refusal and MCP filtering keep running before routing, so they now apply to events the Action goes on to skip. A skip that was green can fail on a persisted checkout credential or `{env:}` in `opencode-config`. The migration note says so.
 - **No new log line.** Setup already logs that the `gh` credential is withheld from the child. Its wording names an "affected trigger"; it is reworded to name the event and the rule. It claims nothing about push or delivery, because brokered push can still apply and a skipped event delivers nothing.
 - **Breaking fix.** Commit type `fix!` with a `BREAKING CHANGE:` footer. Under the 0.x policy that is a minor release.
@@ -173,9 +174,9 @@ The two `reuse` rows are idioms to follow, not code to call.
 
 - [x] **Unit 1: Discussion response surface**
 
-**Goal:** A response-file run on a discussion trigger posts a top-level discussion comment to the discussion named by trusted context, and the prompt says where discussion and review-comment replies land.
+**Goal:** A response-file run on a discussion trigger posts a top-level discussion comment to the discussion named by trusted context, the prompt says where discussion and review-comment replies land, and a discussion run can read the discussion.
 
-**Requirements:** R3, R4, R7
+**Requirements:** R3, R4, R7, R11
 
 **Dependencies:** None
 
@@ -185,6 +186,12 @@ The two `reuse` rows are idioms to follow, not code to call.
 - Modify: `src/features/agent/response-file.ts`
 - Modify: `src/features/agent/response-post.ts`
 - Modify: `packages/runtime/src/agent/prompt.ts`
+- Modify: `packages/runtime/src/agent/types.ts`
+- Modify: `src/features/agent/context.ts`
+- Modify: `src/features/context/budget.ts`
+- Create: `src/features/context/discussion.ts`
+- Test: `src/features/context/discussion.test.ts`
+- Test: `src/features/agent/context.test.ts`
 - Test: `src/features/agent/response-file.test.ts`
 - Test: `src/features/agent/response-post.test.ts`
 - Test: `packages/runtime/src/agent/prompt.test.ts`
@@ -198,6 +205,7 @@ The two `reuse` rows are idioms to follow, not code to call.
 - Every reader of the policy table handles the new member: the output-contract gate and the protocol builders in the prompt.
 - The context block for a discussion target says Discussion, not Issue of unknown type.
 - Under file-convention only, the discussion directive and the review-comment directive each gain one sentence: the Action posts the reply as a top-level comment on the discussion or the pull request. Text under `model-gh` delivery is unchanged.
+- A discussion run is hydrated like an issue run. Before this, its prompt carried the title and the triggering comment only, and a withheld model cannot read the rest with `gh`. `hydrateDiscussionContext` reads the thread through `readThread` in `src/features/comments/reader.ts` with the Action's client and applies the issue bounds: a 10 KiB body, the last 50 comments, and truncation flags. The body and comments reach the model as attached reference files, as issue content does, and the triggering comment stays a separate attachment. A failed read returns null and the run proceeds on the event's facts, as a failed issue read does. It applies under every delivery mode. Only top-level comments are read; replies to a comment are not.
 - The review-comment post path needs no change. It already resolves to `pr-comment` and posts a top-level PR comment (`src/features/agent/response-post.test.ts` covers it).
 
 **Execution note:** Implement test-first. Start with the failing post-path test.
@@ -218,6 +226,9 @@ The two `reuse` rows are idioms to follow, not code to call.
 - Error path: a discussion surface with no target in trusted context -> missing target, no post.
 - Error path: a discussion surface whose trusted target is an issue or a pull request -> missing target, no post.
 - Integration: for one discussion run, the success target and the error-comment target are the same discussion.
+- Happy path: a discussion run's context carries the discussion body and prior comments within the issue bounds, and the prompt attaches them separately from the triggering comment, under file-convention and model-gh delivery.
+- Edge case: a body over the budget and more comments than the budget are truncated and flagged, with the true comment count.
+- Error path: a failed or empty discussion read leaves no hydrated context and does not throw; issue and PR hydration are unchanged.
 
 **Verification:**
 
@@ -275,7 +286,7 @@ The two `reuse` rows are idioms to follow, not code to call.
 
 - [x] **Unit 3: Skip the Action's own comments**
 
-**Goal:** A comment written by the Action's own identity never starts a run.
+**Goal:** A comment the Action itself posted never starts a run, and a person using the Action's token can still mention it.
 
 **Requirements:** R10
 
@@ -283,14 +294,19 @@ The two `reuse` rows are idioms to follow, not code to call.
 
 **Files:**
 
+- Modify: `src/features/triggers/author-utils.ts`
 - Modify: `src/features/triggers/skip-conditions-comment.ts`
+- Modify: `src/features/triggers/skip-conditions-pr.ts`
+- Modify: `src/features/triggers/types.ts`
 - Test: `src/features/triggers/router.test.ts`
 
 **Approach:**
 
-- The comment skip check compares the comment author's login with the Action's own login from the trigger config and skips with its own reason when they match. The `[bot]` suffix check stays.
-- It applies to `issue_comment`, `pull_request_review_comment` and `discussion_comment`, which share the check.
+- A comment is skipped, with its own reason `own_posted_comment`, only when its body carries the Action's marker (`BOT_COMMENT_MARKER`) and its author's login equals the Action's login. The comparison ignores case and a trailing `[bot]` on either side. The `[bot]` suffix check stays.
+- The login alone is not enough: with a personal token the Action's login is a person's, and when the login lookup fails the stored login falls back to `fro-bot[bot]`.
+- It applies to `issue_comment`, `discussion_comment` and `pull_request_review_comment`. Review comments have their own skip function in `skip-conditions-pr.ts`, so the same helper is called there. The comment body is already on the trigger context for all three.
 - When the Action's login is unknown the check does not skip; the suffix check and the caller's workflow filter still apply.
+- Error comments posted by finalize carry no marker, so this check does not skip them.
 
 **Execution note:** Implement test-first.
 
@@ -300,11 +316,11 @@ The two `reuse` rows are idioms to follow, not code to call.
 
 **Test scenarios:**
 
-- Happy path: comment author equals the Action's login (a PAT user with no `[bot]` suffix), mention present, association OWNER -> skipped with the self-comment reason.
-- Happy path: comment author differs from the Action's login -> not skipped by this check.
-- Edge case: login comparison ignores case.
+- Happy path: a marked comment by the Action's login (a PAT user with no `[bot]` suffix), mention present, association OWNER -> skipped with the own-comment reason, for each of the three events.
+- Happy path: an unmarked comment by the same login with a mention -> not skipped, routes normally.
+- Edge case: the stored login is `fro-bot[bot]` and the author is `fro-bot` -> skipped when marked. Login comparison ignores case.
+- Edge case: a marked comment by a different user -> not skipped by this check.
 - Edge case: the Action's login is unknown -> this check does not skip.
-- Integration: a discussion comment authored by the Action's login is skipped at routing.
 
 **Verification:**
 
