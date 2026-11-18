@@ -249,6 +249,78 @@ async function drain(): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Non-blocking proof helpers (no wall clock)
+// ---------------------------------------------------------------------------
+
+interface GatedSubscriber {
+  readonly callbacks: {onEvent: (frame: ObservationFrame) => Promise<void>; onClose: (reason: string) => void}
+  /** Frames whose write completed (only after `release()`). */
+  readonly received: ObservationFrame[]
+  readonly closes: string[]
+  /** How many writes have been entered, including ones still pending. */
+  readonly writesStarted: () => number
+  readonly release: () => void
+}
+
+/**
+ * A subscriber whose writes stay pending until `release()`. `writesStarted()` proves a write is in flight,
+ * i.e. the subscriber is attached and not dropped before observe() runs.
+ */
+function makeGatedSubscriber(): GatedSubscriber {
+  let release: () => void = () => {}
+  const gate = new Promise<void>(resolve => {
+    release = resolve
+  })
+  const received: ObservationFrame[] = []
+  const closes: string[] = []
+  let writesStarted = 0
+  return {
+    callbacks: {
+      onEvent: async frame => {
+        writesStarted++
+        await gate
+        received.push(frame)
+      },
+      onClose: reason => {
+        closes.push(reason)
+      },
+    },
+    received,
+    closes,
+    writesStarted: () => writesStarted,
+    release,
+  }
+}
+
+type ObservationOutcome =
+  {readonly kind: 'pending'} | {readonly kind: 'resolved'} | {readonly kind: 'rejected'; readonly error: unknown}
+
+/**
+ * Asserts `observation` settles while subscriber writes are still pending. The budget is counted in
+ * microtask turns, not milliseconds: observe() with an in-memory projector needs only a handful, while a
+ * call awaiting a write that never resolves stays pending for the whole budget on any machine. A failure
+ * names the invariant instead of hitting the runner timeout. A rejection is rethrown, never treated as success.
+ */
+async function expectObserveReturnsWithoutAwaitingWrites(observation: Promise<void>): Promise<void> {
+  const state: {outcome: ObservationOutcome} = {outcome: {kind: 'pending'}}
+  observation.then(
+    () => {
+      state.outcome = {kind: 'resolved'}
+    },
+    (error: unknown) => {
+      state.outcome = {kind: 'rejected', error}
+    },
+  )
+  for (let turn = 0; turn < 1_000 && state.outcome.kind === 'pending'; turn++) {
+    await Promise.resolve()
+  }
+  if (state.outcome.kind === 'rejected') {
+    throw state.outcome.error
+  }
+  expect(state.outcome.kind, 'observe() must return without awaiting subscriber writes').toBe('resolved')
+}
+
 // ===========================================================================
 // 1. Happy path: ordered frames + terminal close + cache clear
 // ===========================================================================
@@ -431,18 +503,11 @@ describe('backpressure — LOAD-BEARING', () => {
     await drain()
 
     // #given a slow subscriber that never drains (simulated by blocking onEvent)
-    const slowCloses: string[] = []
-    manager.subscribe('run-001', {
-      onEvent: async () => {
-        // Simulate a slow consumer: never resolves during the test
-        await new Promise<void>(() => {
-          // intentionally never resolves
-        })
-      },
-      onClose: reason => {
-        slowCloses.push(reason)
-      },
-    })
+    const slow = makeGatedSubscriber()
+    const slowCloses = slow.closes
+    manager.subscribe('run-001', slow.callbacks)
+    // the slow subscriber's snapshot write is in flight and stays pending
+    expect(slow.writesStarted()).toBe(1)
 
     // #given a fast subscriber
     const fastFrames: ObservationFrame[] = []
@@ -460,14 +525,11 @@ describe('backpressure — LOAD-BEARING', () => {
     // Queue is empty. Enqueue TWO more frames simultaneously — first fits, second overflows.
 
     // #when observing twice without draining (second frame overflows slow subscriber)
-    const observeStart = Date.now()
-    await manager.observe(makeRunState({phase: 'EXECUTING'}))
-    await manager.observe(makeRunState({phase: 'EXECUTING'}))
-    const observeElapsed = Date.now() - observeStart
-
-    // #then observe() completes in bounded time (not blocked by slow subscriber)
+    // #then each observe() returns while the slow subscriber's write is still pending
     // The key invariant: observe() must return without awaiting any subscriber write
-    expect(observeElapsed).toBeLessThan(100) // well under any real I/O timeout
+    await expectObserveReturnsWithoutAwaitingWrites(manager.observe(makeRunState({phase: 'EXECUTING'})))
+    await expectObserveReturnsWithoutAwaitingWrites(manager.observe(makeRunState({phase: 'EXECUTING'})))
+    expect(slow.received).toHaveLength(0)
 
     await drain()
 
@@ -481,47 +543,78 @@ describe('backpressure — LOAD-BEARING', () => {
     manager.shutdown()
   })
 
-  it('observe() completes in bounded time with ALL subscribers slow (no await on any write)', async () => {
-    // #given a manager with a tiny cap to force all subscribers to overflow
+  it('observe() returns while ALL attached subscribers have a write in flight (no await on any write)', async () => {
+    // #given a manager with the default cap, so every subscriber stays attached
     const status = makeOperatorRunStatus({status: 'running'})
     const projectFn: ProjectFn = async () => status
-    const {manager} = makeManager(projectFn, {subscriberQueueCapBytes: 1})
+    const {manager} = makeManager(projectFn)
 
-    // #given multiple slow subscribers
-    const closes: string[] = []
-    for (let i = 0; i < 5; i++) {
-      manager.subscribe('run-001', {
-        onEvent: async () => {
-          // Never resolves — simulates a completely stuck consumer
-          await new Promise<void>(() => {
-            // intentionally never resolves
-          })
-        },
-        onClose: reason => {
-          closes.push(reason)
-        },
-      })
+    // #given five subscribers, each with its initial write pending
+    const subscribers = Array.from({length: 5}, () => makeGatedSubscriber())
+    for (const subscriber of subscribers) {
+      manager.subscribe('run-001', subscriber.callbacks)
     }
+    expect(subscribers.map(subscriber => subscriber.writesStarted())).toEqual([1, 1, 1, 1, 1])
 
-    // #when observing with all subscribers slow
-    const start = Date.now()
+    // #when observing while every write is pending
+    // #then observe() returns without awaiting any of them — the publisher is non-blocking
+    try {
+      await expectObserveReturnsWithoutAwaitingWrites(manager.observe(makeRunState({phase: 'EXECUTING'})))
+      for (const subscriber of subscribers) {
+        expect(subscriber.received).toHaveLength(0)
+        expect(subscriber.closes).toEqual([])
+      }
+
+      // #then the status was fanned out behind the pending write: releasing delivers reset then status
+      for (const subscriber of subscribers) {
+        subscriber.release()
+      }
+      await drain()
+      for (const subscriber of subscribers) {
+        expect(subscriber.received.map(frame => frame.type)).toEqual(['reset', 'status'])
+        expect(subscriber.closes).toEqual([])
+      }
+    } finally {
+      for (const subscriber of subscribers) {
+        subscriber.release()
+      }
+      manager.shutdown()
+    }
+  })
+
+  it('observe() returns while every subscriber overflows its queue behind a pending write', async () => {
+    // #given a cap that fits exactly one status frame and a seeded cache
+    const status = makeOperatorRunStatus({status: 'running'})
+    const projectFn: ProjectFn = async () => status
+    const oneFrameBytes = JSON.stringify({type: 'status', data: status}).length
+    const {manager} = makeManager(projectFn, {subscriberQueueCapBytes: oneFrameBytes})
     await manager.observe(makeRunState({phase: 'EXECUTING'}))
-    const elapsed = Date.now() - start
-
-    // #then observe() returns in bounded time — it NEVER awaits subscriber writes
-    // This is the critical invariant: the publisher is non-blocking
-    expect(elapsed).toBeLessThan(100)
-
-    // #then the latest-status cache is updated (O(1) operation)
-    // Verify by subscribing a new fast subscriber and getting the snapshot
     await drain()
 
-    // All slow subscribers should have been dropped due to overflow
-    // The cache may or may not have been updated depending on whether the
-    // enqueue happened before the overflow check — but observe() must have returned
-    expect(elapsed).toBeLessThan(100) // re-assert the key invariant
+    // #given five subscribers whose snapshot write is in flight (so the queue is empty but busy)
+    const subscribers = Array.from({length: 5}, () => makeGatedSubscriber())
+    for (const subscriber of subscribers) {
+      manager.subscribe('run-001', subscriber.callbacks)
+    }
+    expect(subscribers.map(subscriber => subscriber.writesStarted())).toEqual([1, 1, 1, 1, 1])
 
-    manager.shutdown()
+    try {
+      // #when two observations arrive: the first fits, the second overflows every queue
+      // #then neither observe() waits on a write
+      await expectObserveReturnsWithoutAwaitingWrites(manager.observe(makeRunState({phase: 'EXECUTING'})))
+      await expectObserveReturnsWithoutAwaitingWrites(manager.observe(makeRunState({phase: 'EXECUTING'})))
+      await drain()
+
+      // #then every subscriber was dropped locally with 'overflow'
+      for (const subscriber of subscribers) {
+        expect(subscriber.closes).toEqual(['overflow'])
+      }
+    } finally {
+      for (const subscriber of subscribers) {
+        subscriber.release()
+      }
+      manager.shutdown()
+    }
   })
 
   it('dropping a subscriber mid-fan-out does not corrupt the publish iteration', async () => {
@@ -2090,29 +2183,29 @@ describe('graceful terminal drain — terminal status delivered after output', (
     const projectFn: ProjectFn = async () => terminalStatus
     const {manager} = makeManager(projectFn)
 
-    // #given a slow subscriber that never drains
-    const closes: string[] = []
-    manager.subscribe('run-001', {
-      onEvent: async () => {
-        await new Promise<void>(() => {
-          // intentionally never resolves
-        })
-      },
-      onClose: reason => {
-        closes.push(reason)
-      },
-    })
+    // #given a slow subscriber whose initial write never completes until released
+    const slow = makeGatedSubscriber()
+    manager.subscribe('run-001', slow.callbacks)
     await drain()
+    expect(slow.writesStarted()).toBe(1)
 
-    // #when observing terminal status
-    const start = Date.now()
-    await manager.observe(makeRunState({phase: 'COMPLETED'}))
-    const elapsed = Date.now() - start
+    try {
+      // #when observing terminal status
+      // #then observe() returns without awaiting the slow drain
+      await expectObserveReturnsWithoutAwaitingWrites(manager.observe(makeRunState({phase: 'COMPLETED'})))
 
-    // #then observe() returns in bounded time (does not await the slow drain)
-    expect(elapsed).toBeLessThan(100)
+      // #then the graceful close is still waiting on the pending write
+      expect(slow.closes).toEqual([])
 
-    manager.shutdown()
+      // #then once the write completes, the terminal status is delivered and the stream closes
+      slow.release()
+      await drain()
+      expect(slow.received.at(-1)).toMatchObject({type: 'status', data: {status: 'succeeded'}})
+      expect(slow.closes).toEqual(['terminal'])
+    } finally {
+      slow.release()
+      manager.shutdown()
+    }
   })
 })
 
