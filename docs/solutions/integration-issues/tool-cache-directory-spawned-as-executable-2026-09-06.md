@@ -6,7 +6,7 @@ module: setup
 problem_type: integration_issue
 component: tooling
 symptoms:
-  - '`Systematic plugin install failed` with `error: "spawn /opt/hostedtoolcache/opencode/1.18.29-harness.88b6b5fb/x64 EACCES"` and `duration: 4`'
+  - "`Systematic plugin install failed` with `error: \"spawn /opt/hostedtoolcache/opencode/1.18.29-harness.88b6b5fb/x64 EACCES\"` and `duration: 4`"
   - "`Skipping tools cache save because Systematic plugin install did not complete` on every run"
   - "Every run logs `Tools cache miss - will install tools` no matter how many times it has run before"
   - "Runs stay green and the agent still works — the plugin install silently falls back to the unbounded server-side path"
@@ -38,11 +38,11 @@ tags:
 - `Tools cache miss - will install tools` on every subsequent run, because the save never happened
 - No failed step, no red check. The `##[warning]` was the only signal.
 
-The second manifestation had no symptom at all in CI — see _Why This Works_.
+The second manifestation had no symptom at all in CI — see *Why This Works*.
 
 ## What Didn't Work
 
-**Asserting the path string in a unit test.** The pre-existing test asserted `opencodePath: '/opt/hostedtoolcache/opencode/1.0.300/x64'` and passed, because that _was_ the value being passed. Nothing in the assertion encoded that the value was a directory. `execAdapter` is mocked in these suites, so nothing ever spawns — a mocked-exec test can prove a string was threaded through, never that the string is executable. This is why the defect shipped past both the test suite and a code review.
+**Asserting the path string in a unit test.** The pre-existing test asserted `opencodePath: '/opt/hostedtoolcache/opencode/1.0.300/x64'` and passed, because that *was* the value being passed. Nothing in the assertion encoded that the value was a directory. `execAdapter` is mocked in these suites, so nothing ever spawns — a mocked-exec test can prove a string was threaded through, never that the string is executable. This is why the defect shipped past both the test suite and a code review.
 
 **Reproducing it with `workflow_dispatch`.** The two gate conditions differ only when a tools-cache key misses while the runner's tool cache still holds the binary. On a hosted runner a cache hit restores `/opt/hostedtoolcache/opencode`, so `tc.find` always succeeds and the state is not reachable on demand. The real end-to-end proof came from the fix PR's own CI job: `ci.yaml`'s review job uses `uses: ./`, so it runs the PR's `dist/`, and the tools cache for the new Systematic version was still cold from the failure.
 
@@ -54,7 +54,7 @@ Derive the binary once, and carry both values to the consumers that actually nee
 
 ```ts
 export function opencodeBinaryPath(installDir: string): string {
-  const basename = os.platform() === "win32" ? `${TOOL_NAME}.exe` : TOOL_NAME
+  const basename = os.platform() === 'win32' ? `${TOOL_NAME}.exe` : TOOL_NAME
   return path.join(installDir, basename)
 }
 ```
@@ -63,16 +63,16 @@ Both halves are then carried under names that say which is which, so a caller ha
 
 ```ts
 // src/services/setup/setup.ts
-core.addPath(opencodeResult.path) // :286  directory
-core.setOutput("opencode-path", opencodeResult.path) // :335  directory
-opencodeBinaryPath: opencodeBinaryPath(opencodeResult.path) // :297  executable (install call)
-opencodeBinaryPath: opencodeBinaryPath(opencodeResult.path) // :371  executable (SetupResult)
+core.addPath(opencodeResult.path)                              // :286  directory
+core.setOutput('opencode-path', opencodeResult.path)           // :335  directory
+opencodeBinaryPath: opencodeBinaryPath(opencodeResult.path)    // :297  executable (install call)
+opencodeBinaryPath: opencodeBinaryPath(opencodeResult.path)    // :371  executable (SetupResult)
 ```
 
 ```ts
 // packages/runtime/src/agent/server.ts
-setupAdapter.addToPath(setupResult.opencodePath) // :435  directory
-process.env.OPENCODE_PATH = setupResult.opencodeBinaryPath // :436  executable
+setupAdapter.addToPath(setupResult.opencodePath)               // :435  directory
+process.env.OPENCODE_PATH = setupResult.opencodeBinaryPath     // :436  executable
 ```
 
 The parameter that gets spawned now says so (`src/services/setup/systematic-plugin.ts:17`):
@@ -89,7 +89,7 @@ One value was serving two distinct roles under one name. `tc.cacheDir` / `tc.fin
 The second manifestation shows why this class of bug hides. `ensureOpenCodeAvailable` assigned the directory to `process.env.OPENCODE_PATH`, which is read back as an executable in three places:
 
 - its own `verifyOpenCodeAvailable` call eleven lines earlier — `src/services/setup/runtime-setup-adapter.ts:13` spawns it with `--version`
-- `@fro.bot/harness`'s `resolveBinary()`, which returns the override verbatim as `path` (`packages/harness/src/resolve-binary.ts:118-120`) for the wrapper CLI to exec — and which the package's own remediation text calls _"an explicit binary path"_ (`resolve-binary.ts:143`), a published npm contract. _(Update: the probing `resolveBinary()` — used by `harness doctor` — still returns the override verbatim. The no-probe resolver that the `opencode` shim and the `harness` passthrough use now validates it: an absolute native executable that is not a harness entry point.)_
+- `@fro.bot/harness`'s `resolveBinary()`, which returns the override verbatim as `path` (`packages/harness/src/resolve-binary.ts:118-120`) for the wrapper CLI to exec — and which the package's own remediation text calls *"an explicit binary path"* (`resolve-binary.ts:143`), a published npm contract. *(Update: the probing `resolveBinary()` — used by `harness doctor` — still returns the override verbatim. The no-probe resolver that the `opencode` shim and the `harness` passthrough use now validates it: an absolute native executable that is not a harness entry point.)*
 - every scrubbed child process, since `filterAgentEnv`'s `ALLOW_PREFIXES` includes `OPENCODE_` (`packages/runtime/src/agent/filter-env.ts:61`)
 
 That produced no CI symptom for one reason: the tool-cache install unpacks the harness release tarball, which carries the binary at archive root, straight onto `PATH`. The real binary never reads `OPENCODE_PATH`. Only the npm wrapper does — so the failure was reserved for mise installs, local runs, and the gateway workspace container.
@@ -103,7 +103,7 @@ That produced no CI symptom for one reason: the tool-cache install unpacks the h
 ```ts
 // src/services/setup/setup.test.ts:1100
 expect(installArgs?.opencodeBinaryPath).not.toBe(addedPath)
-expect(installArgs?.opencodeBinaryPath).toBe(join(addedPath ?? "", "opencode"))
+expect(installArgs?.opencodeBinaryPath).toBe(join(addedPath ?? '', 'opencode'))
 expect(result?.opencodeBinaryPath).not.toBe(result?.opencodePath)
 ```
 
