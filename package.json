@@ -93,7 +93,7 @@
     "eslint-config-prettier": "10.1.8",
     "eslint-plugin-prettier": "5.5.7",
     "jiti": "2.7.0",
-    "lint-staged": "17.6.0",
+    "lint-staged": "17.6.1",
     "prettier": "3.10.1",
     "read-package-up": "12.0.0",
     "semantic-release": "25.0.9",
