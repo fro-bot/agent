@@ -38,8 +38,10 @@ jobs:
           # contents: fetch `release`; push the release commit and tag; create the GitHub release; update the
           #   major-version ref; delete the `next` branch.
           # issues: semantic-release closes its failure issue on success and opens or comments on one on failure.
+          # workflows: moving the major-version ref carries every workflow change since the last release.
           permission-contents: write
           permission-issues: write
+          permission-workflows: write
 
       - id: get-user-id
         name: Get GitHub App User ID and Setup Git user
@@ -77,7 +79,7 @@ jobs:
           GIT_COMMITTER_NAME: ${{ steps.get-user-id.outputs.user-name }}
           GITHUB_TOKEN: ${{ steps.get-app-token.outputs.token }}
           # Used by the release-notes narration successCmd to dispatch fro-bot.yaml.
-          # The App token is scoped to contents:write and issues:write (see get-app-token); FRO_BOT_PAT carries
+          # The App token is scoped to contents, issues and workflows write (see get-app-token); FRO_BOT_PAT carries
           # actions:write.
           RELEASE_NOTES_DISPATCH_TOKEN: ${{ secrets.FRO_BOT_PAT }}
           RELEASE_NOTES_MODEL: ${{ vars.RELEASE_NOTES_MODEL }}
