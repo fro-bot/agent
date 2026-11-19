@@ -36,7 +36,7 @@ To turn it on, create `~/.config/fro-bot/opencode-plugin/tracing.json` (under `$
 }
 ```
 
-- `endpoint` is the full OTLP/HTTP traces URL. A remote collector **must be `https`**, and the exporter verifies its certificate with the platform's defaults: there is no switch to turn that off, and the exporter does not follow a redirect (a `3xx` counts as a failed batch), so the credential in `headers` goes only to the URL you wrote. Plain `http` is accepted only for a loopback address (`127.0.0.1`, `[::1]`).
+- `endpoint` is the full OTLP/HTTP traces URL. The plugin sends OTLP as **JSON over HTTP, uncompressed** (`Content-Type: application/json`, no `Content-Encoding`), so point it at a collector's OTLP/HTTP receiver that accepts JSON. A remote collector **must be `https`**, and the exporter verifies its certificate with the platform's defaults: there is no switch to turn that off, and the exporter does not follow a redirect (a `3xx` counts as a failed batch), so the credential in `headers` goes only to the URL you wrote. Plain `http` is accepted only for a loopback address (`127.0.0.1`, `[::1]`).
 - `headers` is optional, at most 16 entries. They carry your collector credential.
 - `hosts` is **required**: one to 16 machine names, and tracing is on only on a machine named in it. A name matches the machine's host name exactly (ignoring case and a trailing dot), or, when it has no dot, the part of the host name before its first dot (`my-laptop` matches `my-laptop.local`). There are no wildcards. A copy of this file on any other machine does nothing there, silently.
 

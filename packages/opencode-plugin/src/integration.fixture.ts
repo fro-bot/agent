@@ -279,7 +279,14 @@ export interface RunningServer {
     pathname: string,
     options?: {readonly body?: unknown; readonly directory?: string},
   ) => Promise<{readonly status: number; readonly data: unknown}>
-  readonly stop: () => Promise<void>
+  /** Closes stdin, as the Action does, and waits for the server to leave on its own; kills it only after a timeout. */
+  readonly stop: () => Promise<StopResult>
+}
+
+/** How a server stopped: whether it left on its own after stdin closed, and how long that took. */
+export interface StopResult {
+  readonly exitedOnItsOwn: boolean
+  readonly ms: number
 }
 
 export interface SandboxPaths {
@@ -432,14 +439,17 @@ export async function startOpenCodeServer(options: {
       return {status: response.status, data}
     },
     stop: async () => {
+      const started = Date.now()
       child.stdin.end()
       const winner = await Promise.race([
         exited.then(() => 'exited' as const),
         new Promise<'timeout'>(resolve => setTimeout(() => resolve('timeout'), EXIT_TIMEOUT_MS)),
       ])
+      const ms = Date.now() - started
       if (winner === 'timeout') killGroup('SIGKILL')
       killGroup('SIGKILL') // reap stragglers in the group
       await exited
+      return {exitedOnItsOwn: winner === 'exited', ms}
     },
   }
 }

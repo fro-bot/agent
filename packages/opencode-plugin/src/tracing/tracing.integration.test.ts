@@ -478,6 +478,34 @@ describe.skipIf(!runnable)('tracing in a real opencode V2', () => {
     })
   }, 90_000)
 
+  it('exports the final batch, spans still open marked interrupted, when stdin closes, before the server is killed', async () => {
+    // #given a turn whose model response stalls, so the root and the model request are still open, and nothing exported yet
+    const steps: FakeStep[] = [{all: ['H-ONE'], text: 'partial answer', hangMs: 60_000}]
+    await run({steps}, async h => {
+      const session = await h.session()
+      await prompt(h.api, session, 'H-ONE hang')
+      await waitUntil('the model request to arrive', () => h.requests().split('\n').filter(Boolean).length >= 2, 30_000)
+      await sleep(1_500)
+      expect(h.spans().some(isRoot)).toBe(false)
+
+      // #when the server is stopped the way the Action stops it: stdin closes, and nothing kills it unless it lingers
+      const stopped = await h.server.stop()
+
+      // #then it left on its own, well inside the Action's 5 s window, and the final batch is at the sink
+      expect(stopped.exitedOnItsOwn).toBe(true)
+      expect(stopped.ms).toBeLessThan(5_000 + 3_000)
+      const spans = h.spans()
+      const root = spans.find(isRoot)
+      expect(root).toBeDefined()
+      // #and the spans that were open are exported as interrupted and incomplete, none left out
+      expect(root?.attrs['fro_bot.outcome']).toBe('interrupted')
+      expect(root?.attrs['fro_bot.span.marks']).toContain('incomplete')
+      const chats = spans.filter(span => span.attrs['gen_ai.operation.name'] === 'chat')
+      expect(chats.some(span => span.attrs['fro_bot.outcome'] === 'interrupted')).toBe(true)
+      expect(h.server.stderr()).toMatch(/tracing stopped, exported [1-9]\d* spans/)
+    })
+  }, 90_000)
+
   it('stays off in a server started with `serve` that shows no headless marker, whatever a user file says', async () => {
     // #given a server whose plugin sees neither OPENCODE_PASSWORD nor OPENCODE_CONFIG_CONTENT (the stdio server deletes
     // the password before plugins load), no launcher variable, and a valid user file naming this machine
