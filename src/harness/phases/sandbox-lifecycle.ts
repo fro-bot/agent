@@ -563,6 +563,17 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   let releaseRef: () => Promise<SandboxReleaseResult> = async () => ({stop: 'never-started', restore: 'not-needed'})
   // Extra stops the signal teardown runs beside the sandbox's (the trace relay's). Not part of the teardown's outcome.
   const signalStops: (() => Promise<unknown>)[] = []
+  // The running extra stops of an active signal teardown, those started late included. Never rejects.
+  const signalStopRuns: Promise<void>[] = []
+  /** Resolves once every stop run so far has settled, including any added while it waits. */
+  const settleSignalStops = async (): Promise<void> => {
+    let waited = 0
+    while (waited < signalStopRuns.length) {
+      const batch = signalStopRuns.slice(waited)
+      waited += batch.length
+      await Promise.all(batch)
+    }
+  }
   /** Runs one extra stop. Never rejects and never throws: a failing extra stop must not touch the sandbox teardown. */
   const runSignalStop = async (stop: () => Promise<unknown>): Promise<void> => {
     try {
@@ -582,10 +593,11 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       timer = setTimeout(() => resolve('timeout'), options.signalTeardownBudgetMs ?? SIGNAL_TEARDOWN_BUDGET_MS)
     })
     // The extra stops start now, beside the sandbox teardown, so both fit the one budget.
-    const extraStops = Promise.all(signalStops.map(runSignalStop))
+    signalStopRuns.push(...signalStops.map(runSignalStop))
     const outcome = await Promise.race([releaseRef().catch(() => 'failed' as const), timedOut])
-    // Whatever budget is left is theirs too; the sandbox's outcome above is decided without them.
-    await Promise.race([extraStops, timedOut])
+    // Whatever budget is left is theirs too, those registered while the teardown ran included; the sandbox's outcome above
+    // is decided without them. With none registered there is nothing to wait for and nothing new on this path.
+    if (signalStopRuns.length > 0) await Promise.race([settleSignalStops(), timedOut])
     if (timer !== undefined) clearTimeout(timer)
     if (outcome === 'timeout' || outcome === 'failed') {
       logger.error('The sandbox was not confirmed stopped and restored before exiting on a signal')
@@ -1353,7 +1365,8 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   // False from the moment a signal begins the teardown (not when it ends), so a caller about to spawn the server sees it.
   const registerSignalStop = (stop: () => Promise<unknown>): void => {
     if (signalled) {
-      runSignalStop(stop).catch(() => undefined)
+      // The teardown is running or over: start it now, and let a teardown still waiting count it against its budget.
+      signalStopRuns.push(runSignalStop(stop))
       return
     }
     signalStops.push(stop)

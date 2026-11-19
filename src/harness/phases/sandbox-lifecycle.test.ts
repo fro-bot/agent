@@ -2682,6 +2682,76 @@ describe('createSandboxLifecycle', () => {
       expect(extra).not.toHaveBeenCalled()
     })
 
+    it('waits for a stop registered while the teardown is running, within the same budget, before it re-raises', async () => {
+      // #given a sandbox stop that is still pending when the signal's teardown is running
+      const {harness, host, states, lifecycle} = await preparedWith()
+      const sandboxStop = deferred<'stopped'>()
+      harness.mocks.stop.mockImplementation(async () => sandboxStop.promise)
+      host.emitter.emit('SIGTERM')
+      await vi.waitFor(() => {
+        expect(harness.mocks.stop).toHaveBeenCalled()
+      })
+
+      // #when a stop is registered now, runs at once, and the sandbox finishes first
+      const lateStop = deferred<void>()
+      const late = vi.fn(async () => lateStop.promise)
+      lifecycle.registerSignalStop(late)
+      expect(late).toHaveBeenCalledTimes(1)
+      sandboxStop.resolve('stopped')
+      await vi.waitFor(() => {
+        expect(harness.mocks.deleteAccount).toHaveBeenCalled()
+      })
+      await new Promise(resolve => setTimeout(resolve, 30))
+
+      // #then the re-raise waits for it, and then goes ahead
+      expect(host.killed).toEqual([])
+      lateStop.resolve()
+      await vi.waitFor(() => {
+        expect(host.killed).toEqual(['4242:SIGTERM'])
+      })
+      expect(states.at(-1)).toBe('restored')
+    })
+
+    it('also waits for a stop registered while it is already waiting for the others', async () => {
+      // #given a registered stop that is still running when the sandbox has finished
+      const {host, lifecycle} = await preparedWith()
+      const firstStop = deferred<void>()
+      lifecycle.registerSignalStop(async () => firstStop.promise)
+      host.emitter.emit('SIGTERM')
+      await new Promise(resolve => setTimeout(resolve, 30))
+
+      // #when another is registered during that wait
+      const lateStop = deferred<void>()
+      lifecycle.registerSignalStop(async () => lateStop.promise)
+      firstStop.resolve()
+      await new Promise(resolve => setTimeout(resolve, 30))
+
+      // #then the re-raise still waits for it
+      expect(host.killed).toEqual([])
+      lateStop.resolve()
+      await vi.waitFor(() => {
+        expect(host.killed).toEqual(['4242:SIGTERM'])
+      })
+    })
+
+    it('cuts a late stop at the budget, and the sandbox outcome does not depend on it', async () => {
+      const {harness, host, states, lifecycle} = await preparedWith({signalTeardownBudgetMs: 60})
+      const sandboxStop = deferred<'stopped'>()
+      harness.mocks.stop.mockImplementation(async () => sandboxStop.promise)
+      host.emitter.emit('SIGINT')
+      await vi.waitFor(() => {
+        expect(harness.mocks.stop).toHaveBeenCalled()
+      })
+      lifecycle.registerSignalStop(async () => new Promise<never>(() => undefined))
+
+      sandboxStop.resolve('stopped')
+
+      await vi.waitFor(() => {
+        expect(host.killed).toEqual(['4242:SIGINT'])
+      })
+      expect(states.at(-1)).toBe('restored')
+    })
+
     it('runs at once when it is registered after a signal began', async () => {
       const {host, lifecycle} = await preparedWith()
       host.emitter.emit('SIGTERM')
