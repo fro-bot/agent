@@ -1359,6 +1359,227 @@ describe.skipIf(!hasBinary)('repo skills against the real stock binary (fro-bot/
   }, 300_000)
 })
 
+/**
+ * The caller's `enabled_providers` / `disabled_providers` in `opencode-config` reach the real server through the Action's
+ * own config builder, and remove the built-in `opencode` provider (the free default model's) from it. Nothing here
+ * touches the network except the plugin install: the only model endpoint is the loopback stub, and the bundled catalog is
+ * used (`OPENCODE_DISABLE_MODELS_FETCH`, set by `createSandbox`). A session on an `opencode/*` model is never sent
+ * anywhere, so the cases below assert what the server reports, not a timeout.
+ */
+describe.skipIf(!hasBinary)('provider restriction against the real stock binary', () => {
+  const restrictionBoxes: Sandbox[] = []
+  const restrictionHandles: OpenCodeV2ServerHandle[] = []
+  const restrictionProviders: Provider[] = []
+  let sharedCacheHome = ''
+  let sharedRoot = ''
+
+  beforeAll(async () => {
+    const box = createSandbox()
+    sharedRoot = box.root
+    sharedCacheHome = box.cacheHome
+    unwrapOk(
+      await installPluginsV2({
+        logger: createMockLogger(),
+        execAdapter: createExecAdapter(),
+        opencodeBinaryPath: BINARY as string,
+        specs: unwrapOk(resolvePluginSpecsV2('latest')).specs,
+        cacheHome: sharedCacheHome,
+        env: box.env,
+      }),
+    )
+  }, 900_000)
+
+  afterAll(async () => {
+    for (const handle of restrictionHandles) await handle.shutdown()
+    for (const provider of restrictionProviders) await provider.stop()
+    for (const box of restrictionBoxes) rmSync(box.root, {recursive: true, force: true})
+    if (sharedRoot !== '') rmSync(sharedRoot, {recursive: true, force: true})
+  }, 120_000)
+
+  /** Starts the Action's server with the stub provider, the caller's `restriction` and the `model` input (or none). */
+  async function start(
+    restriction: object,
+    model: string | null,
+    overrides: {readonly authJson?: string; readonly baseConfig?: object} = {},
+  ) {
+    const box = createSandbox(sharedCacheHome)
+    restrictionBoxes.push(box)
+    const provider = await startProvider()
+    restrictionProviders.push(provider)
+    let spawned: OpenCodeV2ServerHandle | undefined
+    const started = await startActionOpenCodeV2({
+      binaryPath: BINARY as string,
+      workspacePath: box.repo,
+      authJson: overrides.authJson ?? JSON.stringify({fake: {type: 'api', key: CANARY}}),
+      opencodeConfig: JSON.stringify({
+        ...(overrides.baseConfig ?? JSON.parse(operatorConfig(provider.baseURL))),
+        ...restriction,
+      }),
+      credential: 'provision',
+      systematicVersion: 'latest',
+      model,
+      dbPath: box.dbPath,
+      authPath: box.authPath,
+      env: box.env,
+      runId: 60,
+      runAttempt: 1,
+      logger: createMockLogger(),
+      deps: {
+        startServer: async (spawnOptions, spawnLogger) => {
+          const {startOpenCodeV2Server} = await import('@fro-bot/runtime')
+          const result = await startOpenCodeV2Server(
+            {...spawnOptions, timeouts: {agentReadyTimeoutMs: 90_000}},
+            spawnLogger,
+          )
+          if (result.success) spawned = result.data
+          return result
+        },
+      },
+    })
+    if (spawned !== undefined) restrictionHandles.push(spawned)
+    return {box, provider, started, spawned}
+  }
+
+  async function providerIds(handle: OpenCodeV2ServerHandle): Promise<string[]> {
+    const body = (await (await handle.fetch('/api/provider')).json()) as {data: {id: string}[]}
+    return body.data.map(entry => entry.id)
+  }
+
+  async function createSessionOn(
+    handle: OpenCodeV2ServerHandle,
+    box: Sandbox,
+    model: {readonly providerID: string; readonly id: string},
+  ): Promise<string> {
+    const created = (await (
+      await handle.fetch('/api/session', {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        body: JSON.stringify({location: {directory: box.repo}, model}),
+      })
+    ).json()) as {data: {id: string}}
+    handle.registerOwnedSession(created.data.id)
+    return created.data.id
+  }
+
+  const RESTRICTIONS = [
+    ['enabled_providers', {enabled_providers: ['fake']}],
+    ['disabled_providers', {disabled_providers: ['opencode']}],
+  ] as const
+
+  it('leaves the built-in opencode provider enabled when the caller does not restrict providers', async () => {
+    // #given the Action's own config and a caller config with no restriction
+    const {started} = await start({}, MODEL)
+
+    // #then both the built-in provider and the caller's are on the server
+    const handle = unwrapOk(started)
+    expect(await providerIds(handle)).toEqual(expect.arrayContaining(['opencode', 'fake']))
+  }, 240_000)
+
+  it('starts with no model input and no credentials when nothing is restricted, through the default model check', async () => {
+    // #given the free default: auth-json is `{}`, no model input, and a config with no provider and no restriction
+    const {started} = await start({}, null, {authJson: '{}', baseConfig: {share: 'disabled'}})
+
+    // #then the start succeeds: the default model's provider is on the server, so the guard lets it through
+    const handle = unwrapOk(started)
+    expect(await providerIds(handle)).toContain('opencode')
+    // (no turn is run: it would go to the hosted free model)
+  }, 240_000)
+
+  it('names the disabled default model, not a missing key, when the config model has no credential', async () => {
+    // #given no model input, no key, a config model on a provider with no key, and the built-in provider disabled
+    const {started} = await start({disabled_providers: ['opencode']}, null, {
+      authJson: '{}',
+      baseConfig: {share: 'disabled', model: 'anthropic/claude-sonnet-4-6'},
+    })
+
+    // #then the start fails at the config stage on the default model, not at the credential gate on anthropic
+    const error = unwrapErr(started)
+    expect(error.stage).toBe('config')
+    expect(error.message).toContain('opencode/big-pickle')
+    expect(error.message).not.toContain('anthropic')
+  }, 240_000)
+
+  it.each(RESTRICTIONS)(
+    'removes the opencode provider and never runs a session on an opencode model with %s',
+    async (_key, restriction) => {
+      // #given the caller's restriction and a model input on the caller's own provider
+      const {box, provider, started} = await start(restriction, MODEL)
+      const handle = unwrapOk(started)
+
+      // #then the built-in provider and its models are gone from the registry
+      expect(await providerIds(handle)).toEqual(['fake'])
+      const models = (await (await handle.fetch('/api/model')).json()) as {data: {providerID: string}[]}
+      expect(models.data.filter(model => model.providerID === 'opencode')).toEqual([])
+
+      // #when a session is created on the free default model and prompted
+      const sessionId = await createSessionOn(handle, box, {providerID: 'opencode', id: 'big-pickle'})
+      const prompt = await handle.fetch(`/api/session/${sessionId}/prompt`, {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        body: JSON.stringify({text: 'go'}),
+      })
+      expect(prompt.status).toBeLessThan(300)
+
+      // #then the turn fails with the server's no-route error and no assistant message exists
+      interface Message {
+        type: string
+        outcome?: string
+        error?: {type?: string; message?: string}
+      }
+      let messages: Message[] = []
+      await vi.waitFor(
+        async () => {
+          const page = (await (await handle.fetch(`/api/session/${sessionId}/message`)).json()) as {data: Message[]}
+          messages = page.data
+          expect(messages.some(message => message.type === 'idle')).toBe(true)
+        },
+        {timeout: 60_000, interval: 250},
+      )
+      const idle = messages.find(message => message.type === 'idle')
+      expect(idle?.outcome).toBe('failed')
+      expect(idle?.error?.type).toBe('provider.no-route')
+      expect(idle?.error?.message).toContain('opencode/big-pickle')
+      expect(messages.some(message => message.type === 'assistant')).toBe(false)
+      expect(provider.requests()).toHaveLength(0)
+
+      // #and a session on the caller's provider still runs: the stub sees its request
+      const control = await createSessionOn(handle, box, {providerID: 'fake', id: 'fixture-model'})
+      await handle.fetch(`/api/session/${control}/prompt`, {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        body: JSON.stringify({text: 'go'}),
+      })
+      // (more than one request is possible: a session with no title also asks for one)
+      expect(await waitFor(() => provider.requests().length >= 1, 60_000)).toBe(true)
+    },
+    300_000,
+  )
+
+  it.each(RESTRICTIONS)(
+    'fails the start, naming the default model, when %s removes opencode and no model input is set',
+    async (_key, restriction) => {
+      // #given the caller's restriction and no model input: the session would be created on opencode/big-pickle
+      const {started, spawned} = await start(restriction, null)
+
+      // #then the start fails at the config stage and names the model, the cause and the remedy
+      const error = unwrapErr(started)
+      expect(error.stage).toBe('config')
+      expect(error.message).toContain('opencode/big-pickle')
+      expect(error.message).toContain('`model` input')
+
+      // #and the server it spawned is gone by the time the start returns
+      expect(spawned).toBeDefined()
+      const server = spawned as OpenCodeV2ServerHandle
+      const exit = await Promise.race([
+        server.exited,
+        new Promise<'still-running'>(resolve => setTimeout(() => resolve('still-running'), PROCESS_EXIT_BOUND_MS)),
+      ])
+      expect(exit, `pid ${server.pid} still running after the failed start`).not.toBe('still-running')
+    },
+    240_000,
+  )
+})
+
 /** Copies a skills tree, keeping symlinks as symlinks (so the control sees exactly what the checkout had). */
 function cpFixtureSkills(from: string, to: string): void {
   mkdirSync(path.dirname(to), {recursive: true})

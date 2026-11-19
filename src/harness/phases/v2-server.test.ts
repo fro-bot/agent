@@ -30,7 +30,9 @@ interface FakeServer {
   readonly loadConfig: (config: Readonly<Record<string, unknown>> | undefined) => void
 }
 
-function fakeServer(options: {agents?: unknown; integration?: unknown; agentStatus?: number} = {}): FakeServer {
+function fakeServer(
+  options: {agents?: unknown; integration?: unknown; agentStatus?: number; providers?: readonly string[]} = {},
+): FakeServer {
   let loaded: unknown[] = []
   const shutdown = vi.fn(async (): Promise<OpenCodeV2ShutdownResult> => ({
     interrupts: {stopped: [], notRunning: [], unconfirmed: []},
@@ -43,6 +45,9 @@ function fakeServer(options: {agents?: unknown; integration?: unknown; agentStat
     }
     if (pathname.startsWith('/api/integration/')) {
       return new Response(JSON.stringify(options.integration ?? {data: {connections: []}}), {status: 200})
+    }
+    if (pathname === '/api/provider' && options.providers !== undefined) {
+      return new Response(JSON.stringify({data: options.providers.map(id => ({id}))}), {status: 200})
     }
     return new Response('{}', {status: 404})
   })
@@ -540,6 +545,29 @@ describe('startActionOpenCodeV2', () => {
     expect(unwrapErr(result).message).toContain('google')
   })
 
+  it('names the disabled default model before the credential gate asks for the config model provider', async () => {
+    // #given no model input, no key, and a config whose top-level model (never the session's model) names a provider
+    // with no credential while the config removes the default model's provider
+    const server = fakeServer({providers: ['anthropic']})
+    const probeKeyProxy = vi.fn()
+    const deps = recordingDeps(server, {probeKeyProxy})
+    const opencodeConfig = JSON.stringify({model: 'anthropic/claude-sonnet-4-6', disabled_providers: ['opencode']})
+
+    // #when
+    const result = await startActionOpenCodeV2(options({deps, model: null, authJson: '{}', opencodeConfig}))
+
+    // #then the start fails at the config stage, naming the default model and the model input
+    expect(result).toMatchObject({success: false, error: {stage: 'config'}})
+    const message = unwrapErr(result).message
+    expect(message).toContain('opencode/big-pickle')
+    expect(message).toContain('`model` input')
+    expect(message).not.toContain('credential')
+    // #and neither later gate was reached
+    expect(server.fetch.mock.calls.map(call => call[0])).not.toContain('/api/integration/anthropic')
+    expect(probeKeyProxy).not.toHaveBeenCalled()
+    expect(server.shutdown).toHaveBeenCalledTimes(1)
+  })
+
   it('checks the provider of every written key when no model is named at all', async () => {
     const server = fakeServer()
 
@@ -554,6 +582,121 @@ describe('startActionOpenCodeV2', () => {
     const result = await startActionOpenCodeV2(options({deps: recordingDeps(server), model: null, authJson: '{}'}))
 
     expect(result.success).toBe(true)
+  })
+
+  describe('the default model', () => {
+    const warnings = (logger: ReturnType<typeof createMockLogger>): string[] =>
+      vi.mocked(logger.warning).mock.calls.map(call => String(call[0]))
+    const defaultModelLines = (lines: string[]): string[] => lines.filter(line => line.includes('opencode/big-pickle'))
+
+    it('warns once, naming the model and the unused provider, when credentials are supplied and no model is set', async () => {
+      // #given an auth-json key and no model input
+      const logger = createMockLogger()
+
+      // #when
+      const result = await startActionOpenCodeV2(options({deps: recordingDeps(fakeServer()), model: null, logger}))
+
+      // #then the run starts, and the one warning says which model runs and that the key is not used by it
+      expect(result.success).toBe(true)
+      const lines = defaultModelLines(warnings(logger))
+      expect(lines).toHaveLength(1)
+      expect(lines[0]).toContain('anthropic')
+      expect(lines[0]).toContain('not used')
+      expect(lines[0]).toContain('`model` input')
+      expect(serializeLoggerCalls(logger)).not.toContain(CANARY)
+    })
+
+    it('warns when only opencode-config declares a provider', async () => {
+      // #given no key, a provider block in opencode-config, and no model input
+      const logger = createMockLogger()
+      const opencodeConfig = JSON.stringify({provider: {gateway: {npm: '@ai-sdk/openai-compatible', options: {}}}})
+
+      // #when
+      const result = await startActionOpenCodeV2(
+        options({deps: recordingDeps(fakeServer()), model: null, authJson: '{}', opencodeConfig, logger}),
+      )
+
+      // #then
+      expect(result.success).toBe(true)
+      const lines = defaultModelLines(warnings(logger))
+      expect(lines).toHaveLength(1)
+      expect(lines[0]).toContain('gateway')
+    })
+
+    it('logs one info line, and no warning, when no credentials are supplied', async () => {
+      // #given
+      const logger = createMockLogger()
+
+      // #when
+      const result = await startActionOpenCodeV2(
+        options({deps: recordingDeps(fakeServer()), model: null, authJson: '{}', logger}),
+      )
+
+      // #then
+      expect(result.success).toBe(true)
+      expect(defaultModelLines(warnings(logger))).toEqual([])
+      const info = vi
+        .mocked(logger.info)
+        .mock.calls.map(call => String(call[0]))
+        .filter(line => line.includes('opencode/big-pickle'))
+      expect(info).toHaveLength(1)
+      expect(info[0]).toContain('free')
+    })
+
+    it('says nothing about the default model when the model input is set', async () => {
+      // #given a model input and a key
+      const logger = createMockLogger()
+      const server = fakeServer({providers: ['anthropic']})
+
+      // #when
+      const result = await startActionOpenCodeV2(options({deps: recordingDeps(server), logger}))
+
+      // #then no default-model line at any level, and the provider list was never read
+      expect(result.success).toBe(true)
+      expect(serializeLoggerCalls(logger)).not.toContain('opencode/big-pickle')
+      expect(server.fetch.mock.calls.map(call => call[0])).not.toContain('/api/provider')
+    })
+
+    it('fails at start, naming the cause, when no model is set and the server has no opencode provider', async () => {
+      // #given a caller config that enables only their provider, and no model input
+      const server = fakeServer({providers: ['anthropic']})
+      const deps = recordingDeps(server)
+      const opencodeConfig = JSON.stringify({enabled_providers: ['anthropic']})
+
+      // #when
+      const result = await startActionOpenCodeV2(options({deps, model: null, opencodeConfig}))
+
+      // #then the start fails with the default model, its provider and the remedy, and the server is stopped
+      expect(result).toMatchObject({success: false, error: {stage: 'config'}})
+      const message = unwrapErr(result).message
+      expect(message).toContain('opencode/big-pickle')
+      expect(message).toContain('`model` input')
+      expect(server.shutdown).toHaveBeenCalledTimes(1)
+      expect(calls).not.toContain('import-wait')
+    })
+
+    it('starts when no model is set and the server lists the opencode provider', async () => {
+      // #given
+      const server = fakeServer({providers: ['opencode', 'anthropic']})
+
+      // #when
+      const result = await startActionOpenCodeV2(options({deps: recordingDeps(server), model: null}))
+
+      // #then
+      expect(result.success).toBe(true)
+    })
+
+    it("does not fail a model-input run for a restricted provider list: the named model is the caller's choice", async () => {
+      // #given a model input on the caller's provider and a server that has only that provider
+      const server = fakeServer({providers: ['anthropic']})
+      const opencodeConfig = JSON.stringify({enabled_providers: ['anthropic']})
+
+      // #when
+      const result = await startActionOpenCodeV2(options({deps: recordingDeps(server), opencodeConfig}))
+
+      // #then
+      expect(result.success).toBe(true)
+    })
   })
 
   it('fails the permission gate, and stops the server, when an agent lacks the deny', async () => {

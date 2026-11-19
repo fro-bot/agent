@@ -20,6 +20,7 @@ sources:
   - src/services/setup/credential-files-v2.ts
   - src/services/setup/plugin-install-v2.ts
   - src/harness/phases/v2-server.ts
+  - src/harness/phases/default-model.ts
   - src/harness/phases/repo-skills.ts
   - src/services/setup/repo-skills.ts
   - src/features/agent/repo-skills-trust.ts
@@ -133,6 +134,26 @@ Plugin activation has its own readiness gate in `packages/runtime/src/agent/serv
 On non-isolated runs, the Action narrows `auth-json` to supported API-key entries and writes each key to its own owner-only file outside cached paths (`credential-files-v2.ts`). Configuration refers to those files through `{file:...}` rather than embedding key bytes. The provided file reference wins over an inline operator key for the same provider while preserving its other settings. Isolated runs instead use [the key proxy](#isolate-agent-the-key-proxy), without key files. Stale `auth.json` is removed before spawn so V2's legacy migration cannot import provider secrets into the database that will later be cached.
 
 Held execution claims from a killed invocation are cleared in the restored database before the server starts. After spawn, a provider credential gate checks the effective model's provider, or the supplied providers when no model selects one. It accepts configured authentication references or a reported connection without reading secret values. Startup then waits for V1 history import to complete before any prompt; [[Session Persistence]] explains that migration barrier.
+
+### Choosing a model and restricting providers
+
+With no `model` input, every session is created on `opencode/big-pickle` (`DEFAULT_MODEL` in `packages/runtime/src/shared/constants.ts`). It is a free model served by OpenCode's built-in `opencode` provider, which needs no credentials, so a run works with `auth-json: '{}'`. The model runs on OpenCode's hosted service, not on the runner, so the agent's requests leave the runner.
+
+Supplying credentials does not change the model. A key in `auth-json`, or a provider declared in `opencode-config`, is used only by a model on that provider, so set `model` (`provider/model`) to use it. A top-level `model` in `opencode-config` does not select the session's model either. When `model` is unset, the Action logs which model will run before it starts the server: a warning naming the providers whose credentials it does not use if any are supplied, or an info line if none are.
+
+The Action leaves every built-in provider enabled, including `opencode`, unless the caller restricts them. `opencode-config` is merged into the server's config, so the OpenCode keys `enabled_providers` and `disabled_providers` work in it. The server removes a restricted provider and all its models from its registry, so nothing can run on it: not the session's model, and not a model the agent names for a subagent (such a call fails with a "not available" error and starts no session).
+
+```yaml
+- uses: fro-bot/agent@v0
+  with:
+    github-token: ${{ secrets.GITHUB_TOKEN }}
+    auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
+    model: anthropic/<model>
+    opencode-config: |
+      {"enabled_providers": ["anthropic"]}
+```
+
+This run can use only `anthropic` models. `disabled_providers: ["opencode"]` removes just the built-in provider and leaves every other provider enabled. Removing `opencode` without setting `model` fails at start, naming the default model and the cause, because the default model's provider is no longer there.
 
 ### Effective configuration and permissions
 
@@ -312,7 +333,7 @@ Independently of whether a credential is provisioned, the OpenCode child process
 
 The action accepts over 20 inputs defined in `action.yaml`, grouped into core, agent, S3, and configuration categories. The most important ones:
 
-- `github-token` and `auth-json` are required — they provide GitHub API access and LLM provider credentials respectively.
+- `github-token` and `auth-json` are required — they provide GitHub API access and LLM provider credentials respectively. A run on the free default model needs no provider credentials: pass `{}` for `auth-json`. See [Choosing a model and restricting providers](#choosing-a-model-and-restricting-providers).
 - `trusted-head-sha` carries a same-repository pull-request head SHA captured before agent execution (empty when unavailable). It is the trust anchor for the [[Execution Lifecycle|brokered push]] step: the harness diffs the workspace against this SHA and re-checks the live PR head against it immediately before committing, so a moved head aborts the push. Consumers wire it from `github.event.pull_request.head.sha` (or the equivalent event field) in the workflow; it has no effect on flows that are not same-repo PR comments.
 - `prompt` provides a custom instruction for the agent. Required for `schedule` and `workflow_dispatch` events.
 - `output-mode` controls the delivery contract for `schedule` and `workflow_dispatch` runs (`auto`, `working-dir`, `branch-pr`; default `auto`). The compatibility value `auto` deterministically resolves to `working-dir`; use `branch-pr` explicitly when branch/PR delivery is required. The `output-mode` input has no effect on non-manual event types (issue comments, PRs, etc.), which always return `null`. See [Delivery-mode contract for manual workflow triggers](../solutions/workflow-issues/delivery-mode-contract-for-manual-triggers-2026-04-17.md) for the historical design rationale.
@@ -320,7 +341,7 @@ The action accepts over 20 inputs defined in `action.yaml`, grouped into core, a
 - `review-skip-label` (default `skip-agent-review`) names a PR label that suppresses the automatic review on `pull_request` events when present (case-insensitive). Setting it empty disables the opt-out. The label is a passive suppressor, not a hard block: an authorized `@fro-bot` mention in the PR body still runs on opened/synchronize/reopened/edited actions, and an explicit review request naming the bot both admits the event and beats the label. The suppression is evaluated in the routing phase (see [[Execution Lifecycle]]).
 - `isolate-agent` (default `false`) runs the OpenCode server and its tools as a separate local user on GitHub-hosted Linux runners with passwordless `sudo`, from a published `fro-bot/agent@<ref>`; any other runner or install fails the run before setup. See [Withholding is not an OS boundary](#withholding-is-not-an-os-boundary).
 - `repo-skills` (default `false`, OpenCode V2 only) loads the repository's `.agents/skills` on trusted runs while project config stays disabled. Trust is an allow list, not the credential disposition: `schedule` and `workflow_dispatch`, or `pull_request`, `issue_comment` and `issues` from an `OWNER`, `MEMBER` or `COLLABORATOR`, with PR-scoped events also requiring the head repository to equal the run's repository (a maintainer commenting on a fork PR is denied, as is anything with missing facts). Every eligible run reads the default branch, fetched fresh from the base repository into a throwaway repository and written to disk as raw stored blobs with `git cat-file --batch` (never `git archive`, which would apply committed `.gitattributes` such as `export-subst` and expand a blob past the budget); the checkout, a dispatched branch and a PR head are never a source, and no ref or config in the checkout is read. The fetched tree is listed from raw `-z` bytes with a strict UTF-8 decode and refused if any path is invalid UTF-8, duplicated (case- and normalization-folded), or both a file and a directory; symlinks are never written to disk (a skill that contains one is rejected by id at admission). It is then checked against a size budget before anything is extracted, one skill (`.agents/skills/<id>/`) at a time: a skill with more than 1000 entries (files, symlinks and directories alike), more than 5 MiB of blobs, or a file more than 6 directories below its own directory is dropped, and so is any skill that would take the running total of the skills already admitted (taken in id order) past 1000 entries or 5 MiB. Each dropped skill gets one warning naming its id and the limit it broke (never a file path), and the other skills still load: one oversized generated skill no longer takes the rest down with it. A submodule or an unsafe path anywhere, a tree listing too large to read (4 MiB), or anything the blob read finds inconsistent still refuses the whole source. Only the blobs of admitted skills are read and written. An admission filter copies only real `<id>/SKILL.md` directories into a run-scoped directory under `RUNNER_TEMP`, publishing each skill by rename only once its copy is complete: symlinks reject the skill, size and file count are bounded, and a skill whose directory name collides with a bundled Systematic skill or an OpenCode built-in is skipped (OpenCode keys skills by directory name; the frontmatter `name` is display text). The copy is named in `skills.paths`, gets the bundled-skills `external_directory` allow and `edit` deny, and is removed when the run ends. See `src/services/setup/repo-skills.ts` and `src/features/agent/repo-skills-trust.ts`.
-- `model` overrides the LLM model in `provider/model` format.
+- `model` sets the LLM model in `provider/model` format. The default is `opencode/big-pickle`, a free model that needs no credentials; supplying `auth-json` does not change it, so set `model` to run on your own provider. See [Choosing a model and restricting providers](#choosing-a-model-and-restricting-providers).
 - `timeout` controls the execution timeout (default: 30 minutes, 0 for no limit).
 - `s3-backup` / `s3-bucket` / `aws-region` / `s3-endpoint` / `s3-prefix` / `s3-expected-bucket-owner` / `s3-allow-insecure-endpoint` / `s3-sse-encryption` / `s3-sse-kms-key-id` enable and configure the durable S3-compatible object store (see [[Session Persistence]]). Input validation always rejects these metadata targets: `169.254.169.254`, `169.254.170.2`, `100.100.100.200`, `fd00:ec2::254`, their IPv4-mapped and translated forms, and `metadata.google.internal`. It also rejects loopback, private, link-local, unspecified, CGNAT, and documentation addresses unless `s3-allow-insecure-endpoint` is `true`. It enforces HTTPS unless that flag is set. Known limits: hostnames are not DNS-resolved, and NAT64, IPv4-compatible IPv6, the benchmarking range `198.18.0.0/15`, `.internal` and `.local` names, and the bare single-label name `metadata` are not classified.
 - `session-retention` controls how many sessions to keep before pruning (default: 50).
