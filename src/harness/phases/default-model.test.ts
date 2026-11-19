@@ -24,6 +24,31 @@ describe('suppliedProviderIds', () => {
     expect(result).toEqual(['anthropic', 'gateway'])
   })
 
+  it('collects providers declared under the V2-native providers key', () => {
+    // #given
+    const result = suppliedProviderIds({
+      keyProviderIds: [],
+      config: {providers: {gateway: {npm: 'x'}, openai: {options: {}}}},
+    })
+
+    // #then
+    expect(result).toEqual(['gateway', 'openai'])
+  })
+
+  it('collects both provider keys and dedupes across them and the auth-json keys', () => {
+    // #given a key for anthropic, the same provider under both keys, and one more under each
+    const result = suppliedProviderIds({
+      keyProviderIds: ['anthropic'],
+      config: {
+        provider: {anthropic: {options: {}}, legacy: {npm: 'x'}},
+        providers: {anthropic: {options: {}}, native: {npm: 'y'}, opencode: {options: {}}},
+      },
+    })
+
+    // #then
+    expect(result).toEqual(['anthropic', 'legacy', 'native'])
+  })
+
   it('leaves out the built-in opencode provider: a key for it is used by the default model', () => {
     // #given
     const result = suppliedProviderIds({keyProviderIds: ['opencode'], config: {provider: {opencode: {options: {}}}}})
@@ -35,6 +60,7 @@ describe('suppliedProviderIds', () => {
   it('is empty when nothing is supplied', () => {
     expect(suppliedProviderIds({keyProviderIds: [], config: {}})).toEqual([])
     expect(suppliedProviderIds({keyProviderIds: [], config: {provider: 'not-an-object'}})).toEqual([])
+    expect(suppliedProviderIds({keyProviderIds: [], config: {providers: ['not', 'a', 'map']}})).toEqual([])
   })
 })
 
@@ -103,10 +129,27 @@ describe('verifyDefaultModelProvider', () => {
     expect(message).toContain('`model` input')
   })
 
+  it('treats a valid empty provider list as a real answer: no providers, so no default model', async () => {
+    // #given a server with every provider removed
+    const handle = handleWith(async () => new Response(JSON.stringify({data: []}), {status: 200}))
+
+    // #when
+    const result = await verifyDefaultModelProvider({...options, handle})
+
+    // #then
+    expect(unwrapErr(result)).toContain('opencode/big-pickle')
+  })
+
   it.each([
     ['a non-200 answer', async () => new Response('{}', {status: 404})],
     ['a body that is not JSON', async () => new Response('nope', {status: 200})],
     ['a body without a provider list', async () => new Response('{}', {status: 200})],
+    ['a row without an id', async () => new Response(JSON.stringify({data: [{id: null}]}), {status: 200})],
+    ['a row that is not an object', async () => new Response(JSON.stringify({data: ['opencode']}), {status: 200})],
+    [
+      'one malformed row among valid ones that omit opencode',
+      async () => new Response(JSON.stringify({data: [{id: 'fake'}, {name: 'no id'}]}), {status: 200}),
+    ],
     [
       'a request that throws',
       async () => {

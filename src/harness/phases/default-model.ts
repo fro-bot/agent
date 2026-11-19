@@ -18,15 +18,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * The providers the caller supplied credentials or settings for: the `auth-json` keys and the `provider` entries of
- * `opencode-config`, each once. The built-in provider is left out: a key or setting for it is used by the default
- * model, so it is not "unused".
+ * The providers the caller supplied credentials or settings for: the `auth-json` keys and the entries of both provider
+ * maps of `opencode-config` (`provider`, the V1 spelling, and `providers`, the V2-native one), each once. The built-in
+ * provider is left out: a key or setting for it is used by the default model, so it is not "unused".
  */
 export function suppliedProviderIds(options: {
   readonly keyProviderIds: readonly string[]
   readonly config: Readonly<Record<string, unknown>>
 }): readonly string[] {
-  const declared = isRecord(options.config.provider) ? Object.keys(options.config.provider) : []
+  const declared = [options.config.provider, options.config.providers].flatMap(map =>
+    isRecord(map) ? Object.keys(map) : [],
+  )
   return [...new Set([...options.keyProviderIds, ...declared])].filter(id => id !== DEFAULT_MODEL.providerID)
 }
 
@@ -54,10 +56,19 @@ export function logDefaultModelNotice(options: {
   })
 }
 
-/** The provider ids in a `GET /api/provider` body, or null when the body is not the list this reads. */
+/**
+ * The provider ids in a `GET /api/provider` body, or null when the body is not the list this reads. One row that is not a
+ * record with a string `id` makes the whole body inconclusive: a partial list could miss the provider that is there. A
+ * valid empty list is a real answer.
+ */
 function listedProviderIds(body: unknown): readonly string[] | null {
   if (!isRecord(body) || !Array.isArray(body.data)) return null
-  return body.data.flatMap(entry => (isRecord(entry) && typeof entry.id === 'string' ? [entry.id] : []))
+  const ids: string[] = []
+  for (const entry of body.data) {
+    if (!isRecord(entry) || typeof entry.id !== 'string') return null
+    ids.push(entry.id)
+  }
+  return ids
 }
 
 /**
