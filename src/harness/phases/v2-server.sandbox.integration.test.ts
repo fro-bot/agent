@@ -293,7 +293,7 @@ function createPublishedActionLayout(): void {
     path.join(fakeActionRoot, 'action.yaml'),
     'name: sandbox-it\nruns:\n  using: node24\n  main: dist/main.js\n',
   )
-  for (const script of ['main.js', 'post.js', 'key-proxy.js', 'trace-relay.js'])
+  for (const script of ['main.js', 'post.js', 'key-proxy.js'])
     fs.writeFileSync(path.join(fakeActionRoot, 'dist', script), '// stand-in\n')
   // The view builder is the real bundle with everything it imports: the preflight probe and every launch run it as root.
   copyBundleWithImports(realDist, path.join(fakeActionRoot, 'dist'), 'sandbox-view.js')
