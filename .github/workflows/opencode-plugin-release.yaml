@@ -84,6 +84,14 @@ jobs:
           const forbidden = ["child_process", "vm", "worker_threads"]
           const hostProvided = s => s === "effect" || s.startsWith("effect/") || s === "@opencode/plugin" || s.startsWith("@opencode/plugin/") || s.startsWith("node:")
           const take = (source, pattern) => [...source.matchAll(pattern)].map(m => m[1])
+          const primitives = [
+            ["a dynamic import with a non-literal argument", /\bimport\s*\((?!\s*["'][^"'\n]*["']\s*\))/],
+            ["createRequire", /\bcreateRequire\b/],
+            ["import.meta.resolve", /\bimport\s*\.\s*meta\s*\.\s*resolve\b/],
+            ["process.binding or process.dlopen", /\bprocess\s*(?:\.|\[\s*["'`])\s*(?:binding|dlopen)\b/],
+            ["eval", /\beval\b/],
+            ["the Function constructor", /\bnew\s+Function\b|(?<![\w$.])Function\s*\(|\bconstructor\s*\.\s*constructor\b/],
+          ]
           const errors = []
           const seen = new Set()
 
@@ -102,6 +110,10 @@ jobs:
             for (const name of forbidden) {
               if (new RegExp(`["'](?:node:)?${name}["']`).test(source)) errors.push(`${file}: names node:${name}`)
             }
+            // Loading and evaluation primitives the import scan cannot see. A textual deny, not a parser: it fails closed, so a
+            // comment or string that spells one is flagged too and has to be reworded. packages/opencode-plugin/src/bundle.test.ts
+            // holds the same list and runs this script over bypass fixtures.
+            for (const [label, pattern] of primitives) if (pattern.test(source)) errors.push(`${file}: uses ${label}`)
             for (const s of [...statics, ...dynamics]) {
               seen.add(s)
               if (hostProvided(s)) continue
