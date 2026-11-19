@@ -53,7 +53,7 @@ The repo's recorded telemetry policy (RFC-007, F83) says raw prompts are never s
 
 **What a trace contains**
 
-- R1. One trace covers one turn of a session: the prompt, the model and tool work it starts, the subagents that work starts, and the follow-on work when a background subagent reports back. OpenCode has no turn id, so the plugin defines the turn from execution and idle events.
+- R1. One trace covers one turn of a session: the prompt, the model and tool work it starts, the subagents that work starts, and the follow-on work when a background subagent reports back. OpenCode has no turn id, so the plugin defines the turn from execution and idle events. Two exceptions, both marked on the spans: a turn with no activity for a bounded time is closed as incomplete, and a report that arrives after that starts a new trace that names the first; a report delivered inside a later turn's execution has its follow-on work in that later turn's trace, which names the turn that dispatched it. Both traces carry the same root session id, so they are found together through the session.
 - R2. Each model request is a span that follows the OpenTelemetry GenAI conventions for inference. It carries the provider, model and agent, and the token usage and finish reason when OpenCode reports them. This includes title and compaction requests, where OpenCode reports less.
 - R3. Each tool call is a span that follows the GenAI conventions for tool execution, with the tool name, call id, input, result and outcome. The result is what the model received, after the tool's own truncation. A rejected or interrupted call is recorded as such.
 - R4. A subagent's spans are in the same trace as the turn that started it, under the tool call that started it. This holds for a background subagent that is still running after that call returned. Reading a subagent never depends on span links, which Langfuse does not show.
@@ -78,7 +78,7 @@ The repo's recorded telemetry policy (RFC-007, F83) says raw prompts are never s
 
 **Release and policy**
 
-- R17. The plugin does nothing when tracing is off, and adds no install or start-up failure to a run that does not use it. Outside a local session and the Action it stays off whatever its settings say, until gateway tracing ships.
+- R17. The plugin does nothing when tracing is off, and adds no install or start-up failure to a run that does not use it. Outside a local session and the Action it stays off whatever its settings say, until gateway tracing ships. A session is local only when no launcher has declared a host, no headless marker is present, and the user's settings file names this machine.
 - R18. RFC-007 F83 is revised to match R8 and R9, and states that the project never receives trace data. The docs state what a trace contains, that it includes session history and may include secrets and other people's text, that scrubbing is best-effort, that an agent can write misleading spans to the operator's collector, and that the collector needs the same access control and retention as CI logs. They recommend an ingest-only credential scoped to one project.
 
 ---

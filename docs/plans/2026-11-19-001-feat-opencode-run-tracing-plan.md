@@ -162,12 +162,12 @@ From the origin document.
 - **Subagents are joined by dispatch, not by time.** A dispatch map links a subagent tool call to the child session id the tool returns. A child's events that arrive before that link exists are buffered in bounded memory. A child whose dispatcher cannot be proven gets its own trace, marked unattributed.
 - **Model output is joined to its request by order within a session and request kind.** The request hook carries no message id. Where order is not proven the span is exported with its output marked absent.
 - **Host mode is declared by the launcher and checked by the plugin.** The Action sets a plugin variable that carries either off or the relay address and run identity. The workspace launcher sets it to off. With the variable absent the plugin treats the session as local only if the headless markers `OPENCODE_PASSWORD` and `OPENCODE_CONFIG_CONTENT` are also absent. So an old Action or any other headless host running a new plugin stays off.
-- **Local settings live in one user-scope file.** It holds the endpoint and optional headers. The plugin refuses a file that is not a regular file owned by the user, is writable by group or others, or resolves inside the project. It logs the destination host once when local tracing starts. Plugin options in OpenCode config are never read for tracing.
+- **Local settings live in one user-scope file.** It holds the endpoint, optional headers, and the list of hostnames it applies to. Tracing is on only when this machine's hostname is in that list, so a container or another host that shares the home directory stays off. A remote endpoint must be `https` with certificate verification, and the exporter follows no redirects. The plugin refuses a file that is not a regular file owned by the user, is writable by group or others, or resolves inside the project. It logs the destination host once when local tracing starts. Plugin options in OpenCode config are never read for tracing.
 - **One Action input turns tracing on.** `trace-endpoint` holds the full OTLP traces URL. `trace-headers`, a secret, holds the credential headers. An empty endpoint is off. A malformed endpoint or header logs one warning that names the input and omits the value, and leaves tracing off.
-- **The relay is stateless.** It accepts a batch, forwards it to the configured URL with the credential headers, waits for the upstream within a timeout, and answers the plugin with a fixed status that says delivered, retry, or dropped. The SDK exporter owns retries. The relay has no queue and nothing to flush at stop. It counts batches by outcome, and the Action logs those counts. The Action starts the server with its error output discarded, so the plugin's own log lines do not reach the run log there. In Action mode the plugin sends its running exported and dropped span counts in one numeric request header on each batch; the relay keeps the last valid value and prints it in its report, labelled as reported by the plugin.
+- **The relay is stateless.** It accepts a batch, forwards it to the configured URL with the credential headers, waits for the upstream within a timeout, and answers the plugin with a fixed status that says delivered, retry, or dropped. The SDK exporter owns retries. The relay has no queue and nothing to flush at stop. It counts batches by outcome, and the Action logs those counts as acknowledged by the collector, to retry, and dropped. An acknowledgement is the collector's HTTP answer, not proof that every span in the batch was stored. The Action starts the server with its error output discarded, so the plugin's own log lines do not reach the run log there. In Action mode the plugin sends its running exported and dropped span counts in one numeric request header on each batch; the relay keeps the last valid value and prints it in its report, labelled as reported by the plugin as of its last batch. It cannot include that batch's own outcome or spans dropped afterwards.
 - **The relay is a sibling of the key proxy, with its own owner.** It reuses the stdin frame, empty environment, ready line and supervision patterns. It does not use the sandbox lifecycle's proxy slot. Its death never aborts the server and never affects persistence.
 - **The plugin moves last only when tracing is on.** A plugin sees only the edits of plugins listed before it. With tracing off the Action's plugin order is unchanged.
-- **Drift shows as gaps.** A field that stops arriving is omitted and marked. The plugin's peer range is narrowed to the OpenCode versions the fixtures were recorded on.
+- **Drift shows as gaps.** A field that stops arriving is omitted and marked. The plugin's peer range is not narrowed; the README names the OpenCode versions tracing was recorded on.
 - **The scrubber is written here and runs at one point.** Every string in a span passes through it just before export: attribute values, span names, status messages and events. A value that cannot be scrubbed within its size ceiling is omitted with a marker.
 - **Recorded as Completed in `RFCs/RFC-007-Observability-Run-Summary.md`, with the F83 acceptance boxes unchecked and its `telemetry` input never built.** This plan replaces that sketch with operator-directed tracing.
 
@@ -307,7 +307,7 @@ Span shape for one turn:
 - Host "workspace", an unknown host, or an unknown version: off.
 - Variable absent and either headless marker present: off, with one log line.
 - Variable absent and no headless marker: local. Read the user-scope file under the user's config directory.
-- The file is checked on the opened handle: regular file, owned by the current user, no group or other write bit, small, and its real path outside the session's project directory. A symlink is resolved and its target checked the same way.
+- The file must list this machine's hostname. The file is checked on the opened handle: regular file, owned by the current user, no group or other write bit, small, and its real path outside the session's project directory. A symlink is resolved and its target checked the same way.
 - Anything unreadable or malformed resolves to off with one log line that names the reason and no values.
 - When local tracing resolves to on, log the destination host once.
 - Settings are resolved once and never written to session or cache state. Plugin options are ignored.
@@ -317,6 +317,8 @@ Span shape for one turn:
 - Happy path: Action variable with a relay address resolves to on with that address and identity.
 - Happy path: no variable, no headless marker and a valid user file resolves to on, and the destination host is logged once.
 - Edge case: no variable and no user file resolves to off, silently.
+- Edge case: a valid user file whose host list does not name this machine resolves to off; a file with no host list is refused.
+- Edge case: a headless host with neither marker set, sharing a home directory with a valid user file that names another machine, resolves to off.
 - Edge case: no variable, a valid user file and `OPENCODE_PASSWORD` set: off.
 - Edge case: Action variable says off while a valid user file exists: off.
 - Edge case: workspace variable present with a valid user file: off.
@@ -348,7 +350,7 @@ Span shape for one turn:
 - A child session's observations are buffered until its dispatch resolves, within a count and byte bound. On overflow or expiry the child gets its own trace marked unattributed.
 - Tool spans open on the before-hook and close on the session tool event, keyed by call id.
 - Retries are separate model spans with an attempt number. Model output joins its request by order within session and kind, and is left absent when order is not proven.
-- A root closes on idle with nothing outstanding, on failure or interruption after its open children, or on the inactivity bound, marked incomplete. A late report for a closed root starts a continuation trace that names the first.
+- A root closes on idle with nothing outstanding, on failure or interruption after its open children, or on the inactivity bound, marked incomplete. A late report for a closed root starts a continuation trace that names the first. A report delivered inside a later turn's execution has its follow-on work in that turn's trace, naming the dispatching turn. The origin document states both exceptions.
 - Manual compaction and generate requests outside any execution get a small standalone trace.
 - Tool results cut by the tool itself keep that fact as a marker, separate from the plugin's own truncation.
 - Cleanup closes every open span as interrupted and incomplete, and releases all state.
@@ -438,11 +440,11 @@ Span shape for one turn:
 
 **Approach:**
 - Widen `HostSurface` to the session hooks, the event subscription and a returned cleanup.
-- Register hooks only when settings resolve to on. A handler takes references to what it needs and returns; extraction and scrubbing run after the hook returns. A handler never changes hook arguments, and every handler body is wrapped.
+- Register hooks only when settings resolve to on. Before a hook returns, the handler takes a bounded, immutable copy of the fields the content module extracts, so a later change by OpenCode or another plugin cannot alter what is recorded as the hook-time view. Scrubbing, bounding and serialization run after the hook returns. Pending copies are bounded by count and bytes, separately from the export queue; over the bound the span keeps its structure and its content is marked omitted. A handler never changes hook arguments, and every handler body is wrapped.
 - The exporter is built with an explicit URL and headers, a hand-built resource, a short batch interval and a bounded queue. A full queue drops and counts.
 - The exporter retries a batch the relay or collector marks retryable, within a bound. After repeated connection failures it stops trying and counts the rest as dropped.
 - Cleanup closes open spans, flushes within a bound shorter than the server's window, and logs exported and dropped span counts without content.
-- Narrow the peer range to the OpenCode versions the fixtures were recorded on.
+- The plugin's peer range is unchanged, so an install that works today still works with tracing off.
 - The plugin README gains a tracing section: the local settings file and its checks, what a trace contains, session history, best-effort scrubbing, that the credential in the file is readable by a local agent, and that OpenCode's own exporter is separate.
 
 **Test scenarios:**
@@ -453,7 +455,9 @@ Span shape for one turn:
 - Error path: the sink answers retryable then delivered; the batch arrives once.
 - Error path: SDK construction, hook registration and cleanup each throwing leaves the plugin active and the session unaffected.
 - Error path: a handler that throws inside tracing does not fail the tool call or the model request.
-- Edge case: a large request snapshot does not delay the hook's return.
+- Edge case: a large request is copied within a stated time bound before the hook returns.
+- Edge case: hook input changed after the hook returns does not change the exported content.
+- Edge case: pending copies over their bound export the span with content marked omitted.
 - Edge case: `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_HEADERS` and `OTEL_RESOURCE_ATTRIBUTES` in the environment change nothing the plugin sends.
 - Edge case: a sink that echoes the request body in an error response does not get that body into the log.
 - Integration: the server is stopped with stdin close; the final batch reaches the sink before the kill, and spans still open are exported as interrupted.
@@ -495,6 +499,7 @@ Span shape for one turn:
 - Error path: `GET`, another path, an absolute-form target, `CONNECT` and an upgrade request are answered locally and nothing is forwarded.
 - Error path: an unsupported `content-type` or `content-encoding` is refused locally.
 - Error path: upstream `301` is not followed and the sender gets dropped.
+- Edge case: an upstream `200` whose body reports partial rejection is counted as acknowledged, and the docs say so.
 - Error path: upstream `401` gives dropped; `429` and `503` give retry; an upstream that never answers gives retry within the timeout. No upstream body reaches the sender.
 - Edge case: a body over the request cap is refused before it is buffered, and the run-total cap refuses further batches once reached.
 - Edge case: a sender that stalls mid-request is cut off by the request timeout.
@@ -523,7 +528,8 @@ Span shape for one turn:
 - Start failure, a ready timeout or a later crash logs one warning with a fixed reason. The run continues with tracing off or, after a crash, with the plugin's exporter giving up. The relay is never joined to the server's abort signal and never declines persistence.
 - `run.ts` holds the handle and stops it after the server has exited, in the normal path and in `finally`. Stop is: close stdin, short grace, kill the process group, confirm. The supervisor logs the report's batch counts, or says the count is incomplete when the child was killed or the server was killed before the plugin's last flush.
 - The sandbox lifecycle's signal teardown gains one registered "also stop" callback, so an isolated run's cancellation stops the relay inside the existing budget. A non-isolated run relies on stdin closing when the Action exits.
-- Add `dist/trace-relay.js` to the preflight's entry list and the sandbox suite's list.
+- The relay's bundle file is checked only when tracing is requested, with the same rules the preflight applies to the Action's other entry files. A missing or unsafe file turns tracing off with one warning. It is not part of the mandatory preflight, so it cannot block an isolated run. The bundle ships in the same change as its supervisor.
+- The signal-teardown stop runs beside the sandbox release, is cut at the existing budget, and never changes the sandbox outcome.
 - Log lines: "Trace relay started" with its process id; "Trace relay stopped"; one warning on failure. None names the collector host.
 - A non-isolated traced run logs one fixed warning before the server starts: the agent can read the collector credential and the content of every span.
 
@@ -539,6 +545,8 @@ Span shape for one turn:
 - Happy path: the stop report's batch counts appear in the run log, with no content.
 - Happy path: a non-isolated traced run logs the exposure warning once; an isolated one does not.
 - Edge case: tracing off starts no relay process.
+- Edge case: with tracing off, a missing or non-regular relay bundle does not affect an isolated run's preflight.
+- Error path: with tracing requested, a missing or non-regular relay bundle turns tracing off with one warning and the run proceeds.
 - Edge case: no log line contains the endpoint or a header value.
 
 **Verification:** No test finds a path that leaves a relay process alive, or that changes a run's outcome because of tracing.
@@ -654,6 +662,7 @@ Span shape for one turn:
 **Approach:**
 - From a throwaway branch in a repository with no private content, dispatch a workflow pinned to the release with tracing on, once isolated and once not. Use an ingest-only credential for a test project, and delete it afterwards.
 - Read the trace in Langfuse and confirm it in Tempo.
+- Run the same subagent scenario in a local session on a registry install of the plugin, and confirm both surfaces show the prompt and tool results in Langfuse without reading session records. Include a continuation trace and confirm it is found through the session.
 - Read the run log for the relay's start and stop lines and the warning on the non-isolated run.
 - Repeat with a wrong credential and confirm the run succeeds and reports dropped spans.
 - The learning records span structure, counts and log lines. It holds no trace content, endpoint or credential.
@@ -676,7 +685,7 @@ Span shape for one turn:
 | Risk | Mitigation |
 |------|------------|
 | The bundled SDK or its lazy chunk does not load in OpenCode's compiled host | Unit 1 proves it on the real binary before anything is built on it |
-| A hook changes shape on an OpenCode pin bump | Narrowed peer range; the plugin's real-binary suite in CI replays the scenarios on the pinned binary; missing fields show as gaps |
+| A hook changes shape on an OpenCode pin bump | The plugin's real-binary suite in CI replays the scenarios on the pinned binary; missing fields show as gaps |
 | Turn attribution is wrong under orderings the probe did not cover | Unit 3 records those orderings first; unprovable joins get their own marked trace |
 | Scrubbing misses a secret | One choke point over every string; omit on failure; docs say it is best-effort and recommend an ingest-only credential |
 | Capture slows model requests or grows memory | Handlers return before extraction; bounds on values, spans and buffered events; a latency test |
