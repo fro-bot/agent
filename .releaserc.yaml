@@ -41,11 +41,50 @@ analyzeCommits:
       scope: rfcs
     - type: skip
       release: false
+    # `@fro.bot/opencode-plugin` is published by its own workflow. A change to it reaches Action
+    # callers only when the Action's plugin pin moves, and that commit releases the Action.
+    - scope: opencode-plugin
+      release: false
 
 preset: conventionalcommits
 
 presetConfig:
   types:
+    # `@fro.bot/opencode-plugin` has its own release and changelog. These entries come first because
+    # the first matching entry wins, so its commits are left out of the Action's notes.
+    - type: feat
+      scope: opencode-plugin
+      effect: hidden
+    - type: features
+      scope: opencode-plugin
+      effect: hidden
+    - type: build
+      scope: opencode-plugin
+      effect: hidden
+    - type: fix
+      scope: opencode-plugin
+      effect: hidden
+    - type: docs
+      scope: opencode-plugin
+      effect: hidden
+    - type: test
+      scope: opencode-plugin
+      effect: hidden
+    - type: ci
+      scope: opencode-plugin
+      effect: hidden
+    - type: style
+      scope: opencode-plugin
+      effect: hidden
+    - type: refactor
+      scope: opencode-plugin
+      effect: hidden
+    - type: perf
+      scope: opencode-plugin
+      effect: hidden
+    - type: chore
+      scope: opencode-plugin
+      effect: hidden
     - type: feat
       section: Features
     - type: features
