@@ -122,7 +122,16 @@ export function observeHook(name: string, payload: unknown, at: number): Observa
     const callId = asString(event.id)
     const tool = asString(event.tool)
     if (callId === undefined || tool === undefined) return undefined
-    return {kind: 'tool.before', at, sessionId, callId, tool, agent: asString(event.agent), input: event.input}
+    return {
+      kind: 'tool.before',
+      at,
+      sessionId,
+      callId,
+      tool,
+      messageId: asString(event.messageID),
+      agent: asString(event.agent),
+      input: event.input,
+    }
   }
 
   if (name === 'tool.execute.after') {

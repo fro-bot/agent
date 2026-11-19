@@ -116,6 +116,8 @@ export type Observation = ObservationBase &
         readonly sessionId: string
         readonly callId: string
         readonly tool: string
+        /** The step (assistant message) whose model response asked for this call. */
+        readonly messageId?: string | undefined
         readonly agent?: string | undefined
         readonly input?: unknown
       }

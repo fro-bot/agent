@@ -78,12 +78,20 @@ export interface ChatRecord extends RecordBase {
   readonly request?: unknown
   readonly texts: readonly string[]
   readonly reasoning: readonly string[]
+  /** Tool calls this response asked for, in order: the response's output alongside its text. */
+  readonly toolCalls: readonly RequestedToolCall[]
   readonly finishReason?: string | undefined
   readonly rawFinishReason?: string | undefined
   readonly usage?: Usage | undefined
   readonly cost?: number | undefined
   /** Traces whose subagent report this request carried while running inside another turn's execution. */
   readonly followOnOf: readonly string[]
+}
+
+export interface RequestedToolCall {
+  readonly callId: string
+  readonly tool: string
+  readonly input?: unknown
 }
 
 export interface ToolRecord extends RecordBase {
@@ -229,6 +237,7 @@ interface RequestState {
   messageId: string | undefined
   texts: string[]
   reasoning: string[]
+  toolCalls: RequestedToolCall[]
   finishReason: string | undefined
   rawFinishReason: string | undefined
   usage: Usage | undefined
@@ -477,6 +486,7 @@ export function createTurnModel(options: {
       request: request.request,
       texts: request.texts,
       reasoning: request.reasoning,
+      toolCalls: request.toolCalls,
       finishReason: request.finishReason,
       rawFinishReason: request.rawFinishReason,
       usage: request.usage,
@@ -925,6 +935,7 @@ export function createTurnModel(options: {
       messageId: undefined,
       texts: [],
       reasoning: [],
+      toolCalls: [],
       finishReason: undefined,
       rawFinishReason: undefined,
       usage: undefined,
@@ -1042,6 +1053,11 @@ export function createTurnModel(options: {
       gaps: new Set(),
     }
     node.tools.set(o.callId, tool)
+    const asked = o.messageId === undefined ? undefined : node.stepOwner.get(o.messageId)
+    if (asked !== undefined) {
+      if (asked.toolCalls.length >= limits.maxOutputParts) asked.gaps.add('tool-calls-over-limit')
+      else asked.toolCalls.push({callId: o.callId, tool: o.tool, input: o.input})
+    }
     if (o.tool === 'subagent') unresolved.add(`${node.id}/${o.callId}`)
     touch(trace, o.at)
   }

@@ -95,8 +95,8 @@ function script() {
       add({kind: 'step.ended', sessionId, messageId, finish: 'stop', rawFinish: 'stop', usage: USAGE, cost: 0}),
     text: (sessionId: string, messageId: string) =>
       add({kind: 'output', sessionId, messageId, part: 'text', text: 'ok'}),
-    toolBefore: (sessionId: string, callId: string, tool = 'read') =>
-      add({kind: 'tool.before', sessionId, callId, tool, agent: 'build', input: {}}),
+    toolBefore: (sessionId: string, callId: string, tool = 'read', messageId?: string) =>
+      add({kind: 'tool.before', sessionId, callId, tool, messageId, agent: 'build', input: {}}),
     toolAfter: (sessionId: string, callId: string, tool = 'read', child?: string) =>
       add({kind: 'tool.after', sessionId, callId, tool, status: 'completed', result: 'r', childSessionId: child}),
     toolEnded: (sessionId: string, callId: string, extra: Partial<Extract<Observation, {kind: 'tool.ended'}>> = {}) =>
@@ -177,6 +177,40 @@ describe('recorded fixtures', () => {
     expect(roots(records)).toHaveLength(2)
     expect(ok?.parentSpanId).toBe(roots(records)[0]?.spanId)
     expect(failed?.parentSpanId).toBe(roots(records)[1]?.spanId)
+  })
+
+  it('a response that asked for tool calls carries them, with their input, alongside its output', () => {
+    // #given a turn whose first response asked for one read and whose second answered
+    const {records} = run('tool-success-and-error')
+
+    // #then the tool-calling response lists the call by id and tool, and the answering one lists none
+    const [asking, answering] = chats(records).filter(chat => chat.requestKind === 'primary')
+    const [tool] = tools(records)
+    expect(asking?.toolCalls).toMatchObject([{callId: tool?.callId, tool: 'read'}])
+    expect(asking?.toolCalls[0]?.input).not.toBeUndefined()
+    expect(answering?.toolCalls).toEqual([])
+  })
+
+  it('bounds the tool calls kept per response and says so', () => {
+    // #given a response that asked for four calls, with room for two
+    const s = script()
+    s.prompt('a', 'm1')
+    s.enqueued('a', 'm1', 'user')
+    s.started('a')
+    s.delivered('a', 'm1')
+    s.request('a')
+    s.stepStarted('a', 's1')
+    for (let index = 0; index < 4; index += 1) s.toolBefore('a', `c${index}`, 'read', 's1')
+    s.stepEnded('a', 's1')
+    s.ended('a')
+
+    // #when replayed with that bound
+    const {records} = replay(s.out, {limits: {maxOutputParts: 2}})
+
+    // #then two are kept and the gap is named
+    const [chat] = chats(records)
+    expect(chat?.toolCalls).toHaveLength(2)
+    expect(chat?.gaps).toContain('tool-calls-over-limit')
   })
 
   it.each([

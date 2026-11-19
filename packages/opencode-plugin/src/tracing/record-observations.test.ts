@@ -197,6 +197,12 @@ describe('observeHook', () => {
     })
 
     // #then
+    expect(
+      observeHook('tool.execute.before', {sessionID: SES, id: 'c', tool: 'read', messageID: 'msg_1', input: {}}, 1),
+    ).toMatchObject({
+      kind: 'tool.before',
+      messageId: 'msg_1',
+    })
     expect(observeHook('tool.execute.after', after('subagent'), 1)).toMatchObject({
       kind: 'tool.after',
       childSessionId: 'ses_child',
