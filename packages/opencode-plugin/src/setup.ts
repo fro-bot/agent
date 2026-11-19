@@ -35,7 +35,7 @@ export interface HostSurface {
 export type PluginCleanup = () => Promise<void>
 
 /**
- * The only way into the tracing chunk. Called only when settings resolved to on, so with tracing off the `import()` never
+ * The only way into the tracing chunk. Called only when settings resolved to on, so with tracing off the dynamic import never
  * runs and the chunk and the SDK inside it are never evaluated. Every step (the import, SDK construction, hook
  * registration, and later the cleanup) is wrapped: a failure leaves the plugin exactly as it was, and the one log line
  * names the failure class only, since an error message can carry a path or URL.
