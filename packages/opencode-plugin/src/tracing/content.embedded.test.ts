@@ -365,3 +365,109 @@ describe('output is built from scanned text, never from the source or a re-seria
     expect(scrubber.scrub(`${plain} ${GITHUB}`)).toEqual({ok: true, text: `${plain} ${REDACTION}`, redactions: 1})
   })
 })
+
+describe('a sensitive key whose value starts on a later line (pretty-printed JSON)', () => {
+  const scrubber = createScrubber({env: {}})
+  const wrap = (text: string): string => JSON.stringify({v: text})
+
+  /** The value as pretty-printed text, nested lines indented one level further, with this end-of-line. */
+  const VALUES = [
+    {label: 'a string', value: () => '"hunter two words"', secrets: ['hunter', 'two words']},
+    {
+      label: 'an object',
+      value: (i: string, e: string) =>
+        `{${e}${i}${i}${i}"inner": "deep secret",${e}${i}${i}${i}"n": [1, 2]${e}${i}${i}}`,
+      secrets: ['deep secret', 'inner'],
+    },
+    {
+      label: 'an array',
+      value: (i: string, e: string) => `[${e}${i}${i}${i}"first secret",${e}${i}${i}${i}2718281${e}${i}${i}]`,
+      secrets: ['first secret', '2718281'],
+    },
+    {label: 'a number', value: () => '8675309', secrets: ['8675309']},
+    {label: 'null', value: () => 'null', secrets: ['"password":\n']},
+  ] as const
+
+  const document = (value: string, indent: string, eol: string, depth: number): string => {
+    let text = `{${eol}${indent}"keep": "fine-text",${eol}${indent}"password":${eol}${indent}${indent}${value},${eol}${indent}"tail": "after-text"${eol}}`
+    for (let layer = 0; layer < depth; layer += 1) text = wrap(text)
+    return text
+  }
+
+  for (const [indentLabel, indent] of [
+    ['2-space', '  '],
+    ['tab', '\t'],
+  ] as const) {
+    for (const [eolLabel, eol] of [
+      ['LF', '\n'],
+      ['CRLF', '\r\n'],
+    ] as const) {
+      for (const depth of [0, 1, 3] as const) {
+        for (const {label, value, secrets} of VALUES) {
+          it(`removes ${label} on the next line: ${indentLabel} indent, ${eolLabel}, escape depth ${String(depth)}`, () => {
+            // #given the pretty-printed document
+            const text = document(value(indent, eol), indent, eol, depth)
+
+            for (const {where, value: placed} of placements(text)) {
+              // #when
+              const out = exported(placed, scrubber)
+
+              // #then nothing of the value survives and the rest of the document is intact
+              for (const secret of secrets) {
+                if (secret.startsWith('"password"')) continue
+                expect({where, secret, found: out.includes(secret)}).toEqual({where, secret, found: false})
+              }
+              expect({where, kept: out.includes('fine-text') && out.includes('after-text')}).toEqual({
+                where,
+                kept: true,
+              })
+              expect(out).toContain(REDACTION)
+            }
+          })
+        }
+      }
+    }
+  }
+
+  it('also removes a value after more than four spaces on the same line, for a quoted key', () => {
+    // #given a quoted key, a colon and ten spaces before the value
+    const out = scrubber.scrub('{"password":          "hunter two", "ok": 1}')
+
+    // #then
+    expect(out).toEqual({ok: true, text: `{"password":          "${REDACTION}", "ok": 1}`, redactions: 1})
+  })
+
+  it('does not look past a newline for an UNQUOTED name: prose stays prose', () => {
+    // #given free text where nothing follows `password:` on its line
+    const text = 'Enter your password:\nis stored in the vault.\nSet token=\nlater'
+
+    // #then nothing is redacted
+    expect(scrubber.scrub(text)).toEqual({ok: true, text, redactions: 0})
+  })
+
+  it('fails closed past the whitespace bound: the value and the rest of its line are removed', () => {
+    // #given a quoted key, 300 newlines (past the 256-character bound), then a string value and more on that line
+    const text = `{"password":${'\n'.repeat(300)}"leaky words", "tail": "after-text"}\nnext line stays`
+
+    // #when
+    const result = scrubber.scrub(text)
+
+    // #then the value is gone along with the rest of its line (its end cannot be located safely), and the next line is not
+    expect(result.ok).toBe(true)
+    const out = result.ok ? result.text : ''
+    expect(out).not.toContain('leaky')
+    expect(out).not.toContain('after-text')
+    expect(out).toContain('next line stays')
+  })
+
+  it('counts a number after a counter name as a counter, even from the next line', () => {
+    // #given
+    const text = '{"max_tokens":\n  8000,\n  "password":\n  12345678}'
+
+    // #when
+    const out = scrubber.scrub(text)
+
+    // #then the counter stays, the password does not
+    expect(out).toEqual({ok: true, text: `{"max_tokens":\n  8000,\n  "password":\n  ${REDACTION}}`, redactions: 1})
+  })
+})

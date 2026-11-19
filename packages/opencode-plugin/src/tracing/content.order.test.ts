@@ -91,7 +91,7 @@ function piece(random: () => number, brackets: boolean): Piece {
   const atom = pick(random, ATOMS)
   const name = pick(random, NAMES)
   const sep = pick(random, [': ', '=', ':', ' = '])
-  switch (Math.floor(random() * (brackets ? 24 : 16))) {
+  switch (Math.floor(random() * (brackets ? 28 : 16))) {
     case 0:
       return {text: token, secrets: [token]}
     case 1:
@@ -149,6 +149,18 @@ function piece(random: () => number, brackets: boolean): Piece {
     case 23:
       // Alternating quotes and backslashes after a sensitive name.
       return {text: String.raw`${name}${sep}{\"a\\"\"b ${atom}`, secrets: [atom]}
+    case 24:
+      // Pretty-printed JSON: the value is on the line after a quoted key.
+      return {text: `{\n  "${name}":\n    "${atom} ${token}",\n  "ok": 1\n}`, secrets: [atom, token]}
+    case 25:
+      // Tab indents and CRLF, an object value on the next line.
+      return {text: `{\r\n\t"${name}":\r\n\t\t{"a": ["${atom}"]},\r\n\t"ok": 1\r\n}`, secrets: [atom]}
+    case 26:
+      // The same one layer down: the newlines are the two characters backslash-n.
+      return {text: JSON.stringify({v: `{\n  "${name}":\n    ["${atom}", 3]\n}`}), secrets: [atom]}
+    case 27:
+      // More whitespace than the gap bound after a quoted key: fails closed to the end of the line.
+      return {text: `{"${name}":${pick(random, [' ', '\n']).repeat(300)}"${atom}"}`, secrets: [atom]}
     default:
       return {text: `${name}${sep}"${PEM} ${atom}"`, secrets: [PEM_BODY, atom]}
   }

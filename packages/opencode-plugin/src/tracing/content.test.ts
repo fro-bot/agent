@@ -718,6 +718,19 @@ describe('adversarial timing: growth, not a ceiling', () => {
     ],
     'name-value-pair': [
       ['dense matches, one every 19 characters', rep('password=abcdefgh ')],
+      ['a quoted key then a long run of spaces', n => `{"password":${' '.repeat(n)}"x"}`],
+      ['a quoted key then a long run of newlines', n => `{"password":${'\n'.repeat(n)}"x"}`],
+      ['quoted keys each followed by a 300-character gap', rep(`"password":${' '.repeat(300)}"x" `)],
+      ['quoted keys each followed by a 255-character gap', rep(`"secret":${'\n'.repeat(255)}1 `)],
+      [
+        'escaped gaps at depth 1, long',
+        n => String.raw`{\"password\":${String.raw`\n  `.repeat(Math.ceil(n / 4))}\"x\"}`,
+      ],
+      [
+        'escaped gaps at depth 3, long',
+        n => String.raw`{\\\\\\\\"password\\\\\\\\":${String.raw`\\\\n `.repeat(Math.ceil(n / 6))}1}`,
+      ],
+      ['a quoted key, whitespace, then an opener never closed', n => `"password":${' \n'.repeat(Math.ceil(n / 4))}{[`],
       ['a long run of openers, no close', n => `password: ${'{['.repeat(Math.ceil(n / 2))}`],
       ['unbalanced openers, one per line', rep('password: {[ x\n')],
       ['unbalanced openers, all on one line', rep('secret: {[ pad ')],

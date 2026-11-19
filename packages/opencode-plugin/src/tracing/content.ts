@@ -275,6 +275,42 @@ const isIdentifierCode = (code: number): boolean =>
   code === 0x2e ||
   code === 0x2d
 
+/** The number of JSON-string encodings a document is under, from the backslash run before its first quote: `2^d - 1`; -1 if it is not of that form. */
+function layersOfRun(run: number): number {
+  for (let candidate = 0; candidate <= 4; candidate += 1) if (run === 2 ** candidate - 1) return candidate
+  return -1
+}
+
+/** The most whitespace (real or escaped, newlines included) allowed between a QUOTED key's colon and its value. */
+const MAX_GAP_CHARS = 256
+
+/**
+ * The whitespace between a quoted key's `:` and its value, from `from`: spaces, tabs, line feeds and carriage returns, and, for a
+ * document under `layers` JSON encodings, the escaped forms a serializer writes for them there (`\n`, `\r`, `\t` after
+ * `2^(layers-1)` backslashes: one at depth 1, two at depth 2, four at depth 3). Returns where the value starts and whether the
+ * whitespace was longer than `MAX_GAP_CHARS` (the caller then fails closed: it cannot tell where the value is, so the rest of the
+ * line goes). One forward scan; the caller continues after it.
+ */
+function skipGap(text: string, from: number, layers: number): {readonly end: number; readonly over: boolean} {
+  const escapedRun = layers >= 1 ? 2 ** (layers - 1) : 0
+  let index = from
+  while (index < text.length) {
+    const code = text.charCodeAt(index)
+    if (code === 0x20 || code === 0x09 || code === 0x0a || code === 0x0d) {
+      index += 1
+    } else if (code === 0x5c && escapedRun > 0) {
+      let run = 1
+      while (run <= escapedRun && text.charCodeAt(index + run) === 0x5c) run += 1
+      const next = text.charCodeAt(index + run)
+      if (run === escapedRun && (next === 0x6e || next === 0x72 || next === 0x74)) index += run + 1
+      else break
+    } else {
+      break
+    }
+  }
+  return {end: index, over: index - from > MAX_GAP_CHARS}
+}
+
 /** The most a bracketed value (`{...}` or `[...]`) is scanned for its balanced close. Past it, the value runs to the end of the line. */
 const MAX_STRUCTURE_VALUE_CHARS = 256 * 1024
 
@@ -294,10 +330,6 @@ function structureEnd(text: string, from: number, budget: {left: number}): numbe
   const limit = Math.min(text.length, from + MAX_STRUCTURE_VALUE_CHARS)
   let layers = -1
   let depth = 0
-  const layerOf = (run: number): number => {
-    for (let candidate = 0; candidate <= 4; candidate += 1) if (run === 2 ** candidate - 1) return candidate
-    return -1
-  }
   /** Whether a quote after `run` backslashes delimits a string (true) or is escaped inside one (false); undefined: not at this depth. */
   const delimits = (run: number): boolean | undefined => {
     let remaining = run
@@ -318,7 +350,7 @@ function structureEnd(text: string, from: number, budget: {left: number}): numbe
       while (text.charCodeAt(index + run) === 0x5c) run += 1
       if (text.charCodeAt(index + run) === 0x22) {
         if (layers === -1) {
-          layers = layerOf(run)
+          layers = layersOfRun(run)
           if (layers === -1) return -1
         }
         const delimiter = delimits(run)
@@ -388,7 +420,7 @@ function schemeCredentialEnd(text: string, end: number): number {
 function nameValueMatcher(): ScrubMatcher {
   const prefix = new RegExp(
     // The quote around a name or a value may sit in an escaped layer: any run of backslashes (JSON in JSON in JSON) before it.
-    String.raw`((?:${SECRET_WORDS})[\w.-]{0,20})(?:\\{0,15}["'])?[ \t]{0,4}[:=][ \t]{0,4}(\\{0,15}["'])?`,
+    String.raw`((?:${SECRET_WORDS})[\w.-]{0,20})(\\{0,15}["'])?[ \t]{0,4}([:=])`,
     'gi',
   )
   return {
@@ -413,8 +445,31 @@ function nameValueMatcher(): ScrubMatcher {
         const match = prefix.exec(text)
         if (match === null) break
         const name = match[1] ?? ''
-        const opener = match[2]
-        const valueStart = match.index + match[0].length
+        const nameQuote = match[2]
+        // The gap between the separator and the value. For a QUOTED key and a colon (the JSON form) it may hold newlines, real or
+        // escaped at the document's depth, up to `MAX_GAP_CHARS`; for every other form it is up to four spaces or tabs, so prose
+        // like `password:` at the end of a line does not reach the next one.
+        let at = match.index + match[0].length
+        let gapOver = false
+        if (nameQuote !== undefined && match[3] === ':') {
+          const gap = skipGap(text, at, layersOfRun(nameQuote.length - 1))
+          at = gap.end
+          gapOver = gap.over
+        } else {
+          for (
+            let blanks = 0;
+            blanks < 4 && (text.charCodeAt(at) === 0x20 || text.charCodeAt(at) === 0x09);
+            blanks += 1
+          )
+            at += 1
+        }
+        // The value's opening quote, in an escaped layer: up to 15 backslashes before it.
+        let runEnd = at
+        while (runEnd - at <= 15 && text.charCodeAt(runEnd) === 0x5c) runEnd += 1
+        const quoteCode = text.charCodeAt(runEnd)
+        const opened = runEnd - at <= 15 && (quoteCode === 0x22 || quoteCode === 0x27)
+        const opener = opened ? text.slice(at, runEnd + 1) : undefined
+        const valueStart = opened ? runEnd + 1 : at
         // The identifier the name belongs to: what precedes the secret word (`max_` of `max_tokens`) counts.
         let from = match.index
         while (from > 0 && match.index - from < MAX_IDENTIFIER_CHARS && isIdentifierCode(text.charCodeAt(from - 1)))
@@ -425,7 +480,12 @@ function nameValueMatcher(): ScrubMatcher {
         // Whether the end was found (a closing quote, a balanced close, a delimiter) or is the fallback, the end of the line.
         let found = true
         const first = text.charCodeAt(valueStart)
-        if (opener === undefined && (first === 0x7b || first === 0x5b)) {
+        if (gapOver) {
+          // More whitespace than the bound: where the value is cannot be told, so it and the rest of its line go (fail closed).
+          found = false
+          valueEnd = endOfLine(valueStart)
+          if (valueEnd === valueStart) continue
+        } else if (opener === undefined && (first === 0x7b || first === 0x5b)) {
           // A whole object or array after a sensitive name: consumed to its balanced close, or to the end of the line.
           const close = structureEnd(text, valueStart, budget)
           found = close !== -1
