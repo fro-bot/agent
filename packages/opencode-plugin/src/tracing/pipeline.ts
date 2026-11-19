@@ -122,6 +122,17 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
     for (const snapshot of dropped) options.ledger.release(snapshot)
   }
 
+  /** Spans the model refused at its open-span limit that the sink has been told about. */
+  let forwardedDrops = 0
+  /** Tells the sink about spans the model refused, once each: the model keeps a running total, this sends the difference. */
+  function forwardDrops(): void {
+    const total = model.stats().droppedSpans
+    if (total > forwardedDrops) {
+      options.sink.drop(total - forwardedDrops)
+      forwardedDrops = total
+    }
+  }
+
   function enqueue(spans: readonly SpanRecord[]): void {
     for (const record of spans) {
       if (records.length >= limits.maxRecords) {
@@ -150,6 +161,7 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
       try {
         enqueue(model.observe(next))
         releaseDiscarded()
+        forwardDrops()
       } catch {
         // A model failure loses this observation, never the session.
         observationsDropped += 1
@@ -203,6 +215,7 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
       try {
         enqueue(model.flush(now()))
         releaseDiscarded()
+        forwardDrops()
       } catch {
         observationsDropped += 1
       }

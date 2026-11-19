@@ -331,3 +331,89 @@ describe('snapshots the model drops without a span', () => {
     expect(ledger.stats().pending).toBe(0)
   })
 })
+
+describe('spans the model refuses at its open-span limit', () => {
+  /** One turn with one request and `calls` tool calls that never end, so the limit is hit by the later ones. */
+  const crowdedTurn = (calls: number): Observation[] => {
+    const out: Observation[] = []
+    let at = 0
+    const add = (observation: Record<string, unknown>): void => {
+      at += 1
+      out.push({at, ...observation} as Observation)
+    }
+    add({kind: 'prompt', sessionId: 'a', messageId: 'm1', delivery: 'steer', content: 'hi'})
+    add({kind: 'inbox.enqueued', sessionId: 'a', inboxId: 'm1', item: 'user'})
+    add({kind: 'execution.started', sessionId: 'a'})
+    add({kind: 'inbox.delivered', sessionId: 'a', inboxId: 'm1'})
+    add({
+      kind: 'request',
+      sessionId: 'a',
+      requestKind: 'primary',
+      agent: 'build',
+      model: 'm',
+      provider: 'p',
+      content: {},
+    })
+    add({kind: 'step.started', sessionId: 'a', messageId: 's1', agent: 'build', model: 'm', provider: 'p'})
+    for (let index = 0; index < calls; index += 1) {
+      add({kind: 'tool.named', sessionId: 'a', callId: `c${index}`, tool: 'read'})
+      add({kind: 'tool.called', sessionId: 'a', callId: `c${index}`, executed: false, input: {}})
+    }
+    // No terminal events: a call that was refused a span stays refused, and the ones that fit close as interrupted.
+    add({
+      kind: 'step.ended',
+      sessionId: 'a',
+      messageId: 's1',
+      finish: 'stop',
+      usage: {input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0},
+      cost: 0,
+    })
+    add({kind: 'execution.ended', sessionId: 'a', outcome: 'succeeded'})
+    return out
+  }
+
+  it('are counted as dropped at the sink, exactly once each, and the rest are exported', async () => {
+    // #given a limit of 4 open spans per trace (the root's request takes one, so three calls fit) and ten calls
+    const {sink, spans, dropped} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber, modelLimits: {maxOpenSpansPerTrace: 4}})
+
+    // #when the turn runs to its end
+    for (const observation of crowdedTurn(10)) pipeline.observe(observation)
+    await flush()
+    pipeline.stop()
+
+    // #then three calls fit and were exported (interrupted), seven were refused, and the sink was told seven
+    const exportedTools = spans.filter(span => span.name.startsWith('execute_tool')).length
+    expect(exportedTools).toBe(3)
+    expect(dropped()).toBe(7)
+  })
+
+  it('are not counted again at stop or on later observations', async () => {
+    // #given the same turn, observed, then more traffic, then stop
+    const {sink, dropped} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber, modelLimits: {maxOpenSpansPerTrace: 4}})
+    for (const observation of crowdedTurn(10)) pipeline.observe(observation)
+    await flush()
+    const afterTurn = dropped()
+
+    // #when a tick and stop follow
+    await new Promise(resolve => setTimeout(resolve, 30))
+    pipeline.stop()
+
+    // #then the count did not change
+    expect(afterTurn).toBeGreaterThan(0)
+    expect(dropped()).toBe(afterTurn)
+  })
+
+  it('count nothing when nothing was refused', async () => {
+    // #given a turn that fits
+    const {sink, dropped} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber})
+    for (const observation of crowdedTurn(3)) pipeline.observe(observation)
+    await flush()
+    pipeline.stop()
+
+    // #then
+    expect(dropped()).toBe(0)
+  })
+})
