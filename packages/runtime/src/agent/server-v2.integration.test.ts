@@ -28,6 +28,7 @@ import {afterAll, beforeAll, describe, expect, it, vi} from 'vitest'
 import {clearHeldClaims} from './held-claims-v2.js'
 import {createRemoteOpenCodeV2Client} from './remote-client-v2.js'
 import {startOpenCodeV2Server} from './server-v2.js'
+import {ACTION_TRACING_OFF} from './tracing-launcher.js'
 
 const BINARY = process.env.FRO_BOT_OPENCODE_V2_BIN
 const hasBinary = BINARY !== undefined && BINARY !== '' && existsSync(BINARY)
@@ -202,6 +203,7 @@ async function boot(sandbox: Sandbox, overrides: Partial<StartOpenCodeV2ServerOp
       binaryPath: BINARY as string,
       directory: sandbox.repo,
       expectedPluginIds: [],
+      tracingHost: ACTION_TRACING_OFF,
       env: sandbox.env,
       timeouts: TIMEOUTS,
       ...overrides,

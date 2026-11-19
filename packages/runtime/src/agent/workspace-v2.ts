@@ -60,6 +60,10 @@ export type {
   StartOpenCodeV2ServerOptions,
 } from './server-v2.js'
 
+export {WORKSPACE_TRACING_HOST} from './tracing-launcher.js'
+
+export type {OpenCodeV2TracingHost} from './tracing-launcher.js'
+
 export {buildWorkspaceConfigV2} from './workspace-config-v2.js'
 
 export type {WorkspaceConfigV2Inputs} from './workspace-config-v2.js'

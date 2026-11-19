@@ -8,6 +8,7 @@ import process from 'node:process'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 import {createFixture} from './server-v2-test-kit.js'
 import {buildSandboxLaunch, startOpenCodeV2Server} from './server-v2.js'
+import {ACTION_TRACING_OFF} from './tracing-launcher.js'
 
 const TIMEOUTS = {
   listenTimeoutMs: 3000,
@@ -161,6 +162,7 @@ child.on('exit', code => process.exit(code ?? 0))
         binaryPath: created.binaryPath,
         directory: created.dir,
         expectedPluginIds: [],
+        tracingHost: ACTION_TRACING_OFF,
         timeouts: TIMEOUTS,
         config: {provider: {key: secret}},
         env: {PATH: process.env.PATH, HOME: '/home/runner', CI: 'true'},
@@ -194,6 +196,7 @@ child.on('exit', code => process.exit(code ?? 0))
         binaryPath: created.binaryPath,
         directory: created.dir,
         expectedPluginIds: [],
+        tracingHost: ACTION_TRACING_OFF,
         uid: 1,
         gid: 1,
         sandbox: launchSpec(),
@@ -783,6 +786,7 @@ describe('startOpenCodeV2Server with a read-only view', () => {
         binaryPath: '/unused',
         directory: dir,
         expectedPluginIds: [],
+        tracingHost: ACTION_TRACING_OFF,
         timeouts: TIMEOUTS,
         sandbox: launchSpec({sudoPath, view}),
         onSpawn: pid => pids.push(pid),
@@ -828,6 +832,7 @@ describe('startOpenCodeV2Server with a read-only view', () => {
         binaryPath: '/unused',
         directory: dir,
         expectedPluginIds: [],
+        tracingHost: ACTION_TRACING_OFF,
         timeouts: TIMEOUTS,
         sandbox: launchSpec({sudoPath, view: {...VIEW, gate: {...VIEW.gate, dir: gateDir}}}),
       },
@@ -857,6 +862,7 @@ describe('startOpenCodeV2Server with a read-only view', () => {
           binaryPath: '/unused',
           directory: dir,
           expectedPluginIds: [],
+          tracingHost: ACTION_TRACING_OFF,
           timeouts: TIMEOUTS,
           sandbox: launchSpec({sudoPath, view: {...VIEW, gate: {...VIEW.gate, dir: viewDir}}}),
         },

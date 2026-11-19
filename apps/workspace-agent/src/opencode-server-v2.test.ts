@@ -18,6 +18,7 @@ import {
   resolveSystematicSkillsDirsV2,
   SYSTEMATIC_V2_PLUGIN_ID,
   verifyPermissionRules,
+  WORKSPACE_TRACING_HOST,
 } from '@fro-bot/runtime/workspace-v2'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
@@ -136,6 +137,22 @@ function scriptedStart(
 }
 
 describe('buildOpencodeV2Env', () => {
+  it('never carries a launcher variable or an OTEL_ variable from the service environment', () => {
+    // #given a service environment that names a tracing launcher and an OpenTelemetry collector
+    const parent: NodeJS.ProcessEnv = {
+      OPENCODE_FROBOT_TRACING: '{"version":1,"host":"action","tracing":"on"}',
+      OTEL_EXPORTER_OTLP_ENDPOINT: 'https://collector.example.test',
+      OTEL_EXPORTER_OTLP_HEADERS: 'authorization=Basic abc',
+    }
+
+    // #when
+    const env = buildOpencodeV2Env(parent, '/db/opencode.db')
+
+    // #then the allowlist drops all of it; the spawn writes the workspace's own launcher value
+    expect(env).not.toHaveProperty('OPENCODE_FROBOT_TRACING')
+    expect(Object.keys(env).filter(name => name.startsWith('OTEL_'))).toEqual([])
+  })
+
   it('constructs the child environment from an allowlist, never from the parent', () => {
     // #given a service environment full of things the agent must never see
     const parent: NodeJS.ProcessEnv = {
@@ -470,6 +487,8 @@ describe('runSupervisedOpencodeV2', () => {
     expect(start?.directory).toBe('/workspace/repos')
     expect(start?.port).toBe(54_321)
     expect(start?.expectedPluginIds).toEqual([SYSTEMATIC_V2_PLUGIN_ID, FRO_BOT_PLUGIN_ID])
+    // The workspace declares itself as the host, so the plugin is told tracing is off here.
+    expect(start?.tracingHost).toBe(WORKSPACE_TRACING_HOST)
     expect(start?.config?.plugins).toEqual([
       `@fro.bot/systematic@${DEFAULT_SYSTEMATIC_VERSION}`,
       '@fro.bot/opencode-plugin@0.1.0',

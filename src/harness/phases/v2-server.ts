@@ -2,6 +2,7 @@ import type {Result} from '@bfra.me/es/result'
 import type {
   BuiltConfigV2,
   CredentialDisposition,
+  OpenCodeV2ActionTracingHost,
   OpenCodeV2SandboxLaunch,
   OpenCodeV2ServerHandle,
   StartOpenCodeV2ServerOptions,
@@ -134,6 +135,12 @@ export interface StartActionOpenCodeV2Options {
   readonly sandbox?: SandboxLifecycle | null
   readonly runId: string | number
   readonly runAttempt: string | number
+  /**
+   * What the plugin is told about tracing: off, or on with the running relay's port and the run's identity. Required, with no
+   * default, so a caller cannot start the server without deciding. The Action's own host only: this surface is never the
+   * workspace. When on, the Fro Bot plugin is listed after the operator's plugins.
+   */
+  readonly tracing: OpenCodeV2ActionTracingHost
   readonly logger: Logger
   readonly signal?: AbortSignal
   /** Masks the server password in the Action's log (`core.setSecret`). */
@@ -399,6 +406,7 @@ export async function startActionOpenCodeV2(
         runnerTemp: options.env.RUNNER_TEMP,
         runId: options.runId,
         runAttempt: options.runAttempt,
+        tracing: options.tracing.tracing === 'on',
         ...(options.env.FRO_BOT_INTEGRATION_WORK_DIR === undefined
           ? {}
           : {integrationWorkDir: options.env.FRO_BOT_INTEGRATION_WORK_DIR}),
@@ -504,6 +512,8 @@ export async function startActionOpenCodeV2(
     ...(extra.onSpawn === undefined ? {} : {onSpawn: extra.onSpawn}),
     ...(options.maskSecret === undefined ? {} : {maskSecret: options.maskSecret}),
     ...deps.startOptions,
+    // After the test seam's spread, so the host the caller declared is always the one the spawn writes.
+    tracingHost: options.tracing,
   })
 
   let started: Awaited<ReturnType<typeof deps.startServer>>

@@ -17,6 +17,7 @@ import {
 import {err, ok} from '../../shared/types.js'
 import {validateJsonString, validatePositiveInteger} from '../../shared/validation.js'
 import {resolveAgentStateHome} from './agent-state-home.js'
+import {parseTraceInputs} from './trace-inputs.js'
 
 /**
  * Parse model input string in "provider/model" format.
@@ -152,6 +153,23 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     // `INPUT_AUTH-JSON` (not `INPUT_AUTH_JSON`). Delete the correct key so the raw secret is
     // not inherited by the OpenCode server child (spawned with `{ ...process.env }`).
     delete process.env['INPUT_AUTH-JSON']
+
+    // Tracing: the endpoint and the credential headers. Read, masked and removed from the environment before anything else
+    // can fail on them, and never allowed to fail the run: a refused value is tracing off with one warning (trace-inputs.ts).
+    // Same hyphen-key gotcha as auth-json: `trace-headers` is read from `INPUT_TRACE-HEADERS`.
+    const traceEndpointRaw = core.getInput('trace-endpoint')
+    const traceHeadersRaw = core.getInput('trace-headers')
+    delete process.env['INPUT_TRACE-ENDPOINT']
+    delete process.env['INPUT_TRACE-HEADERS']
+    const tracing = parseTraceInputs(
+      {endpoint: traceEndpointRaw, headers: traceHeadersRaw},
+      {
+        warning: message => core.warning(message),
+        notice: message => core.notice(message),
+        info: message => core.info(message),
+        mask: value => core.setSecret(value),
+      },
+    )
 
     // Optional string inputs (null if empty)
     const trustedHeadSha = core.getInput('trusted-head-sha').trim()
@@ -295,6 +313,7 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
       repoSkills,
       isolateAgent,
       agentStateHome,
+      tracing,
     })
   } catch (error) {
     return err(error instanceof Error ? error : new Error(String(error)))

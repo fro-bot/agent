@@ -1,4 +1,4 @@
-import type {OpenCodeV2ServerHandle, OpenCodeV2ShutdownResult} from '@fro-bot/runtime'
+import type {OpenCodeV2ActionTracingHost, OpenCodeV2ServerHandle, OpenCodeV2ShutdownResult} from '@fro-bot/runtime'
 import type {KeyProxyProbeResult} from './key-proxy-probe.js'
 import type {KeyProxyProcess} from './key-proxy-process.js'
 import type {SandboxLifecycle} from './sandbox-lifecycle.js'
@@ -8,7 +8,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import {DatabaseSync} from 'node:sqlite'
 import {err} from '@bfra.me/es/result'
-import {clearHeldClaims} from '@fro-bot/runtime'
+import {ACTION_TRACING_OFF, clearHeldClaims} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi, type Mock} from 'vitest'
 import {pluginCacheDir, resolvePluginSpecsV2} from '../../services/setup/plugin-install-v2.js'
 import {createRepoSkillsStagingRoot} from '../../services/setup/repo-skills.js'
@@ -148,6 +148,7 @@ describe('startActionOpenCodeV2', () => {
       env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
       runId: 42,
       runAttempt: 1,
+      tracing: ACTION_TRACING_OFF,
       logger: createMockLogger(),
       ...overrides,
     }
@@ -213,6 +214,45 @@ describe('startActionOpenCodeV2', () => {
     expect(JSON.stringify(startArgs?.config)).not.toContain(CANARY)
   })
 
+  describe('tracing', () => {
+    const TRACING_ON: OpenCodeV2ActionTracingHost = {
+      host: 'action',
+      tracing: 'on',
+      relayPort: 43_210,
+      identity: {repository: 'owner/repo', runId: '42', attempt: '1', job: 'review', trigger: 'pull_request'},
+    }
+
+    it('hands the spawn the host setting it was given, off or on', async () => {
+      // #given
+      const offDeps = recordingDeps(fakeServer())
+      const onDeps = recordingDeps(fakeServer())
+
+      // #when
+      await startActionOpenCodeV2(options({deps: offDeps, tracing: ACTION_TRACING_OFF}))
+      await startActionOpenCodeV2(options({deps: onDeps, tracing: TRACING_ON}))
+
+      // #then
+      expect(vi.mocked(offDeps.startServer as StartServer).mock.calls[0]?.[0].tracingHost).toEqual(ACTION_TRACING_OFF)
+      expect(vi.mocked(onDeps.startServer as StartServer).mock.calls[0]?.[0].tracingHost).toEqual(TRACING_ON)
+    })
+
+    it('lists the Fro Bot plugin after the operator plugins only when tracing is on', async () => {
+      // #given two operator plugins
+      const opencodeConfig = JSON.stringify({plugins: ['op-one', 'op-two']})
+      const offDeps = recordingDeps(fakeServer())
+      const onDeps = recordingDeps(fakeServer())
+
+      // #when
+      await startActionOpenCodeV2(options({deps: offDeps, opencodeConfig}))
+      await startActionOpenCodeV2(options({deps: onDeps, opencodeConfig, tracing: TRACING_ON}))
+
+      // #then tracing off is the order it has always had, and tracing on moves only this plugin
+      const [systematic, froBot] = PLUGIN_SPECS
+      expect(spawnedContent(offDeps).plugins).toEqual([systematic, froBot, 'op-one', 'op-two'])
+      expect(spawnedContent(onDeps).plugins).toEqual([systematic, 'op-one', 'op-two', froBot])
+    })
+  })
+
   it('produces the config and credential files it always did, and starts no proxy, when isolation is off', async () => {
     // #given two API keys and an operator config that sets a base URL, a timeout and a key reference
     const server = fakeServer()
@@ -244,6 +284,7 @@ describe('startActionOpenCodeV2', () => {
       'directory',
       'env',
       'expectedPluginIds',
+      'tracingHost',
     ])
 
     // #then each provider keeps its operator settings and gains only a {file:} key reference; no baseURL is rewritten
@@ -1494,6 +1535,7 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
       env,
       runId: 42,
       runAttempt: 1,
+      tracing: ACTION_TRACING_OFF,
       logger: createMockLogger(),
       sandbox,
       deps,
@@ -1718,6 +1760,7 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
         env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
         runId: 42,
         runAttempt: 1,
+        tracing: ACTION_TRACING_OFF,
         logger,
         sandbox: sandbox.sandbox,
         deps,
@@ -1780,6 +1823,7 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
         env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
         runId: 42,
         runAttempt: 1,
+        tracing: ACTION_TRACING_OFF,
         logger: createMockLogger(),
         sandbox: sandbox.sandbox,
         maskSecret: value => masked.push(value),
@@ -1949,6 +1993,7 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
         env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
         runId: 42,
         runAttempt: 1,
+        tracing: ACTION_TRACING_OFF,
         logger: createMockLogger(),
         sandbox: sandbox.sandbox,
         deps,
@@ -1983,6 +2028,7 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
         env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
         runId: 42,
         runAttempt: 1,
+        tracing: ACTION_TRACING_OFF,
         logger: createMockLogger(),
         sandbox: sandbox.sandbox,
         deps,
@@ -2017,6 +2063,7 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
         env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
         runId: 42,
         runAttempt: 1,
+        tracing: ACTION_TRACING_OFF,
         logger: createMockLogger(),
         sandbox: sandbox.sandbox,
         deps,
@@ -2056,6 +2103,7 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
         env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
         runId: 42,
         runAttempt: 1,
+        tracing: ACTION_TRACING_OFF,
         logger: overrides.logger ?? createMockLogger(),
         sandbox,
         deps,
@@ -2083,6 +2131,7 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
         env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
         runId: 42,
         runAttempt: 1,
+        tracing: ACTION_TRACING_OFF,
         logger,
         sandbox: sandbox.sandbox,
         deps,

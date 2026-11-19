@@ -403,6 +403,16 @@ export type {
   TraceRelayWireConfig,
 } from './trace-relay-wire.js'
 export type {StartTraceRelayOptions, TraceRelayServer} from './trace-relay.js'
+export {
+  ACTION_TRACING_OFF,
+  buildTracingLauncherValue,
+  isUsableTracingIdentity,
+  TRACING_IDENTITY_FIELD_MAX_CHARS,
+  TRACING_LAUNCHER_VERSION,
+  tracingRelayUrl,
+  WORKSPACE_TRACING_HOST,
+} from './tracing-launcher.js'
+export type {OpenCodeV2ActionTracingHost, OpenCodeV2TracingHost, TracingRunIdentity} from './tracing-launcher.js'
 export type {
   AcknowledgmentState,
   AgentContext,

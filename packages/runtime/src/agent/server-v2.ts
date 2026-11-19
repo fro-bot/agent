@@ -9,11 +9,13 @@ import {readFileSync} from 'node:fs'
 import net from 'node:net'
 import process from 'node:process'
 import {sleep} from '../shared/async.js'
+import {FRO_BOT_TRACING_LAUNCHER_ENV} from '../shared/constants.js'
 import {toErrorMessage} from '../shared/errors.js'
 import {err, ok} from '../shared/types.js'
 import {filterAgentEnv} from './filter-env.js'
 import {buildSetprivDropArgs} from './sandbox-identity.js'
 import {GATE_ERR_FILE, GATE_GO_FILE, GATE_NS_FILE, rootChainReport, rootChainTail} from './sandbox-namespace.js'
+import {buildTracingLauncherValue, type OpenCodeV2TracingHost} from './tracing-launcher.js'
 
 /**
  * Spawn, authenticate to, gate and shut down a stock OpenCode V2 server (`serve --stdio`).
@@ -233,6 +235,13 @@ export interface StartOpenCodeV2ServerOptions {
   readonly expectedPluginIds: readonly string[]
   /** Becomes `OPENCODE_CONFIG_CONTENT`. When absent the child gets none, whatever the parent environment holds. */
   readonly config?: Readonly<Record<string, unknown>>
+  /**
+   * Who launches this server, and what it says about tracing: the Action (off, or on with the relay's port and the run's
+   * identity) or the workspace. Required, with no default, so a new launcher cannot start a server without saying which it
+   * is. It becomes the plugin's launcher variable (`OPENCODE_FROBOT_TRACING`); any value of that variable in `env` is
+   * removed first, so a job environment can never set what the plugin reads.
+   */
+  readonly tracingHost: OpenCodeV2TracingHost
   /** Source environment, scrubbed through `filterAgentEnv`. Default `process.env`. */
   readonly env?: NodeJS.ProcessEnv
   /** Default: a free loopback port picked here. */
@@ -626,6 +635,9 @@ export async function startOpenCodeV2Server(
   delete childEnv.OPENCODE_CONFIG_CONTENT
   if (options.config !== undefined) childEnv.OPENCODE_CONFIG_CONTENT = JSON.stringify(options.config)
   childEnv.OPENCODE_PASSWORD = password
+  // The launcher's declaration, never the job's: `filterAgentEnv` admits the name by its `OPENCODE_` prefix, so an inherited
+  // value would reach the plugin. Assigned for every host, which replaces it.
+  childEnv[FRO_BOT_TRACING_LAUNCHER_ENV] = buildTracingLauncherValue(options.tracingHost)
   // Project config can re-allow what the CI config denies (P4/P6); it is never read.
   childEnv.OPENCODE_DISABLE_PROJECT_CONFIG = '1'
   // A self-update would replace the digest-verified binary mid-run.

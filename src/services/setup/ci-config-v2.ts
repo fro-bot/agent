@@ -11,6 +11,7 @@ import {
   buildResponseFileDir,
   buildResponseFileFallbackRoots,
   FORBIDDEN_TOOL_ACTIONS_V2,
+  FRO_BOT_PLUGIN_PACKAGE,
   RESPONSE_FILE_DIR_SEGMENT,
   WEBSEARCH_ACTION_V2,
 } from '@fro-bot/runtime'
@@ -65,6 +66,43 @@ export interface CIConfigV2Inputs {
    * the model, so the operator's `mcp` is cut to its static local servers (`applyOperatorMcpV2`).
    */
   readonly credential: CredentialDisposition
+  /**
+   * True when this run traces (the relay is up and the plugin was told so). Only then is the Fro Bot plugin listed after the
+   * operator's plugins, because a plugin sees only the edits of plugins listed before it and the tracing plugin must see the
+   * request as the others left it. Absent or false leaves the list as it always was.
+   */
+  readonly tracing?: boolean
+}
+
+/** The Fro Bot plugin's entry as the Action writes it (`<package>@<version>`) or as an operator may (`<package>`, any version). */
+function isFroBotPluginSpec(spec: string): boolean {
+  return spec === FRO_BOT_PLUGIN_PACKAGE || spec.startsWith(`${FRO_BOT_PLUGIN_PACKAGE}@`)
+}
+
+/**
+ * The plugin list. Without tracing: the Action's specs, then the operator's, with exact repeats dropped. With tracing: the
+ * Action's other specs, the operator's, then the Fro Bot plugin last; an operator entry that names the Fro Bot plugin (any
+ * version) is dropped so it is listed once, at the end, at the version the Action installed.
+ */
+function orderPlugins(
+  actionSpecs: readonly string[],
+  operatorPlugins: readonly string[],
+  tracing: boolean,
+  logger: Logger,
+): string[] {
+  if (!tracing) return [...new Set([...actionSpecs, ...operatorPlugins])]
+  const froBot = actionSpecs.filter(isFroBotPluginSpec)
+  const operatorOwn = operatorPlugins.filter(isFroBotPluginSpec)
+  if (operatorOwn.length > 0) {
+    logger.debug('Dropped an operator entry for the Fro Bot plugin: it is listed once, last, while tracing is on')
+  }
+  return [
+    ...new Set([
+      ...actionSpecs.filter(spec => !isFroBotPluginSpec(spec)),
+      ...operatorPlugins.filter(spec => !isFroBotPluginSpec(spec)),
+      ...froBot,
+    ]),
+  ]
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -335,7 +373,7 @@ export function buildCIConfigV2(inputs: CIConfigV2Inputs, logger: Logger): Resul
       ? {}
       : {skills: withRepoSkillsPath(operator.skills, inputs.repoSkillsDirectory)}),
     ...base,
-    plugins: [...new Set([...inputs.plugins, ...operatorPlugins])],
+    plugins: orderPlugins(inputs.plugins, operatorPlugins, inputs.tracing === true, logger),
     experimental: {...operatorExperimental, ...(base.experimental as Record<string, unknown>)},
   }
 

@@ -1,5 +1,6 @@
 import type {
   ObjectStoreConfig,
+  OpenCodeV2ActionTracingHost,
   OpenCodeV2ServerHandle,
   OutputModeMigrationState,
   OutputModeRequestState,
@@ -20,6 +21,7 @@ import {applyTerminalReaction} from '../features/agent/index.js'
 import {createMetricsCollector, writeInvocationOutcomeSummary} from '../features/observability/index.js'
 import {resolveReviewedHeadSha} from '../features/reviews/reviewed-head.js'
 import {createReviewDeliveryReceiptOperations} from '../services/github/review-delivery-receipt.js'
+import {buildActionTracingHost, buildTracingRunIdentity, relayRequestFromInputs} from '../services/setup/tracing.js'
 import {getGitHubRunAttempt, getInvocationIdentity, getOpenCodeLogPath} from '../shared/env.js'
 import {toErrorMessage} from '../shared/errors.js'
 import {createLogger} from '../shared/logger.js'
@@ -52,34 +54,21 @@ import {runReviewReconciliation} from './phases/review-reconciliation.js'
 import {runRouting} from './phases/routing.js'
 import {runSessionPrep} from './phases/session-prep.js'
 import {checkTraceRelayBundle} from './phases/trace-relay-bundle.js'
-import {
-  createTraceRelayLaunch,
-  startTraceRelayProcess,
-  type TraceRelayConfig,
-  type TraceRelayProcess,
-} from './phases/trace-relay-process.js'
+import {createTraceRelayLaunch, startTraceRelayProcess, type TraceRelayProcess} from './phases/trace-relay-process.js'
 
 const KEY_PROXY_CRASHED_DECLINE_REASON =
   'the isolate-agent key proxy exited unexpectedly, so the run is incomplete and no session state is saved'
 
-/** What a caller can hand `run`. Nothing in production passes anything yet: `main.ts` calls `run()`. */
-export interface RunOptions {
-  /**
-   * Where the trace relay sends batches (URL and credential headers), already validated, or undefined for no tracing. The
-   * seam for tracing: when it is set the run starts the relay before the server, stops it after the server has exited, and
-   * registers it with the sandbox lifecycle's signal teardown. Unit 8 fills it from the `trace-endpoint` and `trace-headers`
-   * inputs, in the same place (right after bootstrap), and passes `traceRelay?.port` on to the server start.
-   */
-  readonly traceRelay?: TraceRelayConfig | undefined
-}
-
 /** Longest the run waits, at its very end, for the relay's stop to finish. The supervisor's own worst case is about 4.5 s. */
 export const TRACE_RELAY_STOP_WAIT_MS = 6000
+
+const TRACE_IDENTITY_WARNING =
+  'Tracing is off: the run identity (repository, run, attempt, job and trigger) is incomplete'
 
 const TRACE_EXPOSURE_WARNING =
   'Tracing is on without isolate-agent: the agent can read the collector credential and the content of every span'
 
-export async function run(options: RunOptions = {}): Promise<number> {
+export async function run(): Promise<number> {
   const startTime = Date.now()
   const bootstrapLogger = createLogger({phase: 'bootstrap'})
   const metrics = createMetricsCollector()
@@ -393,30 +382,48 @@ export async function run(options: RunOptions = {}): Promise<number> {
     const repoSkills = await runRepoSkills(bootstrap, routing)
     repoSkillsStagingRoot = repoSkills?.stagingRoot ?? null
 
-    // Tracing: the relay is up before the server can start, so the plugin's exporter has somewhere to post from its first
-    // batch. A relay that does not start has been warned about by its supervisor and the run goes on untraced. Unit 8: read
-    // `options.traceRelay` here from the parsed inputs instead, and give `runCacheRestore` the relay's port (`traceRelay?.port`,
-    // null meaning "tell the plugin tracing is off").
-    if (options.traceRelay !== undefined) {
-      // The signal teardown owns the launch from before the spawn: a cancellation while the child is still starting aborts the
-      // start and reaps it, one that arrives when it is ready stops it, inside the teardown's own budget. Registering installs
-      // the lifecycle's signal handlers, which at this point (before the server, the key proxy and the account) nothing else
-      // has. The server is being killed on a signal, so a relay stopped that way cannot have a complete count.
-      const launch = createTraceRelayLaunch(startTraceRelayProcess)
-      sandboxLifecycle?.registerSignalStop(async () => launch.stop())
-      const started = await launch.start({
-        config: options.traceRelay,
-        logger: createLogger({phase: 'trace-relay'}),
-        // The relay bundle is optional, so only a run that traces looks at it (the supervisor asks, before it spawns).
-        bundleCheck: async () => checkTraceRelayBundle({isolated: isolationRequested}),
+    // Tracing: the operator's `trace-endpoint` and `trace-headers` (already parsed, masked and removed from the environment by
+    // bootstrap) decide whether a relay starts. The relay is up before the server can start, so the plugin's exporter has
+    // somewhere to post from its first batch, and what the plugin is told is decided here, once: on only with a relay that is
+    // running and a complete run identity, off for everything else. A relay that does not start has been warned about by its
+    // supervisor and the run goes on untraced.
+    let tracingHost: OpenCodeV2ActionTracingHost = buildActionTracingHost(null, null)
+    const relayRequest = relayRequestFromInputs(bootstrap.inputs.tracing)
+    if (relayRequest !== null) {
+      // Each field from where it is authoritative: the routed context for the repository, run and trigger (never the payload
+      // or `github.context`), the Action's own environment for the attempt (`GITHUB_RUN_ATTEMPT` is not admitted to the agent,
+      // so it travels in the launcher document) and the invocation identity for the job (the lock's `holder_job`).
+      const identity = buildTracingRunIdentity({
+        repository: repo,
+        runId,
+        attempt: runAttempt,
+        job: getInvocationIdentity(),
+        trigger: routing.triggerResult.context.eventName,
       })
-      if (started.success) {
-        traceRelay = started.data
-        if (sandboxLifecycle === null && !isolationRequested) bootstrapLogger.warning(TRACE_EXPOSURE_WARNING)
+      if (identity.success) {
+        // The signal teardown owns the launch from before the spawn: a cancellation while the child is still starting aborts the
+        // start and reaps it, one that arrives when it is ready stops it, inside the teardown's own budget. Registering installs
+        // the lifecycle's signal handlers, which at this point (before the server, the key proxy and the account) nothing else
+        // has. The server is being killed on a signal, so a relay stopped that way cannot have a complete count.
+        const launch = createTraceRelayLaunch(startTraceRelayProcess)
+        sandboxLifecycle?.registerSignalStop(async () => launch.stop())
+        const started = await launch.start({
+          config: relayRequest,
+          logger: createLogger({phase: 'trace-relay'}),
+          // The relay bundle is optional, so only a run that traces looks at it (the supervisor asks, before it spawns).
+          bundleCheck: async () => checkTraceRelayBundle({isolated: isolationRequested}),
+        })
+        if (started.success) {
+          traceRelay = started.data
+          tracingHost = buildActionTracingHost(started.data.port, identity.data)
+          if (sandboxLifecycle === null && !isolationRequested) bootstrapLogger.warning(TRACE_EXPOSURE_WARNING)
+        }
+      } else {
+        bootstrapLogger.warning(TRACE_IDENTITY_WARNING)
       }
     }
 
-    const cacheRestore = await runCacheRestore(bootstrap, metrics, repoSkills)
+    const cacheRestore = await runCacheRestore(bootstrap, metrics, repoSkills, tracingHost)
     if (cacheRestore == null) {
       deliveryOutcome = 'failed'
       setUnavailableActionOutputs(Date.now() - startTime)
