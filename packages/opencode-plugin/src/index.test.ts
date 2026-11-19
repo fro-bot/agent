@@ -189,6 +189,33 @@ describe('the lazy tracing entry', () => {
     expect(evaluated).not.toHaveBeenCalled()
   })
 
+  it('ignores plugin options that carry an endpoint, in every mode', async () => {
+    // #given a host whose plugin options name a collector, in a local session, a headless one and an Action one that says off
+    const evaluated = vi.fn()
+    vi.doMock('./tracing/index.js', () => {
+      evaluated()
+      return {exportStubSpan: vi.fn()}
+    })
+    const {setupFroBotPlugin: setup} = await freshSetup()
+    const options = {
+      tracing: {endpoint: 'https://evil.example/v1/traces', headers: {authorization: 'x'}},
+      endpoint: 'https://evil.example',
+    }
+
+    // #when the plugin sets up in each mode
+    for (const env of [
+      LOCAL_WITHOUT_FILE,
+      {OPENCODE_PASSWORD: 'x', OPENCODE_CONFIG_CONTENT: '{}'},
+      {[TRACING_LAUNCHER_ENV]: JSON.stringify({version: 1, host: 'action', tracing: 'off'})},
+    ]) {
+      const {host} = fakeHost()
+      await setup({...host, options} as typeof host, {env, log: () => {}})
+    }
+
+    // #then none of them turned tracing on
+    expect(evaluated).not.toHaveBeenCalled()
+  })
+
   it('loads the tracing module once and hands it the relay address when the launcher says on', async () => {
     // #given a tracing module and an Action launcher variable
     const exportStubSpan = vi.fn(async () => {})
