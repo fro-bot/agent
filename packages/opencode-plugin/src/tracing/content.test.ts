@@ -334,6 +334,132 @@ describe('scrub patterns', () => {
   })
 })
 
+describe('a secret-named field is removed whole, not in part', () => {
+  const attribute = (value: unknown): string => {
+    const span = scrubSpan(
+      spanWith({attributes: {'gen_ai.tool.call.arguments': contentAttribute(value, 65_536)}}),
+      scrubber,
+    )
+    return String(span.attributes['gen_ai.tool.call.arguments'])
+  }
+  const PARTS = [
+    'correct',
+    'horse',
+    'battery',
+    'staple',
+    'hunter2',
+    '123456',
+    '654321',
+    'inner "quote',
+    'cr3t',
+    'k1',
+    'k2',
+  ]
+
+  it('removes quoted, escaped, multi-word, numeric, array, object, boolean and null values of a sensitive key, at any depth', () => {
+    // #given sensitive keys holding every shape, at the top, nested and inside arrays
+    const exported = attribute({
+      password: 'correct horse battery staple',
+      nested: {
+        deep: {Password: 'inner "quote cr3t', pin: 5, pwd: 123456, secret: ['k1', {a: 'k2'}], token: {a: 'hunter2'}},
+      },
+      list: [{api_key: 654321}, {authorization: 'Basic hunter2'}, {passphrase: true}, {credential: null}],
+    })
+
+    // #then the exported JSON holds no part of any of them
+    for (const part of PARTS) expect({part, found: exported.includes(part)}).toEqual({part, found: false})
+    expect(JSON.parse(exported)).toMatchObject({
+      password: REDACTION,
+      nested: {deep: {Password: REDACTION, pwd: REDACTION}},
+    })
+  })
+
+  it('removes the values inside a JSON string carried in a tool argument, at any depth', () => {
+    // #given an argument whose value is itself JSON text, nested and with an escaped quote
+    const inner = JSON.stringify({
+      password: 'correct horse battery',
+      config: {secret: ['k1', 'k2'], api_key: 123456},
+      ok: 'fine',
+    })
+    const exported = attribute({input: inner, list: [JSON.stringify([{client_secret: 'staple hunter2'}])]})
+
+    // #then none of it survives, and the rest does
+    for (const part of ['correct', 'horse', 'battery', 'k1', 'k2', '123456', 'staple', 'hunter2']) {
+      expect({part, found: exported.includes(part)}).toEqual({part, found: false})
+    }
+    expect(exported).toContain('fine')
+  })
+
+  it('keeps a counter or a limit: max_tokens and token counts are left alone, with numbers', () => {
+    // #given counters and limits next to a password
+    const exported = JSON.parse(
+      attribute({
+        max_tokens: 8000,
+        tokens: 120,
+        token_count: 55,
+        input_tokens: 70,
+        maxTokens: 4096,
+        password: 12345678,
+      }),
+    ) as Record<string, unknown>
+
+    // #then
+    expect(exported).toMatchObject({
+      max_tokens: 8000,
+      tokens: 120,
+      token_count: 55,
+      input_tokens: 70,
+      maxTokens: 4096,
+      password: REDACTION,
+    })
+  })
+
+  it('does not exempt a counter-looking name whose value is not a number', () => {
+    // #given
+    const exported = attribute({tokens: 'abcdef-secret-value', max_tokens: 'sk-notanumber-hunter2'})
+
+    // #then
+    expect(exported).not.toContain('abcdef')
+    expect(exported).not.toContain('hunter2')
+  })
+
+  it.each([
+    ['a quoted multi-word value', 'login password: "correct horse battery" then more', 'correct'],
+    ['a single-quoted value', "secret='correct horse battery' end", 'horse'],
+    ['an escaped quote inside the value', String.raw`password: "he said \"correct horse\" there" tail`, 'horse'],
+    ['a value in an escaped (JSON-in-JSON) layer', String.raw`password: \"correct horse battery\" tail`, 'battery'],
+    ['an unterminated quote, to the end of the line', 'password: "correct horse\nnext line stays', 'horse'],
+    ['a numeric password', 'password: 123456 done', '123456'],
+    ['a short numeric pin', 'pwd=1234', '1234'],
+    ['a numeric token that is not a counter', 'token: 99 end', '99'],
+    ['a numeric secret in a url query', 'https://x.test/?api_key=1234567&page=2', '1234567'],
+  ])('removes the whole value in free text: %s', (_label, text, part) => {
+    // #given / #when
+    const out = scrubText(text)
+
+    // #then
+    expect(out).not.toContain(part)
+    expect(out).toContain(REDACTION)
+  })
+
+  it('stops at the closing quote and keeps what follows, and ends an unterminated quote at the line', () => {
+    // #given
+    expect(scrubText('a password: "x y z" and the rest')).toBe(`a password: "${REDACTION}" and the rest`)
+    expect(scrubText('password: "x y\nnext line stays')).toContain('next line stays')
+  })
+
+  it.each([
+    ['max_tokens: 8000', 'max_tokens: 8000'],
+    ['"max_tokens": 4096', '"max_tokens": 4096'],
+    ['tokens: 120 used', 'tokens: 120 used'],
+    ['token_count=55', 'token_count=55'],
+    ['output_tokens: 13', 'output_tokens: 13'],
+  ])('leaves a counter alone in free text: %s', (text, expected) => {
+    // #given / #when / #then
+    expect(scrubText(text)).toBe(expected)
+  })
+})
+
 /**
  * Why this block replaced the one before it. The old one gave each pattern a few inputs (a prefix repeated, a prefix and a
  * long run of one letter) and failed a pattern only when one run passed 2 s at 300 KB. The JWT pattern was quadratic on
@@ -428,6 +554,16 @@ describe('adversarial timing: growth, not a ceiling', () => {
       ['quote forms', rep('api_key"')],
       ['escaped quotes', rep(String.raw`token\": \"`)],
       ['one long value', n => `secret=${'a'.repeat(n)}`],
+      ['a quote that never closes', rep('password: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')],
+      ['quotes that close just past the bound', rep(`password: "${'a'.repeat(9_000)}" `)],
+      ['an escaped layer that never closes', rep(String.raw`password: \\"aaaaaaaaaaaaaaaaaaaa`)],
+      [
+        'backslashes inside a quoted value',
+        rep('password: "\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\"'),
+      ],
+      ['a numeric value at the exemption edge', rep('password: 12345678 ')],
+      ['a counter name then a long number', rep('max_tokens: 123456789012 ')],
+      ['a long line with no quote at all', n => `password: "${'x '.repeat(n / 2)}`],
     ],
   }
 

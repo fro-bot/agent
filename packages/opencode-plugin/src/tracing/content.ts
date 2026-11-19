@@ -224,15 +224,130 @@ const SECRET_NEEDLES: readonly string[] = [
   'bearer',
 ]
 
-/**
- * `name=value` and `name: value`, in plain text and in JSON text (`\"name\": \"value\"`). The match starts at the secret
- * word itself, so nothing before it is scanned or kept; every gap is a bounded class, so adjacent optional parts cannot
- * trade characters. Only the value is replaced. A value of at most eight digits is left alone (`max_tokens: 8000`).
- */
-const NAME_VALUE = new RegExp(
-  String.raw`((?:${SECRET_WORDS})[\w.-]{0,20}(?:\\?["'])?[ \t]{0,4}[:=][ \t]{0,4}(?:\\?["'])?)(?!\[REDACTED\])(?!\d{1,8}(?:[\s"'\\<>,;&)}\]]|$))[^\s"'\\<>,;&)}\]]{3,}`,
-  'gi',
+/** Characters that end an unquoted value: whitespace, quotes, a backslash and the delimiters of a URL or a list. */
+const UNQUOTED_STOP: ReadonlySet<number> = new Set(
+  [' ', '\t', '\n', '\r', '\f', '\v', '"', "'", '\\', '<', '>', ',', ';', '&', ')', '}', ']'].map(char =>
+    char.charCodeAt(0),
+  ),
 )
+
+/**
+ * Names that are a count or a limit, not a credential: `max_tokens`, `token_count`, `tokens`, `input_tokens`. Only these may
+ * keep a numeric value; a password, secret, credential or authorization name never does. Tested on a bounded identifier.
+ */
+const COUNTER_NAME =
+  /(?:^|[_.-])(?:max|min|total|num|count|limit|input|output|prompt|completion|cache|reasoning|used|remaining|budget)[_.-]?tokens$|^tokens$|tokens?[_.-]?(?:count|limit|used|budget|remaining|total|usage)$/i
+const MAX_IDENTIFIER_CHARS = 64
+
+function isCounterName(identifier: string): boolean {
+  return COUNTER_NAME.test(identifier.slice(-MAX_IDENTIFIER_CHARS))
+}
+
+/** A value that is only a short number: a count, never a password. */
+const isShortNumber = (text: string): boolean => /^\d{1,8}$/.test(text)
+
+const isIdentifierCode = (code: number): boolean =>
+  (code >= 0x30 && code <= 0x39) ||
+  (code >= 0x41 && code <= 0x5a) ||
+  (code >= 0x61 && code <= 0x7a) ||
+  code === 0x5f ||
+  code === 0x2e ||
+  code === 0x2d
+
+/** The most a quoted value is searched for its closing quote. Past it the value is redacted to the end of the line. */
+const MAX_QUOTED_VALUE_CHARS = 8192
+
+/**
+ * `name=value` and `name: value`, in plain text and in JSON text (`\"name\": \"value\"`). The match starts at the secret word
+ * itself, so nothing before it is scanned or kept; every gap is a bounded class, so adjacent optional parts cannot trade
+ * characters. The value is then read by hand, once, forward:
+ * - a quoted value runs to its closing quote, honouring escapes (in an escaped layer, `\"` closes and `\\\"` does not); if
+ *   no closing quote is found within `MAX_QUOTED_VALUE_CHARS` it runs to the end of the line;
+ * - an unquoted value is a run of non-delimiter characters (the first token only);
+ * - a number of up to eight digits survives only after a counter or limit name (`max_tokens: 8000`), never after a name that
+ *   says password, secret, credential or authorization.
+ * The cursor moves past everything consumed, so no character is scanned more than a bounded number of times.
+ */
+function nameValuePattern(): ScrubPattern {
+  const prefix = new RegExp(
+    String.raw`((?:${SECRET_WORDS})[\w.-]{0,20})(?:\\?["'])?[ \t]{0,4}[:=][ \t]{0,4}(\\?["'])?`,
+    'gi',
+  )
+  return {
+    id: 'name-value-pair',
+    apply: (text, lower) => {
+      if (!SECRET_NEEDLES.some(needle => lower.includes(needle))) return {text, count: 0}
+      let count = 0
+      let out = ''
+      let cursor = 0
+      prefix.lastIndex = 0
+      for (;;) {
+        const match = prefix.exec(text)
+        if (match === null) break
+        const name = match[1] ?? ''
+        const opener = match[2]
+        const valueStart = match.index + match[0].length
+        if (text.startsWith(REDACTION, valueStart)) continue
+        // The identifier the name belongs to: what precedes the secret word (`max_` of `max_tokens`) counts.
+        let from = match.index
+        while (from > 0 && match.index - from < MAX_IDENTIFIER_CHARS && isIdentifierCode(text.charCodeAt(from - 1)))
+          from -= 1
+        const counter = isCounterName(text.slice(from, match.index) + name)
+
+        let valueEnd = valueStart
+        if (opener === undefined) {
+          while (valueEnd < text.length && !UNQUOTED_STOP.has(text.charCodeAt(valueEnd))) valueEnd += 1
+          const value = text.slice(valueStart, valueEnd)
+          if (counter && isShortNumber(value)) continue
+          // A counter name keeps the old floor of three characters; a credential name has none.
+          if (value.length < (counter ? 3 : 1)) continue
+        } else {
+          valueEnd = closingQuote(text, valueStart, opener)
+          if (valueEnd === valueStart) continue
+        }
+        if (valueStart < cursor) continue
+        out += text.slice(cursor, valueStart) + REDACTION
+        cursor = valueEnd
+        prefix.lastIndex = Math.max(prefix.lastIndex, valueEnd)
+        count += 1
+      }
+      return count === 0 ? {text, count: 0} : {text: out + text.slice(cursor), count}
+    },
+  }
+}
+
+/**
+ * Where a quoted value that starts at `from` ends: the index of its closing quote, or the end of the line when none is
+ * found within the bound. `opener` is the quote and any backslash before it (`"`, `'`, `\"`, `\'`).
+ */
+function closingQuote(text: string, from: number, opener: string): number {
+  const quote = opener.endsWith('"') ? 0x22 : 0x27
+  const escapedLayer = opener.length === 2
+  const limit = Math.min(text.length, from + MAX_QUOTED_VALUE_CHARS)
+  let index = from
+  while (index < limit) {
+    const code = text.charCodeAt(index)
+    if (code === 0x5c) {
+      let run = 1
+      while (text.charCodeAt(index + run) === 0x5c) run += 1
+      const next = text.charCodeAt(index + run)
+      if (escapedLayer) {
+        // A single backslash before the quote closes the value; a longer run escapes the quote and is skipped with it.
+        if (run === 1 && next === quote) return index
+        index += next === quote ? run + 1 : run
+      } else {
+        // An odd run escapes the character after it; an even run is escaped backslashes only.
+        index += run + (run % 2 === 1 ? 1 : 0)
+      }
+      continue
+    }
+    if (!escapedLayer && code === quote) return index
+    index += 1
+  }
+  // Not closed within the bound: redact to the end of the line.
+  const newline = text.indexOf('\n', from)
+  return newline === -1 ? text.length : newline
+}
 
 /** URL userinfo: everything between `scheme://` and the `@`. */
 const URL_USERINFO = /([a-z][a-z0-9+.-]{1,15}:\/\/)[^\s/@"'\\]{1,256}@/gi
@@ -315,7 +430,7 @@ export const SCRUB_PATTERNS: readonly ScrubPattern[] = [
     'bearer',
     'sig=',
   ]),
-  replacing('name-value-pair', NAME_VALUE, name => `${name}${REDACTION}`, SECRET_NEEDLES),
+  nameValuePattern(),
 ]
 
 /** Env names whose value the literal pass removes. `OPENCODE_PASSWORD` is the server's own credential. */
@@ -597,6 +712,89 @@ function safeScrub(scrubber: Scrubber, text: string): ScrubResult {
   }
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Structured redaction
+// ---------------------------------------------------------------------------------------------------------------------
+
+/** A key whose name says it holds a credential. Same words as the text patterns. */
+const SENSITIVE_KEY = new RegExp(SECRET_WORDS, 'i')
+const MAX_KEY_CHARS = 200
+/** Nodes visited and depth reached in one structured pass. Past either, the attribute is omitted, not exported. */
+const MAX_REDACTION_NODES = 500_000
+const MAX_REDACTION_DEPTH = 64
+/** A string that is itself JSON is parsed (and re-serialized if anything in it was redacted) up to this length. */
+const MAX_EMBEDDED_JSON_CHARS = 256 * 1024
+
+/** Whether a key's value is removed whole. A counter or limit name keeps a number. */
+function isSensitiveKey(key: string, value: unknown): boolean {
+  const name = key.slice(0, MAX_KEY_CHARS)
+  if (!SENSITIVE_KEY.test(name)) return false
+  if (isCounterName(name) && (typeof value === 'number' || (typeof value === 'string' && isShortNumber(value))))
+    return false
+  return true
+}
+
+interface RedactionWalk {
+  nodes: number
+  redactions: number
+}
+
+class RedactionBudgetError extends Error {}
+
+function redactValue(value: unknown, depth: number, walk: RedactionWalk): unknown {
+  walk.nodes += 1
+  if (walk.nodes > MAX_REDACTION_NODES || depth > MAX_REDACTION_DEPTH) throw new RedactionBudgetError()
+  if (typeof value === 'string') return redactEmbeddedJson(value, depth, walk)
+  if (Array.isArray(value)) return value.map(item => redactValue(item, depth + 1, walk))
+  if (typeof value === 'object' && value !== null) {
+    const copy: Record<string, unknown> = {}
+    for (const key of Object.keys(value)) {
+      if (key === '__proto__') continue
+      const child = (value as Record<string, unknown>)[key]
+      if (isSensitiveKey(key, child)) {
+        walk.redactions += 1
+        copy[key] = REDACTION
+      } else {
+        copy[key] = redactValue(child, depth + 1, walk)
+      }
+    }
+    return copy
+  }
+  return value
+}
+
+/** A string that holds JSON (a tool argument carrying a JSON document): its sensitive keys are removed too, at any depth. */
+function redactEmbeddedJson(text: string, depth: number, walk: RedactionWalk): string {
+  if (text.length < 2 || text.length > MAX_EMBEDDED_JSON_CHARS) return text
+  const first = text.trimStart()[0]
+  if (first !== '{' && first !== '[') return text
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return text
+  }
+  if (typeof parsed !== 'object' || parsed === null) return text
+  const before = walk.redactions
+  const redacted = redactValue(parsed, depth + 1, walk)
+  return walk.redactions === before ? text : JSON.stringify(redacted)
+}
+
+/**
+ * Removes the entire value of every key whose name says it is a credential, at any depth, whatever its type (string,
+ * number, array, object, boolean, null), including inside a string that holds JSON. Runs before the text patterns, which
+ * only ever see what is left. Undefined when the structure is too large or deep to walk: the caller omits the attribute.
+ */
+export function redactSensitiveKeys(value: unknown): {readonly value: unknown; readonly count: number} | undefined {
+  const walk: RedactionWalk = {nodes: 0, redactions: 0}
+  try {
+    const redacted = redactValue(value, 0, walk)
+    return {value: redacted, count: walk.redactions}
+  } catch {
+    return undefined
+  }
+}
+
 function serialize(value: unknown): string | undefined {
   try {
     return JSON.stringify(value)
@@ -621,7 +819,14 @@ export function scrubSpan(
 
   for (const [name, value] of Object.entries(span.attributes)) {
     if (isContentAttribute(value)) {
-      const json = serialize(value.value)
+      const walked = redactSensitiveKeys(value.value)
+      if (walked === undefined) {
+        // Too large or too deep to walk, or not serializable at all (a cycle shows up as depth): say which.
+        tally.omitted.push(`${name}:${serialize(value.value) === undefined ? 'unserializable' : 'scrub-failed'}`)
+        continue
+      }
+      tally.redactions += walked.count
+      const json = serialize(walked.value)
       if (json === undefined) {
         tally.omitted.push(`${name}:unserializable`)
         continue
