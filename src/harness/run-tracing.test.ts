@@ -110,6 +110,11 @@ vi.mock('../services/github/review-delivery-receipt.js', () => ({
 vi.mock('./phases/routing.js', () => ({runRouting: vi.fn()}))
 vi.mock('./phases/session-prep.js', () => ({runSessionPrep: vi.fn()}))
 
+vi.mock('./phases/trace-relay-bundle.js', () => ({
+  TRACE_RELAY_BUNDLE_FILE: 'trace-relay.js',
+  checkTraceRelayBundle: vi.fn(async () => true),
+}))
+
 // The real supervisor stays available (one test starts it against a launcher that cannot work); every other test replaces it.
 vi.mock('./phases/trace-relay-process.js', async importOriginal => ({
   ...(await importOriginal<typeof import('./phases/trace-relay-process.js')>()),
@@ -379,6 +384,8 @@ describe('run with tracing', () => {
     loggers.all.length = 0
     const core = await import('@actions/core')
     vi.mocked(core.getInput).mockImplementation(() => '')
+    const {checkTraceRelayBundle} = await import('./phases/trace-relay-bundle.js')
+    vi.mocked(checkTraceRelayBundle).mockResolvedValue(true)
     const {startTraceRelayProcess} = await import('./phases/trace-relay-process.js')
     const actual = await vi.importActual<typeof import('./phases/trace-relay-process.js')>(
       './phases/trace-relay-process.js',
@@ -422,7 +429,68 @@ describe('run with tracing', () => {
 
     const call = vi.mocked(startTraceRelayProcess).mock.calls[0]?.[0]
     expect(call?.config).toEqual(TRACE_RELAY)
-    expect(Object.keys(call ?? {}).sort()).toEqual(['config', 'logger'])
+    expect(Object.keys(call ?? {}).sort()).toEqual(['bundleCheck', 'config', 'logger'])
+  })
+
+  it.each([
+    ['without isolation', undefined, false],
+    ['with isolation', 'sandbox', true],
+  ] as const)(
+    'hands the supervisor the bundle check, for the mode of the run (%s)',
+    async (_name, withSandbox, isolated) => {
+      const {startTraceRelayProcess} = await import('./phases/trace-relay-process.js')
+      const {checkTraceRelayBundle} = await import('./phases/trace-relay-bundle.js')
+      const core = await import('@actions/core')
+      if (isolated) vi.mocked(core.getInput).mockImplementation(name => (name === 'isolate-agent' ? 'true' : ''))
+      await arrange(withSandbox === undefined ? {} : {sandbox: fakeSandbox().sandbox})
+      vi.mocked(startTraceRelayProcess).mockResolvedValue({success: true, data: fakeRelay().relay})
+
+      await run({traceRelay: TRACE_RELAY})
+
+      // the check is not run by the run itself: the supervisor asks it, once the config is accepted
+      expect(vi.mocked(checkTraceRelayBundle)).not.toHaveBeenCalled()
+      const bundleCheck = vi.mocked(startTraceRelayProcess).mock.calls[0]?.[0].bundleCheck
+      expect(await bundleCheck?.()).toBe(true)
+      expect(vi.mocked(checkTraceRelayBundle)).toHaveBeenCalledWith({isolated})
+    },
+  )
+
+  it('runs on untraced and without a relay when the bundle check fails, with one fixed warning and no spawn', async () => {
+    // #given the real supervisor, and a bundle that is not fit to run
+    const {checkTraceRelayBundle} = await import('./phases/trace-relay-bundle.js')
+    const {runCacheRestore} = await import('./phases/cache-restore.js')
+    const {runExecute} = await import('./phases/execute.js')
+    const {runCleanup} = await import('./phases/cleanup.js')
+    const core = await import('@actions/core')
+    vi.mocked(checkTraceRelayBundle).mockResolvedValue(false)
+    const {sandbox, registerSignalStop} = fakeSandbox()
+    await arrange({sandbox})
+
+    // #when an isolated run asks for tracing
+    const exitCode = await run({traceRelay: TRACE_RELAY})
+
+    // #then it went on exactly as an untraced run: no stop registered, the server started, nothing declined
+    expect(exitCode).toBe(0)
+    expect(registerSignalStop).not.toHaveBeenCalled()
+    expect(vi.mocked(runCacheRestore)).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(runExecute)).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(runCleanup).mock.calls[0]?.[0]).toMatchObject({skipSessionPersistence: false})
+    expect(vi.mocked(core.setFailed)).not.toHaveBeenCalled()
+    const warnings = everyLogged('warning').filter(call => /trace/i.test(String(call[0])))
+    expect(warnings).toEqual([['The trace relay did not start; this run is not traced', {reason: 'bundle-invalid'}]])
+    for (const canary of [ENDPOINT_HOST_CANARY, CREDENTIAL_CANARY, 'Authorization']) {
+      expect(allLoggedText()).not.toContain(canary)
+    }
+  })
+
+  it('never checks the relay bundle when tracing is off, in an isolated run or not', async () => {
+    const {checkTraceRelayBundle} = await import('./phases/trace-relay-bundle.js')
+    const {sandbox} = fakeSandbox()
+    await arrange({sandbox})
+
+    await run()
+
+    expect(vi.mocked(checkTraceRelayBundle)).not.toHaveBeenCalled()
   })
 
   it('starts no relay process when tracing is off', async () => {

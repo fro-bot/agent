@@ -51,6 +51,7 @@ import {removeRepoSkillsStaging, runRepoSkills} from './phases/repo-skills.js'
 import {runReviewReconciliation} from './phases/review-reconciliation.js'
 import {runRouting} from './phases/routing.js'
 import {runSessionPrep} from './phases/session-prep.js'
+import {checkTraceRelayBundle} from './phases/trace-relay-bundle.js'
 import {startTraceRelayProcess, type TraceRelayConfig, type TraceRelayProcess} from './phases/trace-relay-process.js'
 
 const KEY_PROXY_CRASHED_DECLINE_REASON =
@@ -388,6 +389,8 @@ export async function run(options: RunOptions = {}): Promise<number> {
       const started = await startTraceRelayProcess({
         config: options.traceRelay,
         logger: createLogger({phase: 'trace-relay'}),
+        // The relay bundle is optional, so only a run that traces looks at it (the supervisor asks, before it spawns).
+        bundleCheck: async () => checkTraceRelayBundle({isolated: isolationRequested}),
       })
       if (started.success) {
         const relay = started.data
