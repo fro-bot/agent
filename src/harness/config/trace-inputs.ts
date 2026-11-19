@@ -69,11 +69,11 @@ function hasControlOrReplacement(value: string): boolean {
   return false
 }
 
-function mask(io: TraceInputIo, value: string): void {
+function mask(io: Pick<TraceInputIo, 'mask'>, value: string): void {
   if (value.length > 0) io.mask(value)
 }
 
-function maskLong(io: TraceInputIo, value: string): void {
+function maskLong(io: Pick<TraceInputIo, 'mask'>, value: string): void {
   if (value.length >= MIN_MASKED_VALUE_LENGTH) io.mask(value)
 }
 
@@ -81,7 +81,7 @@ function maskLong(io: TraceInputIo, value: string): void {
  * The credential-shaped parts of a header value: for `Basic`, the encoded part, the decoded `user:password` and the
  * password; for `Bearer`, the token. A part is registered only when it is eight characters or more.
  */
-function maskDerivedForms(io: TraceInputIo, value: string): void {
+function maskDerivedForms(io: Pick<TraceInputIo, 'mask'>, value: string): void {
   const match = BASIC_OR_BEARER.exec(value)
   if (match === null) return
   const scheme = (match[1] ?? '').toLowerCase()
@@ -98,7 +98,7 @@ function maskDerivedForms(io: TraceInputIo, value: string): void {
 }
 
 /** Registers everything the endpoint and the headers could appear as, before any of it is checked. */
-function maskInputs(io: TraceInputIo, endpoint: string, headers: string): void {
+function maskInputs(io: Pick<TraceInputIo, 'mask'>, endpoint: string, headers: string): void {
   mask(io, endpoint)
   mask(io, headers.trim())
   for (const line of headers.split(/\r?\n/)) {
