@@ -9,7 +9,7 @@ import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {postBatch, rawExchange, startHttpUpstream} from '../../../packages/runtime/src/agent/trace-relay-test-kit.js'
 import {TRACE_RELAY_COUNTS_HEADER} from '../../../packages/runtime/src/agent/trace-relay-wire.js'
 import {createMockLogger, serializeLoggerCalls, unwrapErr, unwrapOk} from '../../shared/test-helpers.js'
-import {startTraceRelayProcess} from './trace-relay-process.js'
+import {startTraceRelayProcess, TRACE_RELAY_BUNDLE_CHECK_TIMEOUT_MS} from './trace-relay-process.js'
 
 const CREDENTIAL = 'Basic c3VwZXJ2aXNvci1jYW5hcnktMDA0Mjpzcw=='
 const COLLECTOR_HOST_CANARY = 'collector-canary.example.com'
@@ -360,6 +360,45 @@ describe('trace-relay-process', () => {
       ])
       expect(loggedAt(logger, 'info')).toEqual([])
       expect(serializeLoggerCalls(logger)).not.toContain(COLLECTOR_HOST_CANARY)
+    })
+
+    it('treats a bundle check that throws synchronously as a failed one: nothing spawned, one fixed warning', async () => {
+      const {started, logger} = await startWith(
+        {command: path.join(dir, 'must-not-spawn'), args: []},
+        {
+          bundleCheck: () => {
+            throw new Error(`sync failure naming ${COLLECTOR_HOST_CANARY}`)
+          },
+        },
+      )
+
+      expect(unwrapErr(started).kind).toBe('bundle-invalid')
+      expect(loggedAt(logger, 'warning')).toEqual([
+        ['The trace relay did not start; this run is not traced', {reason: 'bundle-invalid'}],
+      ])
+      expect(serializeLoggerCalls(logger)).not.toContain(COLLECTOR_HOST_CANARY)
+    })
+
+    it('does not wait for a bundle check that never settles: it is cut at its bound, with nothing spawned', async () => {
+      const started = Date.now()
+      const {started: result, logger} = await startWith(
+        {command: path.join(dir, 'must-not-spawn'), args: []},
+        {
+          timeouts: {readyMs: 5000, exitGraceMs: 1500, killConfirmMs: 1500, bundleCheckMs: 100},
+          bundleCheck: async () => new Promise<never>(() => undefined),
+        },
+      )
+
+      expect(unwrapErr(result).kind).toBe('bundle-invalid')
+      expect(Date.now() - started).toBeLessThan(2000)
+      expect(loggedAt(logger, 'warning')).toEqual([
+        ['The trace relay did not start; this run is not traced', {reason: 'bundle-invalid'}],
+      ])
+    })
+
+    it('has a default bound on the bundle check of a few seconds', () => {
+      expect(TRACE_RELAY_BUNDLE_CHECK_TIMEOUT_MS).toBeGreaterThanOrEqual(1000)
+      expect(TRACE_RELAY_BUNDLE_CHECK_TIMEOUT_MS).toBeLessThanOrEqual(5000)
     })
 
     it('does not run the bundle check for a config it refuses, and runs it once, before the spawn, for one it accepts', async () => {

@@ -58,9 +58,19 @@ export interface TraceRelayProcessTimeouts {
   readonly exitGraceMs: number
   /** After SIGKILL, to observe the exit. */
   readonly killConfirmMs: number
+  /** For the bundle check to answer; past it the check counts as failed. */
+  readonly bundleCheckMs: number
 }
 
-const DEFAULT_TIMEOUTS: TraceRelayProcessTimeouts = {readyMs: 5000, exitGraceMs: 2000, killConfirmMs: 2000}
+/** Longest the bundle check may hold up the server start. A filesystem walk takes milliseconds; this only bounds a hang. */
+export const TRACE_RELAY_BUNDLE_CHECK_TIMEOUT_MS = 3000
+
+const DEFAULT_TIMEOUTS: TraceRelayProcessTimeouts = {
+  readyMs: 5000,
+  exitGraceMs: 2000,
+  killConfirmMs: 2000,
+  bundleCheckMs: TRACE_RELAY_BUNDLE_CHECK_TIMEOUT_MS,
+}
 
 /** After the exit, longest to wait for the child's stdout to drain, so its report line is read. */
 const STDOUT_DRAIN_MS = 500
@@ -135,6 +145,24 @@ function killProcessGroup(pid: number, signal: NodeJS.Signals): void {
   }
 }
 
+/**
+ * Runs the bundle check inside its own `try`, so a synchronous throw and a rejection are the same failed check, and bounds it,
+ * so a check that never settles cannot hold up the server start. True only when it answered true in time.
+ */
+async function runBundleCheck(check: () => Promise<boolean>, boundMs: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    const timedOut = new Promise<false>(resolve => {
+      timer = setTimeout(() => resolve(false), boundMs)
+    })
+    return (await Promise.race([check(), timedOut])) === true
+  } catch {
+    return false
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 async function settlesWithin(promise: Promise<unknown>, ms: number): Promise<boolean> {
   let timer: ReturnType<typeof setTimeout> | undefined
   const timedOut = new Promise<false>(resolve => {
@@ -175,7 +203,7 @@ export async function startTraceRelayProcess(
 
   if (options.bundleCheck !== undefined) {
     // The bundle is optional for the Action as a whole, so it is checked only now that a relay is about to start.
-    const usable = await options.bundleCheck().catch(() => false)
+    const usable = await runBundleCheck(options.bundleCheck, timeouts.bundleCheckMs)
     if (!usable) {
       warnNotStarted('bundle-invalid')
       return err({kind: 'bundle-invalid'})
