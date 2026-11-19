@@ -5,6 +5,7 @@ import {describe, expect, it} from 'vitest'
 
 import {createScrubber, MARKER} from './content.js'
 import {GENAI_SEMCONV_REVISION, toExportSpan, toPendingSpan} from './genai-attributes.js'
+import {omittedContent, snapshotPrompt, snapshotRequest, snapshotToolArguments, snapshotToolResult} from './snapshot.js'
 import {recordedFixtures} from './turn-model.fixtures.js'
 import {replay} from './turn-model.testing.js'
 
@@ -535,5 +536,102 @@ describe('the exported payload', () => {
     // #given / #when / #then
     expect(GENAI_SEMCONV_REVISION).toBe('open-telemetry/semantic-conventions-genai@76e0c19')
     expect(toPendingSpan(chat()).attributes['gen_ai.operation.name']).toBe('chat')
+  })
+})
+
+describe('what a hook-time snapshot could not take', () => {
+  it('names each omitted request field on the span, with the reason, and sets no attribute for it', () => {
+    // #given a request whose snapshot found no room, and one whose system text was over its ceiling
+    const noRoom = snapshotRequest(
+      {system: [{text: 's'}], messages: [], tools: {}},
+      {
+        ledger: {
+          room: () => undefined,
+          hold: () => {},
+          release: () => {},
+          refuse: () => {},
+          stats: () => ({pending: 0, pendingChars: 0, refused: 0}),
+        },
+      },
+    )
+    const bigSystem = snapshotRequest(
+      {system: [{text: 'S'.repeat(100)}], messages: [{role: 'user', content: 'hi'}]},
+      {limits: {systemChars: 10}},
+    )
+
+    // #when
+    const first = exported(chat({request: noRoom}))
+    const second = exported(chat({request: bigSystem}))
+
+    // #then the structure is intact, the content attributes are absent, and the markers say what and why
+    expect(first.attributes['gen_ai.operation.name']).toBe('chat')
+    expect(first.attributes['gen_ai.input.messages']).toBeUndefined()
+    expect(first.attributes[MARKER.omitted]).toEqual([
+      'gen_ai.system_instructions:pending-bound',
+      'gen_ai.tool.definitions:pending-bound',
+      'gen_ai.input.messages:pending-bound',
+    ])
+    expect(second.attributes['gen_ai.system_instructions']).toBeUndefined()
+    expect(second.attributes[MARKER.omitted]).toEqual(['gen_ai.system_instructions:snapshot-bound'])
+    expect(parse(second, 'gen_ai.input.messages')).toEqual([{role: 'user', parts: [{type: 'text', content: 'hi'}]}])
+  })
+
+  it('states how many of the oldest messages the snapshot left out, added to any the bound drops later', () => {
+    // #given a snapshot that dropped six messages for its ceiling
+    const messages = Array.from({length: 10}, (_, index) => ({
+      role: 'user',
+      content: [{type: 'text', text: `m${index}:${'z'.repeat(96)}`}],
+    }))
+    const snapshot = snapshotRequest({messages}, {limits: {requestChars: 430}})
+
+    // #when
+    const span = exported(chat({request: snapshot}))
+
+    // #then
+    expect(span.attributes[MARKER.dropped('gen_ai.input.messages')]).toBe(6)
+    expect((parse(span, 'gen_ai.input.messages') as unknown[]).length).toBe(4)
+  })
+
+  it('marks an omitted tool argument and result, and a prompt that was over its ceiling', () => {
+    // #given snapshots that were omitted
+    const args = snapshotToolArguments({a: 'x'.repeat(100)}, {limits: {valueChars: 10}})
+    const result = snapshotToolResult({content: 'x'.repeat(100)}, {limits: {valueChars: 10}})
+    const prompt = snapshotPrompt({text: 'x'.repeat(100)}, {limits: {valueChars: 10}})
+
+    // #when
+    const toolSpan = exported(tool({input: args, result}))
+    const invokeSpan = exported(invoke({prompts: [{messageId: 'm', at: 1, content: prompt, midTurn: false}]}))
+
+    // #then
+    expect(toolSpan.attributes['gen_ai.tool.call.arguments']).toBeUndefined()
+    expect(toolSpan.attributes['gen_ai.tool.call.result']).toBeUndefined()
+    expect(toolSpan.attributes[MARKER.omitted]).toEqual([
+      'gen_ai.tool.call.arguments:snapshot-bound',
+      'gen_ai.tool.call.result:snapshot-bound',
+    ])
+    expect(invokeSpan.attributes['gen_ai.input.messages']).toBeUndefined()
+    expect(invokeSpan.attributes[MARKER.omitted]).toEqual(['gen_ai.input.messages:snapshot-bound'])
+    expect(omittedContent('unreadable').reason).toBe('unreadable')
+  })
+
+  it('exports a snapshot’s content exactly as it exported the raw input', () => {
+    // #given the same request as a raw hook input and as a snapshot of it
+    const raw = {
+      system: [{text: 'sys'}],
+      messages: [
+        {role: 'user', content: [{type: 'text', text: 'hi'}]},
+        {role: 'assistant', content: [{type: 'tool-call', id: 'c', name: 'read', input: {path: 'a'}}]},
+      ],
+      tools: {read: {description: 'd', input: {type: 'object'}}},
+    }
+
+    // #when
+    const fromRaw = exported(chat({request: raw}))
+    const fromSnapshot = exported(chat({request: snapshotRequest(raw)}))
+
+    // #then
+    for (const name of ['gen_ai.system_instructions', 'gen_ai.tool.definitions', 'gen_ai.input.messages']) {
+      expect(fromSnapshot.attributes[name]).toBe(fromRaw.attributes[name])
+    }
   })
 })

@@ -8,6 +8,9 @@
  */
 
 import type {ErrorInfo, Observation, RequestKind, Usage} from './observation.js'
+import type {SnapshotContext} from './snapshot.js'
+
+import {snapshotPrompt, snapshotRequest, snapshotToolArguments, snapshotToolResult} from './snapshot.js'
 
 type Json = Record<string, unknown>
 
@@ -16,15 +19,6 @@ const asRecord = (value: unknown): Json | undefined => (isRecord(value) ? value 
 const asString = (value: unknown): string | undefined => (typeof value === 'string' ? value : undefined)
 const asNumber = (value: unknown): number | undefined =>
   typeof value === 'number' && Number.isFinite(value) ? value : undefined
-
-/** A rough byte size of a value, for the buffer bound. Never throws, never walks deeper than it must. */
-export function approximateBytes(value: unknown): number {
-  try {
-    return JSON.stringify(value)?.length ?? 0
-  } catch {
-    return 0
-  }
-}
 
 function modelOf(value: unknown): {model: string | undefined; provider: string | undefined} {
   const model = asRecord(value)
@@ -65,18 +59,19 @@ function childOfSubagent(tool: string, metadata: unknown): string | undefined {
 }
 
 /**
- * One hook call as an observation. `name` is `session.<hook>` or `tool.<hook>`. The payload is read, never kept, except
- * the request and prompt content the span will carry.
+ * One hook call as an observation. `name` is `session.<hook>` or `tool.<hook>`.
+ *
+ * Nothing of the payload is kept. What the span will carry (request, prompt, tool arguments and result) is taken here, as
+ * an immutable bounded snapshot of the named fields (`snapshot.ts`), so a later edit to the hook's input by the host or by
+ * another plugin cannot change the hook-time view. Everything else is read into primitives. The work is a walk over the
+ * named fields: strings are shared, never copied or serialized.
  */
 export function observeHook(
   name: string,
   payload: unknown,
   at: number,
-  options: {readonly measure?: boolean} = {},
+  snapshot: SnapshotContext = {},
 ): Observation | undefined {
-  // Sizing serializes the whole payload, which a host-path handler must not do: it is left to whoever consumes the
-  // observation (the recorder measures here; the tracing pipeline measures after the hook has returned).
-  const measure = options.measure !== false
   const event = asRecord(payload)
   if (event === undefined) return undefined
   const sessionId = asString(event.sessionID)
@@ -85,21 +80,14 @@ export function observeHook(
   if (name === 'session.prompt') {
     const messageId = asString(event.messageID)
     if (messageId === undefined) return undefined
-    return {
-      kind: 'prompt',
-      at,
-      sessionId,
-      messageId,
-      delivery: asString(event.delivery),
-      content: event.prompt,
-      ...(measure ? {bytes: approximateBytes(event.prompt)} : {}),
-    }
+    const content = snapshotPrompt(event.prompt, snapshot)
+    return {kind: 'prompt', at, sessionId, messageId, delivery: asString(event.delivery), content, bytes: content.size}
   }
 
   const requestKind = name.startsWith('session.') ? REQUEST_HOOKS[name.slice('session.'.length)] : undefined
   if (requestKind !== undefined) {
     const {model, provider} = modelOf(event.model)
-    const content = {system: event.system, messages: event.messages, tools: event.tools, options: event.options}
+    const content = snapshotRequest({system: event.system, messages: event.messages, tools: event.tools}, snapshot)
     return {
       kind: 'request',
       at,
@@ -109,7 +97,7 @@ export function observeHook(
       model,
       provider,
       content,
-      ...(measure ? {bytes: approximateBytes(content)} : {}),
+      bytes: content.size,
     }
   }
 
@@ -137,7 +125,7 @@ export function observeHook(
       tool,
       messageId: asString(event.messageID),
       agent: asString(event.agent),
-      input: event.input,
+      input: snapshotToolArguments(event.input, snapshot),
     }
   }
 
@@ -155,8 +143,8 @@ export function observeHook(
       callId,
       tool,
       status: failed ? 'error' : 'completed',
-      result: failed ? undefined : event.result,
-      error: failed ? event.error : undefined,
+      result: failed ? undefined : snapshotToolResult(event.result, snapshot),
+      error: failed ? errorOf(event.error) : undefined,
       interrupted: asRecord(error?.metadata)?.interrupted === true,
       childSessionId: childOfSubagent(tool, result?.metadata),
     }
@@ -348,7 +336,7 @@ export async function registerObservers(
   host: ObserverHost,
   emit: (observation: Observation) => void,
   now: () => number = Date.now,
-  options: {readonly measure?: boolean} = {},
+  snapshot: SnapshotContext = {},
 ): Promise<() => void> {
   const deliver = (observation: Observation | undefined): void => {
     if (observation === undefined) return
@@ -361,7 +349,7 @@ export async function registerObservers(
   const sessionHook = async (name: SessionHookName): Promise<void> => {
     await host.session.hook(name, event => {
       try {
-        deliver(observeHook(`session.${name}`, event, now(), options))
+        deliver(observeHook(`session.${name}`, event, now(), snapshot))
       } catch {
         // See above.
       }
@@ -371,7 +359,7 @@ export async function registerObservers(
   for (const name of ['execute.before', 'execute.after'] as const) {
     await host.tool.hook(name, event => {
       try {
-        deliver(observeHook(`tool.${name}`, event, now(), options))
+        deliver(observeHook(`tool.${name}`, event, now(), snapshot))
       } catch {
         // See above.
       }

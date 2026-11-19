@@ -6,6 +6,13 @@ import {describe, expect, it, vi} from 'vitest'
 
 import {createScrubber} from './content.js'
 import {createTracePipeline, randomIds} from './pipeline.js'
+import {
+  createSnapshotLedger,
+  snapshotPrompt,
+  snapshotRequest,
+  snapshotToolArguments,
+  snapshotToolResult,
+} from './snapshot.js'
 import {recordedFixtures} from './turn-model.fixtures.js'
 import {replay} from './turn-model.testing.js'
 
@@ -193,5 +200,88 @@ describe('the pipeline', () => {
     // #then the secret is in no span
     expect(JSON.stringify(spans)).not.toContain('aB3dE5fG7hJ9')
     expect(JSON.stringify(spans)).toContain('[REDACTED]')
+  })
+})
+
+describe('the snapshot ledger in the pipeline', () => {
+  /** The text turn, with each content field replaced by a real snapshot held in `ledger`, as the hook handlers make them. */
+  const snapshotted = (ledger: ReturnType<typeof createSnapshotLedger>): Observation[] =>
+    fixture('tool-success-and-error').map(observation => {
+      const context = {ledger}
+      if (observation.kind === 'prompt') return {...observation, content: snapshotPrompt({text: 'a prompt'}, context)}
+      if (observation.kind === 'request') {
+        return {
+          ...observation,
+          content: snapshotRequest({system: [{text: 's'}], messages: [{role: 'user', content: 'hi'}]}, context),
+        }
+      }
+      if (observation.kind === 'tool.before')
+        return {...observation, input: snapshotToolArguments({path: 'a'}, context)}
+      // As the hook handler does: a failed call carries no result snapshot.
+      if (observation.kind === 'tool.after') {
+        const result = observation.status === 'completed' ? snapshotToolResult({content: 'body'}, context) : undefined
+        return {...observation, result}
+      }
+      return observation
+    })
+
+  it('frees every snapshot once the spans that carried them are exported', () => {
+    // #given a ledger and a recorded turn whose content fields are held snapshots
+    const ledger = createSnapshotLedger()
+    const {sink} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber, ledger})
+    const observations = snapshotted(ledger)
+    for (const observation of observations) pipeline.observe(observation)
+    expect(ledger.stats().pending).toBeGreaterThan(0)
+
+    // #when the pipeline stops and every record has been exported
+    pipeline.stop()
+
+    // #then nothing is left pending
+    expect(ledger.stats()).toMatchObject({pending: 0, pendingChars: 0})
+  })
+
+  it('frees the snapshot of an observation it discards for lack of inbox room', () => {
+    // #given an inbox of one
+    const ledger = createSnapshotLedger()
+    const {sink} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber, ledger, limits: {maxInbox: 1}})
+    const first = {
+      kind: 'prompt',
+      at: 1,
+      sessionId: 's',
+      messageId: 'm1',
+      content: snapshotPrompt({text: 'one'}, {ledger}),
+    } as const
+    const second = {
+      kind: 'prompt',
+      at: 2,
+      sessionId: 's',
+      messageId: 'm2',
+      content: snapshotPrompt({text: 'two'}, {ledger}),
+    } as const
+
+    // #when a second observation finds the inbox full
+    pipeline.observe(first)
+    pipeline.observe(second)
+
+    // #then its snapshot was freed at once; the first is still pending
+    expect(pipeline.stats().observationsDropped).toBe(1)
+    expect(ledger.stats().pending).toBe(1)
+    pipeline.stop()
+  })
+
+  it('frees the snapshots of a record it drops for lack of room', () => {
+    // #given room for one record
+    const ledger = createSnapshotLedger()
+    const {sink} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber, ledger, limits: {maxRecords: 1}})
+
+    // #when a recording that yields several records is stopped
+    for (const observation of snapshotted(ledger)) pipeline.observe(observation)
+    pipeline.stop()
+
+    // #then dropped and exported records alike gave their snapshots back
+    expect(ledger.stats()).toMatchObject({pending: 0, pendingChars: 0})
   })
 })

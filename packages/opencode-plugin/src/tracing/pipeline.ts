@@ -1,10 +1,14 @@
 /**
  * The path from a hook call to an exported span, kept off the host's request path.
  *
- * A hook handler calls `observe`, which appends one already-normalized observation to a bounded inbox and returns. Sizing,
- * the turn model, attribute mapping, scrubbing and export all run later, from `setImmediate`, a few milliseconds at a
- * time, so a large request snapshot never delays the model call that fired the hook. The content a request carries is a
- * reference to the host's own arrays; nothing here writes to a hook's arguments, and nothing serializes them in the hook.
+ * A hook handler normalizes its payload into an observation, which already carries an immutable bounded snapshot of the
+ * named content fields (`snapshot.ts`), and calls `observe`, which appends it to a bounded inbox and returns. The turn
+ * model, attribute mapping, scrubbing, bounding, serialization and export all run later, from `setImmediate`, a few
+ * milliseconds at a time, so a large request never delays the model call that fired the hook. Nothing here holds a
+ * reference to a hook's input, so a later edit to it cannot change what a span records.
+ *
+ * Snapshots are counted by a ledger (count and characters, apart from the exporter's queue) and freed when the span they
+ * belong to is exported or dropped, or when their observation is discarded.
  *
  * No SDK import: the exporter is an interface, so the whole path is testable without the OpenTelemetry packages.
  */
@@ -12,11 +16,11 @@
 import type {ScrubbedSpan, Scrubber} from './content.js'
 import type {Observation} from './observation.js'
 import type {ActionIdentity} from './settings.js'
+import type {SnapshotLedger} from './snapshot.js'
 import type {IdSource, SpanRecord, TurnModelLimits} from './turn-model.js'
 
 import {randomBytes} from 'node:crypto'
 import {toExportSpan} from './genai-attributes.js'
-import {approximateBytes} from './record-observations.js'
 import {createTurnModel} from './turn-model.js'
 
 export interface SpanSink {
@@ -43,6 +47,8 @@ export interface TracePipelineOptions {
   readonly scrubber: Scrubber
   /** Action mode only. */
   readonly identity?: ActionIdentity | undefined
+  /** Frees each snapshot as its span leaves the pipeline. Absent: nothing is counted. */
+  readonly ledger?: SnapshotLedger | undefined
   readonly now?: () => number
   readonly ids?: IdSource
   readonly modelLimits?: Partial<TurnModelLimits>
@@ -86,16 +92,32 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
   let recordsFailed = 0
   let tick: NodeJS.Timeout | undefined
 
-  function sized(observation: Observation): Observation {
-    if (observation.bytes !== undefined) return observation
-    if (observation.kind !== 'prompt' && observation.kind !== 'request') return observation
-    return {...observation, bytes: approximateBytes(observation.content)}
+  /** Every snapshot a record holds: the request, the prompts, a tool's arguments and its result. */
+  function release(record: SpanRecord): void {
+    const {ledger} = options
+    if (ledger === undefined) return
+    if (record.kind === 'chat') ledger.release(record.request)
+    else if (record.kind === 'execute_tool') {
+      ledger.release(record.input)
+      ledger.release(record.result)
+    } else for (const prompt of record.prompts) ledger.release(prompt.content)
+    if (record.kind === 'chat') for (const call of record.toolCalls) ledger.release(call.input)
+  }
+
+  /** An observation that never reaches the model gives its snapshot back. */
+  function releaseObservation(observation: Observation): void {
+    const {ledger} = options
+    if (ledger === undefined || typeof observation !== 'object' || observation === null) return
+    if (observation.kind === 'prompt' || observation.kind === 'request') ledger.release(observation.content)
+    else if (observation.kind === 'tool.before') ledger.release(observation.input)
+    else if (observation.kind === 'tool.after') ledger.release(observation.result)
   }
 
   function enqueue(spans: readonly SpanRecord[]): void {
     for (const record of spans) {
       if (records.length >= limits.maxRecords) {
         options.sink.drop(1)
+        release(record)
         continue
       }
       records.push(record)
@@ -108,6 +130,8 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
     } catch {
       recordsFailed += 1
       options.sink.drop(1)
+    } finally {
+      release(record)
     }
   }
 
@@ -115,10 +139,11 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
     const next = inbox.shift()
     if (next !== undefined) {
       try {
-        enqueue(model.observe(sized(next)))
+        enqueue(model.observe(next))
       } catch {
         // A model failure loses this observation, never the session.
         observationsDropped += 1
+        releaseObservation(next)
       }
       return true
     }
@@ -154,6 +179,7 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
       if (stopped) return
       if (inbox.length >= limits.maxInbox) {
         observationsDropped += 1
+        releaseObservation(observation)
         return
       }
       inbox.push(observation)

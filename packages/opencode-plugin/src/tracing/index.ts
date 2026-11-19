@@ -13,6 +13,7 @@ import {createScrubber} from './content.js'
 import {createSpanExporter} from './exporter.js'
 import {createTracePipeline} from './pipeline.js'
 import {registerObservers, type ObserverHost} from './record-observations.js'
+import {createSnapshotLedger, type PendingLimits} from './snapshot.js'
 
 /**
  * How long cleanup may take, all of it: closing spans, the final batch, the transport.
@@ -36,6 +37,8 @@ export interface StartTracingOptions {
   readonly env: Readonly<Record<string, string | undefined>>
   readonly log: (line: string) => void
   readonly now?: () => number
+  /** Bounds on snapshots pending export. Tests lower them; production uses the defaults. */
+  readonly pending?: Partial<PendingLimits>
 }
 
 export async function startTracing(
@@ -59,9 +62,12 @@ export async function startTracing(
       log('tracing stopped exporting after repeated failures')
     },
   })
+  // Snapshots pending export are counted apart from the exporter's queue; the pipeline frees each as its span leaves.
+  const ledger = createSnapshotLedger(options.pending)
   const pipeline = createTracePipeline({
     sink: exporter,
     scrubber,
+    ledger,
     ...(settings.host === 'action' ? {identity: settings.identity} : {}),
     ...(options.now === undefined ? {} : {now: options.now}),
   })
@@ -74,7 +80,7 @@ export async function startTracing(
         pipeline.observe(observation)
       },
       options.now,
-      {measure: false},
+      {ledger},
     )
   } catch (error) {
     // Some hooks may already be registered: they only append to a pipeline that is stopped now.

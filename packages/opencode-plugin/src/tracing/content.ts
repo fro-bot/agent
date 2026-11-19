@@ -458,6 +458,10 @@ export interface PendingSpan {
     readonly timeMs: number
     readonly attributes: Readonly<Record<string, string>>
   }[]
+  /** Content the hook-time snapshot could not take, as `attribute:reason`. Carried into the span's omission marker. */
+  readonly omitted?: readonly string[]
+  /** Items already left out before this point (oldest history over the snapshot's ceiling), per attribute. */
+  readonly dropped?: Readonly<Record<string, number>>
 }
 
 /** Set only by `scrubSpan`. The exporter takes `ScrubbedSpan`, so a span that skipped the scrubber does not type-check. */
@@ -537,7 +541,7 @@ export function scrubSpan(
   scrubber: Scrubber,
   limits: ContentLimits = DEFAULT_CONTENT_LIMITS,
 ): ScrubbedSpan {
-  const tally: Tally = {redactions: 0, truncated: [], omitted: [], dropped: []}
+  const tally: Tally = {redactions: 0, truncated: [], omitted: [...(span.omitted ?? [])], dropped: []}
   let budget = limits.spanContentChars
   const attributes: Record<string, string | number | boolean | readonly string[]> = {}
 
@@ -569,7 +573,8 @@ export function scrubSpan(
       }
       budget -= bounded.json.length
       if (bounded.truncated) tally.truncated.push(name)
-      if (bounded.dropped > 0) tally.dropped.push([name, bounded.dropped])
+      const before = span.dropped?.[name] ?? 0
+      if (bounded.dropped > 0 || before > 0) tally.dropped.push([name, bounded.dropped + before])
       attributes[name] = bounded.json
     } else if (typeof value === 'string') {
       attributes[name] = scrubPlain(value, name, scrubber, limits, tally)

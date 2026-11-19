@@ -295,6 +295,168 @@ describe('startTracing', () => {
   })
 })
 
+/** A turn with a tool call, driven through mutable hook inputs that the test keeps and edits after each hook returns. */
+function mutableTurn(host: ReturnType<typeof fakeObserverHost>, session: string, label: string) {
+  const t = 1_700_000_000_000
+  const inputs = {
+    prompt: {text: `${label} ORIGINAL PROMPT`},
+    request: {
+      sessionID: session,
+      agent: 'build',
+      model: {id: 'm', providerID: 'p'},
+      system: [{type: 'text', text: `${label} ORIGINAL SYSTEM`}],
+      messages: [{role: 'user', content: [{type: 'text', text: `${label} ORIGINAL USER`}]}],
+      tools: {read: {description: `${label} ORIGINAL TOOL DESCRIPTION`, input: {type: 'object'}}},
+      options: {},
+    },
+    toolBefore: {
+      sessionID: session,
+      id: `call_${label}`,
+      tool: 'read',
+      agent: 'build',
+      input: {path: `${label} ORIGINAL PATH`},
+    },
+    toolAfter: {
+      sessionID: session,
+      id: `call_${label}`,
+      tool: 'read',
+      status: 'completed',
+      result: {content: [{type: 'text', text: `${label} ORIGINAL RESULT`}]},
+    },
+  }
+  const mutate = (): void => {
+    inputs.prompt.text = 'EDITED PROMPT'
+    ;(inputs.request.system[0] as {text: string}).text = 'EDITED SYSTEM'
+    ;(inputs.request.messages[0]?.content[0] as {text: string}).text = 'EDITED USER'
+    inputs.request.messages.push({role: 'user', content: [{type: 'text', text: 'EDITED APPENDED'}]})
+    inputs.request.tools.read.description = 'EDITED TOOL DESCRIPTION'
+    inputs.toolBefore.input.path = 'EDITED PATH'
+    ;(inputs.toolAfter.result.content[0] as {text: string}).text = 'EDITED RESULT'
+  }
+  host.call('session.prompt', {sessionID: session, messageID: `msg_${label}`, delivery: 'steer', prompt: inputs.prompt})
+  host.emit(event('session.inbox.enqueued', {sessionID: session, inboxID: `msg_${label}`, item: {type: 'user'}}, t))
+  host.emit(event('session.execution.started', {sessionID: session}, t + 1))
+  host.emit(event('session.inbox.delivered', {sessionID: session, inboxID: `msg_${label}`}, t + 2))
+  host.call('session.context', inputs.request)
+  host.emit(
+    event(
+      'session.step.started',
+      {sessionID: session, assistantMessageID: `a_${label}`, agent: 'build', model: {id: 'm', providerID: 'p'}},
+      t + 3,
+    ),
+  )
+  host.call('tool.execute.before', inputs.toolBefore)
+  host.call('tool.execute.after', inputs.toolAfter)
+  host.emit(event('session.tool.success', {sessionID: session, id: `call_${label}`, metadata: {}}, t + 4))
+  host.emit(
+    event(
+      'session.step.ended',
+      {
+        sessionID: session,
+        assistantMessageID: `a_${label}`,
+        finish: 'tool-calls',
+        rawFinish: 'tool_calls',
+        tokens: {input: 5, output: 2, reasoning: 0, cache: {read: 0, write: 0}},
+        cost: 0,
+      },
+      t + 5,
+    ),
+  )
+  host.emit(event('session.execution.succeeded', {sessionID: session}, t + 6))
+  return {mutate}
+}
+
+describe('the hook-time snapshot', () => {
+  it('exports what the hooks carried when they fired, not what the host edited afterwards', async () => {
+    // #given a turn whose every hook input is a live object the test still holds
+    const target = await sink()
+    const fake = fakeObserverHost()
+    const handle = await startTracing(fake.host, LOCAL(target.url), {env: {}, log: () => {}})
+    const turn = mutableTurn(fake, 'ses_mut', 'T')
+
+    // #when the host (or another plugin) edits every one of them right after its hook returned, before anything ran
+    turn.mutate()
+    await new Promise(resolve => setTimeout(resolve, 60))
+    await handle.stop()
+    fake.end()
+
+    // #then the exported content is the pre-mutation value, and none of the edits is in any byte sent
+    const text = target
+      .accepted()
+      .map(request => request.text)
+      .join('\n')
+    for (const original of [
+      'T ORIGINAL PROMPT',
+      'T ORIGINAL SYSTEM',
+      'T ORIGINAL USER',
+      'T ORIGINAL TOOL DESCRIPTION',
+      'T ORIGINAL PATH',
+      'T ORIGINAL RESULT',
+    ]) {
+      expect(text).toContain(original)
+    }
+    expect(text).not.toContain('EDITED')
+  })
+
+  it('keeps the span’s structure and marks the content omitted when too many snapshots are pending', async () => {
+    // #given room for one pending snapshot, and two sessions whose hooks fire before anything has been exported
+    const target = await sink()
+    const fake = fakeObserverHost()
+    const handle = await startTracing(fake.host, LOCAL(target.url), {
+      env: {},
+      log: () => {},
+      pending: {maxPending: 1},
+    })
+
+    // #when both turns run
+    mutableTurn(fake, 'ses_a', 'A')
+    mutableTurn(fake, 'ses_b', 'B')
+    await new Promise(resolve => setTimeout(resolve, 80))
+    await handle.stop()
+    fake.end()
+
+    // #then every span of both turns is exported, and the ones that found no room say so in a marker
+    const spans = target
+      .accepted()
+      .flatMap(
+        request =>
+          (
+            request.body as {
+              resourceSpans: {
+                scopeSpans: {
+                  spans: {
+                    name: string
+                    attributes: {
+                      key: string
+                      value: {stringValue?: string; arrayValue?: {values: {stringValue: string}[]}}
+                    }[]
+                  }[]
+                }[]
+              }[]
+            }
+          ).resourceSpans,
+      )
+      .flatMap(resource => resource.scopeSpans.flatMap(scope => scope.spans))
+    const names = spans.map(span => span.name).toSorted((a, b) => a.localeCompare(b))
+    expect(names).toEqual([
+      'chat m',
+      'chat m',
+      'execute_tool read',
+      'execute_tool read',
+      'invoke_agent build',
+      'invoke_agent build',
+    ])
+    const omitted = spans.flatMap(span =>
+      span.attributes
+        .filter(attribute => attribute.key === 'fro_bot.content.omitted')
+        .flatMap(attribute => attribute.value.arrayValue?.values.map(value => value.stringValue) ?? []),
+    )
+    expect(omitted.length).toBeGreaterThan(0)
+    expect(omitted.every(entry => entry.endsWith(':pending-bound'))).toBe(true)
+    expect(omitted).toContain('gen_ai.input.messages:pending-bound')
+  })
+})
+
 describe('the handlers', () => {
   it('return at once and never change a hook’s arguments', async () => {
     // #given a deep-frozen request payload, and the hook as the host calls it
@@ -331,7 +493,7 @@ describe('the handlers', () => {
     fake.end()
   })
 
-  it('do not delay the hook with a large request: the handler costs a small fraction of serializing it', async () => {
+  it('do not delay the hook with a large request: the snapshot costs a fraction of serializing it, under a fixed ceiling', async () => {
     // #given a request with a very large history (about 30 MB of text) and the hook as the host calls it
     const target = await sink()
     const fake = fakeObserverHost()
@@ -362,10 +524,11 @@ describe('the handlers', () => {
       `[latency] hook handler ${handlerMs.toFixed(3)} ms for ${size} chars (serializing alone: ${serializeMs.toFixed(1)} ms)\n`,
     )
 
-    // #then the handler is under a tenth of the serialization time and far under any absolute cost that would be felt
+    // #then the handler, which takes the bounded hook-time snapshot (a walk over the newest few hundred messages, strings
+    // shared), costs a fraction of serializing the payload and stays under an absolute ceiling nobody would feel
     expect(size).toBeGreaterThan(25_000_000)
-    expect(handlerMs).toBeLessThan(serializeMs / 10)
-    expect(handlerMs).toBeLessThan(25)
+    expect(handlerMs).toBeLessThan(serializeMs / 2)
+    expect(handlerMs).toBeLessThan(50)
     await handle.stop()
     fake.end()
   }, 30_000)

@@ -1,0 +1,443 @@
+import {describe, expect, it} from 'vitest'
+
+import {
+  createSnapshotLedger,
+  DEFAULT_PENDING_LIMITS,
+  DEFAULT_SNAPSHOT_LIMITS,
+  omittedReason,
+  snapshotPrompt,
+  snapshotRequest,
+  snapshotSize,
+  snapshotToolArguments,
+  snapshotToolResult,
+  type RequestSnapshot,
+} from './snapshot.js'
+
+const isFrozen = (value: unknown): boolean => {
+  if (typeof value !== 'object' || value === null) return true
+  return Object.isFrozen(value) && Object.values(value).every(child => isFrozen(child))
+}
+
+const requestInput = () => ({
+  system: [
+    {type: 'text', text: 'You are Fro Bot.', metadata: {experimental: {instructions: [{key: 'k', text: 'dup'}]}}},
+  ],
+  messages: [
+    {id: 'm1', role: 'user', content: [{type: 'text', text: 'first question'}], metadata: {private: 'x'}},
+    {
+      id: 'm2',
+      role: 'assistant',
+      content: [
+        {type: 'reasoning', text: 'thinking'},
+        {type: 'tool-call', id: 'c1', name: 'read', input: {path: 'README.md'}, providerOptions: {apiKey: 'sk-hidden'}},
+      ],
+    },
+    {
+      id: 'm3',
+      role: 'user',
+      content: [
+        {type: 'tool-result', id: 'c1', name: 'read', result: {type: 'text', value: 'file body'}},
+        {type: 'file', mediaType: 'image/png', data: 'BASE64-IMAGE-BYTES'},
+      ],
+    },
+  ],
+  tools: {
+    read: {description: 'Read a file', input: {type: 'object', properties: {path: {type: 'string'}}}, execute: () => 1},
+  },
+  options: {apiKey: 'sk-never-copied', headers: {authorization: 'Bearer nope'}},
+})
+
+describe('a request snapshot', () => {
+  it('holds exactly the named fields, pruned of everything else', () => {
+    // #given a request with metadata, provider options, an attachment, a function and an options object
+    const input = requestInput()
+
+    // #when
+    const snapshot = snapshotRequest(input)
+
+    // #then only system text, role and text/reasoning/tool parts, and tool name, description and schema are in it
+    expect(snapshot.system).toEqual([{text: 'You are Fro Bot.'}])
+    expect(snapshot.tools).toEqual({
+      read: {description: 'Read a file', input: {type: 'object', properties: {path: {type: 'string'}}}},
+    })
+    expect(snapshot.messages).toEqual([
+      {role: 'user', content: [{type: 'text', text: 'first question'}]},
+      {
+        role: 'assistant',
+        content: [
+          {type: 'reasoning', text: 'thinking'},
+          {type: 'tool-call', id: 'c1', name: 'read', input: {path: 'README.md'}},
+        ],
+      },
+      {
+        role: 'user',
+        content: [{type: 'tool-result', id: 'c1', result: {type: 'text', value: 'file body'}}, {type: 'omitted'}],
+      },
+    ])
+    const text = JSON.stringify(snapshot)
+    for (const never of [
+      'sk-never-copied',
+      'sk-hidden',
+      'Bearer nope',
+      'BASE64-IMAGE-BYTES',
+      'metadata',
+      'providerOptions',
+    ]) {
+      expect(text).not.toContain(never)
+    }
+  })
+
+  it('is frozen all the way down', () => {
+    // #given / #when
+    const snapshot = snapshotRequest(requestInput())
+
+    // #then
+    expect(isFrozen(snapshot)).toBe(true)
+    const [first] = snapshot.messages as {role: string}[]
+    expect(() => {
+      Object.assign(first as object, {role: 'changed'})
+    }).toThrow(TypeError)
+  })
+
+  it('is not changed by an edit to the hook input made afterwards, however deep', () => {
+    // #given a snapshot, then every kind of edit a host or another plugin could make
+    const input = requestInput()
+    const snapshot = snapshotRequest(input)
+    const before = JSON.stringify(snapshot)
+
+    // #when the input is mutated in place
+    const [system] = input.system
+    const [firstMessage, secondMessage] = input.messages
+    Object.assign(system as object, {text: 'EDITED SYSTEM'})
+    Object.assign(firstMessage as object, {role: 'edited'})
+    Object.assign((firstMessage?.content as object[])[0] as object, {text: 'EDITED USER TEXT'})
+    Object.assign(((secondMessage?.content as {input: object}[])[1] as {input: object}).input, {path: 'EDITED/PATH'})
+    input.messages.push({id: 'm4', role: 'user', content: [{type: 'text', text: 'APPENDED'}]})
+    input.messages.splice(0, 1)
+    input.tools.read.description = 'EDITED DESCRIPTION'
+    ;(input.tools.read.input.properties as {path: unknown}).path = 'EDITED SCHEMA'
+    ;(input as {tools: unknown}).tools = {}
+
+    // #then the snapshot is the pre-mutation value
+    expect(JSON.stringify(snapshot)).toBe(before)
+    expect(JSON.stringify(snapshot)).not.toContain('EDITED')
+    expect(JSON.stringify(snapshot)).not.toContain('APPENDED')
+  })
+
+  it('shares strings rather than copying them, so a very large history costs a walk, not bytes', () => {
+    // #given 50 MB of history in 5000 messages
+    const messages = Array.from({length: 5_000}, (_, index) => ({
+      role: index % 2 === 0 ? 'user' : 'assistant',
+      content: [{type: 'text', text: `line ${index} ${'x'.repeat(10_000)}`}],
+    }))
+
+    // #when
+    const started = performance.now()
+    const snapshot = snapshotRequest({system: [], messages, tools: {}})
+    const elapsed = performance.now() - started
+
+    // #then it kept only the newest that fit, and it was quick
+    expect(snapshot.size).toBeLessThanOrEqual(DEFAULT_SNAPSHOT_LIMITS.requestChars)
+    expect((snapshot.messages as unknown[]).length).toBeLessThan(500)
+    expect(elapsed).toBeLessThan(250)
+  })
+
+  it('drops the oldest history first when over its ceiling, keeps the newest in order, and says how many', () => {
+    // #given ten messages of 100 characters and a ceiling for about four
+    const messages = Array.from({length: 10}, (_, index) => ({
+      role: 'user',
+      content: [{type: 'text', text: `m${index}:${'z'.repeat(96)}`}],
+    }))
+
+    // #when
+    const snapshot = snapshotRequest({messages}, {limits: {requestChars: 430}})
+
+    // #then
+    const kept = snapshot.messages as {content: {text: string}[]}[]
+    expect(kept.map(message => message.content[0]?.text.slice(0, 2))).toEqual(['m6', 'm7', 'm8', 'm9'])
+    expect(snapshot.droppedMessages).toBe(6)
+  })
+
+  it('omits system text and tool definitions that exceed their own ceilings, and says why', () => {
+    // #given
+    const snapshot = snapshotRequest(
+      {system: [{text: 'S'.repeat(100)}], tools: {big: {description: 'D'.repeat(100), input: {}}}, messages: []},
+      {limits: {systemChars: 50, toolDefinitionChars: 50}},
+    )
+
+    // #then
+    expect(omittedReason(snapshot.system)).toBe('snapshot-bound')
+    expect(omittedReason(snapshot.tools)).toBe('snapshot-bound')
+    expect(snapshot.messages).toEqual([])
+  })
+
+  it('omits a value that is too deep or that loops, rather than following it', () => {
+    // #given a tool schema that contains itself
+    const schema: Record<string, unknown> = {type: 'object'}
+    schema.self = schema
+
+    // #when
+    const snapshot = snapshotRequest({tools: {loop: {description: 'd', input: schema}}})
+
+    // #then the tools field is omitted as over its bound, and nothing hung
+    expect(omittedReason(snapshot.tools)).toBe('snapshot-bound')
+  })
+
+  it('reads past a getter that throws and a field that is not content', () => {
+    // #given a message whose role getter throws, and one with a function-valued text
+    const hostile = {
+      get role(): string {
+        throw new Error('boom')
+      },
+      content: [],
+    }
+    const snapshot = snapshotRequest({
+      messages: [hostile, {role: 'user', content: [{type: 'text', text: () => 'fn'}]}],
+    })
+
+    // #then no throw, the hostile message is skipped and the other keeps a placeholder part
+    expect(snapshot.messages).toEqual([{role: 'user', content: [{type: 'omitted'}]}])
+  })
+
+  it('reports a field it cannot read as unreadable, never throws', () => {
+    // #given an input whose property access throws
+    const input = new Proxy(
+      {},
+      {
+        get: () => {
+          throw new Error('boom')
+        },
+      },
+    )
+
+    // #when / #then
+    const snapshot = snapshotRequest(input)
+    expect(omittedReason(snapshot.messages)).toBe('unreadable')
+  })
+
+  it('prunes a tool result part to its text and the names of its files', () => {
+    // #given a tool-result part with content items including a file that carries data
+    const snapshot = snapshotRequest({
+      messages: [
+        {
+          role: 'tool',
+          content: [
+            {
+              type: 'tool-result',
+              id: 'c',
+              result: {
+                type: 'content',
+                value: [
+                  {type: 'text', text: 'hello'},
+                  {type: 'file', name: 'a.png', mime: 'image/png', data: 'BASE64'},
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    })
+
+    // #then
+    expect(JSON.stringify(snapshot.messages)).not.toContain('BASE64')
+    expect(snapshot.messages).toEqual([
+      {
+        role: 'tool',
+        content: [
+          {
+            type: 'tool-result',
+            id: 'c',
+            result: {
+              type: 'content',
+              value: [
+                {type: 'text', text: 'hello'},
+                {type: 'file', name: 'a.png', mime: 'image/png'},
+              ],
+            },
+          },
+        ],
+      },
+    ])
+  })
+})
+
+describe('the other snapshots', () => {
+  it('takes a prompt’s text and nothing else', () => {
+    // #given a prompt with an attachment
+    const prompt = {text: 'please read it', files: [{uri: 'file:///secret', data: 'BYTES'}]}
+
+    // #when
+    const snapshot = snapshotPrompt(prompt)
+    prompt.text = 'EDITED'
+
+    // #then
+    expect(snapshot).toEqual({text: 'please read it', size: 14})
+    expect(JSON.stringify(snapshot)).not.toContain('secret')
+  })
+
+  it('has no text for an attachment-only prompt, and no attribute follows', () => {
+    // #given / #when / #then
+    expect(snapshotPrompt({files: []}).text).toBeUndefined()
+    expect(snapshotPrompt(undefined).text).toBeUndefined()
+  })
+
+  it('omits a prompt over the value ceiling', () => {
+    // #given / #when
+    const snapshot = snapshotPrompt({text: 'x'.repeat(100)}, {limits: {valueChars: 50}})
+
+    // #then
+    expect(omittedReason(snapshot.text)).toBe('snapshot-bound')
+  })
+
+  it('copies tool arguments, deeply and frozen', () => {
+    // #given
+    const input = {path: 'a', options: {depth: [1, 2, {x: 'y'}]}}
+
+    // #when
+    const snapshot = snapshotToolArguments(input)
+    input.options.depth[2] = {x: 'EDITED'}
+    input.path = 'EDITED'
+
+    // #then
+    expect(snapshot).toEqual({path: 'a', options: {depth: [1, 2, {x: 'y'}]}})
+    expect(isFrozen(snapshot)).toBe(true)
+  })
+
+  it('parses JSON-string arguments and wraps anything else, as the span carries them', () => {
+    // #given / #when / #then
+    expect(snapshotToolArguments('{"a":1}')).toEqual({a: 1})
+    expect(snapshotToolArguments('not json')).toEqual({value: 'not json'})
+    expect(snapshotToolArguments(42)).toEqual({value: 42})
+    expect(snapshotToolArguments(undefined)).toBeUndefined()
+  })
+
+  it('takes a tool result as text and file names, notes the tool’s own truncation, and is not changed by a later edit', () => {
+    // #given a result with metadata and a file
+    const result = {
+      content: [
+        {type: 'text', text: 'body'},
+        {type: 'file', name: 'x.png', mime: 'image/png', data: 'BASE64'},
+      ],
+      metadata: {truncated: true, path: '/private/location'},
+    }
+
+    // #when
+    const snapshot = snapshotToolResult(result)
+    ;(result.content[0] as {text: string}).text = 'EDITED'
+    result.metadata.truncated = false
+
+    // #then
+    expect(snapshot).toMatchObject({
+      content: [
+        {type: 'text', text: 'body'},
+        {type: 'file', name: 'x.png', mime: 'image/png'},
+      ],
+      metadata: {truncated: true},
+    })
+    expect(JSON.stringify(snapshot)).not.toMatch(/BASE64|private|EDITED/)
+  })
+
+  it('takes a result that has only structured output', () => {
+    // #given / #when / #then
+    expect(snapshotToolResult({output: {rows: [1, 2]}})).toMatchObject({output: {rows: [1, 2]}})
+    expect(snapshotToolResult('plain string')).toBeUndefined()
+    expect(snapshotToolResult({})).toBeUndefined()
+  })
+
+  it('omits a result over the value ceiling and says why', () => {
+    // #given / #when
+    const snapshot = snapshotToolResult({content: 'x'.repeat(1_000)}, {limits: {valueChars: 100}})
+
+    // #then
+    expect(omittedReason(snapshot)).toBe('snapshot-bound')
+  })
+
+  it('reports the size a snapshot holds', () => {
+    // #given / #when / #then
+    expect(snapshotSize(snapshotPrompt({text: 'abcd'}))).toBe(4)
+    expect(snapshotSize(undefined)).toBe(0)
+    expect(snapshotSize('text')).toBe(0)
+  })
+})
+
+describe('the pending ledger', () => {
+  it('has room until its count or its characters run out, and then refuses and counts the refusals', () => {
+    // #given a ledger of two snapshots and 100 characters
+    const ledger = createSnapshotLedger({maxPending: 2, maxPendingChars: 100})
+    const context = {ledger}
+
+    // #when
+    const first = snapshotPrompt({text: 'a'.repeat(30)}, context)
+    const second = snapshotPrompt({text: 'b'.repeat(30)}, context)
+    const third = snapshotPrompt({text: 'c'.repeat(30)}, context)
+
+    // #then the third found no room by count and was omitted, with the content marked
+    expect(first.text).toBe('a'.repeat(30))
+    expect(second.text).toBe('b'.repeat(30))
+    expect(omittedReason(third.text)).toBe('pending-bound')
+    expect(ledger.stats()).toEqual({pending: 2, pendingChars: 60, refused: 1})
+  })
+
+  it('limits one snapshot to the characters that remain', () => {
+    // #given 100 characters of room, 80 of them taken
+    const ledger = createSnapshotLedger({maxPending: 10, maxPendingChars: 100})
+    snapshotPrompt({text: 'a'.repeat(80)}, {ledger})
+
+    // #when a 40-character prompt arrives
+    const next = snapshotPrompt({text: 'b'.repeat(40)}, {ledger})
+
+    // #then it did not fit the 20 that remain: omitted for this snapshot's bound, and nothing more is held
+    expect(omittedReason(next.text)).toBe('snapshot-bound')
+    expect(ledger.stats().pendingChars).toBe(80)
+  })
+
+  it('frees a snapshot when it is released, and ignores one it does not hold', () => {
+    // #given two held snapshots
+    const ledger = createSnapshotLedger()
+    const prompt = snapshotPrompt({text: 'hello'}, {ledger})
+    const request = snapshotRequest(requestInput(), {ledger})
+    expect(ledger.stats().pending).toBe(2)
+
+    // #when each is released, twice, and unrelated values too
+    ledger.release(prompt)
+    ledger.release(prompt)
+    ledger.release(request)
+    ledger.release(undefined)
+    ledger.release('text')
+    ledger.release({})
+
+    // #then the books are empty and never negative
+    expect(ledger.stats()).toEqual({pending: 0, pendingChars: 0, refused: 0})
+  })
+
+  it('refuses a whole request when full, which comes back with every field marked omitted', () => {
+    // #given a full ledger
+    const ledger = createSnapshotLedger({maxPending: 1, maxPendingChars: DEFAULT_PENDING_LIMITS.maxPendingChars})
+    snapshotPrompt({text: 'x'}, {ledger})
+
+    // #when
+    const snapshot: RequestSnapshot = snapshotRequest(requestInput(), {ledger})
+
+    // #then the structure is there, the content is not
+    expect([omittedReason(snapshot.system), omittedReason(snapshot.messages), omittedReason(snapshot.tools)]).toEqual([
+      'pending-bound',
+      'pending-bound',
+      'pending-bound',
+    ])
+    expect(snapshot.size).toBe(0)
+  })
+
+  it('counts what a request holds against the characters, and a request never takes more than the room', () => {
+    // #given 1,000 characters of room and a history far over it
+    const ledger = createSnapshotLedger({maxPending: 10, maxPendingChars: 1_000})
+    const messages = Array.from({length: 50}, () => ({role: 'user', content: [{type: 'text', text: 'y'.repeat(200)}]}))
+
+    // #when
+    const snapshot = snapshotRequest({messages}, {ledger})
+
+    // #then
+    expect(snapshot.size).toBeLessThanOrEqual(1_000)
+    expect(ledger.stats().pendingChars).toBe(snapshot.size)
+    expect(snapshot.droppedMessages).toBeGreaterThan(40)
+  })
+})

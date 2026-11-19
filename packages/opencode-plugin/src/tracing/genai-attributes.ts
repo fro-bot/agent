@@ -22,6 +22,7 @@
 
 import type {ActionIdentity} from './settings.js'
 import type {ChatRecord, InvokeRecord, SpanRecord, ToolRecord} from './turn-model.js'
+
 import {
   actionIdentityAttributes,
   CONTENT_MAX_CHARS,
@@ -40,6 +41,7 @@ import {
   type ScrubbedSpan,
   type Scrubber,
 } from './content.js'
+import {omittedReason} from './snapshot.js'
 
 export const GENAI_SEMCONV_REVISION = 'open-telemetry/semantic-conventions-genai@76e0c19'
 
@@ -107,7 +109,20 @@ function finishReasons(record: ChatRecord): readonly string[] | undefined {
   return undefined
 }
 
+/**
+ * The value of a snapshot field, or undefined when the snapshot could not take it: the omission is then recorded under the
+ * attribute's name, and the span says so in its markers.
+ */
+function noting(value: unknown, attribute: string, omitted: string[]): unknown {
+  const reason = omittedReason(value)
+  if (reason === undefined) return value
+  omitted.push(`${attribute}:${reason}`)
+  return undefined
+}
+
 function chatSpan(record: ChatRecord, options: AttributeOptions): PendingSpan {
+  const omitted: string[] = []
+  const preDropped: Record<string, number> = {}
   const attributes: Attributes = {
     'gen_ai.operation.name': 'chat',
     ...identityAttributes(record, options),
@@ -124,18 +139,27 @@ function chatSpan(record: ChatRecord, options: AttributeOptions): PendingSpan {
   if (record.cost !== undefined) attributes['fro_bot.usage.cost_usd'] = record.cost
   if (record.followOnOf.length > 0) attributes['fro_bot.turn.follow_on_of'] = record.followOnOf
 
-  // Content, in the order the span's budget is spent: the small values first, the long history last.
-  const request = (record.request ?? {}) as {system?: unknown; messages?: unknown; tools?: unknown}
-  const system = extractSystemInstructions(request.system)
+  // Content, in the order the span's budget is spent: the small values first, the long history last. The request is the
+  // hook-time snapshot; a field it could not take is a sentinel, which becomes a marker on the span.
+  const request = (record.request ?? {}) as {
+    system?: unknown
+    messages?: unknown
+    tools?: unknown
+    droppedMessages?: unknown
+  }
+  const system = extractSystemInstructions(noting(request.system, 'gen_ai.system_instructions', omitted))
   if (system !== undefined)
     attributes['gen_ai.system_instructions'] = contentAttribute(system, CONTENT_MAX_CHARS.systemInstructions)
-  const definitions = extractToolDefinitions(request.tools)
+  const definitions = extractToolDefinitions(noting(request.tools, 'gen_ai.tool.definitions', omitted))
   if (definitions !== undefined)
     attributes['gen_ai.tool.definitions'] = contentAttribute(definitions, CONTENT_MAX_CHARS.toolDefinitions)
   const output = extractOutputMessages({texts: record.texts, reasoning: record.reasoning, toolCalls: record.toolCalls})
   if (output !== undefined)
     attributes['gen_ai.output.messages'] = contentAttribute(output, CONTENT_MAX_CHARS.outputMessages)
-  const input = extractInputMessages(request.messages)
+  const input = extractInputMessages(noting(request.messages, 'gen_ai.input.messages', omitted))
+  if (typeof request.droppedMessages === 'number' && request.droppedMessages > 0) {
+    preDropped['gen_ai.input.messages'] = request.droppedMessages
+  }
   if (input !== undefined) {
     if (input.omittedParts > 0) attributes['fro_bot.content.parts_omitted'] = input.omittedParts
     attributes['gen_ai.input.messages'] = contentAttribute(input.messages, CONTENT_MAX_CHARS.inputMessages, true)
@@ -152,6 +176,8 @@ function chatSpan(record: ChatRecord, options: AttributeOptions): PendingSpan {
     attributes,
     status: statusOf(record),
     events: eventsOf(record),
+    ...(omitted.length === 0 ? {} : {omitted}),
+    ...(Object.keys(preDropped).length === 0 ? {} : {dropped: preDropped}),
   }
 }
 
@@ -168,10 +194,11 @@ function toolSpan(record: ToolRecord, options: AttributeOptions): PendingSpan {
   set(attributes, 'fro_bot.tool.error_type', record.errorType)
   set(attributes, 'fro_bot.subagent.session_id', record.childSessionId)
 
-  const args = extractToolArguments(record.input)
+  const omitted: string[] = []
+  const args = extractToolArguments(noting(record.input, 'gen_ai.tool.call.arguments', omitted))
   if (args !== undefined)
     attributes['gen_ai.tool.call.arguments'] = contentAttribute(args, CONTENT_MAX_CHARS.toolArguments)
-  const result = extractToolResult(record.result)
+  const result = extractToolResult(noting(record.result, 'gen_ai.tool.call.result', omitted))
   if (result !== undefined)
     attributes['gen_ai.tool.call.result'] = contentAttribute(result.value, CONTENT_MAX_CHARS.toolResult)
   // The tool cut its own output: said apart from this plugin's truncation (`fro_bot.content.truncated`).
@@ -189,10 +216,12 @@ function toolSpan(record: ToolRecord, options: AttributeOptions): PendingSpan {
     attributes,
     status: statusOf(record),
     events: eventsOf(record),
+    ...(omitted.length === 0 ? {} : {omitted}),
   }
 }
 
 function invokeSpan(record: InvokeRecord, options: AttributeOptions): PendingSpan {
+  const omitted: string[] = []
   const attributes: Attributes = {
     'gen_ai.operation.name': 'invoke_agent',
     ...identityAttributes(record, options),
@@ -206,6 +235,9 @@ function invokeSpan(record: InvokeRecord, options: AttributeOptions): PendingSpa
     attributes['fro_bot.prompt.count'] = record.prompts.length
     if (record.prompts.some(prompt => prompt.midTurn)) attributes['fro_bot.prompt.mid_turn'] = true
     const messages = record.prompts.flatMap(prompt => {
+      const text = (prompt.content as {text?: unknown} | undefined)?.text
+      const reason = omittedReason(text)
+      if (reason !== undefined) omitted.push(`gen_ai.input.messages:${reason}`)
       const message = extractPromptMessage(prompt.content)
       return message === undefined ? [] : [message]
     })
@@ -224,6 +256,7 @@ function invokeSpan(record: InvokeRecord, options: AttributeOptions): PendingSpa
     attributes,
     status: statusOf(record),
     events: eventsOf(record),
+    ...(omitted.length === 0 ? {} : {omitted}),
   }
 }
 
