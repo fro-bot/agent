@@ -13,8 +13,11 @@
  * What the SDK's delegate does with a response (read from `@opentelemetry/otlp-exporter-base` 0.219.0, and pinned by
  * `exporter.test.ts`): status up to 299 is success; 429, 502, 503 and 504 and these network errors (ECONNRESET,
  * ECONNREFUSED, EPIPE, ETIMEDOUT, EAI_AGAIN, ENOTFOUND, ENETUNREACH, EHOSTUNREACH) are retried with backoff (1 s growing
- * by 1.5, at most five retries) until the per-batch timeout; every other status is final. The relay's `503` is therefore a
- * retry and its `422` a drop. One batch is in flight at a time, far under the relay's refusal threshold of eight.
+ * by 1.5, at most five retries) until the per-batch timeout; every other status is final, a 3xx included: Node's `http`
+ * does not follow redirects and the delegate does not either (pinned by `exporter.test.ts`), so the credential in a
+ * local-mode header goes only to the URL in the settings file, which must be `https` for a remote collector with
+ * certificate verification left at the platform default (`settings.ts` accepts nothing else). The relay's `503` is
+ * therefore a retry and its `422` a drop. One batch is in flight at a time, far under the relay's refusal threshold of eight.
  */
 
 import type {ReadableSpan, SpanProcessor} from '@opentelemetry/sdk-trace-base'

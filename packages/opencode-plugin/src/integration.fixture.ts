@@ -314,8 +314,9 @@ export async function startOpenCodeServer(options: {
   /** Extra top-level server config (for example `permissions`), merged over the base config. */
   readonly config?: Readonly<Record<string, unknown>>
   /**
-   * Start like a local session: no `OPENCODE_PASSWORD` and no `OPENCODE_CONFIG_CONTENT`, with the config in the user's
-   * global config file instead. Without it the server always has both headless markers, which this harness needs.
+   * Start so that the plugin sees none of the headless markers: the config goes in the user's global config file instead
+   * of `OPENCODE_CONFIG_CONTENT`, and the password goes in `OPENCODE_SERVER_PASSWORD`, which `serve --stdio` deletes from
+   * the process environment before any plugin loads (measured on 2.3.2). The command line still says `serve`.
    */
   readonly localMode?: boolean
 }): Promise<RunningServer> {
@@ -360,7 +361,7 @@ export async function startOpenCodeServer(options: {
       OPENCODE_DISABLE_MODELS_FETCH: '1',
       OPENCODE_DISABLE_PROJECT_CONFIG: '1',
       ...(options.localMode === true
-        ? {}
+        ? {OPENCODE_SERVER_PASSWORD: password}
         : {OPENCODE_PASSWORD: password, OPENCODE_CONFIG_CONTENT: JSON.stringify(config)}),
       ...options.env,
     },

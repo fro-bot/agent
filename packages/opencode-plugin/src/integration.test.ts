@@ -6,6 +6,7 @@
 import type {FakeProvider, OtlpSink, RunningServer, SandboxPaths} from './integration.fixture.js'
 
 import {cpSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync} from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import {fileURLToPath} from 'node:url'
@@ -199,8 +200,9 @@ describe.skipIf(!runnable)('built plugin in a real opencode V2', () => {
     expect(rejectionText).not.toContain('CHILD_PROMPT')
 
     // #and the fresh subagent was allowed through: it ran and the parent saw its result
-    const finalRequest = provider.requests.find(
-      request => request.body.includes('GUARD_PROMPT') && request.body.includes('CHILD_DONE'),
+    // A subagent is a background job: its report reaches the parent after the fresh dispatch returns, so wait for it.
+    const finalRequest = await waitFor('the parent to see the child result', async () =>
+      provider.requests.find(request => request.body.includes('GUARD_PROMPT') && request.body.includes('CHILD_DONE')),
     )
     expect(finalRequest).toBeDefined()
     const children = await server.api('GET', `/api/session?parentID=${sessionID}`)
@@ -334,7 +336,7 @@ describe.skipIf(!runnable)('the lazy tracing chunk in a real opencode V2', () =>
     // #given a valid, safe user file in the server's config directory, and a chunk that records its evaluation
     const settingsFile = userSettingsFilePath({XDG_CONFIG_HOME: path.join(sandbox.home, 'config')})
     mkdirSync(path.dirname(settingsFile), {recursive: true})
-    writeFileSync(settingsFile, JSON.stringify({version: 1, endpoint: sink.url}), {mode: 0o600})
+    writeFileSync(settingsFile, JSON.stringify({version: 1, endpoint: sink.url, hosts: [os.hostname()]}), {mode: 0o600})
     const marker = path.join(sandbox.root, 'chunk-evaluated-file')
     const dir = stagePlugin(sandbox, 'marker', marker)
     const before = sink.requests.length

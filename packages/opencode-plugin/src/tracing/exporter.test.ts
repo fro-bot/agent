@@ -342,6 +342,30 @@ describe('retry and refusal against the relay’s three answers', () => {
   }, 15_000)
 })
 
+describe('redirects', () => {
+  it.each([301, 302, 303, 307, 308])(
+    'does not follow a %i: the request is not repeated anywhere else, and the batch counts as a final failure',
+    async status => {
+      // #given a destination that answers with a redirect to a second collector, and that second collector
+      const elsewhere = await sink()
+      const target = await sink({respond: () => ({status, headers: {location: elsewhere.url}})})
+      const exporter = exporterFor({url: target.url, headers: {authorization: 'Basic credential-never-to-follow'}})
+      exporter.export(span())
+      exporter.export(span())
+
+      // #when the batch is exported
+      const counts = await exporter.close(3_000)
+
+      // #then the redirect target heard nothing (so the credential never went there), the destination heard one request
+      // (a redirect is neither retried nor followed), and both spans are counted dropped
+      expect(elsewhere.requests).toHaveLength(0)
+      expect(target.requests).toHaveLength(1)
+      expect(target.requests[0]?.status).toBe(status)
+      expect(counts).toEqual({exported: 0, dropped: 2})
+    },
+  )
+})
+
 describe('failure, overflow and shutdown', () => {
   it('stops trying after repeated connection failures and counts the rest as dropped', async () => {
     // #given a port nothing listens on (a sink that was stopped), and a short batch timeout
