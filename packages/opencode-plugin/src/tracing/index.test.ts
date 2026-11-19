@@ -527,8 +527,8 @@ describe('the handlers', () => {
     // #then the handler, which takes the bounded hook-time snapshot (a walk over the newest few hundred messages, strings
     // shared), costs a fraction of serializing the payload and stays under an absolute ceiling nobody would feel
     expect(size).toBeGreaterThan(25_000_000)
-    expect(handlerMs).toBeLessThan(serializeMs / 2)
-    expect(handlerMs).toBeLessThan(50)
+    expect(handlerMs).toBeLessThan(serializeMs / 5)
+    expect(handlerMs).toBeLessThan(15)
     await handle.stop()
     fake.end()
   }, 30_000)

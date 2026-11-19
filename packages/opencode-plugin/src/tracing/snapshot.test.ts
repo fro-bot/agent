@@ -1,4 +1,4 @@
-import {describe, expect, it} from 'vitest'
+import {describe, expect, it, vi} from 'vitest'
 
 import {
   createSnapshotLedger,
@@ -439,5 +439,157 @@ describe('the pending ledger', () => {
     expect(snapshot.size).toBeLessThanOrEqual(1_000)
     expect(ledger.stats().pendingChars).toBe(snapshot.size)
     expect(snapshot.droppedMessages).toBeGreaterThan(40)
+  })
+})
+
+/** An array that counts how many of its elements were read: the walk's real size, not a guess from its time. */
+function counting<T>(items: T[]): {array: T[]; visited: () => number} {
+  let visited = 0
+  const array = new Proxy(items, {
+    get(target, key, receiver) {
+      if (typeof key === 'string' && /^\d+$/.test(key)) visited += 1
+      return Reflect.get(target, key, receiver) as unknown
+    },
+  })
+  return {array, visited: () => visited}
+}
+
+describe('the work a snapshot does does not scale with the history', () => {
+  const message = (index: number) => ({
+    role: index % 2 === 0 ? 'user' : 'assistant',
+    content: [{type: 'text', text: `m${index}`}],
+  })
+
+  it('charges every unknown part to one request-wide node budget, so a huge array of them is not copied', () => {
+    // #given one message of 50,000 media parts and a budget of 1,000 nodes
+    const parts = Array.from({length: 50_000}, () => ({type: 'image', data: 'BASE64'}))
+    const {array, visited} = counting(parts)
+
+    // #when
+    const snapshot = snapshotRequest({messages: [{role: 'user', content: array}]}, {limits: {maxNodes: 1_000}})
+
+    // #then the walk stopped near the budget, the message was not kept, and the snapshot says one was left out
+    expect(visited()).toBeLessThanOrEqual(1_100)
+    expect(snapshot.messages).toEqual([])
+    expect(snapshot.droppedMessages).toBe(1)
+    expect(JSON.stringify(snapshot)).not.toContain('BASE64')
+  })
+
+  it('keeps a message whose placeholders fit exactly in the budget, and drops one that is a node over', () => {
+    // #given the budget is spent by the entry, the role and N placeholders (one node each), and the same message with one more part
+    const build = (count: number) => ({role: 'user', content: Array.from({length: count}, () => ({type: 'file'}))})
+    const limits = {maxNodes: 12}
+
+    // #when
+    const fits = snapshotRequest({messages: [build(10)]}, {limits})
+    const over = snapshotRequest({messages: [build(11)]}, {limits})
+
+    // #then
+    expect((fits.messages as unknown[]).length).toBe(1)
+    expect(over.messages).toEqual([])
+  })
+
+  it('shares the budget across messages: ten thousand small ones stop the walk, and it does not visit the rest', () => {
+    // #given a million tiny messages, newest last, and a budget of 4,000 nodes
+    const {array, visited} = counting(Array.from({length: 1_000_000}, (_, index) => message(index)))
+
+    // #when
+    const snapshot = snapshotRequest({messages: array}, {limits: {maxNodes: 4_000}})
+
+    // #then it read about a budget's worth of entries, kept the newest, and counted the rest by arithmetic
+    expect(visited()).toBeLessThan(4_100)
+    const kept = (snapshot.messages as {content: {text: string}[]}[]).length
+    expect(kept).toBeGreaterThan(0)
+    expect((snapshot.messages as {content: {text: string}[]}[]).at(-1)?.content[0]?.text).toBe('m999999')
+    expect(kept + (snapshot.droppedMessages ?? 0)).toBe(1_000_000)
+  })
+
+  it('reads the same number of entries for a million messages as for a hundred thousand', () => {
+    // #given
+    const small = counting(Array.from({length: 100_000}, (_, index) => message(index)))
+    const large = counting(Array.from({length: 1_000_000}, (_, index) => message(index)))
+
+    // #when
+    snapshotRequest({messages: small.array})
+    snapshotRequest({messages: large.array})
+
+    // #then the cost is the budget's, not the history's
+    expect(large.visited()).toBe(small.visited())
+  })
+
+  it('charges entries that are not messages, so a million nulls cost the budget and no more', () => {
+    // #given
+    const {array, visited} = counting(Array.from({length: 1_000_000}, () => null))
+
+    // #when
+    const snapshot = snapshotRequest({messages: array}, {limits: {maxNodes: 2_000}})
+
+    // #then
+    expect(visited()).toBeLessThan(2_100)
+    expect(snapshot.messages).toEqual([])
+  })
+
+  it('charges the non-record items of a tool result, and of a content array in a message', () => {
+    // #given a million non-record items in a tool result, and in a message's tool-result part
+    const first = counting(Array.from({length: 1_000_000}, () => 7))
+    const second = counting(Array.from({length: 1_000_000}, () => 7))
+
+    // #when
+    snapshotToolResult({content: first.array}, {limits: {maxNodes: 1_000}})
+    snapshotRequest(
+      {messages: [{role: 'tool', content: [{type: 'tool-result', result: {type: 'content', value: second.array}}]}]},
+      {limits: {maxNodes: 1_000}},
+    )
+
+    // #then
+    expect(first.visited()).toBeLessThan(1_100)
+    expect(second.visited()).toBeLessThan(1_100)
+  })
+
+  it('charges the system parts and the tools it skips', () => {
+    // #given
+    const parts = counting(Array.from({length: 1_000_000}, () => ({type: 'image'})))
+
+    // #when
+    snapshotRequest({system: parts.array}, {limits: {maxNodes: 500}})
+
+    // #then
+    expect(parts.visited()).toBeLessThan(600)
+  })
+
+  it('does not parse an argument string that is over its bound, or over the parse ceiling', () => {
+    // #given a spy on JSON.parse, a 300,000-character JSON string and a 20,000-character one with a 10,000 bound
+    const parse = vi.spyOn(JSON, 'parse')
+    const big = JSON.stringify({a: 'x'.repeat(300_000)})
+    const mid = JSON.stringify({a: 'x'.repeat(20_000)})
+
+    // #when
+    const over = snapshotToolArguments(mid, {limits: {valueChars: 10_000}})
+    const huge = snapshotToolArguments(big)
+    const calls = parse.mock.calls.map(call => String(call[0]).length)
+    parse.mockRestore()
+
+    // #then neither was parsed; the first is omitted for its bound, the second is carried as the text it is
+    expect(calls.filter(length => length > 10_000)).toEqual([])
+    expect(omittedReason(over)).toBe('snapshot-bound')
+    expect(huge).toEqual({value: big})
+  })
+
+  it('still parses an ordinary JSON-string argument', () => {
+    // #given / #when / #then
+    expect(snapshotToolArguments('{"path":"a"}')).toEqual({path: 'a'})
+  })
+
+  it('counts what it left out as the entries it did not keep', () => {
+    // #given ten messages and a budget that keeps about four
+    const messages = Array.from({length: 10}, (_, index) => message(index))
+
+    // #when
+    const snapshot = snapshotRequest({messages}, {limits: {maxNodes: 12}})
+
+    // #then kept plus dropped is the whole history
+    const kept = (snapshot.messages as unknown[]).length
+    expect(kept).toBeGreaterThan(0)
+    expect(kept + (snapshot.droppedMessages ?? 0)).toBe(10)
   })
 })

@@ -33,9 +33,17 @@ export interface SnapshotLimits {
   readonly toolDefinitionChars: number
   /** One prompt, one tool call's arguments, one tool result. At the scrubber's input ceiling: over it the value would be omitted anyway. */
   readonly valueChars: number
+  /**
+   * A JSON-string argument longer than this is carried as the text it is (`{value: text}`), not parsed: parsing is the one
+   * step whose cost is not a walk we count.
+   */
+  readonly argumentParseChars: number
   /** Depth of a copied value. Past it (a cycle included) the value is omitted. */
   readonly maxDepth: number
-  /** Objects, arrays and strings in one snapshot. */
+  /**
+   * Everything visited in one snapshot: objects, arrays, strings, and every entry looked at and skipped (a part left as a
+   * placeholder, an entry that is not a message). One budget for the whole request, so a huge array of cheap things is stopped.
+   */
   readonly maxNodes: number
 }
 
@@ -44,6 +52,7 @@ export const DEFAULT_SNAPSHOT_LIMITS: SnapshotLimits = {
   systemChars: 512 * 1024,
   toolDefinitionChars: 512 * 1024,
   valueChars: 8 * 1024 * 1024,
+  argumentParseChars: 256 * 1024,
   maxDepth: 24,
   maxNodes: 200_000,
 }
@@ -159,28 +168,33 @@ export interface SnapshotContext {
 // Bounded, frozen copy
 // ---------------------------------------------------------------------------------------------------------------------
 
+/** Nodes visited so far, shared by every meter of one snapshot so the budget is request-wide. */
+interface NodeCount {
+  nodes: number
+}
+
 interface Meter {
   readonly limit: number
   readonly maxDepth: number
   readonly maxNodes: number
+  readonly shared: NodeCount
   chars: number
-  nodes: number
   over: boolean
 }
 
-const meterFor = (limit: number, limits: SnapshotLimits): Meter => ({
+const meterFor = (limit: number, limits: SnapshotLimits, shared: NodeCount = {nodes: 0}): Meter => ({
   limit,
   maxDepth: limits.maxDepth,
   maxNodes: limits.maxNodes,
+  shared,
   chars: 0,
-  nodes: 0,
   over: false,
 })
 
 function spend(meter: Meter, chars: number, nodes: number): boolean {
   meter.chars += chars
-  meter.nodes += nodes
-  if (meter.chars > meter.limit || meter.nodes > meter.maxNodes) meter.over = true
+  meter.shared.nodes += nodes
+  if (meter.chars > meter.limit || meter.shared.nodes > meter.maxNodes) meter.over = true
   return !meter.over
 }
 
@@ -260,7 +274,10 @@ export interface RequestSnapshot {
   readonly system?: readonly {readonly text: string}[] | OmittedContent
   readonly messages?: readonly Json[] | OmittedContent
   readonly tools?: Readonly<Record<string, {readonly description?: string; readonly input?: unknown}>> | OmittedContent
-  /** Oldest messages left out to fit the snapshot's ceiling. */
+  /**
+   * Entries of the history not kept (the oldest, left out to fit the snapshot's bounds). Counted by arithmetic on the
+   * array's length, so it is an upper bound: it also counts entries that were not messages.
+   */
   readonly droppedMessages?: number
   /** Characters this snapshot holds; what the ledger counts. */
   readonly size: number
@@ -290,6 +307,8 @@ function pruneToolResultValue(value: unknown, type: unknown, meter: Meter): unkn
     const items: Json[] = []
     for (const item of value) {
       if (!isRecord(item)) {
+        spend(meter, 0, 1)
+        if (meter.over) return undefined
         items.push(Object.freeze({type: 'text', text: ''}))
         continue
       }
@@ -314,7 +333,9 @@ function pruneToolResultValue(value: unknown, type: unknown, meter: Meter): unkn
 }
 
 function pruneMessagePart(part: unknown, meter: Meter): Json {
-  if (!isRecord(part)) return PLACEHOLDER
+  // Every part visited costs a node, the ones that are only a placeholder included.
+  spend(meter, 0, 1)
+  if (meter.over || !isRecord(part)) return PLACEHOLDER
   const type = readKey(part, 'type')
   switch (type) {
     case 'text':
@@ -373,11 +394,14 @@ function pruneSystem(
   system: unknown,
   limit: number,
   limits: SnapshotLimits,
+  shared: NodeCount,
 ): {value: RequestSnapshot['system']; chars: number} | undefined {
   if (!Array.isArray(system)) return undefined
-  const meter = meterFor(limit, limits)
+  const meter = meterFor(limit, limits, shared)
   const parts: {text: string}[] = []
   for (const part of system) {
+    spend(meter, 0, 1)
+    if (meter.over) return {value: omittedContent('snapshot-bound'), chars: 0}
     const text = isRecord(part) ? asString(readKey(part, 'text')) : undefined
     if (text === undefined) continue
     spend(meter, text.length, 1)
@@ -391,12 +415,15 @@ function pruneTools(
   tools: unknown,
   limit: number,
   limits: SnapshotLimits,
+  shared: NodeCount,
 ): {value: RequestSnapshot['tools']; chars: number} | undefined {
   if (!isRecord(tools)) return undefined
-  const meter = meterFor(limit, limits)
+  const meter = meterFor(limit, limits, shared)
   const copy: Record<string, {description?: string; input?: unknown}> = {}
   for (const name of Object.keys(tools)) {
     if (name === '__proto__') continue
+    spend(meter, 0, 1)
+    if (meter.over) return {value: omittedContent('snapshot-bound'), chars: 0}
     const tool = readKey(tools, name)
     if (!isRecord(tool)) continue
     spend(meter, name.length, 1)
@@ -431,12 +458,20 @@ export function snapshotRequest(
     const {limits, room} = resolve(context)
     if (room === undefined) return omittedRequest('pending-bound')
     const total = Math.min(limits.requestChars, room)
-    const system = pruneSystem(input.system, Math.min(limits.systemChars, total), limits)
+    // One node budget for the whole request: the system text, the tools and every message draw on it.
+    const shared: NodeCount = {nodes: 0}
+    const system = pruneSystem(input.system, Math.min(limits.systemChars, total), limits, shared)
     let used = system?.chars ?? 0
-    const tools = pruneTools(input.tools, Math.min(limits.toolDefinitionChars, Math.max(0, total - used)), limits)
+    const tools = pruneTools(
+      input.tools,
+      Math.min(limits.toolDefinitionChars, Math.max(0, total - used)),
+      limits,
+      shared,
+    )
     used += tools?.chars ?? 0
 
-    // The newest history that fits, kept in order. A message that does not fit ends the walk: older ones go too.
+    // The newest history that fits, kept in order. The walk ends at the first message that does not fit or when the node
+    // budget is spent, and what is older is counted by its length, not walked: the cost is the budget's, not the history's.
     let messages: RequestSnapshot['messages']
     let droppedMessages = 0
     if (Array.isArray(input.messages)) {
@@ -444,7 +479,10 @@ export function snapshotRequest(
       let remaining = Math.max(0, total - used)
       let index = input.messages.length - 1
       for (; index >= 0; index -= 1) {
-        const meter = meterFor(remaining, limits)
+        // An entry costs a node whether or not it is a message.
+        shared.nodes += 1
+        if (shared.nodes > limits.maxNodes) break
+        const meter = meterFor(remaining, limits, shared)
         const message = pruneMessage(input.messages[index], meter)
         if (message === undefined) continue
         if (meter.over) break
@@ -452,10 +490,8 @@ export function snapshotRequest(
         used += meter.chars
         kept.push(message)
       }
-      for (; index >= 0; index -= 1) {
-        const older: unknown = input.messages[index]
-        if (isRecord(older) && asString(readKey(older, 'role')) !== undefined) droppedMessages += 1
-      }
+      // Entries not kept, by length: an upper bound, since it also counts entries that were not messages.
+      droppedMessages = index + 1
       kept.reverse()
       messages = Object.freeze(kept)
     }
@@ -503,12 +539,16 @@ export function snapshotToolArguments(
     if (room === undefined) return omittedContent('pending-bound')
     let value: unknown = input
     if (typeof input === 'string') {
+      // Length first: a string over its bound is omitted unparsed, and one over the parse ceiling is carried as text.
+      if (input.length > Math.min(limits.valueChars, room)) return omittedContent('snapshot-bound')
       value = {value: input}
-      try {
-        const parsed: unknown = JSON.parse(input)
-        if (isRecord(parsed)) value = parsed
-      } catch {
-        // Not JSON: wrapped.
+      if (input.length <= limits.argumentParseChars) {
+        try {
+          const parsed: unknown = JSON.parse(input)
+          if (isRecord(parsed)) value = parsed
+        } catch {
+          // Not JSON: wrapped.
+        }
       }
     } else if (!isRecord(input)) {
       value = {value: input}
@@ -543,6 +583,8 @@ export function snapshotToolResult(
     } else if (Array.isArray(raw)) {
       const parts: Json[] = []
       for (const item of raw) {
+        spend(meter, 0, 1)
+        if (meter.over) break
         if (!isRecord(item)) continue
         const type = readKey(item, 'type')
         if (type === 'text') {
