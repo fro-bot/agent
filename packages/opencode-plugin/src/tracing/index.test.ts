@@ -487,6 +487,119 @@ describe('the hook-time snapshot', () => {
   })
 })
 
+describe('a hostile tool result', () => {
+  /** The class that made the JWT pattern quadratic: `eyJ-` repeated, a megabyte of it. */
+  const HOSTILE = 'eyJ-'.repeat(256 * 1024)
+
+  it('does not delay the hook, the next request or the event loop beyond a stated bound, and the span is exported', async () => {
+    // #given a turn with one tool call whose result is 1 MiB of `eyJ-`, and a timer that records the longest the event loop stalls
+    const target = await sink()
+    const fake = fakeObserverHost()
+    const handle = await startTracing(fake.host, LOCAL(target.url), {env: {}, log: () => {}})
+    const t = 1_700_000_000_000
+    fake.call('session.prompt', {sessionID: SES, messageID: 'msg_1', delivery: 'steer', prompt: {text: 'run it'}})
+    fake.emit(event('session.inbox.enqueued', {sessionID: SES, inboxID: 'msg_1', item: {type: 'user'}}, t))
+    fake.emit(event('session.execution.started', {sessionID: SES}, t + 1))
+    fake.emit(event('session.inbox.delivered', {sessionID: SES, inboxID: 'msg_1'}, t + 2))
+    const request = (): Record<string, unknown> => ({
+      sessionID: SES,
+      agent: 'build',
+      model: {id: 'm', providerID: 'p'},
+      system: [{type: 'text', text: 'sys'}],
+      messages: [{role: 'user', content: [{type: 'text', text: 'run it'}]}],
+      tools: {},
+      options: {},
+    })
+    fake.call('session.context', request())
+    fake.emit(
+      event(
+        'session.step.started',
+        {sessionID: SES, assistantMessageID: 'msg_2', agent: 'build', model: {id: 'm', providerID: 'p'}},
+        t + 3,
+      ),
+    )
+    fake.emit(
+      event(
+        'session.tool.input.started',
+        {sessionID: SES, assistantMessageID: 'msg_2', id: 'call_1', name: 'read'},
+        t + 4,
+      ),
+    )
+    fake.emit(
+      event(
+        'session.tool.called',
+        {sessionID: SES, assistantMessageID: 'msg_2', id: 'call_1', input: {path: 'x'}, executed: false},
+        t + 5,
+      ),
+    )
+    fake.call('tool.execute.before', {sessionID: SES, id: 'call_1', tool: 'read', agent: 'build', input: {path: 'x'}})
+    let worst = 0
+    let last = performance.now()
+    const watcher = setInterval(() => {
+      const nowMs = performance.now()
+      worst = Math.max(worst, nowMs - last)
+      last = nowMs
+    }, 5)
+
+    // #when the after hook carries the hostile result, and the next model request follows at once
+    const hookStarted = performance.now()
+    fake.call('tool.execute.after', {
+      sessionID: SES,
+      id: 'call_1',
+      tool: 'read',
+      status: 'completed',
+      result: {content: [{type: 'text', text: HOSTILE}]},
+    })
+    const hookMs = performance.now() - hookStarted
+    fake.emit(
+      event(
+        'session.tool.success',
+        {
+          sessionID: SES,
+          assistantMessageID: 'msg_2',
+          id: 'call_1',
+          content: [{type: 'text', text: 'ok'}],
+          executed: false,
+        },
+        t + 6,
+      ),
+    )
+    const nextStarted = performance.now()
+    fake.call('session.context', request())
+    const nextMs = performance.now() - nextStarted
+    fake.emit(
+      event(
+        'session.step.ended',
+        {
+          sessionID: SES,
+          assistantMessageID: 'msg_2',
+          finish: 'tool-calls',
+          tokens: {input: 1, output: 1, reasoning: 0, cache: {read: 0, write: 0}},
+          cost: 0,
+        },
+        t + 7,
+      ),
+    )
+    fake.emit(event('session.execution.succeeded', {sessionID: SES}, t + 8))
+    await new Promise(resolve => setTimeout(resolve, 600))
+    clearInterval(watcher)
+    await handle.stop()
+    fake.end()
+
+    // #then the hook and the next request returned in a few milliseconds, the loop never stalled for more than a slice and
+    // one string's scrub, and the tool span reached the sink, with its content either scrubbed or marked omitted
+    expect(hookMs).toBeLessThan(50)
+    expect(nextMs).toBeLessThan(50)
+    expect(worst).toBeLessThan(250)
+    const text = target
+      .accepted()
+      .map(request => request.text)
+      .join('')
+    expect(text).toContain('execute_tool read')
+    expect(text.length).toBeLessThan(2 * 1024 * 1024)
+  })
+})
+
 describe('the handlers', () => {
   it('return at once and never change a hook’s arguments', async () => {
     // #given a deep-frozen request payload, and the hook as the host calls it
