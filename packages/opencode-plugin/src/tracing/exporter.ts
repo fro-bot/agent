@@ -381,6 +381,12 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
       // Whatever is still queued or in flight is cancelled and counted dropped (a request already fully received may still have
       // been accepted: a dropped count is an upper bound, and the Action-mode counts header, which only has exported and
       // dropped, reports it the same way).
+      // What this does not cancel: the SDK's retry wait. `retrying-transport.js` holds it as a plain, referenced `setTimeout`
+      // (v0.219.0, no handle exposed, and the package's exports map allows no deep import to build the transport ourselves), so
+      // a host that waits for its event loop to drain stays up until it fires. That timer is bounded by the request timeout
+      // (`requestTimeoutMs`, 10 s): the wait is at most 5 s of backoff, or a server-sent `Retry-After` up to the time left of the
+      // request. Measured with `Retry-After: 9`: the process exits about 7.4 s after cleanup returns; without it, about 0.5 to
+      // 1.1 s. When it fires the headers function above throws, so nothing is sent. OpenCode's server does not wait for it.
       cancelled = true
       try {
         agent?.destroy()
