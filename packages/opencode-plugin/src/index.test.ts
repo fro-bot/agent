@@ -6,6 +6,7 @@ import plugin, {FRO_BOT_PLUGIN_ID} from './index.js'
 import {SESSION_TOOL_NAMES} from './session-tools.js'
 import {setupFroBotPlugin} from './setup.js'
 import {TASK_REUSE_REJECTION} from './task-reuse-guard.js'
+import {TRACING_LAUNCHER_ENV} from './tracing/settings.js'
 
 type Added = Parameters<Parameters<HostSurface['tool']['transform']>[0]>[0] extends {add: (tool: infer T) => void}
   ? T
@@ -145,48 +146,95 @@ async function freshSetup() {
   return import('./setup.js')
 }
 
-describe('the lazy tracing entry', () => {
-  const STUB_SWITCH = 'OPENCODE_FROBOT_TRACING_STUB_URL'
+const RELAY = 'http://127.0.0.1:43211/v1/traces'
+const ON = JSON.stringify({
+  version: 1,
+  host: 'action',
+  tracing: 'on',
+  relay: RELAY,
+  identity: {repository: 'fro-bot/agent', runId: '1', attempt: '1', job: 'j', trigger: 'push'},
+})
+/** An environment with no launcher variable, no headless marker and no user file anywhere. */
+const LOCAL_WITHOUT_FILE = {HOME: '/nonexistent/fro-bot-home', XDG_CONFIG_HOME: '/nonexistent/fro-bot-xdg'}
 
+describe('the lazy tracing entry', () => {
   afterEach(() => {
-    vi.unstubAllEnvs()
     vi.doUnmock('./tracing/index.js')
     vi.restoreAllMocks()
     vi.resetModules()
   })
 
-  it('never evaluates the tracing module when the switch is off', async () => {
-    // #given a tracing module that counts its evaluations, and no switch
+  it.each([
+    ['no launcher and no user file', LOCAL_WITHOUT_FILE],
+    [
+      'a launcher that says off',
+      {[TRACING_LAUNCHER_ENV]: JSON.stringify({version: 1, host: 'action', tracing: 'off'})},
+    ],
+    ['a headless host with no launcher', {OPENCODE_PASSWORD: 'x', OPENCODE_CONFIG_CONTENT: '{}'}],
+  ])('never evaluates the tracing module with %s', async (_label, env) => {
+    // #given a tracing module that counts its evaluations
     const evaluated = vi.fn()
     vi.doMock('./tracing/index.js', () => {
       evaluated()
       return {exportStubSpan: vi.fn()}
     })
-    vi.stubEnv(STUB_SWITCH, '')
     const {setupFroBotPlugin: setup} = await freshSetup()
     const {host, order} = fakeHost()
 
     // #when the plugin sets up
-    await setup(host)
+    await setup(host, {env, log: () => {}})
 
     // #then the plugin is registered as usual and the tracing module was never loaded
     expect(order).toEqual(['hook:execute.before', 'tools'])
     expect(evaluated).not.toHaveBeenCalled()
   })
 
-  it('loads the tracing module once and hands it the URL when the switch is on', async () => {
-    // #given a tracing module and a switch carrying a URL
+  it('loads the tracing module once and hands it the relay address when the launcher says on', async () => {
+    // #given a tracing module and an Action launcher variable
     const exportStubSpan = vi.fn(async () => {})
     vi.doMock('./tracing/index.js', () => ({exportStubSpan}))
-    vi.stubEnv(STUB_SWITCH, 'http://127.0.0.1:4318/v1/traces')
     const {setupFroBotPlugin: setup} = await freshSetup()
     const {host} = fakeHost()
 
     // #when the plugin sets up
-    await setup(host)
+    await setup(host, {env: {[TRACING_LAUNCHER_ENV]: ON}, log: () => {}})
 
-    // #then the stub ran against that URL
-    expect(exportStubSpan).toHaveBeenCalledExactlyOnceWith({url: 'http://127.0.0.1:4318/v1/traces'})
+    // #then the stub ran against the relay, with no headers: the credential never reaches the plugin
+    expect(exportStubSpan).toHaveBeenCalledExactlyOnceWith({url: RELAY})
+  })
+
+  it('ignores plugin options and the project config: they cannot turn tracing on', async () => {
+    // #given a host whose plugin options name an endpoint, and a tracing module that counts evaluations
+    const evaluated = vi.fn()
+    vi.doMock('./tracing/index.js', () => {
+      evaluated()
+      return {exportStubSpan: vi.fn()}
+    })
+    const {setupFroBotPlugin: setup} = await freshSetup()
+    const {host} = fakeHost()
+    const withOptions = {...host, options: {endpoint: 'https://evil.example/v1/traces', tracing: true}}
+
+    // #when the plugin sets up in a local session with no user file
+    await setup(withOptions, {env: LOCAL_WITHOUT_FILE, log: () => {}})
+
+    // #then tracing stayed off
+    expect(evaluated).not.toHaveBeenCalled()
+  })
+
+  it('logs one fixed line for a refused launcher and still registers everything', async () => {
+    // #given a launcher naming a public relay
+    const lines: string[] = []
+    vi.doMock('./tracing/index.js', () => ({exportStubSpan: vi.fn()}))
+    const {setupFroBotPlugin: setup} = await freshSetup()
+    const {host, order} = fakeHost()
+    const refused = JSON.stringify({...JSON.parse(ON), relay: 'http://203.0.113.9:4318/v1/traces'})
+
+    // #when the plugin sets up
+    await setup(host, {env: {[TRACING_LAUNCHER_ENV]: refused}, log: line => lines.push(line)})
+
+    // #then
+    expect(order).toEqual(['hook:execute.before', 'tools'])
+    expect(lines).toEqual(['tracing off (launcher-relay-invalid)'])
   })
 
   it.each([
@@ -206,13 +254,14 @@ describe('the lazy tracing entry', () => {
         },
       }))
     }
-    vi.stubEnv(STUB_SWITCH, 'http://127.0.0.1:4318/v1/traces')
-    const write = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+    const lines: string[] = []
     const {setupFroBotPlugin: setup} = await freshSetup()
     const {host, added, order, before} = fakeHost()
 
     // #when the plugin sets up
-    await expect(setup(host)).resolves.toBeUndefined()
+    await expect(
+      setup(host, {env: {[TRACING_LAUNCHER_ENV]: ON}, log: line => lines.push(line)}),
+    ).resolves.toBeUndefined()
 
     // #then the guard and the tools are registered exactly as without tracing
     expect(order).toEqual(['hook:execute.before', 'tools'])
@@ -222,9 +271,8 @@ describe('the lazy tracing entry', () => {
     )
 
     // #and one line names the failure class and carries nothing from the error message
-    expect(write).toHaveBeenCalledOnce()
-    const line = String(write.mock.calls[0]?.[0])
-    expect(line).toMatch(/^\[fro-bot\/opencode-plugin\] tracing could not start \(\w+\)\n$/)
-    expect(line).not.toContain('hunter2')
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toMatch(/^tracing could not start \(\w+\)$/)
+    expect(lines.join('')).not.toContain('hunter2')
   })
 })

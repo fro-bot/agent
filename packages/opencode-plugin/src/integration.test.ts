@@ -5,11 +5,11 @@
 
 import type {FakeProvider, OtlpSink, RunningServer, SandboxPaths} from './integration.fixture.js'
 
-import {cpSync, existsSync, readdirSync, rmSync, writeFileSync} from 'node:fs'
+import {cpSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync} from 'node:fs'
 import path from 'node:path'
 import process from 'node:process'
 import {fileURLToPath} from 'node:url'
-import {afterAll, beforeAll, describe, expect, it} from 'vitest'
+import {afterAll, afterEach, beforeAll, describe, expect, it} from 'vitest'
 
 import {
   makeSandbox,
@@ -20,6 +20,7 @@ import {
 } from './integration.fixture.js'
 import {FRO_BOT_PLUGIN_ID} from './plugin-id.js'
 import {TASK_REUSE_REJECTION} from './task-reuse-guard.js'
+import {TRACING_LAUNCHER_ENV, userSettingsFilePath} from './tracing/settings.js'
 
 const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const binary = process.env.FRO_BOT_OPENCODE_V2_BIN
@@ -207,15 +208,27 @@ describe.skipIf(!runnable)('built plugin in a real opencode V2', () => {
   }, 90_000)
 })
 
-const STUB_SWITCH = 'OPENCODE_FROBOT_TRACING_STUB_URL'
+const IDENTITY = {repository: 'fro-bot/agent', runId: '1', attempt: '1', job: 'it', trigger: 'workflow_dispatch'}
+
+/** The launcher variable an Action run would set: tracing on, spans to `relay`. */
+const launcherOn = (relay: string): Record<string, string> => ({
+  [TRACING_LAUNCHER_ENV]: JSON.stringify({version: 1, host: 'action', tracing: 'on', relay, identity: IDENTITY}),
+})
+const launcherOff: Record<string, string> = {
+  [TRACING_LAUNCHER_ENV]: JSON.stringify({version: 1, host: 'action', tracing: 'off'}),
+}
 const SETTLE_MS = 1_500
 
 /**
  * A throwaway copy of the built plugin, so a test can replace or remove the lazy tracing chunk without touching `dist/`.
  * `chunk: 'marker'` swaps the SDK chunk for one that writes `marker` when it is evaluated.
  */
+let stagedCopies = 0
+
 function stagePlugin(sandbox: SandboxPaths, chunk: 'keep' | 'marker' | 'missing', marker: string): string {
-  const dir = path.join(sandbox.root, `plugin-${chunk}`)
+  // A fresh directory per call: a still-running server may watch an earlier copy and reload it.
+  stagedCopies += 1
+  const dir = path.join(sandbox.root, `plugin-${chunk}-${stagedCopies}`)
   cpSync(path.join(packageDir, 'package.json'), path.join(dir, 'package.json'))
   cpSync(path.join(packageDir, 'dist'), path.join(dir, 'dist'), {recursive: true})
   const name = readdirSync(path.join(dir, 'dist')).find(file => /^tracing-.*\.mjs$/.test(file))
@@ -264,19 +277,23 @@ describe.skipIf(!runnable)('the lazy tracing chunk in a real opencode V2', () =>
     sink = await startOtlpSink()
   }, 30_000)
 
+  // Stop each test's servers before the next starts: they share a HOME, and a live server reacts to file changes in it.
+  afterEach(async () => {
+    for (const server of servers.splice(0)) await server.stop()
+  }, 60_000)
+
   afterAll(async () => {
-    for (const server of servers) await server.stop()
     await provider?.stop()
     await sink?.stop()
     if (sandbox != null) removeSandbox(sandbox)
   }, 60_000)
 
   it('exports one trace from the bundled SDK and leaves the plugin active', async () => {
-    // #given the built plugin and the stub switch pointed at a loopback sink
+    // #given the built plugin and an Action launcher variable pointing at a loopback sink
     const before = sink.requests.length
 
     // #when the server loads it
-    const server = await start(packageDir, {[STUB_SWITCH]: sink.url})
+    const server = await start(packageDir, launcherOn(sink.url))
     const state = await pluginState(server)
 
     // #then the plugin is active and the sink received exactly one OTLP trace export
@@ -294,12 +311,12 @@ describe.skipIf(!runnable)('the lazy tracing chunk in a real opencode V2', () =>
     expect(server.stderr()).not.toContain('tracing could not start')
   }, 90_000)
 
-  it('does not evaluate the chunk when the switch is off, and evaluates it from the install location when on', async () => {
+  it('does not evaluate the chunk when tracing is off, and evaluates it from the install location when on', async () => {
     // #given a copy of the built plugin whose chunk records when it is evaluated
     const marker = path.join(sandbox.root, 'chunk-evaluated')
     const dir = stagePlugin(sandbox, 'marker', marker)
 
-    // #when the server runs it with the switch off
+    // #when the server runs it with no launcher variable (a headless host: off)
     const off = await start(dir, {})
     expect(await pluginState(off)).toEqual({status: 'active'})
     await settle()
@@ -307,8 +324,8 @@ describe.skipIf(!runnable)('the lazy tracing chunk in a real opencode V2', () =>
     // #then the chunk was never evaluated
     expect(existsSync(marker)).toBe(false)
 
-    // #when it runs with the switch on
-    const on = await start(dir, {[STUB_SWITCH]: sink.url})
+    // #when it runs with an Action launcher that says on
+    const on = await start(dir, launcherOn(sink.url))
     expect(await pluginState(on)).toEqual({status: 'active'})
 
     // #then the chunk was resolved next to the entry and evaluated
@@ -320,8 +337,8 @@ describe.skipIf(!runnable)('the lazy tracing chunk in a real opencode V2', () =>
     const dir = stagePlugin(sandbox, 'missing', '')
     const before = sink.requests.length
 
-    // #when the server runs it with the switch on
-    const server = await start(dir, {[STUB_SWITCH]: sink.url})
+    // #when the server runs it with an Action launcher that says on
+    const server = await start(dir, launcherOn(sink.url))
     const state = await pluginState(server)
     await settle()
 
@@ -334,5 +351,26 @@ describe.skipIf(!runnable)('the lazy tracing chunk in a real opencode V2', () =>
       .filter(line => line.includes('tracing could not start'))
     expect(lines).toHaveLength(1)
     expect(lines[0]).toMatch(/^\[fro-bot\/opencode-plugin\] tracing could not start \(\w+\)$/)
+  }, 90_000)
+
+  it('sends nothing and loads no chunk when only a user file names an endpoint, in any off mode', async () => {
+    // #given a valid, safe user file in the server's config directory, and a chunk that records its evaluation
+    const settingsFile = userSettingsFilePath({XDG_CONFIG_HOME: path.join(sandbox.home, 'config')})
+    mkdirSync(path.dirname(settingsFile), {recursive: true})
+    writeFileSync(settingsFile, JSON.stringify({version: 1, endpoint: sink.url}), {mode: 0o600})
+    const marker = path.join(sandbox.root, 'chunk-evaluated-file')
+    const dir = stagePlugin(sandbox, 'marker', marker)
+    const before = sink.requests.length
+
+    // #when servers run with no launcher variable (headless) and with a launcher that says off
+    const headless = await start(dir, {})
+    const declaredOff = await start(dir, launcherOff)
+    const states = [await pluginState(headless), await pluginState(declaredOff)]
+    await settle()
+
+    // #then both plugins are active, nothing reached the sink, and the chunk was never evaluated
+    expect(states).toEqual([{status: 'active'}, {status: 'active'}])
+    expect(sink.requests.length).toBe(before)
+    expect(existsSync(marker)).toBe(false)
   }, 90_000)
 })

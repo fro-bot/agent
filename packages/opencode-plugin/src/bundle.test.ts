@@ -89,6 +89,29 @@ describe('scanImports', () => {
   })
 })
 
+describe('the lazy boundary in the sources', () => {
+  const sourceDir = path.join(packageDir, 'src')
+  const staticTracingImports = (file: string): string[] =>
+    scanImports(readFileSync(path.join(sourceDir, file), 'utf8')).static.filter(specifier =>
+      specifier.includes('/tracing/'),
+    )
+
+  it('lets only the settings module be imported statically from outside the tracing directory', () => {
+    // #given the files that make up the plugin's eager graph
+    // #when / #then they import tracing code statically only through `settings.js`, which decides whether to load the rest
+    expect(staticTracingImports('index.ts')).toEqual([])
+    expect(staticTracingImports('setup.ts')).toEqual(['./tracing/settings.js'])
+  })
+
+  it('keeps the settings module free of the SDK and of the rest of the tracing code', () => {
+    // #given the settings module
+    const imports = scanImports(readFileSync(path.join(sourceDir, 'tracing/settings.ts'), 'utf8'))
+
+    // #when / #then it imports only Node built-ins
+    expect(imports.static.filter(specifier => !specifier.startsWith('node:'))).toEqual([])
+  })
+})
+
 describe('the built plugin', () => {
   it.runIf(required)('is present when the build is required', () => {
     // #given the release workflow set the flag
@@ -144,6 +167,16 @@ describe('the built plugin', () => {
         })
         expect({chunk, required: imports.required}).toEqual({chunk, required: []})
       }
+    })
+
+    it('keeps the settings decision in the entry and out of the lazy chunks', () => {
+      // #given the launcher variable's name, which only the eager settings module owns
+      const name = 'OPENCODE_FROBOT_TRACING'
+
+      // #when / #then the entry holds it and no chunk does
+      expect(read(ENTRY)).toContain(name)
+      for (const chunk of chunks)
+        expect({chunk, holdsLauncher: read(chunk).includes(name)}).toEqual({chunk, holdsLauncher: false})
     })
 
     it('names no forbidden Node module in any emitted file, however it is spelled', () => {

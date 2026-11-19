@@ -8,6 +8,7 @@ import {logPluginLine} from './log.js'
 import {createPluginSessionClient} from './session-client.js'
 import {createSessionTools} from './session-tools.js'
 import {rejectSubagentReuse} from './task-reuse-guard.js'
+import {resolveTracingSettings, type TracingSettings} from './tracing/settings.js'
 
 type ToolEditor = Parameters<Parameters<Plugin.Context['tool']['transform']>[0]>[0]
 type ToolInfo = Parameters<ToolEditor['add']>[0]
@@ -22,24 +23,34 @@ export interface HostSurface {
   }
 }
 
-/** Feasibility-stage switch: a traces URL turns the tracing stub on. Replaced by real settings resolution. */
-const TRACING_STUB_URL_ENV = 'OPENCODE_FROBOT_TRACING_STUB_URL'
-
 /**
- * The only way into the tracing chunk. With the switch off the `import()` never runs, so the chunk and the SDK inside it
- * are never evaluated. Any failure leaves the plugin exactly as it was.
+ * The only way into the tracing chunk. Called only when settings resolved to on, so with tracing off the `import()` never
+ * runs and the chunk and the SDK inside it are never evaluated. Any failure leaves the plugin exactly as it was.
  */
-async function runTracingStub(url: string): Promise<void> {
+async function runTracingStub(
+  settings: Extract<TracingSettings, {mode: 'on'}>,
+  log: (line: string) => void,
+): Promise<void> {
   try {
     const tracing = await import('./tracing/index.js')
-    await tracing.exportStubSpan({url})
+    // Feasibility stub until the exporter is wired: one span to the resolved endpoint.
+    await tracing.exportStubSpan({
+      url: settings.endpoint,
+      ...(settings.host === 'local' ? {headers: settings.headers} : {}),
+    })
   } catch (error) {
     // Tracing must never fail the plugin. The line names the failure class only: an error message can carry a path or URL.
-    logPluginLine(`tracing could not start (${error instanceof Error ? error.name : 'unknown error'})`)
+    log(`tracing could not start (${error instanceof Error ? error.name : 'unknown error'})`)
   }
 }
 
-export async function setupFroBotPlugin(host: HostSurface): Promise<void> {
+/** What `setupFroBotPlugin` reads from outside the host: injected so tests need no real environment. */
+export interface SetupOptions {
+  readonly env?: Readonly<Record<string, string | undefined>>
+  readonly log?: (line: string) => void
+}
+
+export async function setupFroBotPlugin(host: HostSurface, options: SetupOptions = {}): Promise<void> {
   // The guard goes first: if it cannot be registered the plugin fails before exposing any tool.
   await host.tool.hook('execute.before', async event => {
     rejectSubagentReuse(event)
@@ -62,6 +73,13 @@ export async function setupFroBotPlugin(host: HostSurface): Promise<void> {
       editor.add(tool)
     }
   })
-  const stubUrl = process.env[TRACING_STUB_URL_ENV]
-  if (stubUrl != null && stubUrl.length > 0) await runTracingStub(stubUrl)
+
+  // Last, and never able to fail the registrations above. The settings decision lives outside the lazy chunk.
+  const log = options.log ?? logPluginLine
+  const settings = resolveTracingSettings({
+    env: options.env ?? process.env,
+    directory: host.location.directory,
+    log,
+  })
+  if (settings.mode === 'on') await runTracingStub(settings, log)
 }
