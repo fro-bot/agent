@@ -400,6 +400,14 @@ function applyBefore(tool: ToolState, o: Extract<Observation, {kind: 'tool.befor
   }
 }
 
+/** What an observation holds, for the buffer's byte bound: its stated bytes, or the text it carries. */
+function observedSize(observation: Observation): number {
+  if (observation.bytes !== undefined) return observation.bytes
+  if (observation.kind === 'output') return observation.text.length
+  if (observation.kind === 'title') return observation.title.length
+  return 0
+}
+
 export function createTurnModel(options: {
   readonly ids: IdSource
   readonly limits?: Partial<TurnModelLimits>
@@ -416,6 +424,8 @@ export function createTurnModel(options: {
   const unresolved = new Set<string>()
   /** Child sessions that have been placed under a dispatch. */
   const linked = new Set<string>()
+  /** Children already given their own unattributed trace (their buffer was released before a link came), oldest first. */
+  const releasedChildren = new Set<string>()
   /** Characters of model output held by open requests, against `maxHeldOutputChars`. */
   let heldOutputChars = 0
 
@@ -789,7 +799,7 @@ export function createTurnModel(options: {
       entry = {sessionId, firstAt: observation.at, items: [], bytes: 0}
       buffered.set(sessionId, entry)
     }
-    const size = observation.bytes ?? 0
+    const size = observedSize(observation)
     if (entry.items.length + 1 > limits.maxBufferedObservations || entry.bytes + size > limits.maxBufferedBytes) {
       const items = [...entry.items, observation]
       bufferedBytes -= entry.bytes
@@ -805,6 +815,15 @@ export function createTurnModel(options: {
   /** Gives a buffered session its own trace. `unattributed` when something said it is a child whose parent never proved. */
   function releaseBuffer(sessionId: string, items: readonly Observation[], reason: 'unattributed' | 'root'): void {
     const hinted = parentHints.has(sessionId)
+    if (hinted || reason === 'unattributed') {
+      // A link that arrives later must not create a second, empty child for work that already has its own trace.
+      releasedChildren.add(sessionId)
+      while (releasedChildren.size > limits.maxTombstones) {
+        const oldest = releasedChildren.values().next()
+        if (oldest.done === true) break
+        releasedChildren.delete(oldest.value)
+      }
+    }
     createRootNode(sessionId, items[0]?.at ?? clock)
     const node = sessions.get(sessionId)
     if (node !== undefined && (hinted || reason === 'unattributed')) pendingMarks.set(sessionId, 'unattributed')
@@ -1373,7 +1392,7 @@ export function createTurnModel(options: {
       tool.childSessionId ??= childId
       unresolved.delete(`${tool.sessionId}/${tool.callId}`)
     }
-    if (linked.has(childId) || sessions.has(childId)) return
+    if (linked.has(childId) || sessions.has(childId) || releasedChildren.has(childId)) return
     const trace = tool?.trace ?? parent.active?.trace ?? parent.childOf?.trace
     const entry = buffered.get(childId)
     buffered.delete(childId)
@@ -1524,6 +1543,13 @@ export function createTurnModel(options: {
   }
 
   function dispatch(observation: Observation): void {
+    // A session waiting for its dispatch link keeps ALL its observations in order, whatever their kind: the step, output,
+    // tool and end events of a child that finished before the link arrived are replayed with its start, never dropped.
+    // (The buffer entry is removed before a replay, so replayed observations do not come back here.)
+    if ('sessionId' in observation && buffered.has(observation.sessionId) && !sessions.has(observation.sessionId)) {
+      bufferObservation(observation.sessionId, observation)
+      return
+    }
     switch (observation.kind) {
       case 'prompt':
         onPrompt(observation)
@@ -1631,6 +1657,7 @@ export function createTurnModel(options: {
       bufferedBytes = 0
       unresolved.clear()
       linked.clear()
+      releasedChildren.clear()
       parentHints.clear()
       pendingMarks.clear()
       return out

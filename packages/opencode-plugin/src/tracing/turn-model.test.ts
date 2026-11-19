@@ -1863,3 +1863,118 @@ describe('a report delivered inside a later turn after the dispatching trace clo
     expect(names.every(([own, named]) => own !== named)).toBe(true)
   })
 })
+
+describe('a child that finishes before its dispatch link arrives', () => {
+  /** The parent dispatches; the child runs a whole turn (request, step, output, tool, usage, end) with the link still unknown. */
+  const fastChild = (extra: (s: ReturnType<typeof script>) => void = () => {}) => {
+    const s = script()
+    s.prompt('p', 'm1')
+    s.enqueued('p', 'm1', 'user')
+    s.started('p')
+    s.delivered('p', 'm1')
+    s.request('p')
+    s.stepStarted('p', 's1')
+    s.toolBefore('p', 'c1', 'subagent')
+    // The child's whole turn, before any observation names it as this tool's child.
+    s.prompt('kid', 'mk')
+    s.enqueued('kid', 'mk', 'user')
+    s.started('kid')
+    s.delivered('kid', 'mk')
+    s.request('kid')
+    s.stepStarted('kid', 'sk')
+    s.text('kid', 'sk', 'child answer')
+    s.toolBefore('kid', 'ck')
+    s.toolEnded('kid', 'ck')
+    s.stepEnded('kid', 'sk')
+    s.ended('kid')
+    extra(s)
+    // Now the link arrives, and the parent finishes.
+    s.toolAfter('p', 'c1', 'subagent', 'kid')
+    s.toolEnded('p', 'c1', {childSessionId: 'kid'})
+    s.stepEnded('p', 's1')
+    // The child's report reaches the parent, which answers it in the same execution, as recorded.
+    s.enqueued('p', 'rep', 'synthetic', 'kid', 'completed')
+    s.request('p')
+    s.stepStarted('p', 's2')
+    s.delivered('p', 'rep')
+    s.stepEnded('p', 's2')
+    s.ended('p')
+    return s
+  }
+
+  it('replays the whole child sequence in order, so output, usage and a normal close all happen, with no forced flush', () => {
+    // #given
+    const s = fastChild()
+
+    // #when replayed with no flush
+    const {records, model} = replay(s.out, {flush: false})
+
+    // #then one trace: the child's model span has its output and usage, its tool span closed, and both agents ended ok
+    expect(roots(records)).toHaveLength(1)
+    const kidChat = chats(records).find(chat => chat.sessionId === 'kid')
+    expect(kidChat?.texts).toEqual(['child answer'])
+    expect(kidChat?.usage).toBeDefined()
+    expect(kidChat?.status).toBe('ok')
+    expect(tools(records).filter(tool => tool.sessionId === 'kid')).toHaveLength(1)
+    const invokes = records.filter(record => record.kind === 'invoke_agent')
+    expect(invokes).toHaveLength(2)
+    expect(invokes.every(record => record.status === 'ok' && !record.marks.includes('incomplete'))).toBe(true)
+    expect(model.stats()).toMatchObject({openTraces: 0, sessions: 0, bufferedSessions: 0, bufferedBytes: 0})
+  })
+
+  it('names the child under the dispatching tool span, as when the link comes first', () => {
+    // #given / #when
+    const {records} = replay(fastChild().out, {flush: false})
+
+    // #then
+    const dispatch = tools(records).find(tool => tool.tool === 'subagent')
+    const child = records.find(record => record.kind === 'invoke_agent' && record.sessionId === 'kid')
+    expect(child?.parentSpanId).toBe(dispatch?.spanId)
+  })
+
+  it('buffers every later kind of observation for a buffered session, and counts them against the bound', () => {
+    // #given a buffer bound of five observations and a child whose whole turn is longer than that
+    const s = fastChild()
+
+    // #when
+    const {records, model} = replay(s.out, {flush: false, limits: {maxBufferedObservations: 5}})
+
+    // #then past the bound the buffer is released as its own unattributed trace, whole and in order, never half
+    const kidRoots = records.filter(record => record.kind === 'invoke_agent' && record.sessionId === 'kid')
+    expect(kidRoots).toHaveLength(1)
+    expect(chats(records).find(chat => chat.sessionId === 'kid')?.texts).toEqual(['child answer'])
+    expect(model.stats().bufferedSessions).toBe(0)
+  })
+
+  it('releases a buffered session that never gets its link as an unattributed trace at the window, with everything it did', () => {
+    // #given a child whose whole turn arrives and whose link never does
+    const s = script()
+    s.prompt('p', 'm1')
+    s.enqueued('p', 'm1', 'user')
+    s.started('p')
+    s.delivered('p', 'm1')
+    s.request('p')
+    s.stepStarted('p', 's1')
+    s.toolBefore('p', 'c1', 'subagent')
+    s.created('kid', 'p')
+    s.prompt('kid', 'mk')
+    s.enqueued('kid', 'mk', 'user')
+    s.started('kid')
+    s.delivered('kid', 'mk')
+    s.request('kid')
+    s.stepStarted('kid', 'sk')
+    s.text('kid', 'sk', 'orphan answer')
+    s.stepEnded('kid', 'sk')
+    s.ended('kid')
+    s.tick(lastAt(s.out) + DEFAULT_LIMITS.bufferWindowMs + 1)
+
+    // #when
+    const {records} = replay(s.out, {flush: false})
+
+    // #then it has its own trace marked unattributed, with its output, and it closed normally
+    const kidRoot = records.find(record => record.kind === 'invoke_agent' && record.sessionId === 'kid')
+    expect(kidRoot?.marks).toContain('unattributed')
+    expect(kidRoot?.status).toBe('ok')
+    expect(chats(records).find(chat => chat.sessionId === 'kid')?.texts).toEqual(['orphan answer'])
+  })
+})
