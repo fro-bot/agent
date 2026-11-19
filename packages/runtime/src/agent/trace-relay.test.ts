@@ -8,6 +8,7 @@ import {afterEach, describe, expect, it, vi} from 'vitest'
 
 import {startTlsUpstream} from './key-proxy-test-kit.js'
 import {postBatch, rawExchange, startHttpUpstream} from './trace-relay-test-kit.js'
+import {TRACE_RELAY_COUNTS_HEADER} from './trace-relay-wire.js'
 import {startTraceRelay} from './trace-relay.js'
 
 const CREDENTIAL = 'Basic dHJhY2UtcmVsYXktY2FuYXJ5LTAwMDc6c2VjcmV0'
@@ -653,5 +654,90 @@ describe('startTraceRelay: its socket and its start', () => {
 
     expect(await waiting).toBe('cut')
     await expect(postBatch(relay.port)).rejects.toThrow()
+  })
+})
+
+async function arrangeCounts() {
+  const upstream = await upstreamAnswering(200)
+  const relay = await relayFor(`${upstream.origin}/v1/traces`)
+  return {upstream, relay}
+}
+
+describe('startTraceRelay: the plugin counts header', () => {
+  const withCounts = (value: string) => ({headers: {[TRACE_RELAY_COUNTS_HEADER]: value}})
+
+  it('records a valid value, and keeps null when none was ever received', async () => {
+    const {relay} = await arrangeCounts()
+    expect(relay.pluginCounts()).toBeNull()
+
+    await postBatch(relay.port)
+    expect(relay.pluginCounts()).toBeNull()
+
+    await postBatch(relay.port, withCounts('exported=12;dropped=3'))
+    expect(relay.pluginCounts()).toEqual({exportedSpans: 12, droppedSpans: 3})
+  })
+
+  it('keeps the last valid value, not a sum, and does not require it to grow', async () => {
+    const {relay} = await arrangeCounts()
+
+    await postBatch(relay.port, withCounts('exported=100;dropped=10'))
+    await postBatch(relay.port, withCounts('exported=7;dropped=1'))
+
+    expect(relay.pluginCounts()).toEqual({exportedSpans: 7, droppedSpans: 1})
+  })
+
+  it.each([
+    ['malformed', 'exported=lots'],
+    ['oversized', `exported=${'9'.repeat(13)};dropped=1`],
+    ['negative', 'exported=-1;dropped=2'],
+    ['non-numeric', 'exported=a;dropped=b'],
+    ['with an extra field', 'exported=1;dropped=2;x=3'],
+    ['empty', ' '],
+  ])('ignores a %s value without refusing the batch, and keeps the earlier valid one', async (_name, value) => {
+    const {upstream, relay} = await arrangeCounts()
+    await postBatch(relay.port, withCounts('exported=5;dropped=6'))
+
+    const answer = await postBatch(relay.port, withCounts(value))
+
+    expect(answer.status).toBe(200)
+    expect(upstream.requests).toHaveLength(2)
+    expect(relay.pluginCounts()).toEqual({exportedSpans: 5, droppedSpans: 6})
+    expect(relay.counts()).toEqual({delivered: 2, retry: 0, dropped: 0})
+  })
+
+  it('ignores a duplicated header without refusing the batch', async () => {
+    const {upstream, relay} = await arrangeCounts()
+
+    const exchange = await rawExchange(
+      relay.port,
+      `POST /v1/traces HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-protobuf\r\nContent-Length: 2\r\n${TRACE_RELAY_COUNTS_HEADER}: exported=1;dropped=2\r\n${TRACE_RELAY_COUNTS_HEADER}: exported=3;dropped=4\r\n\r\nab`,
+      {waitMs: 400},
+    )
+
+    expect(exchange.status).toBe(200)
+    expect(upstream.requests).toHaveLength(1)
+    expect(relay.pluginCounts()).toBeNull()
+  })
+
+  it('does not forward the header upstream, valid or not', async () => {
+    const {upstream, relay} = await arrangeCounts()
+
+    await postBatch(relay.port, withCounts('exported=1;dropped=2'))
+    await postBatch(relay.port, withCounts('garbage'))
+
+    expect(upstream.requests).toHaveLength(2)
+    for (const request of upstream.requests) {
+      expect(request.headers[TRACE_RELAY_COUNTS_HEADER]).toBeUndefined()
+      expect(JSON.stringify(request.headers)).not.toContain('exported=')
+    }
+  })
+
+  it('records the value only from a request on the route', async () => {
+    const {relay} = await arrangeCounts()
+
+    await postBatch(relay.port, {path: '/elsewhere', ...withCounts('exported=1;dropped=2')})
+    await postBatch(relay.port, {method: 'GET', body: '', ...withCounts('exported=1;dropped=2')})
+
+    expect(relay.pluginCounts()).toBeNull()
   })
 })

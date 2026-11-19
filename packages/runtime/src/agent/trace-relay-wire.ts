@@ -11,8 +11,9 @@ import {err, ok} from '../shared/types.js'
  * collector's traces URL, its credential headers and the caps. The pipe then stays open; closing it is the stop signal.
  *
  * Child to Action, on stdout: one ready line, `{"ready":true,"port":N}` or `{"error":"<code>"}` with a fixed code, and,
- * once stdin has closed, one report line, `{"report":{"delivered":N,"retry":N,"dropped":N}}`. Nothing else, ever. An
- * error line never quotes input.
+ * once stdin has closed, one report line, `{"report":{"delivered":N,"retry":N,"dropped":N}}`, plus
+ * `"plugin":{"exportedSpans":N,"droppedSpans":N}` inside the report when the plugin ever sent a valid counts header.
+ * Nothing else, ever. An error line never quotes input, and the report holds only integers of bounded size.
  *
  * Node-only: no Action, SDK or logger dependency, so the child entry stays small.
  */
@@ -36,6 +37,39 @@ export const TRACE_RELAY_PATH = '/v1/traces'
  * dropped and does not retry. Locally refused requests (wrong path, method, type, size) use final statuses too.
  */
 export const TRACE_RELAY_STATUS = {delivered: 200, retry: 503, dropped: 422} as const
+
+/**
+ * The one request header the plugin may add to a batch: its running totals of exported and dropped spans for this run. The
+ * Action starts the server with its error output discarded, so this is how the plugin's counts reach the run log. The
+ * relay never forwards it upstream, and ignores a value of any other form without refusing the batch.
+ */
+export const TRACE_RELAY_COUNTS_HEADER = 'x-frobot-trace-counts'
+
+/** What the plugin said it exported and dropped. Untrusted: the sender is whatever can reach the loopback port. */
+export interface TraceRelayPluginCounts {
+  readonly exportedSpans: number
+  readonly droppedSpans: number
+}
+
+/** Exactly `exported=<n>;dropped=<n>`, each `n` one to twelve ASCII digits. Anchored and free of nesting: linear time. */
+const COUNTS_HEADER_PATTERN = /^exported=(\d{1,12});dropped=(\d{1,12})$/
+
+/** The value for {@link TRACE_RELAY_COUNTS_HEADER}. The plugin mirrors this form. */
+export function formatTraceRelayCountsHeader(counts: TraceRelayPluginCounts): string {
+  return `exported=${counts.exportedSpans};dropped=${counts.droppedSpans}`
+}
+
+/**
+ * The counts a header value carries, or null for anything else: a missing header, another form, a number over twelve
+ * digits, a sign, a duplicate (Node joins repeated headers with a comma, which the pattern rejects). Never throws and
+ * never quotes the value.
+ */
+export function parseTraceRelayCountsHeader(value: string | string[] | undefined): TraceRelayPluginCounts | null {
+  if (typeof value !== 'string' || value.length > 64) return null
+  const match = COUNTS_HEADER_PATTERN.exec(value)
+  if (match === null) return null
+  return {exportedSpans: Number(match[1]), droppedSpans: Number(match[2])}
+}
 
 /** Exit codes of the child. Zero is a clean stop after stdin closed. */
 export const TRACE_RELAY_EXIT_INVALID_CONFIG = 64
@@ -99,7 +133,7 @@ export type TraceRelayChildLine =
   | {readonly kind: 'error'; readonly code: TraceRelayChildErrorCode}
   | {readonly kind: 'invalid'}
   | {readonly kind: 'ready'; readonly port: number}
-  | {readonly kind: 'report'; readonly counts: TraceRelayBatchCounts}
+  | {readonly kind: 'report'; readonly counts: TraceRelayBatchCounts; readonly plugin?: TraceRelayPluginCounts}
 
 /** Headers the relay sets itself, or whose meaning is one hop. A configured header may not name one of them. */
 const REFUSED_HEADER_NAMES: ReadonlySet<string> = new Set([
@@ -261,6 +295,16 @@ function isCount(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0
 }
 
+function isPluginCount(value: unknown): value is number {
+  return isCount(value) && value <= 999_999_999_999
+}
+
+function readPluginCounts(value: unknown): TraceRelayPluginCounts | null {
+  if (!isRecord(value)) return null
+  const {exportedSpans, droppedSpans} = value
+  return isPluginCount(exportedSpans) && isPluginCount(droppedSpans) ? {exportedSpans, droppedSpans} : null
+}
+
 export function parseTraceRelayChildLine(line: string): TraceRelayChildLine {
   let parsed: unknown
   try {
@@ -276,9 +320,10 @@ export function parseTraceRelayChildLine(line: string): TraceRelayChildLine {
   const {report, error} = parsed
   if (isRecord(report)) {
     const {delivered, retry, dropped} = report
-    return isCount(delivered) && isCount(retry) && isCount(dropped)
-      ? {kind: 'report', counts: {delivered, retry, dropped}}
-      : {kind: 'invalid'}
+    if (!isCount(delivered) || !isCount(retry) || !isCount(dropped)) return {kind: 'invalid'}
+    // A malformed plugin field is dropped on its own: the relay's own counts stay usable.
+    const plugin = readPluginCounts(report.plugin)
+    return {kind: 'report', counts: {delivered, retry, dropped}, ...(plugin === null ? {} : {plugin})}
   }
   if (error === 'internal' || error === 'invalid-config' || error === 'start-failed')
     return {kind: 'error', code: error}

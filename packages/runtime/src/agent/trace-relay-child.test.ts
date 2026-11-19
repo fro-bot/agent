@@ -6,7 +6,7 @@ import {afterEach, describe, expect, it} from 'vitest'
 import {err} from '../shared/types.js'
 import {runTraceRelayChild} from './trace-relay-child.js'
 import {postBatch, startHttpUpstream} from './trace-relay-test-kit.js'
-import {encodeTraceRelayConfig, TRACE_RELAY_MAX_CONFIG_BYTES} from './trace-relay-wire.js'
+import {encodeTraceRelayConfig, TRACE_RELAY_COUNTS_HEADER, TRACE_RELAY_MAX_CONFIG_BYTES} from './trace-relay-wire.js'
 
 const CREDENTIAL = 'Basic Y2hpbGQtY2FuYXJ5LTAwMDc6c2VjcmV0'
 const BODY_CANARY = 'BATCH-BODY-CANARY-0007'
@@ -261,5 +261,70 @@ describe('runTraceRelayChild', () => {
 
     expect(await r.waitForExit()).toBe(0)
     expect(r.output().endsWith('{"report":{"delivered":1,"retry":0,"dropped":0}}\n')).toBe(true)
+  })
+})
+
+async function started() {
+  const upstream = await startHttpUpstream((_request, res) => res.end())
+  cleanups.push(upstream.close)
+  const r = run()
+  r.stdin.write(encodeTraceRelayConfig(configFor(upstream.origin)))
+  const ready = JSON.parse(await r.waitForLines(1)) as {port: number}
+  return {r, port: ready.port}
+}
+
+describe('runTraceRelayChild: the plugin counts in the report', () => {
+  it('puts the last valid plugin totals in the report line, beside the relay counts', async () => {
+    const {r, port} = await started()
+    await postBatch(port, {headers: {[TRACE_RELAY_COUNTS_HEADER]: 'exported=10;dropped=1'}})
+    await postBatch(port, {headers: {[TRACE_RELAY_COUNTS_HEADER]: 'exported=25;dropped=2'}})
+
+    r.stdin.end()
+    await r.waitForExit()
+
+    expect(r.output().split('\n')[1]).toBe(
+      '{"report":{"delivered":2,"retry":0,"dropped":0,"plugin":{"exportedSpans":25,"droppedSpans":2}}}',
+    )
+  })
+
+  it('leaves the plugin field out when no valid value was ever received', async () => {
+    const {r, port} = await started()
+    await postBatch(port)
+    await postBatch(port, {headers: {[TRACE_RELAY_COUNTS_HEADER]: 'exported=-1;dropped=2'}})
+
+    r.stdin.end()
+    await r.waitForExit()
+
+    expect(r.output().split('\n')[1]).toBe('{"report":{"delivered":2,"retry":0,"dropped":0}}')
+  })
+
+  it('keeps the output to the ready line and one bounded report line, whatever the sender puts in its headers', async () => {
+    // #given a sender that fills its headers with canaries, long values and almost-valid counts
+    const {r, port} = await started()
+    const hostile = [
+      'exported=1;dropped=2;CANARY-EXTRA',
+      `exported=${'9'.repeat(5000)};dropped=1`,
+      'CANARY-NOT-NUMBERS',
+      'exported=0x1;dropped=CANARY',
+      'exported=\u00E9;dropped=1',
+    ]
+    for (const value of hostile) {
+      await postBatch(port, {headers: {[TRACE_RELAY_COUNTS_HEADER]: value, 'x-canary': 'CANARY-HEADER'}})
+    }
+    await postBatch(port, {headers: {[TRACE_RELAY_COUNTS_HEADER]: 'exported=999999999999;dropped=999999999999'}})
+
+    // #when it stops
+    r.stdin.end()
+    await r.waitForExit()
+
+    // #then it printed exactly two lines, the second a short fixed-shape line of integers
+    const lines = r.output().split('\n')
+    expect(lines).toHaveLength(3)
+    expect(lines[2]).toBe('')
+    expect(r.output()).not.toContain('CANARY')
+    expect(lines[1]).toMatch(
+      /^\{"report":\{"delivered":\d+,"retry":\d+,"dropped":\d+,"plugin":\{"exportedSpans":\d{1,12},"droppedSpans":\d{1,12}\}\}\}$/,
+    )
+    expect(Buffer.byteLength(lines[1] ?? '')).toBeLessThan(200)
   })
 })

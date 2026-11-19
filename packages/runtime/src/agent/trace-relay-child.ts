@@ -71,9 +71,17 @@ export function runTraceRelayChild(io: TraceRelayChildIo, deps: TraceRelayChildD
 
   const requestShutdown = (): void => {
     if (finished) return
-    const closing = relay?.close() ?? Promise.resolve(undefined)
+    const stopping = relay
+    const closing = stopping?.close() ?? Promise.resolve(undefined)
     closing.then(
-      counts => finish(0, counts === undefined ? undefined : JSON.stringify({report: counts})),
+      counts => {
+        // Only integers reach the line: the batch counts, and the plugin's totals as the wire module validated them.
+        const plugin = stopping?.pluginCounts()
+        finish(
+          0,
+          counts === undefined ? undefined : JSON.stringify({report: {...counts, ...(plugin == null ? {} : {plugin})}}),
+        )
+      },
       () => finish(0),
     )
   }

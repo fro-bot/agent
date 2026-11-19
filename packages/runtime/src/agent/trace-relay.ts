@@ -1,13 +1,24 @@
 import type {ClientRequest, IncomingMessage, Server, ServerResponse} from 'node:http'
 import type {Duplex} from 'node:stream'
 import type {Result} from '../shared/types.js'
-import type {TraceRelayBatchCounts, TraceRelayHeader, TraceRelayLimits} from './trace-relay-wire.js'
+import type {
+  TraceRelayBatchCounts,
+  TraceRelayHeader,
+  TraceRelayLimits,
+  TraceRelayPluginCounts,
+} from './trace-relay-wire.js'
 import {Buffer} from 'node:buffer'
 import http from 'node:http'
 import https from 'node:https'
 import {err, ok} from '../shared/types.js'
 import {isForwardableTarget} from './forwardable-target.js'
-import {TRACE_RELAY_PATH, TRACE_RELAY_STATUS, validateTraceRelayUrl} from './trace-relay-wire.js'
+import {
+  parseTraceRelayCountsHeader,
+  TRACE_RELAY_COUNTS_HEADER,
+  TRACE_RELAY_PATH,
+  TRACE_RELAY_STATUS,
+  validateTraceRelayUrl,
+} from './trace-relay-wire.js'
 
 /**
  * The trace relay: a loopback HTTP server that holds the collector credential and forwards each OpenTelemetry trace
@@ -24,6 +35,8 @@ import {TRACE_RELAY_PATH, TRACE_RELAY_STATUS, validateTraceRelayUrl} from './tra
  *    nothing upstream. The upstream is always the configured URL; the sender's path, `Host` header and body never choose it.
  * 2. The proxy does not authenticate its local callers. No sender header is forwarded except the content type (protobuf or
  *    JSON, normalized) and the content encoding (gzip only); the configured credential headers are set from the config.
+ *    One sender header is read and never forwarded: the plugin's span counts (`TRACE_RELAY_COUNTS_HEADER`). Only a value
+ *    of exactly the fixed numeric form is kept, as numbers; the last valid one wins, and anything else is ignored.
  * 3. A 3xx from the upstream is never followed, nor passed on. An upstream 101 (Upgrade) is never followed either.
  * 4. Nothing of the upstream's response reaches the sender but the fixed status: no body, no header. A `retry-after` is
  *    never forwarded, so the collector cannot stall the sender's exporter.
@@ -46,6 +59,8 @@ export interface TraceRelayServer {
   readonly address: '127.0.0.1'
   /** Batches answered so far, by outcome. */
   readonly counts: () => TraceRelayBatchCounts
+  /** The last valid span totals the plugin sent in the counts header, or null if it never sent one. Untrusted. */
+  readonly pluginCounts: () => TraceRelayPluginCounts | null
   /** Stops accepting, destroys every connection and aborts every forward. Resolves with the final counts. */
   readonly close: () => Promise<TraceRelayBatchCounts>
 }
@@ -123,6 +138,7 @@ export async function startTraceRelay(options: StartTraceRelayOptions): Promise<
   const inflight = new Set<ClientRequest>()
   const counts = {delivered: 0, retry: 0, dropped: 0}
   let totalBytes = 0
+  let pluginCounts: TraceRelayPluginCounts | null = null
   let closing = false
 
   const snapshot = (): TraceRelayBatchCounts => ({...counts})
@@ -221,6 +237,8 @@ export async function startTraceRelay(options: StartTraceRelayOptions): Promise<
     if (!forwardable) return refuse(res, onRoute ? 405 : 404, false)
 
     // From here on this is a batch: a refusal below counts as a dropped one.
+    // The plugin's running totals: the last valid value wins, and any other value is ignored, never a reason to refuse.
+    pluginCounts = parseTraceRelayCountsHeader(req.headers[TRACE_RELAY_COUNTS_HEADER]) ?? pluginCounts
     const mediaType = mediaTypeOf(req.headers['content-type'])
     const encoding = encodingOf(req.headers['content-encoding'])
     if (mediaType === undefined || encoding === 'refused') return refuse(res, 415, true)
@@ -341,6 +359,7 @@ export async function startTraceRelay(options: StartTraceRelayOptions): Promise<
     port: listening.data,
     address: LOOPBACK,
     counts: snapshot,
+    pluginCounts: () => pluginCounts,
     close: async () => {
       if (closing) return snapshot()
       closing = true

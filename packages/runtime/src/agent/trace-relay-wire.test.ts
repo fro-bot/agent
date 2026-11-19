@@ -3,11 +3,14 @@ import {describe, expect, it} from 'vitest'
 
 import {
   encodeTraceRelayConfig,
+  formatTraceRelayCountsHeader,
   isValidTraceRelayHeaderName,
   isValidTraceRelayHeaderValue,
   parseTraceRelayChildLine,
   parseTraceRelayConfig,
+  parseTraceRelayCountsHeader,
   readTraceRelayFrameLength,
+  TRACE_RELAY_COUNTS_HEADER,
   TRACE_RELAY_MAX_CONFIG_BYTES,
   TRACE_RELAY_PATH,
   TRACE_RELAY_STATUS,
@@ -252,5 +255,84 @@ describe('the sender-facing contract', () => {
     expect(retryable.has(TRACE_RELAY_STATUS.retry)).toBe(true)
     expect(TRACE_RELAY_STATUS.dropped).toBeGreaterThan(299)
     expect(retryable.has(TRACE_RELAY_STATUS.dropped)).toBe(false)
+  })
+})
+
+describe('the plugin counts header', () => {
+  it('has a fixed lower-case name and a fixed form, so the plugin can mirror them', () => {
+    expect(TRACE_RELAY_COUNTS_HEADER).toBe('x-frobot-trace-counts')
+    expect(formatTraceRelayCountsHeader({exportedSpans: 12, droppedSpans: 3})).toBe('exported=12;dropped=3')
+  })
+
+  it.each([
+    ['exported=0;dropped=0', {exportedSpans: 0, droppedSpans: 0}],
+    ['exported=12;dropped=3', {exportedSpans: 12, droppedSpans: 3}],
+    ['exported=999999999999;dropped=999999999999', {exportedSpans: 999_999_999_999, droppedSpans: 999_999_999_999}],
+    ['exported=000000000007;dropped=1', {exportedSpans: 7, droppedSpans: 1}],
+  ])('reads %j', (value, expected) => {
+    expect(parseTraceRelayCountsHeader(value)).toEqual(expected)
+  })
+
+  it('round-trips what the formatter writes', () => {
+    const counts = {exportedSpans: 4096, droppedSpans: 17}
+    expect(parseTraceRelayCountsHeader(formatTraceRelayCountsHeader(counts))).toEqual(counts)
+  })
+
+  it.each([
+    ['a missing header', undefined],
+    ['an empty value', ''],
+    ['more than 12 digits', 'exported=1000000000000;dropped=1'],
+    ['more than 12 digits in dropped', 'exported=1;dropped=1000000000000'],
+    ['a negative number', 'exported=-1;dropped=2'],
+    ['a plus sign', 'exported=+1;dropped=2'],
+    ['a decimal', 'exported=1.5;dropped=2'],
+    ['an exponent', 'exported=1e3;dropped=2'],
+    ['hex', 'exported=0x10;dropped=2'],
+    ['words', 'exported=many;dropped=few'],
+    ['an empty number', 'exported=;dropped='],
+    ['a space after the semicolon', 'exported=1; dropped=2'],
+    ['reversed order', 'dropped=2;exported=1'],
+    ['an extra field', 'exported=1;dropped=2;canary=3'],
+    ['upper case', 'Exported=1;Dropped=2'],
+    ['a trailing newline', 'exported=1;dropped=2\n'],
+    ['a leading newline', '\nexported=1;dropped=2'],
+    ['a duplicated header as Node joins it', 'exported=1;dropped=2, exported=3;dropped=4'],
+    ['non-ASCII digits', 'exported=\u0661;dropped=2'],
+    ['an array of values', ['exported=1;dropped=2', 'exported=3;dropped=4']],
+  ])('ignores %s', (_name, value) => {
+    expect(parseTraceRelayCountsHeader(value)).toBeNull()
+  })
+
+  it('checks a huge value in linear time', () => {
+    const huge = `exported=${'1'.repeat(2_000_000)};dropped=${'1'.repeat(2_000_000)}`
+    const started = performance.now()
+    expect(parseTraceRelayCountsHeader(huge)).toBeNull()
+    expect(parseTraceRelayCountsHeader(`${'a'.repeat(2_000_000)}=;`)).toBeNull()
+    expect(performance.now() - started).toBeLessThan(250)
+  })
+
+  it('reads the plugin counts a report line carries, and ignores a malformed field without losing the batch counts', () => {
+    expect(
+      parseTraceRelayChildLine(
+        '{"report":{"delivered":3,"retry":2,"dropped":1,"plugin":{"exportedSpans":40,"droppedSpans":5}}}',
+      ),
+    ).toEqual({
+      kind: 'report',
+      counts: {delivered: 3, retry: 2, dropped: 1},
+      plugin: {exportedSpans: 40, droppedSpans: 5},
+    })
+    for (const plugin of [
+      '{"exportedSpans":"CANARY","droppedSpans":5}',
+      '{"exportedSpans":1000000000000,"droppedSpans":5}',
+      '{"exportedSpans":-1,"droppedSpans":5}',
+      '{"exportedSpans":1}',
+      '"CANARY"',
+      '7',
+    ]) {
+      expect(parseTraceRelayChildLine(`{"report":{"delivered":3,"retry":2,"dropped":1,"plugin":${plugin}}}`)).toEqual({
+        kind: 'report',
+        counts: {delivered: 3, retry: 2, dropped: 1},
+      })
+    }
   })
 })
