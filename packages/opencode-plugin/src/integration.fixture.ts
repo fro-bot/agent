@@ -19,7 +19,16 @@ export interface FakeStep {
   /** None of these may appear in the request body. */
   readonly none?: readonly string[]
   readonly text?: string
+  readonly reasoning?: string
   readonly tools?: readonly {readonly name: string; readonly args: unknown}[]
+  /** Answer with this HTTP status and an error body instead of a stream. */
+  readonly status?: number
+  /** Wait this long before answering, so a test can act while the request is in flight. */
+  readonly delayMs?: number
+  /** After the text, stall this long before finishing the stream (cut short when the client goes away). */
+  readonly hangMs?: number
+  /** Provider-reported prompt, cached and completion token counts. */
+  readonly usage?: {readonly prompt: number; readonly cached?: number; readonly completion: number}
 }
 
 export interface RecordedRequest {
@@ -51,14 +60,20 @@ function sse(delta: Record<string, unknown>, finish: string | null, extra: Recor
   })}\n\n`
 }
 
+const sleep = async (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
+
 export async function startFakeProvider(): Promise<FakeProvider> {
   const queue: FakeStep[] = []
   const requests: RecordedRequest[] = []
 
   const server = createServer((req, res) => {
     const chunks: Buffer[] = []
+    const gone = {value: false}
+    res.on('close', () => {
+      gone.value = true
+    })
     req.on('data', (chunk: Buffer) => chunks.push(chunk))
-    req.on('end', () => {
+    const respond = async (): Promise<void> => {
       if (req.url?.endsWith('/models') === true) {
         res.writeHead(200, {'content-type': 'application/json'})
         res.end(JSON.stringify({object: 'list', data: [{id: 'fixture-model', object: 'model'}]}))
@@ -89,10 +104,28 @@ export async function startFakeProvider(): Promise<FakeProvider> {
             )
       const step: FakeStep = index === -1 ? {text: 'ok'} : (queue.splice(index, 1)[0] ?? {text: 'ok'})
 
+      if (step.delayMs != null) await sleep(step.delayMs)
+      if (step.status != null && step.status !== 200) {
+        res.writeHead(step.status, {'content-type': 'application/json'})
+        res.end(JSON.stringify({error: {message: `scripted ${step.status}`, type: 'server_error'}}))
+        return
+      }
       res.writeHead(200, {'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive'})
       res.write(sse({role: 'assistant', content: ''}, null))
+      if (step.reasoning != null) res.write(sse({reasoning_content: step.reasoning}, null))
       if (step.text != null) res.write(sse({content: step.text}, null))
-      const usage = {usage: {prompt_tokens: 10, completion_tokens: 5, total_tokens: 15}}
+      if (step.hangMs != null) {
+        for (let waited = 0; waited < step.hangMs && !gone.value; waited += 100) await sleep(100)
+        if (gone.value) return
+      }
+      const usage = {
+        usage: {
+          prompt_tokens: step.usage?.prompt ?? 10,
+          completion_tokens: step.usage?.completion ?? 5,
+          total_tokens: (step.usage?.prompt ?? 10) + (step.usage?.completion ?? 5),
+          ...(step.usage?.cached == null ? {} : {prompt_tokens_details: {cached_tokens: step.usage.cached}}),
+        },
+      }
       if (step.tools != null && step.tools.length > 0) {
         step.tools.forEach((tool, i) => {
           const args = typeof tool.args === 'string' ? tool.args : JSON.stringify(tool.args)
@@ -118,6 +151,11 @@ export async function startFakeProvider(): Promise<FakeProvider> {
       }
       res.write('data: [DONE]\n\n')
       res.end()
+    }
+    req.on('end', () => {
+      respond().catch(() => {
+        res.destroy()
+      })
     })
   })
 
@@ -232,6 +270,8 @@ export async function startOpenCodeServer(options: {
   readonly providerBaseURL: string
   /** Extra server environment, applied last. */
   readonly env?: Readonly<Record<string, string>>
+  /** Extra top-level server config (for example `permissions`), merged over the base config. */
+  readonly config?: Readonly<Record<string, unknown>>
 }): Promise<RunningServer> {
   const {binary, sandbox, pluginDir, providerBaseURL} = options
   const password = randomBytes(24).toString('base64url')
@@ -249,6 +289,7 @@ export async function startOpenCodeServer(options: {
     },
     model: 'fake/fixture-model',
     plugins: [pluginDir],
+    ...options.config,
   }
 
   const child = spawn(binary, ['serve', '--stdio', '--port', '0'], {
