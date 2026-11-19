@@ -46,6 +46,7 @@ import {
 } from '../../services/setup/plugin-install-v2.js'
 import {admitRepoSkills, discardRepoSkillsStaging} from '../../services/setup/repo-skills.js'
 import {toErrorMessage} from '../../shared/errors.js'
+import {logDefaultModelNotice, suppliedProviderIds} from './default-model.js'
 import {probeKeyProxy} from './key-proxy-probe.js'
 import {startKeyProxyProcess} from './key-proxy-process.js'
 import {readV1DatabaseFacts, waitForV1Import} from './v1-import-wait.js'
@@ -254,6 +255,9 @@ export async function startActionOpenCodeV2(
   const {logger} = options
   const deps = {...defaultDeps, ...options.deps}
   const stageError = (stage: V2StartStage, message: string): Result<never, V2StartError> => err({stage, message})
+  // No `model` input: the session is created on `DEFAULT_MODEL` (`executeOpenCodeV2`), whatever the credentials and the
+  // config say. Decided once here.
+  const usesDefaultModel = options.model == null
 
   // --- 1. Credentials ----------------------------------------------------------------------------------------
   let authConfig: ReturnType<typeof parseAuthJsonInput>
@@ -404,6 +408,15 @@ export async function startActionOpenCodeV2(
       logger,
     )
     if (!builtConfig.success) return stageError('config', `Invalid OpenCode configuration: ${builtConfig.error}`)
+    if (usesDefaultModel) {
+      logDefaultModelNotice({
+        logger,
+        suppliedProviders: suppliedProviderIds({
+          keyProviderIds: keys.data.map(entry => entry.providerId),
+          config: builtConfig.data.content,
+        }),
+      })
+    }
 
     // Last check before anything is handed to the sandbox user: no auth-json key value may be in the config it will read.
     // `OPENCODE_CONFIG_CONTENT` is the only config the sandbox gets (the proxy holds the keys, not a file).

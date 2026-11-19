@@ -556,6 +556,78 @@ describe('startActionOpenCodeV2', () => {
     expect(result.success).toBe(true)
   })
 
+  describe('the default model', () => {
+    const warnings = (logger: ReturnType<typeof createMockLogger>): string[] =>
+      vi.mocked(logger.warning).mock.calls.map(call => String(call[0]))
+    const defaultModelLines = (lines: string[]): string[] => lines.filter(line => line.includes('opencode/big-pickle'))
+
+    it('warns once, naming the model and the unused provider, when credentials are supplied and no model is set', async () => {
+      // #given an auth-json key and no model input
+      const logger = createMockLogger()
+
+      // #when
+      const result = await startActionOpenCodeV2(options({deps: recordingDeps(fakeServer()), model: null, logger}))
+
+      // #then the run starts, and the one warning says which model runs and that the key is not used by it
+      expect(result.success).toBe(true)
+      const lines = defaultModelLines(warnings(logger))
+      expect(lines).toHaveLength(1)
+      expect(lines[0]).toContain('anthropic')
+      expect(lines[0]).toContain('not used')
+      expect(lines[0]).toContain('`model` input')
+      expect(serializeLoggerCalls(logger)).not.toContain(CANARY)
+    })
+
+    it('warns when only opencode-config declares a provider', async () => {
+      // #given no key, a provider block in opencode-config, and no model input
+      const logger = createMockLogger()
+      const opencodeConfig = JSON.stringify({provider: {gateway: {npm: '@ai-sdk/openai-compatible', options: {}}}})
+
+      // #when
+      const result = await startActionOpenCodeV2(
+        options({deps: recordingDeps(fakeServer()), model: null, authJson: '{}', opencodeConfig, logger}),
+      )
+
+      // #then
+      expect(result.success).toBe(true)
+      const lines = defaultModelLines(warnings(logger))
+      expect(lines).toHaveLength(1)
+      expect(lines[0]).toContain('gateway')
+    })
+
+    it('logs one info line, and no warning, when no credentials are supplied', async () => {
+      // #given
+      const logger = createMockLogger()
+
+      // #when
+      const result = await startActionOpenCodeV2(
+        options({deps: recordingDeps(fakeServer()), model: null, authJson: '{}', logger}),
+      )
+
+      // #then
+      expect(result.success).toBe(true)
+      expect(defaultModelLines(warnings(logger))).toEqual([])
+      const info = vi
+        .mocked(logger.info)
+        .mock.calls.map(call => String(call[0]))
+        .filter(line => line.includes('opencode/big-pickle'))
+      expect(info).toHaveLength(1)
+      expect(info[0]).toContain('free')
+    })
+
+    it('says nothing about the default model when the model input is set', async () => {
+      // #given a model input and a key
+      const logger = createMockLogger()
+
+      // #when
+      const result = await startActionOpenCodeV2(options({deps: recordingDeps(fakeServer()), logger}))
+
+      // #then no default-model line at any level
+      expect(result.success).toBe(true)
+      expect(serializeLoggerCalls(logger)).not.toContain('opencode/big-pickle')
+    })
+  })
+
   it('fails the permission gate, and stops the server, when an agent lacks the deny', async () => {
     // #given an agent list with no external_directory boundary
     const server = fakeServer({agents: {location: {}, data: [{id: 'build', permissions: []}]}})
