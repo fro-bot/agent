@@ -96,67 +96,107 @@ export const randomIds = (): IdSource => ({
   span: () => randomBytes(8).toString('hex'),
 })
 
-/** The raw text an observation carries (not its snapshots, which the ledger bounds), in characters. */
-function textSize(observation: Observation): number {
-  if (typeof observation !== 'object' || observation === null) return 0
-  // Only the kinds that carry raw text are listed; everything else carries none.
-  // eslint-disable-next-line @typescript-eslint/switch-exhaustiveness-check
-  switch (observation.kind) {
-    case 'output':
-      return observation.text.length
-    case 'title':
-      return observation.title.length
-    case 'compaction.ended':
-      return (observation.text?.length ?? 0) + (observation.error?.message?.length ?? 0)
-    case 'execution.ended':
-      return (observation.error?.message?.length ?? 0) + (observation.reason?.length ?? 0)
-    case 'retry':
-    case 'step.failed':
-      return observation.error.message?.length ?? 0
-    case 'tool.ended':
-      return observation.message?.length ?? 0
-    default:
-      return 0
+/**
+ * Which strings an observation carries, by kind and what the inbox does with them. Every string-valued field is counted
+ * against `maxInboxChars`; the table is the audit:
+ *
+ * | kind                | free text (counted, omittable)          | identifiers and labels (counted, never omitted)                    |
+ * | ------------------- | --------------------------------------- | ------------------------------------------------------------------ |
+ * | prompt              | content when it is a raw string         | sessionId, messageId, delivery                                     |
+ * | inbox.enqueued      |                                         | sessionId, inboxId, item, childSessionId, reportState              |
+ * | inbox.delivered     |                                         | sessionId, inboxId                                                 |
+ * | session.created     |                                         | sessionId, parentSessionId, agent                                  |
+ * | execution.started   |                                         | sessionId                                                          |
+ * | execution.ended     | reason, error.message                   | sessionId, outcome, error.type                                     |
+ * | request             | content when it is a raw string         | sessionId, requestKind, agent, model, provider                     |
+ * | retry               | error.message                           | sessionId, error.type                                              |
+ * | step.started        |                                         | sessionId, messageId, agent, model, provider                       |
+ * | step.ended          |                                         | sessionId, messageId, finish, rawFinish                            |
+ * | step.failed         | error.message                           | sessionId, messageId, error.type                                   |
+ * | output              | text                                    | sessionId, messageId, part                                         |
+ * | tool.named          |                                         | sessionId, callId, tool                                            |
+ * | tool.called         | input when it is a raw string           | sessionId, callId, messageId                                       |
+ * | tool.before         | input when it is a raw string           | sessionId, callId, tool, messageId, agent                          |
+ * | tool.after          | error.message, result when raw string   | sessionId, callId, tool, status, childSessionId, error.type        |
+ * | tool.ended          | message, result when it is a raw string | sessionId, callId, errorType, childSessionId                       |
+ * | compaction.started  | reason                                  | sessionId, inputId                                                 |
+ * | compaction.ended    | text, error.message                     | sessionId, error.type                                              |
+ * | title               | title                                   | sessionId                                                          |
+ * | usage, tick         |                                         | sessionId                                                          |
+ *
+ * A snapshot (a frozen object in `content`, `input` or `result`) is not text: the ledger bounds it. An identifier over
+ * `MAX_IDENTIFIER_CHARS` is not real: the observation is dropped as malformed.
+ */
+const FREE_TEXT_KEYS: ReadonlySet<string> = new Set([
+  'text',
+  'title',
+  'message',
+  'reason',
+  'content',
+  'input',
+  'result',
+])
+const MAX_IDENTIFIER_CHARS = 4096
+
+interface Measured {
+  /** Characters of omittable free text. */
+  readonly text: number
+  /** Characters of identifiers and labels. */
+  readonly identifiers: number
+  /** An identifier too long to be real. */
+  readonly oversized: boolean
+}
+
+const isPlainRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null
+
+/** What an observation holds in raw strings, by the audit above. Never throws. */
+function measure(observation: Observation): Measured {
+  if (!isPlainRecord(observation)) return {text: 0, identifiers: 0, oversized: false}
+  let text = 0
+  let identifiers = 0
+  let oversized = false
+  const label = (value: string): void => {
+    identifiers += value.length
+    if (value.length > MAX_IDENTIFIER_CHARS) oversized = true
   }
+  for (const [key, value] of Object.entries(observation)) {
+    if (key === 'kind') continue
+    if (typeof value === 'string') {
+      if (FREE_TEXT_KEYS.has(key)) text += value.length
+      else label(value)
+    } else if (key === 'error') {
+      if (typeof value === 'string') text += value.length
+      else if (isPlainRecord(value)) {
+        for (const [errorKey, errorValue] of Object.entries(value)) {
+          if (typeof errorValue !== 'string') continue
+          if (errorKey === 'message') text += errorValue.length
+          else label(errorValue)
+        }
+      }
+    }
+  }
+  return {text, identifiers, oversized}
 }
 
 const OMITTED_MESSAGE = '[omitted]'
-const withoutMessage = <E extends {readonly message?: string | undefined}>(error: E): E => ({
-  ...error,
-  message: error.message === undefined ? undefined : OMITTED_MESSAGE,
-})
 
-/** The same observation without its raw text, marked omitted: its place in the sequence and everything else are kept. */
+/** The same observation without its free text, marked omitted: its place in the sequence, its identifiers and its snapshots are kept. */
 function withoutText(observation: Observation): Observation {
-  // Only the kinds that carry raw text are listed; everything else is returned as it is.
-  // eslint-disable-next-line @typescript-eslint/switch-exhaustiveness-check
-  switch (observation.kind) {
-    case 'output':
-      return {...observation, text: '', omitted: true}
-    case 'title':
-      return {...observation, title: '', omitted: true}
-    case 'compaction.ended':
-      return {
-        ...observation,
-        text: undefined,
-        error: observation.error === undefined ? undefined : withoutMessage(observation.error),
-        omitted: true,
-      }
-    case 'execution.ended':
-      return {
-        ...observation,
-        reason: undefined,
-        error: observation.error === undefined ? undefined : withoutMessage(observation.error),
-        omitted: true,
-      }
-    case 'retry':
-    case 'step.failed':
-      return {...observation, error: withoutMessage(observation.error), omitted: true}
-    case 'tool.ended':
-      return {...observation, message: observation.message === undefined ? undefined : OMITTED_MESSAGE, omitted: true}
-    default:
-      return observation
+  const copy: Record<string, unknown> = {...observation}
+  for (const [key, value] of Object.entries(observation)) {
+    if (typeof value === 'string' && FREE_TEXT_KEYS.has(key)) {
+      // A part's text stays a string (the model reads its absence from the flag); a message keeps a visible marker.
+      copy[key] = key === 'text' || key === 'title' ? '' : key === 'message' ? OMITTED_MESSAGE : undefined
+    } else if (key === 'error' && isPlainRecord(value)) {
+      const error: Record<string, unknown> = {...value}
+      if (typeof error.message === 'string') error.message = OMITTED_MESSAGE
+      copy.error = error
+    } else if (key === 'error' && typeof value === 'string') {
+      copy.error = OMITTED_MESSAGE
+    }
   }
+  copy.omitted = true
+  return copy as unknown as Observation
 }
 
 export function createTracePipeline(options: TracePipelineOptions): TracePipeline {
@@ -300,14 +340,20 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
         releaseObservation(observation)
         return
       }
-      // Raw text over the remaining budget is replaced by its structure with the text omitted and marked.
-      const chars = textSize(observation)
-      let held = observation
-      let heldChars = chars
-      if (chars > 0 && inboxChars + chars > limits.maxInboxChars) {
+      const measured = measure(observation)
+      if (measured.oversized) {
+        // An identifier that size is not real: malformed, dropped, and anything it holds is freed.
+        observationsDropped += 1
         releaseObservation(observation)
+        return
+      }
+      // Raw text over the remaining budget is replaced by its structure with the text omitted and marked. The replacement
+      // keeps the snapshots the observation holds, so they stay charged in the ledger until their span goes.
+      let held = observation
+      let heldChars = measured.text + measured.identifiers
+      if (measured.text > 0 && inboxChars + heldChars > limits.maxInboxChars) {
         held = withoutText(observation)
-        heldChars = 0
+        heldChars = measured.identifiers
         observationsOmitted += 1
       }
       inboxChars += heldChars

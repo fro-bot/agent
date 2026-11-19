@@ -795,18 +795,271 @@ describe('the inbox holds a bounded amount of raw text', () => {
     pipeline.stop()
   })
 
-  it('counts a budget exactly at the limit as fitting, and one character more as omitted', async () => {
-    // #given
-    const {sink} = collectingSink()
-    const pipeline = createTracePipeline({sink, scrubber, limits: {maxInboxChars: 1_000}})
-    turnStart(pipeline)
+  it('counts a budget exactly at the limit as fitting, and one character more as omitted', () => {
+    // #given the characters the turn's opening already holds, and an output whose identifiers are 7 characters (`a`, `s1`, `text`)
+    const probe = createTracePipeline({sink: collectingSink().sink, scrubber, limits: {maxInboxChars: 10_000_000}})
+    turnStart(probe)
+    const opening = probe.stats().inboxChars
+    probe.stop()
+    const exact = opening + 7 + 1_000
+    const at = createTracePipeline({sink: collectingSink().sink, scrubber, limits: {maxInboxChars: exact}})
+    const over = createTracePipeline({sink: collectingSink().sink, scrubber, limits: {maxInboxChars: exact - 1}})
+    turnStart(at)
+    turnStart(over)
+
+    // #when the same 1,000-character output reaches each
+    output(at, 10, 'a'.repeat(1_000))
+    output(over, 10, 'a'.repeat(1_000))
+
+    // #then it fits exactly, and one character short it is omitted
+    expect(at.stats().observationsOmitted).toBe(0)
+    expect(at.stats().inboxChars).toBe(exact)
+    expect(over.stats().observationsOmitted).toBe(1)
+    at.stop()
+    over.stop()
+  })
+})
+
+describe('every raw string an observation carries is counted at ingress', () => {
+  const MIB = 1024 * 1024
+  const USAGE = {input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0}
+  const budgeted = (maxInboxChars: number, ledger?: ReturnType<typeof createSnapshotLedger>) => {
+    const {sink, spans} = collectingSink()
+    const pipeline = createTracePipeline({
+      sink,
+      scrubber,
+      ...(ledger === undefined ? {} : {ledger}),
+      limits: {maxInboxChars},
+    })
+    return {pipeline, spans}
+  }
+  const open = (pipeline: ReturnType<typeof createTracePipeline>, session = 'a'): void => {
+    pipeline.observe({kind: 'prompt', at: 1, sessionId: session, messageId: 'm1', delivery: 'steer', content: 'hi'})
+    pipeline.observe({kind: 'inbox.enqueued', at: 2, sessionId: session, inboxId: 'm1', item: 'user'})
+    pipeline.observe({kind: 'execution.started', at: 3, sessionId: session})
+    pipeline.observe({kind: 'inbox.delivered', at: 4, sessionId: session, inboxId: 'm1'})
+    pipeline.observe({
+      kind: 'request',
+      at: 5,
+      sessionId: session,
+      requestKind: 'primary',
+      agent: 'build',
+      model: 'm',
+      provider: 'p',
+      content: {},
+    })
+    pipeline.observe({
+      kind: 'step.started',
+      at: 6,
+      sessionId: session,
+      messageId: 's1',
+      agent: 'build',
+      model: 'm',
+      provider: 'p',
+    })
+  }
+  const close = (pipeline: ReturnType<typeof createTracePipeline>, at = 90): void => {
+    pipeline.observe({kind: 'step.ended', at, sessionId: 'a', messageId: 's1', finish: 'stop', usage: USAGE, cost: 0})
+    pipeline.observe({kind: 'execution.ended', at: at + 1, sessionId: 'a', outcome: 'succeeded'})
+  }
+
+  it('counts the error message of a tool.after, and keeps the tool’s outcome and error type when it is omitted', async () => {
+    // #given a budget of 100 KiB and ten failed calls whose after hook carries a 1 MiB error message each
+    const {pipeline, spans} = budgeted(100 * 1024)
+    open(pipeline)
+    for (let index = 0; index < 10; index += 1) {
+      const callId = `c${String(index)}`
+      pipeline.observe({kind: 'tool.named', at: 10 + index, sessionId: 'a', callId, tool: 'read'})
+      pipeline.observe({kind: 'tool.called', at: 10 + index, sessionId: 'a', callId, executed: false, input: {}})
+      pipeline.observe({
+        kind: 'tool.after',
+        at: 20 + index,
+        sessionId: 'a',
+        callId,
+        tool: 'read',
+        status: 'error',
+        error: {type: 'tool.execution', message: 'm'.repeat(MIB)},
+      })
+      pipeline.observe({
+        kind: 'tool.ended',
+        at: 30 + index,
+        sessionId: 'a',
+        callId,
+        succeeded: false,
+        errorType: 'tool.execution',
+        message: 'short',
+      })
+    }
+    close(pipeline)
+
+    // #then the inbox never held more than its budget of raw text, even though a megabyte arrived with each call
+    expect(pipeline.stats().inboxChars).toBeLessThanOrEqual(100 * 1024)
+    expect(pipeline.stats().observationsOmitted).toBeGreaterThanOrEqual(9)
+
+    // #when it drains
+    await flush()
+    pipeline.stop()
+
+    // #then every call still has its span, with its outcome and error type, and no megabyte of text went out
+    const tools = spans.filter(span => span.name.startsWith('execute_tool'))
+    expect(tools).toHaveLength(10)
+    expect(tools.every(span => span.attributes['fro_bot.tool.outcome'] === 'error')).toBe(true)
+    expect(tools.every(span => span.attributes['fro_bot.tool.error_type'] === 'tool.execution')).toBe(true)
+    expect(JSON.stringify(spans)).not.toMatch(/m{1000}/)
+    expect(pipeline.stats().inboxChars).toBe(0)
+  })
+
+  it('keeps a snapshot the replacement still owns charged in the ledger, and frees it only when its span goes', async () => {
+    // #given a tool call whose result is a held snapshot, and a terminal event whose message is over the budget
+    const ledger = createSnapshotLedger()
+    const {pipeline} = budgeted(1_000, ledger)
+    open(pipeline)
+    pipeline.observe({kind: 'tool.named', at: 10, sessionId: 'a', callId: 'c1', tool: 'read'})
+    pipeline.observe({kind: 'tool.called', at: 11, sessionId: 'a', callId: 'c1', executed: false, input: {}})
+    const result = snapshotToolResult({content: [{type: 'text', text: 'file body'}]}, {ledger})
+    const before = ledger.stats().pending
+    expect(before).toBeGreaterThanOrEqual(1)
+
+    // #when the observation that owns it is replaced because its message does not fit
+    pipeline.observe({
+      kind: 'tool.ended',
+      at: 12,
+      sessionId: 'a',
+      callId: 'c1',
+      succeeded: true,
+      message: 'x'.repeat(5_000),
+      result,
+    })
+    expect(pipeline.stats().observationsOmitted).toBe(1)
+
+    // #then the snapshot is still charged: the replacement still holds it
+    expect(ledger.stats().pending).toBe(before)
+
+    // #when the turn ends and the span is exported
+    close(pipeline)
+    await flush()
+    pipeline.stop()
+
+    // #then it is released then, once
+    expect(ledger.stats().pending).toBe(0)
+  })
+
+  it('does not release a snapshot twice for an observation that is dropped for an oversized identifier', () => {
+    // #given a held snapshot in an observation whose call id is absurdly long
+    const ledger = createSnapshotLedger()
+    const {pipeline} = budgeted(1_000_000, ledger)
+    const result = snapshotToolResult({content: [{type: 'text', text: 'b'}]}, {ledger})
+    expect(ledger.stats().pending).toBe(1)
 
     // #when
-    output(pipeline, 10, 'a'.repeat(1_000))
-    output(pipeline, 11, 'b')
+    pipeline.observe({kind: 'tool.ended', at: 1, sessionId: 'a', callId: 'x'.repeat(10_000), succeeded: true, result})
 
-    // #then the first fit exactly, and the second did not
+    // #then it is dropped as malformed, and its snapshot is freed
+    expect(pipeline.stats().observationsDropped).toBe(1)
+    expect(ledger.stats().pending).toBe(0)
+    pipeline.stop()
+  })
+
+  it.each([
+    ['prompt', {kind: 'prompt', sessionId: 'a', messageId: 'm', delivery: 'steer', content: 'p'.repeat(2_000)}],
+    ['request', {kind: 'request', sessionId: 'a', requestKind: 'primary', content: 'r'.repeat(2_000)}],
+    ['tool.called', {kind: 'tool.called', sessionId: 'a', callId: 'c', executed: false, input: 'i'.repeat(2_000)}],
+    ['tool.before', {kind: 'tool.before', sessionId: 'a', callId: 'c', tool: 'read', input: 'i'.repeat(2_000)}],
+    [
+      'tool.after (error text)',
+      {
+        kind: 'tool.after',
+        sessionId: 'a',
+        callId: 'c',
+        tool: 'read',
+        status: 'error',
+        error: {type: 't', message: 'e'.repeat(2_000)},
+      },
+    ],
+    [
+      'tool.after (raw result)',
+      {kind: 'tool.after', sessionId: 'a', callId: 'c', tool: 'read', status: 'completed', result: 'r'.repeat(2_000)},
+    ],
+    [
+      'tool.ended (message)',
+      {kind: 'tool.ended', sessionId: 'a', callId: 'c', succeeded: false, message: 'e'.repeat(2_000)},
+    ],
+    [
+      'tool.ended (raw result)',
+      {kind: 'tool.ended', sessionId: 'a', callId: 'c', succeeded: true, result: 'r'.repeat(2_000)},
+    ],
+    [
+      'retry',
+      {kind: 'retry', sessionId: 'a', attempt: 2, willRetry: true, error: {type: 't', message: 'e'.repeat(2_000)}},
+    ],
+    [
+      'step.failed',
+      {kind: 'step.failed', sessionId: 'a', messageId: 's', error: {type: 't', message: 'e'.repeat(2_000)}},
+    ],
+    [
+      'execution.ended (reason)',
+      {kind: 'execution.ended', sessionId: 'a', outcome: 'failed', reason: 'e'.repeat(2_000)},
+    ],
+    ['compaction.started (reason)', {kind: 'compaction.started', sessionId: 'a', reason: 'e'.repeat(2_000)}],
+    [
+      'compaction.ended (error)',
+      {kind: 'compaction.ended', sessionId: 'a', ok: false, error: {type: 't', message: 'e'.repeat(2_000)}},
+    ],
+    ['title', {kind: 'title', sessionId: 'a', title: 't'.repeat(2_000)}],
+    ['output', {kind: 'output', sessionId: 'a', messageId: 's', part: 'text', text: 'o'.repeat(2_000)}],
+  ] as const)('counts the raw text of a %s observation against the budget', (_label, observation) => {
+    // #given a budget of 1,000 and one observation carrying 2,000 characters of raw text
+    const {pipeline} = budgeted(1_000)
+
+    // #when
+    pipeline.observe(observation as unknown as Observation)
+
+    // #then the text was not held: it was omitted at ingress, and what the inbox holds is within the budget
     expect(pipeline.stats().observationsOmitted).toBe(1)
+    expect(pipeline.stats().inboxChars).toBeLessThanOrEqual(1_000)
+    pipeline.stop()
+  })
+
+  it.each([
+    ['sessionId', {kind: 'usage', sessionId: 's'.repeat(10_000)}],
+    ['messageId', {kind: 'step.started', sessionId: 'a', messageId: 'm'.repeat(10_000)}],
+    ['model', {kind: 'request', sessionId: 'a', requestKind: 'primary', model: 'm'.repeat(10_000)}],
+    ['tool name', {kind: 'tool.named', sessionId: 'a', callId: 'c', tool: 't'.repeat(10_000)}],
+    ['error type', {kind: 'retry', sessionId: 'a', attempt: 2, willRetry: true, error: {type: 't'.repeat(10_000)}}],
+  ] as const)(
+    'drops an observation with an absurdly long %s, since an identifier that size is not real',
+    (_label, observation) => {
+      // #given
+      const {pipeline} = budgeted(1_000_000)
+
+      // #when
+      pipeline.observe(observation as unknown as Observation)
+
+      // #then
+      expect(pipeline.stats().observationsDropped).toBe(1)
+      expect(pipeline.stats().inboxChars).toBe(0)
+      pipeline.stop()
+    },
+  )
+
+  it('counts identifiers and labels in the same budget, and never omits them', () => {
+    // #given a budget of 100 and an observation whose identifiers add up to more
+    const {pipeline} = budgeted(100)
+
+    // #when
+    pipeline.observe({
+      kind: 'step.started',
+      at: 1,
+      sessionId: 's'.repeat(60),
+      messageId: 'm'.repeat(60),
+      agent: 'a',
+      model: 'm',
+      provider: 'p',
+    })
+
+    // #then it was not replaced (identifiers are structure), and the inbox holds what it holds
+    expect(pipeline.stats().observationsOmitted).toBe(0)
+    expect(pipeline.stats().inboxChars).toBeGreaterThanOrEqual(120)
     pipeline.stop()
   })
 })
