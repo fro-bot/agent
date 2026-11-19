@@ -33,11 +33,11 @@ export interface SpanSink {
  * What the inbox can hold, in two separate bounds (there is no third budget):
  * - FREE TEXT (`maxInboxChars`): model output, titles, summaries, error messages. Past it the text is omitted and marked.
  * - IDENTIFIER-ONLY entries (ids, names, labels): bounded by COUNT (`maxInbox` entries) and by SIZE per identifier
- *   (`MAX_IDENTIFIER_CHARS`, 4,096 characters; a longer one is dropped as malformed). The identifier characters an entry holds
+ *   (`MAX_IDENTIFIER_CHARS`, 512 characters; a longer one is dropped as malformed). The identifier characters an entry holds
  *   are counted in `stats().inboxChars` but never omitted. Worst case, an adversary filling every slot with the observation
- *   kind that carries the most identifier fields (6, a `tool.after`) holds 8,192 x 6 x 4,096 = 201,326,592 characters
- *   (192 Mi), on top of the 8 Mi of free text. Real identifiers are tens of characters (session, message and call ids), so a
- *   full inbox holds about 1 Mi in practice. Tightening `MAX_IDENTIFIER_CHARS` is the lever if the worst case matters.
+ *   kind that carries the most identifier fields (6, a `tool.after`) holds 8,192 x 6 x 512 = 25,165,824 characters
+ *   (24 Mi), on top of the 8 Mi of free text. Real identifiers are tens of characters (the longest seen in real-binary runs is
+ *   30: session, message and inbox ids), so a full inbox holds about 1 Mi in practice.
  */
 export interface PipelineLimits {
   /** Observations waiting for the model. Past this a new one is discarded and counted. */
@@ -146,7 +146,7 @@ const FREE_TEXT_KEYS: ReadonlySet<string> = new Set([
   'input',
   'result',
 ])
-const MAX_IDENTIFIER_CHARS = 4096
+const MAX_IDENTIFIER_CHARS = 512
 
 interface Measured {
   /** Characters of omittable free text. */

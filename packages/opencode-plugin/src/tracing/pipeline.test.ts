@@ -1041,6 +1041,39 @@ describe('every raw string an observation carries is counted at ingress', () => 
     },
   )
 
+  it('accepts an identifier of exactly 512 characters, and drops one of 513 as malformed, freeing its snapshot', () => {
+    // #given a ledger, and two tool.ended observations whose call ids are 512 and 513 characters, each holding a snapshot
+    const ledger = createSnapshotLedger()
+    const {pipeline} = budgeted(1_000_000, ledger)
+    const held = (text: string) => snapshotToolResult({content: [{type: 'text', text}]}, {ledger})
+
+    // #when
+    pipeline.observe({
+      kind: 'tool.ended',
+      at: 1,
+      sessionId: 'a',
+      callId: 'x'.repeat(512),
+      succeeded: true,
+      result: held('one'),
+    })
+    const afterAt = {dropped: pipeline.stats().observationsDropped, pending: ledger.stats().pending}
+    pipeline.observe({
+      kind: 'tool.ended',
+      at: 2,
+      sessionId: 'a',
+      callId: 'x'.repeat(513),
+      succeeded: true,
+      result: held('two'),
+    })
+
+    // #then the 512 one was accepted (and still holds its snapshot), the 513 one was dropped and its snapshot freed
+    expect(afterAt).toEqual({dropped: 0, pending: 1})
+    expect(pipeline.stats().observationsDropped).toBe(1)
+    expect(ledger.stats().pending).toBe(1)
+    pipeline.stop()
+    expect(ledger.stats().pending).toBe(0)
+  })
+
   it('counts identifiers and labels in the same budget, and never omits them', () => {
     // #given a budget of 100 and an observation whose identifiers add up to more
     const {pipeline} = budgeted(100)
