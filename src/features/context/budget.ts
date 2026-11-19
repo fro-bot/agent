@@ -1,4 +1,11 @@
-import type {ContextBudget, HydratedContext, IssueContext, PullRequestContext, TruncateResult} from './types.js'
+import type {
+  ContextBudget,
+  DiscussionContext,
+  HydratedContext,
+  IssueContext,
+  PullRequestContext,
+  TruncateResult,
+} from './types.js'
 import {cleanMarkdownBody} from '../../shared/format.js'
 
 export {DEFAULT_CONTEXT_BUDGET} from './types.js'
@@ -103,6 +110,38 @@ function formatIssueContext(context: IssueContext): string {
   return lines.join('\n')
 }
 
+function formatDiscussionContext(context: DiscussionContext): string {
+  const lines: string[] = []
+
+  lines.push(`## Discussion #${context.number}`)
+  lines.push('')
+  lines.push(`**Title:** ${context.title}`)
+  lines.push(`**Author:** ${context.author ?? 'unknown'}`)
+  lines.push('')
+  lines.push('### Body')
+  lines.push('')
+  lines.push(cleanMarkdownBody(context.body))
+  if (context.bodyTruncated) {
+    lines.push('')
+    lines.push('*Note: Body was truncated due to size limits.*')
+  }
+
+  if (context.comments.length > 0) {
+    lines.push('')
+    lines.push(
+      `### Comments (${context.comments.length}${context.commentsTruncated ? ` of ${context.totalComments}` : ''})`,
+    )
+    lines.push('')
+    for (const comment of context.comments) {
+      lines.push(`**${comment.author ?? 'unknown'}** (${comment.createdAt}):`)
+      lines.push(comment.body)
+      lines.push('')
+    }
+  }
+
+  return lines.join('\n')
+}
+
 function formatPullRequestContext(context: PullRequestContext): string {
   const lines: string[] = []
   const body = cleanMarkdownBody(context.body)
@@ -191,8 +230,12 @@ function formatPullRequestContext(context: PullRequestContext): string {
 }
 
 export function formatContextForPrompt(context: HydratedContext): string {
-  if (context.type === 'issue') {
-    return formatIssueContext(context)
+  switch (context.type) {
+    case 'issue':
+      return formatIssueContext(context)
+    case 'discussion':
+      return formatDiscussionContext(context)
+    case 'pull_request':
+      return formatPullRequestContext(context)
   }
-  return formatPullRequestContext(context)
 }

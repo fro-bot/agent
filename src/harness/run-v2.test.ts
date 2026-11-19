@@ -173,6 +173,7 @@ function createBootstrap(): BootstrapPhaseResult {
     logger: createLogger({phase: 'test'}),
     opencodeResult: {path: 'opencode', version: '1.0.0'},
     delivery: 'model-gh',
+    credential: 'provision',
     responseFilePath: null,
     responseFilePathCandidates: null,
     trustedHeadSha: '',

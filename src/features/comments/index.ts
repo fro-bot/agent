@@ -25,4 +25,4 @@ export {
   type UpdateDiscussionCommentResponse,
 } from './types.js'
 
-export {isBotComment, postComment} from './writer.js'
+export {isBotComment, postComment, withBotMarker} from './writer.js'

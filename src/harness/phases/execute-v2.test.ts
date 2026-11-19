@@ -31,13 +31,6 @@ vi.mock('node:fs/promises', () => ({
   readFile: vi.fn().mockRejectedValue(Object.assign(new Error('ENOENT'), {code: 'ENOENT'})),
   rm: vi.fn().mockResolvedValue(undefined),
 }))
-vi.mock('@fro-bot/runtime', async importOriginal => {
-  const original: typeof import('@fro-bot/runtime') = await importOriginal()
-  return {
-    ...original,
-    resolveResponseDelivery: vi.fn(() => ({delivery: 'file-convention', credential: 'withhold'})),
-  }
-})
 vi.mock('../../features/agent/index.js', () => ({
   resolveOutputMode: vi.fn(() => 'branch-pr'),
 }))
@@ -103,6 +96,7 @@ function bootstrap(): BootstrapPhaseResult {
     logger: mocks.logger,
     opencodeResult: {path: 'opencode', version: '2.2.5'},
     delivery: 'model-gh',
+    credential: 'withhold',
     responseFilePath: null,
     responseFilePathCandidates: null,
     trustedHeadSha: '',

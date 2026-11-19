@@ -254,4 +254,87 @@ describe('collectAgentContext', () => {
     // #then
     expect(ctx.diffContext).toBeNull()
   })
+
+  describe('discussion runs', () => {
+    const discussionTarget = createMockTarget({kind: 'discussion', number: 9, title: 'Question'})
+
+    it('hydrates the discussion body and comments through the Action client', async () => {
+      // #given a discussion trigger and a client that serves the discussion
+      const graphql = vi.fn().mockResolvedValue({
+        repository: {
+          discussion: {
+            number: 9,
+            title: 'Question',
+            body: 'The original question',
+            author: {login: 'asker'},
+            comments: {
+              nodes: [
+                {
+                  id: 'DC_1',
+                  body: 'an earlier answer',
+                  author: {login: 'helper'},
+                  createdAt: '2024-01-01T00:00:00Z',
+                },
+              ],
+              totalCount: 1,
+            },
+          },
+        },
+      })
+      const octokit = {graphql} as unknown as Octokit
+      const triggerContext = createMockTriggerContext({
+        eventType: 'discussion_comment',
+        target: discussionTarget,
+        commentBody: 'the triggering comment',
+      })
+
+      // #when collecting context
+      const ctx = await collectAgentContext({logger: mockLogger, octokit, triggerContext, botLogin: null})
+
+      // #then the discussion body and prior comments are carried, apart from the triggering comment
+      expect(ctx.issueType).toBeNull()
+      expect(ctx.commentBody).toBe('the triggering comment')
+      expect(ctx.hydratedContext).toMatchObject({
+        type: 'discussion',
+        number: 9,
+        body: 'The original question',
+        comments: [{author: 'helper', body: 'an earlier answer'}],
+      })
+      expect(graphql).toHaveBeenCalledWith(
+        expect.stringContaining('comments(last: $maxComments)'),
+        expect.objectContaining({owner: 'test-owner', repo: 'test-repo', number: 9}),
+      )
+    })
+
+    it('proceeds with no hydrated context when the discussion query fails', async () => {
+      // #given a client whose GraphQL calls fail
+      const octokit = {graphql: vi.fn().mockRejectedValue(new Error('Resource not accessible'))} as unknown as Octokit
+      const triggerContext = createMockTriggerContext({eventType: 'discussion_comment', target: discussionTarget})
+
+      // #when collecting context
+      const ctx = await collectAgentContext({logger: mockLogger, octokit, triggerContext, botLogin: null})
+
+      // #then it does not throw and carries what the event provided
+      expect(ctx.hydratedContext).toBeNull()
+      expect(ctx.issueNumber).toBe(9)
+      expect(ctx.issueTitle).toBe('Question')
+    })
+
+    it('does not call the discussion query for an issue target', async () => {
+      // #given an issue trigger
+      const graphql = vi.fn().mockResolvedValue({repository: {issue: null}})
+      const octokit = {
+        graphql,
+        rest: {issues: {get: vi.fn().mockRejectedValue(new Error('nope')), listComments: vi.fn()}},
+      } as unknown as Octokit
+      const triggerContext = createMockTriggerContext({target: createMockTarget({kind: 'issue', number: 5})})
+
+      // #when collecting context
+      await collectAgentContext({logger: mockLogger, octokit, triggerContext, botLogin: null})
+
+      // #then only the issue query ran
+      expect(graphql).toHaveBeenCalledTimes(1)
+      expect(graphql).toHaveBeenCalledWith(expect.stringContaining('issue(number: $number)'), expect.anything())
+    })
+  })
 })

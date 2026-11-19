@@ -130,6 +130,7 @@ function createBootstrapPhaseResult(overrides: Partial<BootstrapPhaseResult> = {
     logger: createMockLogger(),
     opencodeResult: {path: '/usr/local/bin/opencode', version: '2.2.5'},
     delivery: 'model-gh',
+    credential: 'provision',
     responseFilePath: null,
     responseFilePathCandidates: null,
     trustedHeadSha: '',
