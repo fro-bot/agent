@@ -237,7 +237,7 @@ function stagePlugin(sandbox: SandboxPaths, chunk: 'keep' | 'marker' | 'missing'
   if (chunk === 'marker') {
     writeFileSync(
       path.join(dir, 'dist', name),
-      `import {writeFileSync} from 'node:fs'\nwriteFileSync(${JSON.stringify(marker)}, 'evaluated')\nexport async function exportStubSpan() {}\n`,
+      `import {writeFileSync} from 'node:fs'\nwriteFileSync(${JSON.stringify(marker)}, 'evaluated')\nexport async function startTracing() { return {stop: async () => {}} }\n`,
     )
   }
   return dir
@@ -287,29 +287,6 @@ describe.skipIf(!runnable)('the lazy tracing chunk in a real opencode V2', () =>
     await sink?.stop()
     if (sandbox != null) removeSandbox(sandbox)
   }, 60_000)
-
-  it('exports one trace from the bundled SDK and leaves the plugin active', async () => {
-    // #given the built plugin and an Action launcher variable pointing at a loopback sink
-    const before = sink.requests.length
-
-    // #when the server loads it
-    const server = await start(packageDir, launcherOn(sink.url))
-    const state = await pluginState(server)
-
-    // #then the plugin is active and the sink received exactly one OTLP trace export
-    expect(state).toEqual({status: 'active'})
-    const received = await waitFor('an OTLP export', async () => (sink.requests.length > before ? true : undefined))
-    expect(received).toBe(true)
-    await settle()
-    const exports = sink.requests.slice(before)
-    expect(exports).toHaveLength(1)
-    expect(exports[0]).toMatchObject({method: 'POST', path: '/v1/traces', contentType: 'application/json'})
-    const spans = (
-      exports[0]?.body as {resourceSpans: {scopeSpans: {spans: {name: string}[]}[]}[]}
-    ).resourceSpans.flatMap(resource => resource.scopeSpans.flatMap(scope => scope.spans))
-    expect(spans.map(span => span.name)).toEqual(['feasibility stub'])
-    expect(server.stderr()).not.toContain('tracing could not start')
-  }, 90_000)
 
   it('does not evaluate the chunk when tracing is off, and evaluates it from the install location when on', async () => {
     // #given a copy of the built plugin whose chunk records when it is evaluated

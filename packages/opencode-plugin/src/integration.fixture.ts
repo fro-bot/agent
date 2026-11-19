@@ -177,24 +177,53 @@ export async function startFakeProvider(): Promise<FakeProvider> {
   }
 }
 
+export interface SinkRequest {
+  readonly method: string
+  readonly path: string
+  readonly contentType: string
+  readonly headers: Readonly<Record<string, string | string[] | undefined>>
+  readonly body: unknown
+  /** The raw request body, for walking every string that was sent. */
+  readonly text: string
+  /** The status this request was answered with. */
+  readonly status: number
+}
+
+export interface SinkResponse {
+  readonly status: number
+  readonly headers?: Record<string, string>
+  readonly body?: string
+  /** Wait this long before answering. */
+  readonly delayMs?: number
+}
+
 export interface OtlpSink {
   /** The full traces URL, for example `http://127.0.0.1:4318/v1/traces`. */
   readonly url: string
-  /** Every request received, with the body decoded as JSON when it parses. */
-  readonly requests: readonly {
-    readonly method: string
-    readonly path: string
-    readonly contentType: string
-    readonly body: unknown
-  }[]
+  /** Every request, in arrival order, whatever it was answered with. */
+  readonly requests: SinkRequest[]
+  /** Requests answered with a status below 300. */
+  readonly accepted: () => SinkRequest[]
+  /** Most requests that were in flight at once. */
+  readonly peakConcurrent: () => number
   readonly stop: () => Promise<void>
 }
 
-/** A loopback OTLP/HTTP collector that accepts anything and records it. */
-export async function startOtlpSink(): Promise<OtlpSink> {
-  const requests: {method: string; path: string; contentType: string; body: unknown}[] = []
+export interface OtlpSinkOptions {
+  /** Decides the answer to request number `n` (from 1). Default: 200 with an empty JSON body. */
+  readonly respond?: (n: number, request: Omit<SinkRequest, 'status'>) => SinkResponse
+}
+
+/** A loopback OTLP/HTTP collector that records every request and answers as scripted. */
+export async function startOtlpSink(options: OtlpSinkOptions = {}): Promise<OtlpSink> {
+  const requests: SinkRequest[] = []
+  let inFlight = 0
+  let peak = 0
+  let count = 0
   const server = createServer((req, res) => {
     const chunks: Buffer[] = []
+    inFlight += 1
+    peak = Math.max(peak, inFlight)
     req.on('data', (chunk: Buffer) => chunks.push(chunk))
     req.on('end', () => {
       const text = Buffer.concat(chunks).toString('utf8')
@@ -204,14 +233,24 @@ export async function startOtlpSink(): Promise<OtlpSink> {
       } catch {
         // Keep the text.
       }
-      requests.push({
+      count += 1
+      const seen = {
         method: req.method ?? '',
         path: req.url ?? '',
         contentType: req.headers['content-type'] ?? '',
+        headers: {...req.headers},
         body,
-      })
-      res.writeHead(200, {'content-type': 'application/json'})
-      res.end('{}')
+        text,
+      }
+      const answer = options.respond?.(count, seen) ?? {status: 200, body: '{}'}
+      const finish = (): void => {
+        requests.push({...seen, status: answer.status})
+        res.writeHead(answer.status, {'content-type': 'application/json', ...answer.headers})
+        res.end(answer.body ?? '{}')
+        inFlight -= 1
+      }
+      if (answer.delayMs === undefined) finish()
+      else setTimeout(finish, answer.delayMs)
     })
   })
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
@@ -220,6 +259,8 @@ export async function startOtlpSink(): Promise<OtlpSink> {
   return {
     url: `http://127.0.0.1:${address.port}/v1/traces`,
     requests,
+    accepted: () => requests.filter(request => request.status < 300),
+    peakConcurrent: () => peak,
     stop: async () =>
       new Promise<void>(resolve => {
         server.closeAllConnections()
@@ -272,6 +313,11 @@ export async function startOpenCodeServer(options: {
   readonly env?: Readonly<Record<string, string>>
   /** Extra top-level server config (for example `permissions`), merged over the base config. */
   readonly config?: Readonly<Record<string, unknown>>
+  /**
+   * Start like a local session: no `OPENCODE_PASSWORD` and no `OPENCODE_CONFIG_CONTENT`, with the config in the user's
+   * global config file instead. Without it the server always has both headless markers, which this harness needs.
+   */
+  readonly localMode?: boolean
 }): Promise<RunningServer> {
   const {binary, sandbox, pluginDir, providerBaseURL} = options
   const password = randomBytes(24).toString('base64url')
@@ -292,6 +338,12 @@ export async function startOpenCodeServer(options: {
     ...options.config,
   }
 
+  if (options.localMode === true) {
+    const configDir = path.join(sandbox.home, 'config', 'opencode')
+    mkdirSync(configDir, {recursive: true})
+    writeFileSync(path.join(configDir, 'opencode.json'), JSON.stringify(config))
+  }
+
   const child = spawn(binary, ['serve', '--stdio', '--port', '0'], {
     cwd: sandbox.repo,
     detached: true,
@@ -307,8 +359,9 @@ export async function startOpenCodeServer(options: {
       OPENCODE_DISABLE_AUTOUPDATE: '1',
       OPENCODE_DISABLE_MODELS_FETCH: '1',
       OPENCODE_DISABLE_PROJECT_CONFIG: '1',
-      OPENCODE_PASSWORD: password,
-      OPENCODE_CONFIG_CONTENT: JSON.stringify(config),
+      ...(options.localMode === true
+        ? {}
+        : {OPENCODE_PASSWORD: password, OPENCODE_CONFIG_CONTENT: JSON.stringify(config)}),
       ...options.env,
     },
   })

@@ -91,8 +91,10 @@ describe('scanImports', () => {
 
 describe('the lazy boundary in the sources', () => {
   const sourceDir = path.join(packageDir, 'src')
+  // A type-only import is erased by the build, so it cannot pull tracing code into the entry.
+  const withoutTypeImports = (source: string): string => source.replaceAll(/^import type [^\n]*$/gm, '')
   const staticTracingImports = (file: string): string[] =>
-    scanImports(readFileSync(path.join(sourceDir, file), 'utf8')).static.filter(specifier =>
+    scanImports(withoutTypeImports(readFileSync(path.join(sourceDir, file), 'utf8'))).static.filter(specifier =>
       specifier.includes('/tracing/'),
     )
 

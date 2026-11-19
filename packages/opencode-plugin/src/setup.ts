@@ -3,6 +3,7 @@
 import type {Plugin} from '@opencode/plugin'
 import type {PluginSessionApi} from './session-client.js'
 import type {ToolCallBefore} from './task-reuse-guard.js'
+import type {ObserverHost} from './tracing/record-observations.js'
 import process from 'node:process'
 import {logPluginLine} from './log.js'
 import {createPluginSessionClient} from './session-client.js'
@@ -13,34 +14,62 @@ import {resolveTracingSettings, type TracingSettings} from './tracing/settings.j
 type ToolEditor = Parameters<Parameters<Plugin.Context['tool']['transform']>[0]>[0]
 type ToolInfo = Parameters<ToolEditor['add']>[0]
 
-/** The slice of `Plugin.Context` this plugin uses. */
+/**
+ * The slice of `Plugin.Context` this plugin uses: the session tools, the reuse guard and, when tracing is on, the
+ * observer hooks and the event stream. Structural, so a fake host can stand in and the real context still fits.
+ */
 export interface HostSurface {
   readonly location: {readonly directory: string}
-  readonly session: PluginSessionApi
+  readonly session: PluginSessionApi & ObserverHost['session']
   readonly tool: {
     transform: (callback: (editor: Pick<ToolEditor, 'add'>) => void) => Promise<unknown>
-    hook: (name: 'execute.before', callback: (event: ToolCallBefore) => Promise<void> | void) => Promise<unknown>
+    hook: {
+      (name: 'execute.before', callback: (event: ToolCallBefore) => Promise<void> | void): Promise<unknown>
+      (name: 'execute.after', callback: (event: unknown) => void): Promise<unknown>
+    }
   }
+  readonly event: ObserverHost['event']
 }
+
+/** Cleanup the host runs when the location shuts down. */
+export type PluginCleanup = () => Promise<void>
 
 /**
  * The only way into the tracing chunk. Called only when settings resolved to on, so with tracing off the `import()` never
- * runs and the chunk and the SDK inside it are never evaluated. Any failure leaves the plugin exactly as it was.
+ * runs and the chunk and the SDK inside it are never evaluated. Every step (the import, SDK construction, hook
+ * registration, and later the cleanup) is wrapped: a failure leaves the plugin exactly as it was, and the one log line
+ * names the failure class only, since an error message can carry a path or URL.
  */
-async function runTracingStub(
+async function startTracing(
+  host: HostSurface,
   settings: Extract<TracingSettings, {mode: 'on'}>,
+  env: Readonly<Record<string, string | undefined>>,
   log: (line: string) => void,
-): Promise<void> {
+): Promise<PluginCleanup | undefined> {
   try {
     const tracing = await import('./tracing/index.js')
-    // Feasibility stub until the exporter is wired: one span to the resolved endpoint.
-    await tracing.exportStubSpan({
-      url: settings.endpoint,
-      ...(settings.host === 'local' ? {headers: settings.headers} : {}),
-    })
+    const handle = await tracing.startTracing(
+      {
+        session: host.session,
+        tool: {
+          hook: async (name, callback) =>
+            name === 'execute.before' ? host.tool.hook(name, callback) : host.tool.hook(name, callback),
+        },
+        event: host.event,
+      },
+      settings,
+      {env, log},
+    )
+    return async () => {
+      try {
+        await handle.stop()
+      } catch (error) {
+        log(`tracing cleanup failed (${error instanceof Error ? error.name : 'unknown error'})`)
+      }
+    }
   } catch (error) {
-    // Tracing must never fail the plugin. The line names the failure class only: an error message can carry a path or URL.
     log(`tracing could not start (${error instanceof Error ? error.name : 'unknown error'})`)
+    return undefined
   }
 }
 
@@ -50,7 +79,10 @@ export interface SetupOptions {
   readonly log?: (line: string) => void
 }
 
-export async function setupFroBotPlugin(host: HostSurface, options: SetupOptions = {}): Promise<void> {
+export async function setupFroBotPlugin(
+  host: HostSurface,
+  options: SetupOptions = {},
+): Promise<PluginCleanup | undefined> {
   // The guard goes first: if it cannot be registered the plugin fails before exposing any tool.
   await host.tool.hook('execute.before', async event => {
     rejectSubagentReuse(event)
@@ -81,5 +113,6 @@ export async function setupFroBotPlugin(host: HostSurface, options: SetupOptions
     directory: host.location.directory,
     log,
   })
-  if (settings.mode === 'on') await runTracingStub(settings, log)
+  if (settings.mode !== 'on') return undefined
+  return startTracing(host, settings, options.env ?? process.env, log)
 }

@@ -1,4 +1,5 @@
 import type {HostSurface} from './setup.js'
+import type {ToolCallBefore} from './task-reuse-guard.js'
 
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
@@ -11,7 +12,7 @@ import {TRACING_LAUNCHER_ENV} from './tracing/settings.js'
 type Added = Parameters<Parameters<HostSurface['tool']['transform']>[0]>[0] extends {add: (tool: infer T) => void}
   ? T
   : never
-type BeforeCallback = Parameters<HostSurface['tool']['hook']>[1]
+type BeforeCallback = (event: ToolCallBefore) => Promise<void> | void
 
 function fakeHost() {
   const added: Added[] = []
@@ -31,6 +32,7 @@ function fakeHost() {
     })),
     get: vi.fn(async () => null),
     context: vi.fn(async () => []),
+    hook: vi.fn(async () => ({dispose: async () => {}})),
   }
   const host: HostSurface = {
     location: {directory: '/work/repo'},
@@ -45,12 +47,13 @@ function fakeHost() {
         })
         return {dispose: async () => {}}
       },
-      async hook(name, callback) {
+      hook: async (name: string, callback: (event: never) => unknown) => {
         order.push(`hook:${name}`)
-        before = callback
+        if (name === 'execute.before') before = callback as BeforeCallback
         return {dispose: async () => {}}
       },
     },
+    event: {subscribe: () => (async function* () {})()},
   }
   return {host, session, added, order, before: () => before}
 }
@@ -176,7 +179,7 @@ describe('the lazy tracing entry', () => {
     const evaluated = vi.fn()
     vi.doMock('./tracing/index.js', () => {
       evaluated()
-      return {exportStubSpan: vi.fn()}
+      return {startTracing: vi.fn()}
     })
     const {setupFroBotPlugin: setup} = await freshSetup()
     const {host, order} = fakeHost()
@@ -194,7 +197,7 @@ describe('the lazy tracing entry', () => {
     const evaluated = vi.fn()
     vi.doMock('./tracing/index.js', () => {
       evaluated()
-      return {exportStubSpan: vi.fn()}
+      return {startTracing: vi.fn()}
     })
     const {setupFroBotPlugin: setup} = await freshSetup()
     const options = {
@@ -216,18 +219,93 @@ describe('the lazy tracing entry', () => {
     expect(evaluated).not.toHaveBeenCalled()
   })
 
-  it('loads the tracing module once and hands it the relay address when the launcher says on', async () => {
+  it('loads the tracing module once and hands it the settings the launcher carried', async () => {
     // #given a tracing module and an Action launcher variable
-    const exportStubSpan = vi.fn(async () => {})
-    vi.doMock('./tracing/index.js', () => ({exportStubSpan}))
+    const stop = vi.fn(async () => {})
+    const startTracing = vi.fn(
+      async (_host: Pick<HostSurface, 'session' | 'event' | 'tool'>, _settings: unknown, _deps: unknown) => ({stop}),
+    )
+    vi.doMock('./tracing/index.js', () => ({startTracing}))
+    const {setupFroBotPlugin: setup} = await freshSetup()
+    const {host} = fakeHost()
+    const env = {[TRACING_LAUNCHER_ENV]: ON}
+    const log = () => {}
+
+    // #when the plugin sets up
+    const cleanup = await setup(host, {env, log})
+
+    // #then tracing started once with the relay address and identity, and no headers: the credential never reaches it
+    expect(startTracing).toHaveBeenCalledOnce()
+    const [handed, settings, deps] = startTracing.mock.calls[0] as Parameters<typeof startTracing>
+    expect(handed.session).toBe(host.session)
+    expect(handed.event).toBe(host.event)
+    expect(typeof handed.tool.hook).toBe('function')
+    expect(settings).toEqual({
+      mode: 'on',
+      host: 'action',
+      endpoint: RELAY,
+      identity: {repository: 'fro-bot/agent', runId: '1', attempt: '1', job: 'j', trigger: 'push'},
+    })
+    expect(deps).toEqual({env, log})
+
+    // #and the host gets a cleanup that stops tracing
+    await cleanup?.()
+    expect(stop).toHaveBeenCalledOnce()
+  })
+
+  it('routes the observer hooks to the host, by name', async () => {
+    // #given a tracing module that registers both tool hooks through the handed host
+    const names: string[] = []
+    vi.doMock('./tracing/index.js', () => ({
+      startTracing: async (handed: {tool: {hook: (name: string, callback: () => void) => Promise<unknown>}}) => {
+        await handed.tool.hook('execute.before', () => {})
+        await handed.tool.hook('execute.after', () => {})
+        return {stop: async () => {}}
+      },
+    }))
+    const {setupFroBotPlugin: setup} = await freshSetup()
+    const {host, order} = fakeHost()
+    host.tool.hook = async (name: string) => {
+      names.push(name)
+      return {dispose: async () => {}}
+    }
+
+    // #when
+    await setup(host, {env: {[TRACING_LAUNCHER_ENV]: ON}, log: () => {}})
+
+    // #then the guard and both observer hooks reached the host's own hook function
+    expect(names).toEqual(['execute.before', 'execute.before', 'execute.after'])
+    expect(order).toContain('tools')
+  })
+
+  it('wraps the cleanup: a stop that throws leaves one fixed line and no rejection', async () => {
+    // #given a tracing handle whose stop throws with a secret-looking message
+    const lines: string[] = []
+    vi.doMock('./tracing/index.js', () => ({
+      startTracing: async () => ({
+        stop: async () => {
+          throw new TypeError('https://user:hunter2@collector.example/v1/traces')
+        },
+      }),
+    }))
+    const {setupFroBotPlugin: setup} = await freshSetup()
+    const {host} = fakeHost()
+    const cleanup = await setup(host, {env: {[TRACING_LAUNCHER_ENV]: ON}, log: line => lines.push(line)})
+
+    // #when the host runs the cleanup
+    await expect(cleanup?.()).resolves.toBeUndefined()
+
+    // #then
+    expect(lines).toEqual(['tracing cleanup failed (TypeError)'])
+  })
+
+  it('returns no cleanup when tracing is off', async () => {
+    // #given / #when
     const {setupFroBotPlugin: setup} = await freshSetup()
     const {host} = fakeHost()
 
-    // #when the plugin sets up
-    await setup(host, {env: {[TRACING_LAUNCHER_ENV]: ON}, log: () => {}})
-
-    // #then the stub ran against the relay, with no headers: the credential never reaches the plugin
-    expect(exportStubSpan).toHaveBeenCalledExactlyOnceWith({url: RELAY})
+    // #then
+    await expect(setup(host, {env: LOCAL_WITHOUT_FILE, log: () => {}})).resolves.toBeUndefined()
   })
 
   it('ignores plugin options and the project config: they cannot turn tracing on', async () => {
@@ -235,7 +313,7 @@ describe('the lazy tracing entry', () => {
     const evaluated = vi.fn()
     vi.doMock('./tracing/index.js', () => {
       evaluated()
-      return {exportStubSpan: vi.fn()}
+      return {startTracing: vi.fn()}
     })
     const {setupFroBotPlugin: setup} = await freshSetup()
     const {host} = fakeHost()
@@ -251,7 +329,7 @@ describe('the lazy tracing entry', () => {
   it('logs one fixed line for a refused launcher and still registers everything', async () => {
     // #given a launcher naming a public relay
     const lines: string[] = []
-    vi.doMock('./tracing/index.js', () => ({exportStubSpan: vi.fn()}))
+    vi.doMock('./tracing/index.js', () => ({startTracing: vi.fn()}))
     const {setupFroBotPlugin: setup} = await freshSetup()
     const {host, order} = fakeHost()
     const refused = JSON.stringify({...JSON.parse(ON), relay: 'http://203.0.113.9:4318/v1/traces'})
@@ -276,7 +354,7 @@ describe('the lazy tracing entry', () => {
       })
     } else {
       vi.doMock('./tracing/index.js', () => ({
-        exportStubSpan: async () => {
+        startTracing: async () => {
           throw new RangeError(secret)
         },
       }))

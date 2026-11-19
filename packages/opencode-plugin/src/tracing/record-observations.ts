@@ -7,7 +7,6 @@
  * observation or an observation without that field: a drifted shape shows up as a gap, never as a throw.
  */
 
-import type {Plugin} from '@opencode/plugin'
 import type {ErrorInfo, Observation, RequestKind, Usage} from './observation.js'
 
 type Json = Record<string, unknown>
@@ -69,7 +68,15 @@ function childOfSubagent(tool: string, metadata: unknown): string | undefined {
  * One hook call as an observation. `name` is `session.<hook>` or `tool.<hook>`. The payload is read, never kept, except
  * the request and prompt content the span will carry.
  */
-export function observeHook(name: string, payload: unknown, at: number): Observation | undefined {
+export function observeHook(
+  name: string,
+  payload: unknown,
+  at: number,
+  options: {readonly measure?: boolean} = {},
+): Observation | undefined {
+  // Sizing serializes the whole payload, which a host-path handler must not do: it is left to whoever consumes the
+  // observation (the recorder measures here; the tracing pipeline measures after the hook has returned).
+  const measure = options.measure !== false
   const event = asRecord(payload)
   if (event === undefined) return undefined
   const sessionId = asString(event.sessionID)
@@ -85,7 +92,7 @@ export function observeHook(name: string, payload: unknown, at: number): Observa
       messageId,
       delivery: asString(event.delivery),
       content: event.prompt,
-      bytes: approximateBytes(event.prompt),
+      ...(measure ? {bytes: approximateBytes(event.prompt)} : {}),
     }
   }
 
@@ -102,7 +109,7 @@ export function observeHook(name: string, payload: unknown, at: number): Observa
       model,
       provider,
       content,
-      bytes: approximateBytes(content),
+      ...(measure ? {bytes: approximateBytes(content)} : {}),
     }
   }
 
@@ -314,8 +321,23 @@ export function observeEvent(raw: unknown): Observation | undefined {
   }
 }
 
-/** The slice of the plugin context the recorder registers on. */
-export type ObserverHost = Pick<Plugin.Context, 'session' | 'tool' | 'event'>
+export type SessionHookName = 'prompt' | 'context' | 'compaction' | 'generate' | 'title' | 'retry'
+
+/**
+ * The slice of the plugin context the observers register on. Structural, so a fake host can stand in and the real
+ * `Plugin.Context` still fits.
+ */
+export interface ObserverHost {
+  readonly session: {
+    hook: (name: SessionHookName, callback: (event: unknown) => void) => Promise<unknown>
+  }
+  readonly tool: {
+    hook: (name: 'execute.before' | 'execute.after', callback: (event: unknown) => void) => Promise<unknown>
+  }
+  readonly event: {
+    subscribe: () => AsyncIterable<unknown>
+  }
+}
 
 /**
  * Registers every hook and the bus subscription the model reads, and passes each observation to `emit`. Handlers read and
@@ -326,6 +348,7 @@ export async function registerObservers(
   host: ObserverHost,
   emit: (observation: Observation) => void,
   now: () => number = Date.now,
+  options: {readonly measure?: boolean} = {},
 ): Promise<() => void> {
   const deliver = (observation: Observation | undefined): void => {
     if (observation === undefined) return
@@ -335,12 +358,10 @@ export async function registerObservers(
       // Observation must never fail a session.
     }
   }
-  const sessionHook = async (
-    name: 'prompt' | 'context' | 'compaction' | 'generate' | 'title' | 'retry',
-  ): Promise<void> => {
+  const sessionHook = async (name: SessionHookName): Promise<void> => {
     await host.session.hook(name, event => {
       try {
-        deliver(observeHook(`session.${name}`, event, now()))
+        deliver(observeHook(`session.${name}`, event, now(), options))
       } catch {
         // See above.
       }
@@ -350,7 +371,7 @@ export async function registerObservers(
   for (const name of ['execute.before', 'execute.after'] as const) {
     await host.tool.hook(name, event => {
       try {
-        deliver(observeHook(`tool.${name}`, event, now()))
+        deliver(observeHook(`tool.${name}`, event, now(), options))
       } catch {
         // See above.
       }

@@ -1,65 +1,110 @@
 /**
  * Lazy tracing entry. `setup.ts` reaches this module through one dynamic `import()` so the bundler emits it, and the
- * OpenTelemetry SDK it pulls in, as a separate chunk that is evaluated only when tracing is on.
+ * OpenTelemetry SDK it pulls in, as a separate chunk that is evaluated only when tracing resolves to on.
  *
- * Everything is constructed explicitly: no detectors, no global tracer provider, and nothing the SDK would otherwise
- * take from an `OTEL_*` variable. The exporter is built from `createOtlpHttpExportDelegate` rather than the
- * `OTLPTraceExporter` class: that class merges `OTEL_EXPORTER_OTLP_HEADERS` into the headers it is given.
+ * `startTracing` builds the whole path (scrubber, exporter, pipeline, hook and event observers) and returns a handle whose
+ * `stop` closes open spans, flushes within a bound and logs the counts. Nothing here is awaited on the host's request
+ * path: handlers only append observations.
  */
 
-import {OTLPExporterBase} from '@opentelemetry/otlp-exporter-base'
-import {createOtlpHttpExportDelegate, httpAgentFactoryFromOptions} from '@opentelemetry/otlp-exporter-base/node-http'
-import {JsonTraceSerializer} from '@opentelemetry/otlp-transformer'
-import {resourceFromAttributes} from '@opentelemetry/resources'
-import {
-  AlwaysOnSampler,
-  BasicTracerProvider,
-  BatchSpanProcessor,
-  type ReadableSpan,
-} from '@opentelemetry/sdk-trace-base'
+import type {TracingSettings} from './settings.js'
 
-export interface StubExportOptions {
-  /** Full OTLP traces URL, for example `http://127.0.0.1:4318/v1/traces`. */
-  readonly url: string
-  readonly headers?: Readonly<Record<string, string>>
+import {createScrubber} from './content.js'
+import {createSpanExporter} from './exporter.js'
+import {createTracePipeline} from './pipeline.js'
+import {registerObservers, type ObserverHost} from './record-observations.js'
+
+/**
+ * How long cleanup may take, all of it: closing spans, the final batch, the transport.
+ *
+ * The server waits for plugin cleanup with no cap of its own, and the Action SIGKILLs the process 5 s after it closes
+ * stdin, starting before this cleanup does (measured: the cleanup begins about 6 ms after stdin closes). Three seconds
+ * leaves two for any other plugin's cleanup and the process exit, and is still longer than a healthy loopback relay or a
+ * nearby collector needs for one batch. A batch still in flight at the bound is abandoned and counted as dropped.
+ */
+export const CLEANUP_BOUND_MS = 3_000
+
+export type OnSettings = Extract<TracingSettings, {mode: 'on'}>
+
+export interface TracingHandle {
+  /** Closes everything, flushes within `CLEANUP_BOUND_MS` and logs the counts. Never throws. */
+  readonly stop: () => Promise<void>
 }
 
-const EXPORT_TIMEOUT_MS = 5_000
+export interface StartTracingOptions {
+  /** The plugin's own environment, read once for secret-named variables. Never exported, never logged. */
+  readonly env: Readonly<Record<string, string | undefined>>
+  readonly log: (line: string) => void
+  readonly now?: () => number
+}
 
-/** Builds a tracer, records one span with explicit times, and flushes. Feasibility stub: replaced by the real exporter. */
-export async function exportStubSpan(options: StubExportOptions): Promise<void> {
-  const headers = {'Content-Type': 'application/json', ...options.headers}
-  const exporter = new OTLPExporterBase<ReadableSpan[]>(
-    createOtlpHttpExportDelegate(
-      {
-        url: options.url,
-        headers: async () => headers,
-        timeoutMillis: EXPORT_TIMEOUT_MS,
-        concurrencyLimit: 4,
-        compression: 'none',
-        agentFactory: httpAgentFactoryFromOptions({keepAlive: true}),
-      },
-      JsonTraceSerializer,
-    ),
-  )
-  const provider = new BasicTracerProvider({
-    resource: resourceFromAttributes({'service.name': 'fro-bot-opencode-plugin'}),
-    sampler: new AlwaysOnSampler(),
-    spanProcessors: [
-      new BatchSpanProcessor(exporter, {
-        maxQueueSize: 64,
-        maxExportBatchSize: 32,
-        scheduledDelayMillis: 1_000,
-        exportTimeoutMillis: EXPORT_TIMEOUT_MS,
-      }),
-    ],
+export async function startTracing(
+  host: ObserverHost,
+  settings: OnSettings,
+  options: StartTracingOptions,
+): Promise<TracingHandle> {
+  const {log} = options
+  const local = settings.host === 'local'
+  const scrubber = createScrubber({
+    env: options.env,
+    // The collector credential is a literal secret too: it must not come back in a tool result or an error message.
+    extraSecrets: local ? Object.values(settings.headers) : [],
   })
+  const exporter = createSpanExporter({
+    url: settings.endpoint,
+    headers: local ? settings.headers : {},
+    // Action mode only: a local collector did not ask for the header.
+    reportCounts: !local,
+    onStopped: () => {
+      log('tracing stopped exporting after repeated failures')
+    },
+  })
+  const pipeline = createTracePipeline({
+    sink: exporter,
+    scrubber,
+    ...(settings.host === 'action' ? {identity: settings.identity} : {}),
+    ...(options.now === undefined ? {} : {now: options.now}),
+  })
+
+  let stopObserving: () => void
   try {
-    const start = Date.now()
-    const span = provider.getTracer('fro-bot-opencode-plugin').startSpan('feasibility stub', {startTime: start})
-    span.end(start + 1)
-    await provider.forceFlush()
-  } finally {
-    await provider.shutdown()
+    stopObserving = await registerObservers(
+      host,
+      observation => {
+        pipeline.observe(observation)
+      },
+      options.now,
+      {measure: false},
+    )
+  } catch (error) {
+    // Some hooks may already be registered: they only append to a pipeline that is stopped now.
+    pipeline.stop()
+    await exporter.close(0)
+    throw error
+  }
+
+  let stopping: Promise<void> | undefined
+  return {
+    stop: async () => {
+      stopping ??= (async () => {
+        const started = Date.now()
+        try {
+          stopObserving()
+          pipeline.stop()
+        } catch {
+          // Counted below as whatever the exporter holds.
+        }
+        let counts = exporter.counts()
+        try {
+          counts = await exporter.close(Math.max(0, CLEANUP_BOUND_MS - (Date.now() - started)))
+        } catch {
+          // The line below reports what is known.
+        }
+        const {observationsDropped} = pipeline.stats()
+        const lost = observationsDropped > 0 ? `, ${observationsDropped} observations lost` : ''
+        log(`tracing stopped, exported ${counts.exported} spans, dropped ${counts.dropped}${lost}`)
+      })()
+      await stopping
+    },
   }
 }
