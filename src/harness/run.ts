@@ -1,6 +1,5 @@
 import type {
   ObjectStoreConfig,
-  OpenCodeV2ActionTracingHost,
   OpenCodeV2ServerHandle,
   OutputModeMigrationState,
   OutputModeRequestState,
@@ -21,7 +20,13 @@ import {applyTerminalReaction} from '../features/agent/index.js'
 import {createMetricsCollector, writeInvocationOutcomeSummary} from '../features/observability/index.js'
 import {resolveReviewedHeadSha} from '../features/reviews/reviewed-head.js'
 import {createReviewDeliveryReceiptOperations} from '../services/github/review-delivery-receipt.js'
-import {buildActionTracingHost, buildTracingRunIdentity, relayRequestFromInputs} from '../services/setup/tracing.js'
+import {
+  buildActionTracingHost,
+  buildTracingRunIdentity,
+  liveActionTracingHost,
+  relayRequestFromInputs,
+  type ActionTracingSource,
+} from '../services/setup/tracing.js'
 import {getGitHubRunAttempt, getInvocationIdentity, getOpenCodeLogPath} from '../shared/env.js'
 import {toErrorMessage} from '../shared/errors.js'
 import {createLogger} from '../shared/logger.js'
@@ -387,7 +392,7 @@ export async function run(): Promise<number> {
     // somewhere to post from its first batch, and what the plugin is told is decided here, once: on only with a relay that is
     // running and a complete run identity, off for everything else. A relay that does not start has been warned about by its
     // supervisor and the run goes on untraced.
-    let tracingHost: OpenCodeV2ActionTracingHost = buildActionTracingHost(null, null)
+    let tracingHost: ActionTracingSource = buildActionTracingHost(null, null)
     const relayRequest = relayRequestFromInputs(bootstrap.inputs.tracing)
     if (relayRequest !== null) {
       // Each field from where it is authoritative: the routed context for the repository, run and trigger (never the payload
@@ -415,7 +420,7 @@ export async function run(): Promise<number> {
         })
         if (started.success) {
           traceRelay = started.data
-          tracingHost = buildActionTracingHost(started.data.port, identity.data)
+          tracingHost = liveActionTracingHost(started.data, identity.data)
           if (sandboxLifecycle === null && !isolationRequested) bootstrapLogger.warning(TRACE_EXPOSURE_WARNING)
         }
       } else {

@@ -2,7 +2,6 @@ import type {Result} from '@bfra.me/es/result'
 import type {
   BuiltConfigV2,
   CredentialDisposition,
-  OpenCodeV2ActionTracingHost,
   OpenCodeV2SandboxLaunch,
   OpenCodeV2ServerHandle,
   StartOpenCodeV2ServerOptions,
@@ -11,6 +10,7 @@ import type {ProviderKeyEntryV2} from '../../services/setup/credential-files-v2.
 import type {KeyProxyProviderPlan} from '../../services/setup/key-proxy-providers.js'
 import type {InstallPluginsV2Options, PluginInstallV2Error} from '../../services/setup/plugin-install-v2.js'
 import type {RepoSkillsSource} from '../../services/setup/repo-skills.js'
+import type {ActionTracingSource} from '../../services/setup/tracing.js'
 import type {Logger} from '../../shared/logger.js'
 import type {KeyProxyProcess, KeyProxyStartError, StartKeyProxyProcessOptions} from './key-proxy-process.js'
 import type {SandboxLifecycle} from './sandbox-lifecycle.js'
@@ -46,6 +46,7 @@ import {
   resolvePluginSpecsV2,
 } from '../../services/setup/plugin-install-v2.js'
 import {admitRepoSkills, discardRepoSkillsStaging} from '../../services/setup/repo-skills.js'
+import {resolveActionTracing} from '../../services/setup/tracing.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {logDefaultModelNotice, suppliedProviderIds, verifyDefaultModelProvider} from './default-model.js'
 import {probeKeyProxy} from './key-proxy-probe.js'
@@ -136,11 +137,14 @@ export interface StartActionOpenCodeV2Options {
   readonly runId: string | number
   readonly runAttempt: string | number
   /**
-   * What the plugin is told about tracing: off, or on with the running relay's port and the run's identity. Required, with no
-   * default, so a caller cannot start the server without deciding. The Action's own host only: this surface is never the
-   * workspace. When on, the Fro Bot plugin is listed after the operator's plugins.
+   * What the plugin is told about tracing: off, or on with the running relay's port and the run's identity, as a host or as a
+   * source read at each use. Required, with no default, so a caller cannot start the server without deciding. The Action's own
+   * host only: this surface is never the workspace. A source is read once when the config is built (whether the Fro Bot plugin
+   * is listed after the operator's plugins) and again immediately before every spawn (what the launcher variable says), so a
+   * relay that died in between is never named to the plugin. Any further server start in a run must go through the same spawn
+   * options, and so reads the source again.
    */
-  readonly tracing: OpenCodeV2ActionTracingHost
+  readonly tracing: ActionTracingSource
   readonly logger: Logger
   readonly signal?: AbortSignal
   /** Masks the server password in the Action's log (`core.setSecret`). */
@@ -406,7 +410,7 @@ export async function startActionOpenCodeV2(
         runnerTemp: options.env.RUNNER_TEMP,
         runId: options.runId,
         runAttempt: options.runAttempt,
-        tracing: options.tracing.tracing === 'on',
+        tracing: resolveActionTracing(options.tracing).tracing === 'on',
         ...(options.env.FRO_BOT_INTEGRATION_WORK_DIR === undefined
           ? {}
           : {integrationWorkDir: options.env.FRO_BOT_INTEGRATION_WORK_DIR}),
@@ -513,7 +517,7 @@ export async function startActionOpenCodeV2(
     ...(options.maskSecret === undefined ? {} : {maskSecret: options.maskSecret}),
     ...deps.startOptions,
     // After the test seam's spread, so the host the caller declared is always the one the spawn writes.
-    tracingHost: options.tracing,
+    tracingHost: resolveActionTracing(options.tracing),
   })
 
   let started: Awaited<ReturnType<typeof deps.startServer>>

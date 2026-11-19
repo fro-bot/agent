@@ -236,6 +236,42 @@ describe('startActionOpenCodeV2', () => {
       expect(vi.mocked(onDeps.startServer as StartServer).mock.calls[0]?.[0].tracingHost).toEqual(TRACING_ON)
     })
 
+    it('reads a tracing source at the spawn, so a relay that died after the config was built is not named to the plugin', async () => {
+      // #given a source that says on while the config is built and off by the time the server is spawned
+      const reads: OpenCodeV2ActionTracingHost[] = [TRACING_ON, ACTION_TRACING_OFF]
+      const source = vi.fn(() => reads.shift() ?? ACTION_TRACING_OFF)
+      const deps = recordingDeps(fakeServer())
+
+      // #when
+      const started = await startActionOpenCodeV2(options({deps, tracing: source}))
+
+      // #then the spawn was given the off host, and the run went on (the server started)
+      expect(started.success).toBe(true)
+      expect(vi.mocked(deps.startServer as StartServer).mock.calls[0]?.[0].tracingHost).toEqual(ACTION_TRACING_OFF)
+    })
+
+    it('reads a tracing source again for every spawn, never caching the first answer', async () => {
+      // #given a source that is on until it has been read twice (config, then the first spawn) and off afterwards
+      let reads = 0
+      const source = vi.fn((): OpenCodeV2ActionTracingHost => {
+        reads += 1
+        return reads <= 2 ? TRACING_ON : ACTION_TRACING_OFF
+      })
+      const firstDeps = recordingDeps(fakeServer())
+      const secondDeps = recordingDeps(fakeServer())
+      const opts = options({deps: firstDeps, tracing: source})
+
+      // #when two servers are started from the same options, as a restart would
+      await startActionOpenCodeV2(opts)
+      await startActionOpenCodeV2({...opts, deps: secondDeps})
+
+      // #then each spawn saw the answer at its own moment
+      expect(vi.mocked(firstDeps.startServer as StartServer).mock.calls[0]?.[0].tracingHost).toEqual(TRACING_ON)
+      expect(vi.mocked(secondDeps.startServer as StartServer).mock.calls[0]?.[0].tracingHost).toEqual(
+        ACTION_TRACING_OFF,
+      )
+    })
+
     it('lists the Fro Bot plugin after the operator plugins only when tracing is on', async () => {
       // #given two operator plugins
       const opencodeConfig = JSON.stringify({plugins: ['op-one', 'op-two']})

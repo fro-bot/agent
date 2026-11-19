@@ -54,6 +54,40 @@ export function buildTracingRunIdentity(facts: TracingRunFacts): Result<TracingR
 }
 
 /**
+ * What a server start is given to decide, at its own moment, what the plugin is told: a plain host, or a source read right
+ * before each spawn. A relay can die between the moment it reported ready and the moment the server is spawned (cache restore,
+ * database repair and server preparation are awaited in between), so a run with a relay passes a source and the spawn reads it.
+ */
+export type ActionTracingSource = OpenCodeV2ActionTracingHost | (() => OpenCodeV2ActionTracingHost)
+
+/** The host a source stands for right now. A plain host is returned as it is; a function is called, every time. */
+export function resolveActionTracing(source: ActionTracingSource): OpenCodeV2ActionTracingHost {
+  return typeof source === 'function' ? source() : source
+}
+
+/** The two things of a running relay the plugin's host depends on. */
+export interface TraceRelayLiveness {
+  readonly port: number
+  /** The relay exited without being asked to, after it was ready. Latched by the supervisor. */
+  readonly crashed: () => boolean
+}
+
+/**
+ * A source that says on while the relay lives and off as soon as it has crashed (and so for good: a dead relay is never
+ * named to the plugin, whose port may by now belong to another process). Each read looks at the relay then.
+ */
+export function liveActionTracingHost(
+  relay: TraceRelayLiveness,
+  identity: TracingRunIdentity,
+): () => OpenCodeV2ActionTracingHost {
+  let dead = false
+  return () => {
+    dead ||= relay.crashed()
+    return buildActionTracingHost(dead ? null : relay.port, identity)
+  }
+}
+
+/**
  * What the plugin is told. On only with a relay that is running (its port) and a complete identity; anything else is off, so
  * a relay that failed to start or a bundle that failed its check means the launcher says off.
  */

@@ -5,9 +5,15 @@ import {
   TRACE_RELAY_PATH,
   TRACING_IDENTITY_FIELD_MAX_CHARS,
 } from '@fro-bot/runtime'
-import {describe, expect, it} from 'vitest'
+import {describe, expect, it, vi} from 'vitest'
 import {unwrapErr, unwrapOk} from '../../shared/test-helpers.js'
-import {buildActionTracingHost, buildTracingRunIdentity, relayRequestFromInputs} from './tracing.js'
+import {
+  buildActionTracingHost,
+  buildTracingRunIdentity,
+  liveActionTracingHost,
+  relayRequestFromInputs,
+  resolveActionTracing,
+} from './tracing.js'
 
 const HOST_CANARY = 'collector-canary.example.test'
 const CREDENTIAL_CANARY = 'Basic cnVuLXRyYWNpbmctY2FuYXJ5LTAwMDc6c2VjcmV0'
@@ -120,5 +126,49 @@ describe('buildActionTracingHost', () => {
     expect(buildTracingLauncherValue(buildActionTracingHost(null, identity))).toBe(
       '{"version":1,"host":"action","tracing":"off"}',
     )
+  })
+})
+
+describe('liveActionTracingHost', () => {
+  const identity = unwrapOk(buildTracingRunIdentity(FACTS))
+
+  it('reads the relay at each evaluation: on while it lives, off from the moment it has crashed', () => {
+    // #given a relay that is up when the source is made
+    let crashed = false
+    const source = liveActionTracingHost({port: 43_210, crashed: () => crashed}, identity)
+
+    // #when it is read before and after the crash
+    const before = source()
+    crashed = true
+    const after = source()
+
+    // #then the first reading is on, with the port, and the second is off: a dead relay is never named to the plugin
+    expect(before).toEqual({host: 'action', tracing: 'on', relayPort: 43_210, identity})
+    expect(after).toEqual({host: 'action', tracing: 'off'})
+  })
+
+  it('stays off once off: a relay cannot come back, and a read after a crash never says on again', () => {
+    let crashed = true
+    const source = liveActionTracingHost({port: 43_210, crashed: () => crashed}, identity)
+    expect(source().tracing).toBe('off')
+    crashed = false
+    expect(source().tracing).toBe('off')
+  })
+
+  it('is on for every evaluation while the relay lives (a second server in the run is told the same)', () => {
+    const source = liveActionTracingHost({port: 1, crashed: () => false}, identity)
+    expect([source().tracing, source().tracing]).toEqual(['on', 'on'])
+  })
+})
+
+describe('resolveActionTracing', () => {
+  it('returns a plain host as it is, and calls a source each time it is asked', () => {
+    const off = buildActionTracingHost(null, null)
+    const source = vi.fn(() => off)
+
+    expect(resolveActionTracing(off)).toBe(off)
+    expect(resolveActionTracing(source)).toBe(off)
+    expect(resolveActionTracing(source)).toBe(off)
+    expect(source).toHaveBeenCalledTimes(2)
   })
 })

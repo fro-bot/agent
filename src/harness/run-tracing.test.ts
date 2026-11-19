@@ -398,6 +398,12 @@ async function hostGiven(): Promise<unknown> {
   return vi.mocked(runCacheRestore).mock.calls[0]?.[3]
 }
 
+/** What the server start would be told right now: a source is read at this moment, as the spawn reads it. */
+async function hostAtSpawn(): Promise<unknown> {
+  const given = await hostGiven()
+  return typeof given === 'function' ? (given as () => unknown)() : given
+}
+
 describe('run with tracing', () => {
   beforeEach(async () => {
     vi.clearAllMocks()
@@ -462,7 +468,7 @@ describe('run with tracing', () => {
       await run()
 
       // #then the server start was handed the declaration, not the credential
-      expect(await hostGiven()).toEqual(ON)
+      expect(await hostAtSpawn()).toEqual(ON)
     })
 
     it('reads each identity field from where it is authoritative, never from the process environment or the payload', async () => {
@@ -496,7 +502,7 @@ describe('run with tracing', () => {
       await run()
 
       // #then repository, run id and trigger are the routed ones; the attempt and the job are this runner's own
-      expect(await hostGiven()).toEqual({
+      expect(await hostAtSpawn()).toEqual({
         ...ON,
         identity: {repository: 'routed/thing', runId: '555', attempt: '4', job: 'remediate', trigger: 'issue_comment'},
       })
@@ -508,8 +514,39 @@ describe('run with tracing', () => {
 
       await run()
 
-      expect(await hostGiven()).toEqual(ACTION_TRACING_OFF)
+      expect(await hostAtSpawn()).toEqual(ACTION_TRACING_OFF)
       expect(vi.mocked(startTraceRelayProcess)).not.toHaveBeenCalled()
+    })
+
+    it('is off at the spawn, with no second warning from the run, when the relay dies after it was ready and before the server starts', async () => {
+      // #given a relay that reports ready, then crashes while cache restore, repair and server preparation are awaited
+      const {startTraceRelayProcess} = await import('./phases/trace-relay-process.js')
+      const {runCacheRestore} = await import('./phases/cache-restore.js')
+      await arrange()
+      let crashed = false
+      const stop = vi.fn(async (): Promise<TraceRelayStopResult> => ({outcome: 'already-exited', counts: 'incomplete'}))
+      const relay: TraceRelayProcess = {pid: 4242, port: 5151, crashed: () => crashed, stop}
+      vi.mocked(startTraceRelayProcess).mockResolvedValue({success: true, data: relay})
+      const phase = vi.mocked(runCacheRestore).getMockImplementation()
+      const seen: unknown[] = []
+      vi.mocked(runCacheRestore).mockImplementation(async (...args) => {
+        // the host as the phase received it while the relay is still up, then the relay dies in the window
+        seen.push(typeof args[3] === 'function' ? (args[3] as () => unknown)() : args[3])
+        crashed = true
+        return phase === undefined ? null : phase(...args)
+      })
+
+      // #when
+      const exitCode = await run()
+
+      // #then a reading while the relay was up is on, the reading at the spawn is off, and the run went on
+      expect(seen[0]).toEqual(ON)
+      expect(await hostAtSpawn()).toEqual(ACTION_TRACING_OFF)
+      expect(exitCode).toBe(0)
+      // and the run added no warning of its own about it: the exposure warning (the relay was up when it was given out) is the
+      // only tracing warning the run logs, and the supervisor's crash warning is the one signal of the crash
+      const tracingWarnings = everyLogged('warning').map(call => String(call[0]))
+      expect(tracingWarnings.filter(message => /trac/i.test(message))).toEqual([EXPOSURE_WARNING])
     })
 
     it('is off when the relay fails to start, with the supervisor having warned once', async () => {
@@ -520,7 +557,7 @@ describe('run with tracing', () => {
       const exitCode = await run()
 
       expect(exitCode).toBe(0)
-      expect(await hostGiven()).toEqual(ACTION_TRACING_OFF)
+      expect(await hostAtSpawn()).toEqual(ACTION_TRACING_OFF)
     })
 
     it('is off when the relay bundle fails its check, and no relay is spawned', async () => {
@@ -533,7 +570,7 @@ describe('run with tracing', () => {
       await run()
 
       // #then
-      expect(await hostGiven()).toEqual(ACTION_TRACING_OFF)
+      expect(await hostAtSpawn()).toEqual(ACTION_TRACING_OFF)
     })
 
     it('is off, with one fixed warning and no relay, when the run identity is incomplete', async () => {
@@ -548,7 +585,7 @@ describe('run with tracing', () => {
       // #then the run goes on untraced: no relay, the plugin told off, and one warning that quotes nothing
       expect(exitCode).toBe(0)
       expect(vi.mocked(startTraceRelayProcess)).not.toHaveBeenCalled()
-      expect(await hostGiven()).toEqual(ACTION_TRACING_OFF)
+      expect(await hostAtSpawn()).toEqual(ACTION_TRACING_OFF)
       const warnings = everyLogged('warning').map(call => String(call[0]))
       expect(warnings.filter(message => /run identity/i.test(message))).toEqual([
         'Tracing is off: the run identity (repository, run, attempt, job and trigger) is incomplete',
@@ -562,7 +599,7 @@ describe('run with tracing', () => {
 
       await run()
 
-      const given = JSON.stringify(await hostGiven())
+      const given = JSON.stringify(await hostAtSpawn())
       expect(given).not.toContain(CREDENTIAL_CANARY)
       expect(given).not.toContain(ENDPOINT_HOST_CANARY)
     })

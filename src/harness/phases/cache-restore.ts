@@ -1,6 +1,7 @@
-import type {OpenCodeV2ActionTracingHost, OpenCodeV2ServerHandle} from '@fro-bot/runtime'
+import type {OpenCodeV2ServerHandle} from '@fro-bot/runtime'
 import type {MetricsCollector} from '../../features/observability/index.js'
 import type {RepoSkillsSource} from '../../services/setup/repo-skills.js'
+import type {ActionTracingSource} from '../../services/setup/tracing.js'
 import type {CacheResult} from '../../shared/types.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {SandboxLifecycle} from './sandbox-lifecycle.js'
@@ -51,7 +52,7 @@ export async function runCacheRestore(
    * What the server's plugin is told about tracing: off, or on with the running relay's port and the run's identity. Decided
    * by `run.ts` (the one place that has the routed context and the relay) and required here so a start cannot skip it.
    */
-  tracing: OpenCodeV2ActionTracingHost,
+  tracing: ActionTracingSource,
 ): Promise<CacheRestorePhaseResult | null> {
   const cacheComponents = buildCacheKeyComponents()
 
@@ -170,7 +171,7 @@ async function startV2Server(
   cacheResult: CacheResult,
   cacheStatus: 'corrupted' | 'hit' | 'miss',
   repoSkills: RepoSkillsSource | null,
-  tracing: OpenCodeV2ActionTracingHost,
+  tracing: ActionTracingSource,
 ): Promise<CacheRestorePhaseResult | null> {
   const serverLogger = createLogger({phase: 'server-bootstrap'})
   const {inputs, opencodeResult} = bootstrap
