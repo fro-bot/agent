@@ -52,7 +52,12 @@ import {runReviewReconciliation} from './phases/review-reconciliation.js'
 import {runRouting} from './phases/routing.js'
 import {runSessionPrep} from './phases/session-prep.js'
 import {checkTraceRelayBundle} from './phases/trace-relay-bundle.js'
-import {startTraceRelayProcess, type TraceRelayConfig, type TraceRelayProcess} from './phases/trace-relay-process.js'
+import {
+  createTraceRelayLaunch,
+  startTraceRelayProcess,
+  type TraceRelayConfig,
+  type TraceRelayProcess,
+} from './phases/trace-relay-process.js'
 
 const KEY_PROXY_CRASHED_DECLINE_REASON =
   'the isolate-agent key proxy exited unexpectedly, so the run is incomplete and no session state is saved'
@@ -393,24 +398,21 @@ export async function run(options: RunOptions = {}): Promise<number> {
     // `options.traceRelay` here from the parsed inputs instead, and give `runCacheRestore` the relay's port (`traceRelay?.port`,
     // null meaning "tell the plugin tracing is off").
     if (options.traceRelay !== undefined) {
-      const started = await startTraceRelayProcess({
+      // The signal teardown owns the launch from before the spawn: a cancellation while the child is still starting aborts the
+      // start and reaps it, one that arrives when it is ready stops it, inside the teardown's own budget. Registering installs
+      // the lifecycle's signal handlers, which at this point (before the server, the key proxy and the account) nothing else
+      // has. The server is being killed on a signal, so a relay stopped that way cannot have a complete count.
+      const launch = createTraceRelayLaunch(startTraceRelayProcess)
+      sandboxLifecycle?.registerSignalStop(async () => launch.stop())
+      const started = await launch.start({
         config: options.traceRelay,
         logger: createLogger({phase: 'trace-relay'}),
         // The relay bundle is optional, so only a run that traces looks at it (the supervisor asks, before it spawns).
         bundleCheck: async () => checkTraceRelayBundle({isolated: isolationRequested}),
       })
       if (started.success) {
-        const relay = started.data
-        traceRelay = relay
-        if (sandboxLifecycle !== null) {
-          // A cancellation ends the process without this function's `finally`: the lifecycle's signal teardown stops the
-          // relay too, inside its own budget. The server is being killed, so the count cannot be complete.
-          sandboxLifecycle.registerSignalStop(async () => {
-            await relay.stop({serverKilled: true})
-          })
-        } else if (!isolationRequested) {
-          bootstrapLogger.warning(TRACE_EXPOSURE_WARNING)
-        }
+        traceRelay = started.data
+        if (sandboxLifecycle === null && !isolationRequested) bootstrapLogger.warning(TRACE_EXPOSURE_WARNING)
       }
     }
 

@@ -99,6 +99,7 @@ export interface StartTraceRelayProcessOptions {
 export type TraceRelayStartErrorKind =
   | 'bad-ready'
   | 'bundle-invalid'
+  | 'cancelled'
   | 'child-error'
   | 'credential-over-http'
   | 'exited-early'

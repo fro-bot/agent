@@ -432,7 +432,7 @@ describe('run with tracing', () => {
 
     const call = vi.mocked(startTraceRelayProcess).mock.calls[0]?.[0]
     expect(call?.config).toEqual(TRACE_RELAY)
-    expect(Object.keys(call ?? {}).sort()).toEqual(['bundleCheck', 'config', 'logger'])
+    expect(Object.keys(call ?? {}).sort()).toEqual(['bundleCheck', 'config', 'logger', 'signal'])
   })
 
   it.each([
@@ -472,9 +472,10 @@ describe('run with tracing', () => {
     // #when an isolated run asks for tracing
     const exitCode = await run({traceRelay: TRACE_RELAY})
 
-    // #then it went on exactly as an untraced run: no stop registered, the server started, nothing declined
+    // #then it went on exactly as an untraced run: the server started and nothing was declined (the launch's stop was
+    // registered before the start and has nothing left to stop)
     expect(exitCode).toBe(0)
-    expect(registerSignalStop).not.toHaveBeenCalled()
+    expect(registerSignalStop).toHaveBeenCalledTimes(1)
     expect(vi.mocked(runCacheRestore)).toHaveBeenCalledTimes(1)
     expect(vi.mocked(runExecute)).toHaveBeenCalledTimes(1)
     expect(vi.mocked(runCleanup).mock.calls[0]?.[0]).toMatchObject({skipSessionPersistence: false})
@@ -788,7 +789,7 @@ describe('run with tracing', () => {
       expect(stop).toHaveBeenCalledWith({serverKilled: true})
     })
 
-    it('registers nothing for a relay that did not start', async () => {
+    it('registers the stop before the start begins, so a signal during the start is owned, even for a relay that then fails', async () => {
       const {startTraceRelayProcess} = await import('./phases/trace-relay-process.js')
       const {sandbox, registerSignalStop} = fakeSandbox()
       await arrange({sandbox})
@@ -796,7 +797,67 @@ describe('run with tracing', () => {
 
       await run({traceRelay: TRACE_RELAY})
 
-      expect(registerSignalStop).not.toHaveBeenCalled()
+      expect(registerSignalStop).toHaveBeenCalledTimes(1)
+      expect(orderOf(registerSignalStop)).toBeLessThan(orderOf(vi.mocked(startTraceRelayProcess)))
+    })
+
+    it('hands the start the launch signal, and the registered stop aborts it while the start is still pending', async () => {
+      // #given a start that is still waiting for its child
+      const {startTraceRelayProcess} = await import('./phases/trace-relay-process.js')
+      const {sandbox, registerSignalStop} = fakeSandbox()
+      await arrange({sandbox})
+      let finishStart!: (result: Awaited<ReturnType<typeof startTraceRelayProcess>>) => void
+      vi.mocked(startTraceRelayProcess).mockImplementation(
+        async () =>
+          new Promise(resolve => {
+            finishStart = resolve
+          }),
+      )
+      const running = run({traceRelay: TRACE_RELAY})
+      await vi.waitFor(() => expect(vi.mocked(startTraceRelayProcess)).toHaveBeenCalledTimes(1))
+      const signal = vi.mocked(startTraceRelayProcess).mock.calls[0]?.[0].signal
+      expect(signal?.aborted).toBe(false)
+
+      // #when the signal teardown calls the registered stop
+      const stopping = registerSignalStop.mock.calls[0]?.[0]()
+      await vi.waitFor(() => expect(signal?.aborted).toBe(true))
+
+      // #then the start was told to give up, and the teardown's stop waits for it to settle
+      let settled = false
+      stopping?.then(
+        () => {
+          settled = true
+        },
+        () => undefined,
+      )
+      await new Promise(resolve => setTimeout(resolve, 20))
+      expect(settled).toBe(false)
+      finishStart({success: false, error: {kind: 'cancelled'}})
+      await stopping
+      await running
+    })
+
+    it('stops a relay that became ready just as the signal teardown ran, as one whose count is incomplete', async () => {
+      const {startTraceRelayProcess} = await import('./phases/trace-relay-process.js')
+      const {sandbox, registerSignalStop} = fakeSandbox()
+      await arrange({sandbox})
+      const {relay, stop} = fakeRelay()
+      let finishStart!: (result: Awaited<ReturnType<typeof startTraceRelayProcess>>) => void
+      vi.mocked(startTraceRelayProcess).mockImplementation(
+        async () =>
+          new Promise(resolve => {
+            finishStart = resolve
+          }),
+      )
+      const running = run({traceRelay: TRACE_RELAY})
+      await vi.waitFor(() => expect(vi.mocked(startTraceRelayProcess)).toHaveBeenCalledTimes(1))
+
+      const stopping = registerSignalStop.mock.calls[0]?.[0]()
+      finishStart({success: true, data: relay})
+      await stopping
+      await running
+
+      expect(stop).toHaveBeenCalledWith({serverKilled: true})
     })
 
     it('registers no extra stop for a run that is not isolated, which relies on stdin closing when the Action exits', async () => {
