@@ -319,6 +319,7 @@ Span shape for one turn:
 - Edge case: no variable and no user file resolves to off, silently.
 - Edge case: a valid user file whose host list does not name this machine resolves to off; a file with no host list is refused.
 - Edge case: a headless host with neither marker set, sharing a home directory with a valid user file that names another machine, resolves to off.
+- Happy path: a server the operator starts by hand on a named machine, with neither marker set, resolves to on. The origin document defines this as a local session.
 - Edge case: no variable, a valid user file and `OPENCODE_PASSWORD` set: off.
 - Edge case: Action variable says off while a valid user file exists: off.
 - Edge case: workspace variable present with a valid user file: off.
@@ -348,8 +349,9 @@ Span shape for one turn:
 - Input is a stream of normalized observations. Output is span records: name, kind, trace, parent, start, end, status, raw content, gaps.
 - Roots per session are a set, not one. A dispatch records its root when it is made and never changes it.
 - A child session's observations are buffered until its dispatch resolves, within a count and byte bound. On overflow or expiry the child gets its own trace marked unattributed.
-- Tool spans open on the before-hook and close on the session tool event, keyed by call id.
-- Retries are separate model spans with an attempt number. Model output joins its request by order within session and kind, and is left absent when order is not proven.
+- Session tool events are the lifecycle of a tool span: the call event opens it and the success or failure event closes it, keyed by call id. The before and after hooks add input and result where they fire. A call the provider executes itself has no hooks and is built from events alone. A call this plugin's own reuse guard rejects is a span with the rejected outcome.
+- Calls made inside a code-execution tool are not separate spans in this release. The outer call's span carries its input and result.
+- Retries are separate model spans with an attempt number where OpenCode exposes the attempt, which it does for a session's model steps. Generate, title and compaction requests are prepared once and retried below the plugin's view, so each is one span whose attempt count is marked unknown. Model output joins its request by order within session and kind, and is left absent when order is not proven.
 - A root closes on idle with nothing outstanding, on failure or interruption after its open children, or on the inactivity bound, marked incomplete. A late report for a closed root starts a continuation trace that names the first. A report delivered inside a later turn's execution has its follow-on work in that turn's trace, naming the dispatching turn. The origin document states both exceptions.
 - Manual compaction and generate requests outside any execution get a small standalone trace.
 - Tool results cut by the tool itself keep that fact as a marker, separate from the plugin's own truncation.
@@ -361,6 +363,9 @@ Span shape for one turn:
 - Happy path: a text turn yields a root span and one model span with output, usage and finish reason.
 - Happy path: a turn with one tool yields a tool span under the root with input and result, closed on tool success.
 - Edge case: a rejected tool call and an interrupted one each yield a closed tool span with that outcome and no result.
+- Edge case: a call rejected by the plugin's own reuse guard yields a tool span with the rejected outcome.
+- Edge case: a tool call with session events and no hooks yields a span from the events alone.
+- Edge case: a generate request yields one span with its attempt count marked unknown.
 - Edge case: a failed model call followed by a retry yields two model spans, the first marked failed.
 - Happy path: a background subagent yields child spans in the root's trace under the dispatching tool span, though that tool span has ended, and the child's prompt is present although it arrived before the dispatch result.
 - Happy path: the parent's follow-on model call after the child reports back is in the same trace.
@@ -379,7 +384,7 @@ Span shape for one turn:
 - Edge case: cleanup with spans open closes them as interrupted and leaves no state.
 - Integration: the long-session fixture, with a compaction, a retry, a background subagent and several large tool results, yields every model and tool span with its identity.
 
-**Verification:** Every recorded fixture replays to the expected span tree with exact parents, and no state remains for a closed root.
+**Verification:** Every recorded fixture replays to the expected span tree with exact parents. A closed root leaves only a bounded record of its trace id, kept so a continuation can name it. When that record has expired, a late report starts an unattributed trace.
 
 - [ ] **Unit 4: Content and GenAI attributes**
 
@@ -451,7 +456,7 @@ Span shape for one turn:
 - Happy path, real binary: a turn with a tool and a background subagent, against a loopback OTLP sink, produces one trace with the expected span tree and content.
 - Integration, real binary: the long-session scenario produces every expected span at the sink, and each span that lost content says so.
 - Happy path, real binary: tracing off sends nothing to the sink and loads no tracing chunk.
-- Error path: the sink refuses connections for the whole session; the session completes and the log reports dropped spans.
+- Error path: the sink refuses connections for the whole session; the session completes and the local log reports dropped spans.
 - Error path: the sink answers retryable then delivered; the batch arrives once.
 - Error path: SDK construction, hook registration and cleanup each throwing leaves the plugin active and the session unaffected.
 - Error path: a handler that throws inside tracing does not fail the tool call or the model request.
@@ -589,7 +594,7 @@ Span shape for one turn:
 - Edge case: an operator who lists this plugin themselves does not get it twice.
 - Edge case: the server environment has no `OTEL_` variable when the job sets one.
 - Integration, real binary: a turn's spans arrive at the recording upstream with the credential header and Action identity attributes, and the credential is absent from the server's environment and config.
-- Integration, real binary: the upstream refuses connections; the run succeeds and the log reports dropped spans.
+- Integration, real binary: the upstream refuses connections for a run that sends one batch; the run succeeds and the log reports that batch as not acknowledged.
 - Integration, real binary: a file in the checkout and a restored session directory that name a tracing endpoint, with tracing off, send nothing.
 - Integration, real binary: the plugin and permission gates pass with the plugin listed last.
 
