@@ -22,7 +22,10 @@
 
 import type {OpenCodeV2ServerHandle} from '@fro-bot/runtime'
 import type {FakeProvider, FakeStep, SinkRequest} from '../../../packages/opencode-plugin/src/integration.fixture.js'
-import type {TlsUpstream} from '../../../packages/runtime/src/agent/key-proxy-test-kit.js'
+import type {
+  RecordedRequest as RecordedUpstreamRequest,
+  TlsUpstream,
+} from '../../../packages/runtime/src/agent/key-proxy-test-kit.js'
 import type {TraceRelayLauncher, TraceRelayProcess, TraceRelayStopResult} from './trace-relay-process.js'
 import {Buffer} from 'node:buffer'
 import {execFileSync} from 'node:child_process'
@@ -35,7 +38,11 @@ import {ok} from '@bfra.me/es/result'
 import {startOpenCodeV2Server} from '@fro-bot/runtime'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 import {startFakeProvider} from '../../../packages/opencode-plugin/src/integration.fixture.js'
-import {decodeSpans, sleep} from '../../../packages/opencode-plugin/src/tracing/tracing.integration.fixture.js'
+import {
+  decodeSpans,
+  sleep,
+  waitUntil,
+} from '../../../packages/opencode-plugin/src/tracing/tracing.integration.fixture.js'
 import {startTlsUpstream} from '../../../packages/runtime/src/agent/key-proxy-test-kit.js'
 import {buildActionTracingHost, buildTracingRunIdentity, relayRequestFromInputs} from '../../services/setup/tracing.js'
 import {createMockLogger, serializeLoggerCalls, unwrapOk} from '../../shared/test-helpers.js'
@@ -221,6 +228,28 @@ interface TurnResult {
   readonly spans: ReturnType<typeof decodeSpans>
 }
 
+const isRoot = (span: {name: string; parentSpanId?: string | undefined}): boolean =>
+  span.name.startsWith('invoke_agent') && span.parentSpanId === undefined
+
+/** The recorded upstream requests in the decoder's shape. */
+function toSinkRequests(received: readonly RecordedUpstreamRequest[]): SinkRequest[] {
+  return received.map(recorded => ({
+    method: recorded.method,
+    path: recorded.url,
+    contentType: String(recorded.headers['content-type'] ?? ''),
+    headers: recorded.headers,
+    body: (() => {
+      try {
+        return JSON.parse(recorded.body.toString('utf8')) as unknown
+      } catch {
+        return recorded.body.toString('utf8')
+      }
+    })(),
+    text: recorded.body.toString('utf8'),
+    status: 200,
+  }))
+}
+
 const cleanups: (() => Promise<void> | void)[] = []
 
 afterEach(async () => {
@@ -373,8 +402,20 @@ async function runTurn(options: TurnOptions): Promise<TurnResult> {
       if (!session.includes(options.finalText)) await sleep(200)
     }
     expect(session).toContain(options.finalText)
-    // Let the exporter's batch interval pass, then stop as the Action does: interrupt, close stdin, wait for the exit.
-    await sleep(500)
+    // Wait for what the turn must have produced, not for a time: the root span ends with the turn, so once the collector holds
+    // it every span of the turn has been exported (children end first). Then stop as the Action does: interrupt, close stdin,
+    // wait for the exit. A refused collector never receives anything, and the stop's final flush is what that scenario tests.
+    if (upstream !== null && options.upstream === 'up') {
+      await waitUntil(
+        'the turn’s root span at the collector',
+        () => decodeSpans(toSinkRequests(upstream.requests)).some(isRoot),
+        60_000,
+        () =>
+          `received ${upstream.requests.length} requests; spans: ${decodeSpans(toSinkRequests(upstream.requests))
+            .map(span => span.name)
+            .join(', ')}`,
+      )
+    }
     const stopped = await handle.shutdown()
     shutdown = stopped.exit.outcome
     // The relay goes after the server has exited, as `run.ts` does.
@@ -383,21 +424,7 @@ async function runTurn(options: TurnOptions): Promise<TurnResult> {
     })
   }
   const relayStop = relay === null ? null : await relay.stop({serverKilled: shutdown !== 'graceful'})
-  const requests: SinkRequest[] = (upstream?.requests ?? []).map(recorded => ({
-    method: recorded.method,
-    path: recorded.url,
-    contentType: String(recorded.headers['content-type'] ?? ''),
-    headers: recorded.headers,
-    body: (() => {
-      try {
-        return JSON.parse(recorded.body.toString('utf8')) as unknown
-      } catch {
-        return recorded.body.toString('utf8')
-      }
-    })(),
-    text: recorded.body.toString('utf8'),
-    status: 200,
-  }))
+  const requests = toSinkRequests(upstream?.requests ?? [])
   return {
     box,
     started,
@@ -413,9 +440,6 @@ async function runTurn(options: TurnOptions): Promise<TurnResult> {
     spans: decodeSpans(requests),
   }
 }
-
-const isRoot = (span: {name: string; parentSpanId?: string | undefined}): boolean =>
-  span.name.startsWith('invoke_agent') && span.parentSpanId === undefined
 
 describe.skipIf(!enabled)('Action tracing against the real OpenCode V2 binary and the built plugin', () => {
   it('delivers a turn through the relay with the configured header and the Action identity, and keeps the credential out of the server', async () => {
@@ -552,10 +576,9 @@ describe.skipIf(!enabled)('Action tracing against the real OpenCode V2 binary an
       plant: planted,
       jobEnv: {OTEL_EXPORTER_OTLP_ENDPOINT: sink.url, OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: `${sink.url}/v1/traces`},
     })
-    await sleep(1_500)
-
-    // #then the run worked as it does today and nothing reached the sink
+    // #then the run worked as it does today and nothing reached the sink; the server has left, so nothing can still be on its way
     expect(turn.started.success).toBe(true)
+    expect(turn.shutdown).toBe('graceful')
     expect(turn.session).toContain('simple answer')
     expect(turn.relay).toBeNull()
     expect(sink.requests).toEqual([])
