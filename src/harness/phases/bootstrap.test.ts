@@ -241,6 +241,49 @@ describe('runBootstrap response-delivery wiring', () => {
     expect(result?.responseFilePath).toBeNull()
   })
 
+  it.each([
+    ['pull_request_review_comment', 'withhold', 'file-convention'],
+    ['discussion_comment', 'withhold', 'file-convention'],
+    ['push', 'withhold', 'file-convention'],
+    ['workflow_dispatch', 'provision', 'model-gh'],
+    ['schedule', 'provision', 'model-gh'],
+  ] as const)(
+    'carries the credential disposition of %s on the result: %s with %s delivery',
+    async (eventName, credential, delivery) => {
+      // #given an event and responseMode github
+      mocks.githubContext.eventName = eventName
+      vi.stubEnv('GITHUB_WORKSPACE', path.join(runnerTempDir, 'repo'))
+      mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({responseMode: 'github'})})
+      const {runBootstrap} = await import('./bootstrap.js')
+
+      // #when bootstrap runs
+      const result = await runBootstrap(createMockLogger())
+
+      // #then the one decision rides on the result, and setup received the same disposition
+      expect(result?.credential).toBe(credential)
+      expect(result?.delivery).toBe(delivery)
+      expect(mocks.ensureOpenCodeAvailable).toHaveBeenCalledWith(
+        expect.objectContaining({credential}),
+        expect.anything(),
+      )
+    },
+  )
+
+  it('selects no delivery but withholds the credential for a non-allowlisted event when responseMode is none', async () => {
+    // #given a discussion_comment trigger with responseMode none
+    mocks.githubContext.eventName = 'discussion_comment'
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({responseMode: 'none'})})
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when bootstrap runs
+    const result = await runBootstrap(createMockLogger())
+
+    // #then nothing is delivered, the credential is withheld, and the preflight ran
+    expect(result?.delivery).toBe('none')
+    expect(result?.credential).toBe('withhold')
+    expect(mocks.assertNoPersistedGitCredentials).toHaveBeenCalledTimes(1)
+  })
+
   it('fails loudly when the nonce response file already exists before execution', async () => {
     // #given a preexisting file at the run-scoped response directory that collides with the generated nonce
     // We can't predict the random nonce, so we simulate by making fs.mkdir succeed but pre-populating

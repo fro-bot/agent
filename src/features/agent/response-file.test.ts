@@ -140,4 +140,27 @@ describe('resolveResponseSurface', () => {
     // #then inline review comments remain comment-only
     expect(surface).toBe('pr-comment')
   })
+
+  it('selects the discussion surface for discussion_comment triggers, whatever the issue type', () => {
+    // #given a discussion comment trigger, whose agent context carries no issue type
+    // #when the response surface is resolved
+    const surface = resolveResponseSurface(makeAgentContext(null), makeTriggerContext('discussion_comment'))
+
+    // #then the reply is routed to the discussion, not to an issue
+    expect(surface).toBe('discussion-comment')
+  })
+
+  it('keeps an authorized discussion mention on the comment-only discussion surface', () => {
+    // #given an authorized, non-bot discussion mention
+    const triggerContext = makeTriggerContext('discussion_comment', {
+      author: {login: 'member', association: 'MEMBER', isBot: false},
+      hasMention: true,
+    })
+
+    // #when the response surface is resolved
+    const surface = resolveResponseSurface(makeAgentContext(null), triggerContext)
+
+    // #then no review authority is granted
+    expect(surface).toBe('discussion-comment')
+  })
 })

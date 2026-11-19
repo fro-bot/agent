@@ -11,10 +11,11 @@ import {err, ok} from '../shared/types.js'
  */
 export const MAX_BODY_BYTES = 65_536
 
-export type ResponseSurface = 'issue-comment' | 'pr-comment' | 'pr-review' | 'pr-review-permitted'
+export type ResponseSurface =
+  'discussion-comment' | 'issue-comment' | 'pr-comment' | 'pr-review' | 'pr-review-permitted'
 
 export interface ResponseSurfacePolicy {
-  readonly target: 'issue' | 'pr'
+  readonly target: 'discussion' | 'issue' | 'pr'
   readonly verdictRequired: boolean
   readonly verdictPermitted: boolean
   readonly reviewCapable: boolean
@@ -26,6 +27,7 @@ export interface ResponseSurfacePolicy {
  * through one of the consumers.
  */
 export const RESPONSE_SURFACE_POLICIES = {
+  'discussion-comment': {target: 'discussion', verdictRequired: false, verdictPermitted: false, reviewCapable: false},
   'issue-comment': {target: 'issue', verdictRequired: false, verdictPermitted: false, reviewCapable: false},
   'pr-comment': {target: 'pr', verdictRequired: false, verdictPermitted: false, reviewCapable: false},
   'pr-review': {target: 'pr', verdictRequired: true, verdictPermitted: true, reviewCapable: true},

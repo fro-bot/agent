@@ -124,6 +124,18 @@ export interface IssueContext {
   readonly totalComments: number
 }
 
+export interface DiscussionContext {
+  readonly type: 'discussion'
+  readonly number: number
+  readonly title: string
+  readonly body: string
+  readonly bodyTruncated: boolean
+  readonly author: string | null
+  readonly comments: readonly Pick<ContextComment, 'id' | 'author' | 'body' | 'createdAt'>[]
+  readonly commentsTruncated: boolean
+  readonly totalComments: number
+}
+
 export interface PullRequestContext {
   readonly type: 'pull_request'
   readonly number: number
@@ -157,7 +169,7 @@ export interface PullRequestContext {
   readonly requestedReviewerTeams: readonly string[]
 }
 
-export type HydratedContext = IssueContext | PullRequestContext
+export type HydratedContext = DiscussionContext | IssueContext | PullRequestContext
 
 export interface TriggerTarget {
   readonly kind: 'discussion' | 'issue' | 'manual' | 'pr'

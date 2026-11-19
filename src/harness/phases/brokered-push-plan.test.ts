@@ -65,12 +65,16 @@ describe('resolveBrokeredPushPlan', () => {
     expect(plan.eligible).toBe(false)
   })
 
-  it.each(['pull_request', 'issues', 'pull_request_review_comment', 'schedule', 'workflow_dispatch'])(
-    'is ineligible for a %s trigger',
-    eventType => {
-      expect(resolveBrokeredPushPlan(createBootstrap(), createRouting({eventType})).eligible).toBe(false)
-    },
-  )
+  it.each([
+    'pull_request',
+    'issues',
+    'pull_request_review_comment',
+    'discussion_comment',
+    'schedule',
+    'workflow_dispatch',
+  ])('is ineligible for a %s trigger', eventType => {
+    expect(resolveBrokeredPushPlan(createBootstrap(), createRouting({eventType})).eligible).toBe(false)
+  })
 
   it.each(['model-gh', 'none'] as const)('is ineligible under %s delivery', delivery => {
     expect(resolveBrokeredPushPlan(createBootstrap({delivery}), createRouting()).eligible).toBe(false)

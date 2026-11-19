@@ -1,6 +1,6 @@
 import type {SkipCheckResult} from './skip-conditions-types.js'
 import type {TriggerConfig, TriggerContext} from './types.js'
-import {isAuthorizedAssociation} from './author-utils.js'
+import {isActionPostedComment, isAuthorizedAssociation} from './author-utils.js'
 
 interface CommentSkipCheckOptions {
   readonly targetLabel: string
@@ -33,6 +33,13 @@ function checkCommentSkipConditions(
       shouldSkip: true,
       reason: 'self_comment',
       message: `Comments from bots (${context.author.login}) are not processed`,
+    }
+  }
+  if (isActionPostedComment(context.commentBody)) {
+    return {
+      shouldSkip: true,
+      reason: 'own_posted_comment',
+      message: 'Comments posted by the Action are not processed',
     }
   }
   if (context.author != null && !isAuthorizedAssociation(context.author.association, config.allowedAssociations)) {

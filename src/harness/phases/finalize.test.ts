@@ -8,9 +8,12 @@ import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {CacheRestorePhaseResult} from './cache-restore.js'
 import type {ExecutePhaseResult} from './execute.js'
 import type {RoutingPhaseResult} from './routing.js'
+import * as fs from 'node:fs/promises'
+import * as os from 'node:os'
+import * as path from 'node:path'
 import {classifyProviderFailure, createProviderAuthError} from '@fro-bot/runtime'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
-import {formatErrorComment} from '../../features/comments/index.js'
+import {BOT_COMMENT_MARKER, formatErrorComment} from '../../features/comments/index.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 
 type RunBrokeredPushMock = (params: BrokeredPushParams) => Promise<BrokeredPushOutcome>
@@ -69,6 +72,7 @@ function createBootstrap(overrides: Partial<BootstrapPhaseResult> = {}): Bootstr
     logger: createMockLogger(),
     opencodeResult: {version: '1.0.0'} as BootstrapPhaseResult['opencodeResult'],
     delivery: 'file-convention',
+    credential: 'withhold',
     responseFilePath: '/fixture/fro-bot-response.md',
     responseFilePathCandidates: null,
     trustedHeadSha: '',
@@ -403,7 +407,7 @@ describe('runFinalize file-convention delivery', () => {
     const [, target, options] = mocks.postComment.mock.calls[0] as [unknown, CommentTarget, {body: string}]
     expect(target).toEqual({type: 'issue', number: 1, owner: 'owner', repo: 'repo'})
     expect(options.body).toBe(
-      'The agent execution failed before it could write a response artifact, so no response was delivered.',
+      `The agent execution failed before it could write a response artifact, so no response was delivered.\n\n${BOT_COMMENT_MARKER}`,
     )
     expect(options.body).not.toContain('ENOENT')
   })
@@ -970,6 +974,7 @@ describe('runFinalize file-convention delivery', () => {
     expect(mocks.postComment).toHaveBeenCalledTimes(1)
     const [, , errorOptions] = mocks.postComment.mock.calls[0] as [unknown, CommentTarget, {readonly body: string}]
     expect(errorOptions.body).toContain('Brokered push failure (moved-head)')
+    expect(errorOptions.body).toContain(BOT_COMMENT_MARKER)
     expect(errorOptions.body).not.toContain('Offending paths')
     expect(errorOptions.body).not.toContain('head SHA changed')
     expect(mocks.setFailed).toHaveBeenCalledWith(expect.stringContaining('head SHA changed'))
@@ -1510,7 +1515,7 @@ describe('runFinalize non-file-convention delivery', () => {
     expect(mocks.postComment).toHaveBeenCalledTimes(1)
     const [, target, options] = mocks.postComment.mock.calls[0] as [unknown, CommentTarget, {body: string}]
     expect(target).toEqual({type: 'issue', number: 1, owner: 'owner', repo: 'repo'})
-    expect(options.body).toBe(formatErrorComment(llmError))
+    expect(options.body).toBe(`${formatErrorComment(llmError)}\n\n${BOT_COMMENT_MARKER}`)
     expect(mocks.setFailed).not.toHaveBeenCalled()
   })
 })
@@ -1602,7 +1607,7 @@ describe('runFinalize provider_auth_error handling', () => {
       expect(mocks.postComment).toHaveBeenCalledTimes(1)
       const [, target, options] = mocks.postComment.mock.calls[0] as [unknown, CommentTarget, {body: string}]
       expect(target).toEqual(expectedTarget)
-      expect(options.body).toBe(formatErrorComment(createProviderAuthError()))
+      expect(options.body).toBe(`${formatErrorComment(createProviderAuthError())}\n\n${BOT_COMMENT_MARKER}`)
       expect(options.body).not.toContain('response artifact')
       expect(mocks.setFailed).toHaveBeenCalledTimes(1)
       const [failedMessage] = mocks.setFailed.mock.calls[0] as [string]
@@ -1646,7 +1651,7 @@ describe('runFinalize provider_auth_error handling', () => {
     expect(mocks.postComment).toHaveBeenCalledTimes(1)
     const [, target, options] = mocks.postComment.mock.calls[0] as [unknown, CommentTarget, {body: string}]
     expect(target).toEqual({type: 'pr', number: 7, owner: 'trusted-owner', repo: 'trusted-repo'})
-    expect(options.body).toBe(formatErrorComment(createProviderAuthError()))
+    expect(options.body).toBe(`${formatErrorComment(createProviderAuthError())}\n\n${BOT_COMMENT_MARKER}`)
     expect(mocks.setFailed).toHaveBeenCalledTimes(1)
     const [failedMessage] = mocks.setFailed.mock.calls[0] as [string]
     assertNoProviderAuthSentinelLeak(options.body)
@@ -1841,6 +1846,7 @@ describe('runFinalize quota_exceeded llmError handling', () => {
     const [failedMessage] = mocks.setFailed.mock.calls[0] as [string]
     assertNoSentinelLeak(options.body)
     assertNoSentinelLeak(failedMessage)
+    expect(options.body).toContain(BOT_COMMENT_MARKER)
     expect(options.body).toContain('Provider quota exceeded')
     expect(options.body).toContain(RESET_TIME.toISOString())
     expect(failedMessage).toContain('provider quota exceeded')
@@ -2176,5 +2182,85 @@ describe('runFinalize knownExecutionVeto gating of brokered push', () => {
     // #then behavior is unchanged: the push still runs
     expect(exitCode).toBe(0)
     expect(mocks.runBrokeredPush).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('runFinalize on a discussion_comment run', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    mocks.runBrokeredPush.mockResolvedValue({kind: 'bypass'})
+  })
+
+  it('addresses the reply and the error comment to the same discussion', async () => {
+    // #given real response posting and a discussion run whose trusted context names discussion 9
+    const actual = await vi.importActual<typeof import('../../features/agent/response-post.js')>(
+      '../../features/agent/response-post.js',
+    )
+    mocks.readAndParseResponseFile.mockImplementation(actual.readAndParseResponseFile)
+    mocks.runResponsePost.mockImplementation(actual.runResponsePost)
+    const graphql = vi.fn(async (query: string) =>
+      query.includes('AddDiscussionComment')
+        ? {addDiscussionComment: {comment: {id: 'DC_1', url: 'https://example.com/discussions/9#c1'}}}
+        : {repository: {discussion: {id: 'D_node', comments: {nodes: [], pageInfo: {hasNextPage: false}}}}},
+    )
+    const routing = createRouting({
+      githubClient: {graphql} as unknown as Octokit,
+      triggerResult: {
+        context: {
+          eventType: 'discussion_comment',
+          eventName: 'discussion_comment',
+          author: {login: 'maintainer', association: 'MEMBER', isBot: false},
+          target: {kind: 'discussion', number: 9, title: 'Question', body: null, locked: false},
+          hasMention: true,
+        },
+      } as unknown as TriggerResultProcess,
+      agentContext: {
+        eventName: 'discussion_comment',
+        repo: 'owner/repo',
+        ref: 'refs/heads/main',
+        runId: '123',
+        issueNumber: 9,
+        issueType: null,
+      } as AgentContext,
+    })
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'finalize-discussion-'))
+    const responseFilePath = path.join(dir, 'response.md')
+    await fs.writeFile(responseFilePath, 'Answer for the discussion.', 'utf8')
+
+    try {
+      // #when the reply is delivered
+      const replyExit = await runFinalize(
+        createBootstrap({responseFilePath}),
+        routing,
+        cacheRestore,
+        createExecution(),
+        createMetrics(),
+        Date.now(),
+        createMockLogger(),
+      )
+
+      // #and the same run later fails with no response file
+      const errorExit = await runFinalize(
+        createBootstrap({responseFilePath: path.join(dir, 'missing.md')}),
+        routing,
+        cacheRestore,
+        createExecution({success: false, exitCode: 1, error: 'boom'}),
+        createMetrics(),
+        Date.now(),
+        createMockLogger(),
+      )
+
+      // #then the reply mutation and the error comment both address discussion 9 in owner/repo
+      expect(replyExit).toBe(0)
+      expect(errorExit).toBe(1)
+      expect(graphql).toHaveBeenCalledWith(
+        expect.stringContaining('GetDiscussionId'),
+        expect.objectContaining({owner: 'owner', repo: 'repo', number: 9}),
+      )
+      const [, errorTarget] = mocks.postComment.mock.calls[0] as [unknown, CommentTarget]
+      expect(errorTarget).toEqual({type: 'discussion', number: 9, owner: 'owner', repo: 'repo'})
+    } finally {
+      await fs.rm(dir, {recursive: true, force: true})
+    }
   })
 })

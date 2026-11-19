@@ -29,19 +29,19 @@ Brokered push exists to help the _credential-withheld_ mention path: on those tr
 
 Derive the eligible surface as the **intersection of two source-verified sets**:
 
-1. **Events where the capability's precondition holds** — here, events that _withhold_ the credential. That is decided by `classifyEvent` in `packages/runtime/src/agent/response-delivery.ts`, which returns `affected` (credential withheld) only for `pull_request` / `issue_comment` / `issues`.
+1. **Events where the capability's precondition holds** — here, events that _withhold_ the credential. That is decided by `resolveResponseDelivery` in `packages/runtime/src/agent/response-delivery.ts`, which withholds the credential for every event except `schedule` / `workflow_dispatch`.
 2. **Events that actually carry the needed resource** — here, events that expose a _PR head branch_ to push to.
 
 Only the overlap qualifies. Working it through:
 
 - `issues` withholds the credential but has **no PR head** → out.
 - `pull_request` would withhold the credential but is **not subscribed** by the workflow at all (`.github/workflows/fro-bot.yaml`) → moot.
-- `pull_request_review_comment` is PR-bound but is **not credential-withheld** (`classifyEvent` → not `affected`), so it already pushes via its provisioned credential → not stranded, out of scope.
+- `pull_request_review_comment` is PR-bound and credential-withheld, so the two sets alone would admit it. It stays out because brokered push sits behind an explicit gate (`evaluateBrokeredPushEarlyGate`) that admits only `issue_comment`: withholding the credential on more events does not widen the broker.
 - `issue_comment` where `issue.pull_request != null` is **both** credential-withheld **and** PR-bound → the one eligible surface.
 
 ## Why This Matters
 
-Getting the surface wrong in either direction is a bug: too broad authorizes a privileged write where the precondition doesn't hold (e.g. treating `pull_request_review_comment` as needing brokering when it already has a credential); too narrow silently drops the case the feature exists for. Because the two facts live in _different files_ (event classification in the runtime, subscribed triggers in the workflow YAML), assuming either one from the feature's name — instead of reading both — is how the surface silently drifts from reality.
+Getting the surface wrong in either direction is a bug: too broad authorizes a privileged write where the precondition doesn't hold (e.g. brokering a push for `pull_request_review_comment` just because it withholds the credential and is PR-bound); too narrow silently drops the case the feature exists for. Because the two facts live in _different files_ (event classification in the runtime, subscribed triggers in the workflow YAML), assuming either one from the feature's name — instead of reading both — is how the surface silently drifts from reality.
 
 ## When to Apply
 
@@ -60,9 +60,10 @@ Getting the surface wrong in either direction is a bug: too broad authorizes a p
 **Right** — intersect two source-verified sets:
 
 ```
-credential-withheld (classifyEvent === 'affected'): pull_request, issue_comment, issues
+credential-withheld (resolveResponseDelivery):      every event except schedule, workflow_dispatch
 resource-bearing (has a PR head branch):            pull_request, issue_comment-on-PR, pull_request_review_comment
 subscribed (workflow YAML):                         issue_comment, pull_request_review_comment, discussion_comment, issues, …
+explicit gate (evaluateBrokeredPushEarlyGate):       issue_comment
 ∩  →  issue_comment where issue.pull_request != null
 ```
 

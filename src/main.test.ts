@@ -1,5 +1,5 @@
 import type {Buffer} from 'node:buffer'
-import {spawn} from 'node:child_process'
+import {execFileSync, spawn} from 'node:child_process'
 import {chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync} from 'node:fs'
 import {createServer, type Server} from 'node:http'
 import {tmpdir} from 'node:os'
@@ -207,6 +207,11 @@ it('runs successfully with valid inputs', {timeout: 15000}, async () => {
   const eventPayload = {ref: 'refs/heads/main'}
   const eventFile = path.join(testDataDir, 'push-event.json')
   writeFileSync(eventFile, JSON.stringify(eventPayload), 'utf8')
+  // A push run withholds the credential: bootstrap checks the checkout for a persisted credential and resolves a
+  // run-scoped response file path under RUNNER_TEMP.
+  const workspaceDir = path.join(testDataDir, 'push-workspace')
+  mkdirSync(workspaceDir, {recursive: true})
+  execFileSync('git', ['init', '--quiet'], {cwd: workspaceDir})
 
   const {stdout, stderr, code} = await runMain({
     'INPUT_GITHUB-TOKEN': 'ghp_test123',
@@ -219,6 +224,8 @@ it('runs successfully with valid inputs', {timeout: 15000}, async () => {
     RUNNER_OS: 'Linux',
     GITHUB_EVENT_NAME: 'push',
     GITHUB_EVENT_PATH: eventFile,
+    GITHUB_WORKSPACE: workspaceDir,
+    RUNNER_TEMP: path.join(testDataDir, 'runner-temp'),
     SKIP_CACHE: 'true',
     SKIP_AGENT_EXECUTION: 'true',
   })

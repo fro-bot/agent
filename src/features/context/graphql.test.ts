@@ -1,6 +1,13 @@
 import type {Logger} from '../../shared/logger.js'
 import {beforeEach, describe, expect, it} from 'vitest'
-import {executeIssueQuery, executePullRequestQuery, ISSUE_QUERY, PULL_REQUEST_QUERY} from './graphql.js'
+import {
+  DISCUSSION_QUERY,
+  executeDiscussionQuery,
+  executeIssueQuery,
+  executePullRequestQuery,
+  ISSUE_QUERY,
+  PULL_REQUEST_QUERY,
+} from './graphql.js'
 import {createFailingMockOctokit, createMockLogger, createMockOctokit} from './test-helpers.js'
 
 describe('ISSUE_QUERY', () => {
@@ -22,6 +29,19 @@ describe('ISSUE_QUERY', () => {
     // #then
     expect(ISSUE_QUERY).toContain('comments(last: $maxComments)')
     expect(ISSUE_QUERY).not.toContain('comments(first: $maxComments)')
+  })
+})
+
+describe('DISCUSSION_QUERY', () => {
+  it('reads the discussion body, author and the newest comments with their total', () => {
+    // #then
+    expect(DISCUSSION_QUERY).toContain('discussion(number: $number)')
+    expect(DISCUSSION_QUERY).toContain('body')
+    expect(DISCUSSION_QUERY).toContain('author { login }')
+    expect(DISCUSSION_QUERY).toContain('comments(last: $maxComments)')
+    expect(DISCUSSION_QUERY).toContain('totalCount')
+    expect(DISCUSSION_QUERY).not.toContain('comments(first:')
+    expect(DISCUSSION_QUERY).not.toContain('pageInfo')
   })
 })
 
@@ -220,5 +240,54 @@ describe('executePullRequestQuery', () => {
     const pr = result?.repository.pullRequest
     expect(pr?.baseRepository?.owner.login).toBe('upstream-owner')
     expect(pr?.headRepository?.owner.login).toBe('fork-owner')
+  })
+})
+
+describe('executeDiscussionQuery', () => {
+  let logger: Logger
+
+  beforeEach(() => {
+    logger = createMockLogger()
+  })
+
+  it('returns discussion data on success', async () => {
+    // #given
+    const mockResponse = {
+      repository: {
+        discussion: {
+          number: 9,
+          title: 'Question',
+          body: 'Body',
+          author: {login: 'asker'},
+          comments: {totalCount: 0, nodes: []},
+        },
+      },
+    }
+    const octokit = createMockOctokit(mockResponse)
+
+    // #when
+    const result = await executeDiscussionQuery(octokit, 'owner', 'repo', 9, 50, logger)
+
+    // #then
+    expect(result).toEqual(mockResponse)
+    expect(octokit.graphql).toHaveBeenCalledWith(
+      DISCUSSION_QUERY,
+      expect.objectContaining({owner: 'owner', repo: 'repo', number: 9, maxComments: 50}),
+    )
+  })
+
+  it('returns null and logs a warning when the query fails', async () => {
+    // #given
+    const octokit = createFailingMockOctokit(new Error('Resource not accessible by integration'))
+
+    // #when
+    const result = await executeDiscussionQuery(octokit, 'owner', 'repo', 9, 50, logger)
+
+    // #then
+    expect(result).toBeNull()
+    expect(logger.warning).toHaveBeenCalledWith(
+      'GraphQL discussion query failed',
+      expect.objectContaining({number: 9, error: 'Resource not accessible by integration'}),
+    )
   })
 })

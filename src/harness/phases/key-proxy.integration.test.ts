@@ -35,6 +35,23 @@ const SOURCE_ENTRY = fileURLToPath(new URL('../../../apps/action/src/key-proxy.t
 
 const REAL_KEY = 'sk-real-binary-canary-9c1d'
 
+/**
+ * The provider and model the session's first assistant message ran on, once it exists. V2 silently replaces a
+ * configured model it cannot resolve with the first model of its bundled catalog, which differs between builds, so
+ * what reached the proxy is only meaningful if the turn ran on the model the test configured.
+ */
+async function modelRanOn(
+  handle: OpenCodeV2ServerHandle,
+  sessionId: string,
+): Promise<{readonly providerID: string; readonly id: string} | null> {
+  const response = await handle.fetch(`/api/session/${sessionId}/message`)
+  if (!response.ok) return null
+  const {data} = (await response.json()) as {
+    data: readonly {readonly type: string; readonly model?: {readonly providerID: string; readonly id: string}}[]
+  }
+  return data.find(message => message.type === 'assistant')?.model ?? null
+}
+
 describe.skipIf(!enabled)('the key proxy against the real OpenCode V2 binary', () => {
   let tmp = ''
   let upstream: TlsUpstream
@@ -73,7 +90,12 @@ describe.skipIf(!enabled)('the key proxy against the real OpenCode V2 binary', (
     if (tmp !== '') rmSync(tmp, {recursive: true, force: true})
   })
 
-  /** Starts a throwaway server, sends one prompt and returns what the upstream saw in the meantime. */
+  /**
+   * Starts a throwaway server, sends one prompt and returns what the upstream saw in the meantime. `modelId` defines
+   * `model`'s id in the test's own config (with `npm`, a custom provider; without it, a model added to the built-in
+   * provider), so the id does not depend on the binary's bundled catalog. A model the catalog already has (and no
+   * `modelId`) is the one exception, and is still checked against the turn below.
+   */
   async function requestsFor(options: {
     readonly model: string
     readonly providerId: string
@@ -86,13 +108,10 @@ describe.skipIf(!enabled)('the key proxy against the real OpenCode V2 binary', (
     mkdirSync(workspace, {recursive: true})
     const provider = {
       options: {baseURL: proxy.baseUrl(options.providerId), apiKey: proxy.placeholder},
-      ...(options.npm === undefined || options.modelId === undefined
+      ...(options.npm === undefined ? {} : {npm: options.npm, name: options.providerId}),
+      ...(options.modelId === undefined
         ? {}
-        : {
-            npm: options.npm,
-            name: options.providerId,
-            models: {[options.modelId]: {name: 'm', tool_call: true, limit: {context: 100_000, output: 8000}}},
-          }),
+        : {models: {[options.modelId]: {name: 'm', tool_call: true, limit: {context: 100_000, output: 8000}}}}),
     }
     const started = await startOpenCodeV2Server(
       {
@@ -132,6 +151,23 @@ describe.skipIf(!enabled)('the key proxy against the real OpenCode V2 binary', (
         headers: {'content-type': 'application/json'},
         body: JSON.stringify({text: 'hi'}),
       })
+
+      // The turn must run on the configured provider and model before the upstream is waited on, so an unresolvable
+      // model fails here naming what ran instead of as a timeout on an empty request list.
+      const separator = options.model.indexOf('/')
+      const expected = {providerID: options.model.slice(0, separator), id: options.model.slice(separator + 1)}
+      let ranOn: Awaited<ReturnType<typeof modelRanOn>> = null
+      await vi
+        .waitFor(
+          async () => {
+            ranOn = await modelRanOn(handle, created.data.id)
+            if (ranOn === null) throw new Error('no assistant message yet')
+          },
+          {timeout: 30_000, interval: 250},
+        )
+        .catch(() => undefined)
+      expect(ranOn, `the turn ran on ${JSON.stringify(ranOn)}, not the configured ${options.model}`).toEqual(expected)
+
       await vi.waitFor(
         () => {
           expect(upstream.requests.length).toBeGreaterThan(0)
@@ -145,7 +181,12 @@ describe.skipIf(!enabled)('the key proxy against the real OpenCode V2 binary', (
   }
 
   it('sends the anthropic provider id to /messages?beta=true and the proxy carries it upstream with the real key', async () => {
-    const requests = await requestsFor({model: 'anthropic/claude-sonnet-4-5', providerId: 'anthropic'})
+    // The model id is defined here, on the built-in `anthropic` provider, not looked up in the binary's catalog.
+    const requests = await requestsFor({
+      model: 'anthropic/key-proxy-probe-model',
+      providerId: 'anthropic',
+      modelId: 'key-proxy-probe-model',
+    })
 
     for (const request of requests) {
       expect(request.method).toBe('POST')

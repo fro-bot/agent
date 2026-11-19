@@ -1,4 +1,4 @@
-import type {ResponseDelivery, ResponseFilePathCandidates} from '@fro-bot/runtime'
+import type {CredentialDisposition, ResponseDelivery, ResponseFilePathCandidates} from '@fro-bot/runtime'
 import type {EnsureOpenCodeResult} from '../../features/agent/types.js'
 import type {SandboxToolPaths} from '../../services/setup/sandbox-preflight.js'
 import type {Logger} from '../../shared/logger.js'
@@ -32,14 +32,16 @@ export interface BootstrapPhaseResult {
   readonly logger: Logger
   readonly opencodeResult: EnsureOpenCodeResult
   /**
-   * The two-axis response-delivery classification for this run's event,
-   * resolved once here from the raw `eventName` (see `resolveResponseDelivery`).
-   * Threaded to the prompt builder (which posting instructions the model sees)
-   * and to the finalize phase (whether to read `responseFilePath` and post on
-   * the model's behalf). Routing later asserts its own event classification
-   * agrees with this value and fails loudly on divergence.
+   * How the model's reply is delivered, resolved once here from the raw event name (see `resolveResponseDelivery`).
+   * Threaded to the prompt builder (which posting instructions the model sees) and to the finalize phase (whether to
+   * read `responseFilePath` and post on the model's behalf).
    */
   readonly delivery: ResponseDelivery
+  /**
+   * Whether the model receives the GitHub credential, resolved with `delivery` in one decision. Every later phase reads
+   * it from here; none resolves its own.
+   */
+  readonly credential: CredentialDisposition
   /**
    * The exact run+attempt+nonce scoped path (outside the checkout, under
    * `RUNNER_TEMP`) the model must write its response to, generated once here
@@ -104,8 +106,7 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
     sandboxTools = preflight.tools
   }
 
-  // Resolved once, from the raw event name, before setup runs any credential
-  // provisioning — routing later asserts its own classification agrees.
+  // The one credential and delivery decision for this run, from the raw event name, before setup provisions anything.
   const {credential, delivery} = resolveResponseDelivery(github.context.eventName, inputs.responseMode)
 
   // Preflight fail-closed assertion: for withhold runs, the checkout must
@@ -164,6 +165,7 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
     logger,
     opencodeResult,
     delivery,
+    credential,
     responseFilePath: responseFile?.responseFilePath ?? null,
     responseFilePathCandidates: responseFile?.responseFilePathCandidates ?? null,
     trustedHeadSha: inputs.trustedHeadSha,

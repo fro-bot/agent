@@ -20,7 +20,7 @@ import type {SessionPrepPhaseResult} from './session-prep.js'
 import * as fs from 'node:fs/promises'
 import process from 'node:process'
 import * as core from '@actions/core'
-import {createOwnershipLedger, resolveResponseDelivery} from '@fro-bot/runtime'
+import {createOwnershipLedger} from '@fro-bot/runtime'
 import {resolveOutputMode} from '../../features/agent/index.js'
 import {inspectResponseFile, resolveResponseSurface} from '../../features/agent/response-file.js'
 import {createLogger} from '../../shared/logger.js'
@@ -372,9 +372,7 @@ export async function runExecute(
       timeoutMs: bootstrap.inputs.timeoutMs,
       continueSessionId: sessionPrep.continueSessionId ?? undefined,
       sessionTitle: sessionPrep.sessionTitle ?? undefined,
-      credentialProvisioned:
-        resolveResponseDelivery(routing.triggerResult.context.eventName, bootstrap.inputs.responseMode).credential ===
-        'provision',
+      credentialProvisioned: bootstrap.credential === 'provision',
     }
 
     // One ledger per invocation, not per attempt: constructed once here and threaded

@@ -670,7 +670,7 @@ describe('buildCIConfigV2', () => {
   })
 
   describe('{env:} references in opencode-config', () => {
-    const RULE = /\{env:\} references.*credential-withheld.*pull_request, issue_comment, issues/s
+    const RULE = /\{env:\} references.*credential-withheld.*every trigger except schedule and workflow_dispatch/s
 
     it.each([
       ['a value', {share: '{env:SHARE}'}],
@@ -686,6 +686,23 @@ describe('buildCIConfigV2', () => {
       // #then
       expect(result.success).toBe(false)
       expect(unwrapErr(result)).toMatch(RULE)
+    })
+
+    it('fails setup on a review-comment run with a message that states the rule, not a trigger list', () => {
+      // #given a review-comment run, which withholds the credential
+      const credential = resolveResponseDelivery('pull_request_review_comment', 'github').credential
+
+      // #when an {env:} reference is in the operator config
+      const result = buildCIConfigV2(
+        {...BASE_INPUTS, credential, opencodeConfig: JSON.stringify({share: '{env:SHARE}'})},
+        createMockLogger(),
+      )
+
+      // #then setup fails with the rule and does not list the three old trigger names
+      expect(credential).toBe('withhold')
+      const error = unwrapErr(result)
+      expect(error).toMatch(RULE)
+      expect(error).not.toContain('pull_request, issue_comment, issues')
     })
 
     it('matches the way upstream does: after JSON decoding, so an escaped brace does not hide it', () => {
