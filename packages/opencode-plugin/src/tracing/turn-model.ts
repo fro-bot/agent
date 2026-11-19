@@ -406,6 +406,9 @@ function observedSize(observation: Observation): number {
   return 0
 }
 
+/** A confirmed subagent dispatch: the stock `subagent` tool, by the same test the called-event path uses. */
+const isSubagentDispatch = (tool: {readonly tool: string}): boolean => tool.tool === 'subagent'
+
 export function createTurnModel(options: {
   readonly ids: IdSource
   readonly limits?: Partial<TurnModelLimits>
@@ -1332,7 +1335,7 @@ export function createTurnModel(options: {
       tool.result = o.result
       tool.resultFromHook = true
     }
-    if (o.childSessionId !== undefined) link(node, tool, o.childSessionId, o.at)
+    if (o.childSessionId !== undefined && isSubagentDispatch(tool)) link(node, tool, o.childSessionId, o.at)
   }
 
   function onToolNamed(o: Extract<Observation, {kind: 'tool.named'}>): void {
@@ -1370,7 +1373,7 @@ export function createTurnModel(options: {
         if (typeof o.input === 'object' && o.input !== null) retained.push(o.input)
       }
     }
-    if (tool.tool === 'subagent') unresolved.add(`${node.id}/${o.callId}`)
+    if (isSubagentDispatch(tool)) unresolved.add(`${node.id}/${o.callId}`)
   }
 
   function onToolBefore(o: Extract<Observation, {kind: 'tool.before'}>): void {
@@ -1448,7 +1451,7 @@ export function createTurnModel(options: {
     const tool = node.tools.get(o.callId) ?? openTool(node, o.callId, o.at, {gaps: ['call-event', 'input']})
     if (tool === undefined) return
     if (o.executed === true) tool.providerExecuted = true
-    if (o.childSessionId !== undefined) link(node, tool, o.childSessionId, o.at)
+    if (o.childSessionId !== undefined && isSubagentDispatch(tool)) link(node, tool, o.childSessionId, o.at)
     // What the hook saw wins; the event's content is what the model saw, for a call no hook fired for.
     if (!tool.resultFromHook && o.result !== undefined) {
       if (tool.result !== undefined) tool.discarded.push(tool.result)

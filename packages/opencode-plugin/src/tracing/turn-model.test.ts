@@ -2040,3 +2040,64 @@ describe('an observation whose text the pipeline omitted', () => {
     expect(titled?.gaps).toContain('output-omitted')
   })
 })
+
+describe('a session id in an ordinary tool’s result', () => {
+  const turnWith = (tool: string, viaHook: boolean) => {
+    const s = script()
+    s.prompt('p', 'm1')
+    s.enqueued('p', 'm1', 'user')
+    s.started('p')
+    s.delivered('p', 'm1')
+    s.request('p')
+    s.stepStarted('p', 's1')
+    s.toolBefore('p', 'c1', tool)
+    if (viaHook) s.toolAfter('p', 'c1', tool, 'not-a-child')
+    s.toolEnded('p', 'c1', {childSessionId: 'not-a-child'})
+    s.stepEnded('p', 's1')
+    s.ended('p')
+    return s
+  }
+
+  it.each([
+    ['the success event', false],
+    ['the after hook and the success event', true],
+  ])(
+    'is not a subagent dispatch: carried by %s of a `read` call, the root closes with nothing to wait for',
+    (_label, viaHook) => {
+      // #given an ordinary tool whose result metadata carries a session id
+      const s = turnWith('read', viaHook)
+
+      // #when replayed with no flush
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then no child was linked: the root closed normally on its own, and nothing is outstanding
+      const invokes = records.filter(record => record.kind === 'invoke_agent')
+      expect(invokes).toHaveLength(1)
+      expect(invokes[0]).toMatchObject({status: 'ok'})
+      expect(invokes[0]?.marks).not.toContain('incomplete')
+      expect(tools(records)[0]?.childSessionId).toBeUndefined()
+      expect(model.stats()).toMatchObject({openTraces: 0, sessions: 0, unresolvedDispatches: 0})
+    },
+  )
+
+  it('is still a dispatch for the subagent tool, by either path', () => {
+    // #given the same with the subagent tool, which then reports back
+    const s = script()
+    s.prompt('p', 'm1')
+    s.enqueued('p', 'm1', 'user')
+    s.started('p')
+    s.delivered('p', 'm1')
+    s.request('p')
+    s.stepStarted('p', 's1')
+    s.toolBefore('p', 'c1', 'subagent')
+    s.toolEnded('p', 'c1', {childSessionId: 'kid'})
+    s.stepEnded('p', 's1')
+    s.ended('p')
+
+    // #when replayed with no flush
+    const {model} = replay(s.out, {flush: false})
+
+    // #then the root waits for the child's report
+    expect(model.stats().openTraces).toBe(1)
+  })
+})
