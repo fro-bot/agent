@@ -3,15 +3,21 @@
  * `dist/index.mjs` exists.
  */
 
-import type {FakeProvider, RunningServer, SandboxPaths} from './integration.fixture.js'
+import type {FakeProvider, OtlpSink, RunningServer, SandboxPaths} from './integration.fixture.js'
 
-import {existsSync} from 'node:fs'
+import {cpSync, existsSync, readdirSync, rmSync, writeFileSync} from 'node:fs'
 import path from 'node:path'
 import process from 'node:process'
 import {fileURLToPath} from 'node:url'
 import {afterAll, beforeAll, describe, expect, it} from 'vitest'
 
-import {makeSandbox, removeSandbox, startFakeProvider, startOpenCodeServer} from './integration.fixture.js'
+import {
+  makeSandbox,
+  removeSandbox,
+  startFakeProvider,
+  startOpenCodeServer,
+  startOtlpSink,
+} from './integration.fixture.js'
 import {FRO_BOT_PLUGIN_ID} from './plugin-id.js'
 import {TASK_REUSE_REJECTION} from './task-reuse-guard.js'
 
@@ -198,5 +204,135 @@ describe.skipIf(!runnable)('built plugin in a real opencode V2', () => {
     expect(finalRequest).toBeDefined()
     const children = await server.api('GET', `/api/session?parentID=${sessionID}`)
     expect(records(dataOf(children))).toHaveLength(1)
+  }, 90_000)
+})
+
+const STUB_SWITCH = 'OPENCODE_FROBOT_TRACING_STUB_URL'
+const SETTLE_MS = 1_500
+
+/**
+ * A throwaway copy of the built plugin, so a test can replace or remove the lazy tracing chunk without touching `dist/`.
+ * `chunk: 'marker'` swaps the SDK chunk for one that writes `marker` when it is evaluated.
+ */
+function stagePlugin(sandbox: SandboxPaths, chunk: 'keep' | 'marker' | 'missing', marker: string): string {
+  const dir = path.join(sandbox.root, `plugin-${chunk}`)
+  cpSync(path.join(packageDir, 'package.json'), path.join(dir, 'package.json'))
+  cpSync(path.join(packageDir, 'dist'), path.join(dir, 'dist'), {recursive: true})
+  const name = readdirSync(path.join(dir, 'dist')).find(file => /^tracing-.*\.mjs$/.test(file))
+  if (name == null) throw new Error('the build emitted no tracing chunk')
+  if (chunk === 'missing') rmSync(path.join(dir, 'dist', name))
+  if (chunk === 'marker') {
+    writeFileSync(
+      path.join(dir, 'dist', name),
+      `import {writeFileSync} from 'node:fs'\nwriteFileSync(${JSON.stringify(marker)}, 'evaluated')\nexport async function exportStubSpan() {}\n`,
+    )
+  }
+  return dir
+}
+
+describe.skipIf(!runnable)('the lazy tracing chunk in a real opencode V2', () => {
+  let provider: FakeProvider
+  let sink: OtlpSink
+  let sandbox: SandboxPaths
+  const servers: RunningServer[] = []
+
+  const start = async (pluginDir: string, env: Record<string, string>): Promise<RunningServer> => {
+    const server = await startOpenCodeServer({
+      binary: binary ?? '',
+      sandbox,
+      pluginDir,
+      providerBaseURL: provider.baseURL,
+      env,
+    })
+    servers.push(server)
+    return server
+  }
+
+  const pluginState = async (server: RunningServer): Promise<unknown> => {
+    const entry = await waitFor('the fro-bot plugin to be listed', async () => {
+      const response = await server.api('GET', '/api/plugin')
+      return records(dataOf(response)).find(plugin => plugin.id === FRO_BOT_PLUGIN_ID)
+    })
+    return entry.state
+  }
+
+  const settle = async (): Promise<void> => new Promise(resolve => setTimeout(resolve, SETTLE_MS))
+
+  beforeAll(async () => {
+    sandbox = makeSandbox()
+    provider = await startFakeProvider()
+    sink = await startOtlpSink()
+  }, 30_000)
+
+  afterAll(async () => {
+    for (const server of servers) await server.stop()
+    await provider?.stop()
+    await sink?.stop()
+    if (sandbox != null) removeSandbox(sandbox)
+  }, 60_000)
+
+  it('exports one trace from the bundled SDK and leaves the plugin active', async () => {
+    // #given the built plugin and the stub switch pointed at a loopback sink
+    const before = sink.requests.length
+
+    // #when the server loads it
+    const server = await start(packageDir, {[STUB_SWITCH]: sink.url})
+    const state = await pluginState(server)
+
+    // #then the plugin is active and the sink received exactly one OTLP trace export
+    expect(state).toEqual({status: 'active'})
+    const received = await waitFor('an OTLP export', async () => (sink.requests.length > before ? true : undefined))
+    expect(received).toBe(true)
+    await settle()
+    const exports = sink.requests.slice(before)
+    expect(exports).toHaveLength(1)
+    expect(exports[0]).toMatchObject({method: 'POST', path: '/v1/traces', contentType: 'application/json'})
+    const spans = (
+      exports[0]?.body as {resourceSpans: {scopeSpans: {spans: {name: string}[]}[]}[]}
+    ).resourceSpans.flatMap(resource => resource.scopeSpans.flatMap(scope => scope.spans))
+    expect(spans.map(span => span.name)).toEqual(['feasibility stub'])
+    expect(server.stderr()).not.toContain('tracing could not start')
+  }, 90_000)
+
+  it('does not evaluate the chunk when the switch is off, and evaluates it from the install location when on', async () => {
+    // #given a copy of the built plugin whose chunk records when it is evaluated
+    const marker = path.join(sandbox.root, 'chunk-evaluated')
+    const dir = stagePlugin(sandbox, 'marker', marker)
+
+    // #when the server runs it with the switch off
+    const off = await start(dir, {})
+    expect(await pluginState(off)).toEqual({status: 'active'})
+    await settle()
+
+    // #then the chunk was never evaluated
+    expect(existsSync(marker)).toBe(false)
+
+    // #when it runs with the switch on
+    const on = await start(dir, {[STUB_SWITCH]: sink.url})
+    expect(await pluginState(on)).toEqual({status: 'active'})
+
+    // #then the chunk was resolved next to the entry and evaluated
+    await waitFor('the chunk to be evaluated', async () => (existsSync(marker) ? true : undefined))
+  }, 90_000)
+
+  it('keeps the plugin active and logs one line when the chunk file is missing', async () => {
+    // #given a copy of the built plugin with the chunk file removed
+    const dir = stagePlugin(sandbox, 'missing', '')
+    const before = sink.requests.length
+
+    // #when the server runs it with the switch on
+    const server = await start(dir, {[STUB_SWITCH]: sink.url})
+    const state = await pluginState(server)
+    await settle()
+
+    // #then the plugin is active, nothing was exported, and one line says tracing did not start
+    expect(state).toEqual({status: 'active'})
+    expect(sink.requests.length).toBe(before)
+    const lines = server
+      .stderr()
+      .split('\n')
+      .filter(line => line.includes('tracing could not start'))
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toMatch(/^\[fro-bot\/opencode-plugin\] tracing could not start \(\w+\)$/)
   }, 90_000)
 })

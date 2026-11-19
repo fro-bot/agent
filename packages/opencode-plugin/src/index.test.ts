@@ -1,6 +1,6 @@
 import type {HostSurface} from './setup.js'
 
-import {describe, expect, it, vi} from 'vitest'
+import {afterEach, describe, expect, it, vi} from 'vitest'
 
 import plugin, {FRO_BOT_PLUGIN_ID} from './index.js'
 import {SESSION_TOOL_NAMES} from './session-tools.js'
@@ -136,5 +136,95 @@ describe('setupFroBotPlugin', () => {
 
     // #when / #then
     await expect(setupFroBotPlugin(broken)).rejects.toThrow('hook registration refused')
+  })
+})
+
+/** Loads a fresh `setup.ts` so a per-test `vi.doMock` of the tracing module takes effect. */
+async function freshSetup() {
+  vi.resetModules()
+  return import('./setup.js')
+}
+
+describe('the lazy tracing entry', () => {
+  const STUB_SWITCH = 'OPENCODE_FROBOT_TRACING_STUB_URL'
+
+  afterEach(() => {
+    vi.unstubAllEnvs()
+    vi.doUnmock('./tracing/index.js')
+    vi.restoreAllMocks()
+    vi.resetModules()
+  })
+
+  it('never evaluates the tracing module when the switch is off', async () => {
+    // #given a tracing module that counts its evaluations, and no switch
+    const evaluated = vi.fn()
+    vi.doMock('./tracing/index.js', () => {
+      evaluated()
+      return {exportStubSpan: vi.fn()}
+    })
+    vi.stubEnv(STUB_SWITCH, '')
+    const {setupFroBotPlugin: setup} = await freshSetup()
+    const {host, order} = fakeHost()
+
+    // #when the plugin sets up
+    await setup(host)
+
+    // #then the plugin is registered as usual and the tracing module was never loaded
+    expect(order).toEqual(['hook:execute.before', 'tools'])
+    expect(evaluated).not.toHaveBeenCalled()
+  })
+
+  it('loads the tracing module once and hands it the URL when the switch is on', async () => {
+    // #given a tracing module and a switch carrying a URL
+    const exportStubSpan = vi.fn(async () => {})
+    vi.doMock('./tracing/index.js', () => ({exportStubSpan}))
+    vi.stubEnv(STUB_SWITCH, 'http://127.0.0.1:4318/v1/traces')
+    const {setupFroBotPlugin: setup} = await freshSetup()
+    const {host} = fakeHost()
+
+    // #when the plugin sets up
+    await setup(host)
+
+    // #then the stub ran against that URL
+    expect(exportStubSpan).toHaveBeenCalledExactlyOnceWith({url: 'http://127.0.0.1:4318/v1/traces'})
+  })
+
+  it.each([
+    ['the module fails to load', 'import'],
+    ['the SDK fails to construct', 'run'],
+  ] as const)('keeps the plugin intact and logs one fixed line when %s', async (_label, failure) => {
+    // #given a tracing module that fails at import or at run time, with a secret-looking message
+    const secret = 'https://user:hunter2@collector.example/v1/traces'
+    if (failure === 'import') {
+      vi.doMock('./tracing/index.js', () => {
+        throw new TypeError(secret)
+      })
+    } else {
+      vi.doMock('./tracing/index.js', () => ({
+        exportStubSpan: async () => {
+          throw new RangeError(secret)
+        },
+      }))
+    }
+    vi.stubEnv(STUB_SWITCH, 'http://127.0.0.1:4318/v1/traces')
+    const write = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
+    const {setupFroBotPlugin: setup} = await freshSetup()
+    const {host, added, order, before} = fakeHost()
+
+    // #when the plugin sets up
+    await expect(setup(host)).resolves.toBeUndefined()
+
+    // #then the guard and the tools are registered exactly as without tracing
+    expect(order).toEqual(['hook:execute.before', 'tools'])
+    expect(added.map(tool => tool.name)).toEqual(Object.values(SESSION_TOOL_NAMES))
+    await expect(Promise.resolve(before()?.({tool: 'subagent', input: {sessionID: 'ses_abc'}}))).rejects.toThrow(
+      TASK_REUSE_REJECTION,
+    )
+
+    // #and one line names the failure class and carries nothing from the error message
+    expect(write).toHaveBeenCalledOnce()
+    const line = String(write.mock.calls[0]?.[0])
+    expect(line).toMatch(/^\[fro-bot\/opencode-plugin\] tracing could not start \(\w+\)\n$/)
+    expect(line).not.toContain('hunter2')
   })
 })

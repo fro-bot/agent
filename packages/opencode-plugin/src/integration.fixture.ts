@@ -11,6 +11,7 @@ import process from 'node:process'
 
 const LISTEN_TIMEOUT_MS = 60_000
 const EXIT_TIMEOUT_MS = 8_000
+const STDERR_KEEP = 64 * 1024
 
 export interface FakeStep {
   /** Every string must appear in the request body. */
@@ -138,8 +139,61 @@ export async function startFakeProvider(): Promise<FakeProvider> {
   }
 }
 
+export interface OtlpSink {
+  /** The full traces URL, for example `http://127.0.0.1:4318/v1/traces`. */
+  readonly url: string
+  /** Every request received, with the body decoded as JSON when it parses. */
+  readonly requests: readonly {
+    readonly method: string
+    readonly path: string
+    readonly contentType: string
+    readonly body: unknown
+  }[]
+  readonly stop: () => Promise<void>
+}
+
+/** A loopback OTLP/HTTP collector that accepts anything and records it. */
+export async function startOtlpSink(): Promise<OtlpSink> {
+  const requests: {method: string; path: string; contentType: string; body: unknown}[] = []
+  const server = createServer((req, res) => {
+    const chunks: Buffer[] = []
+    req.on('data', (chunk: Buffer) => chunks.push(chunk))
+    req.on('end', () => {
+      const text = Buffer.concat(chunks).toString('utf8')
+      let body: unknown = text
+      try {
+        body = JSON.parse(text)
+      } catch {
+        // Keep the text.
+      }
+      requests.push({
+        method: req.method ?? '',
+        path: req.url ?? '',
+        contentType: req.headers['content-type'] ?? '',
+        body,
+      })
+      res.writeHead(200, {'content-type': 'application/json'})
+      res.end('{}')
+    })
+  })
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  if (address == null || typeof address === 'string') throw new Error('OTLP sink did not bind a TCP port')
+  return {
+    url: `http://127.0.0.1:${address.port}/v1/traces`,
+    requests,
+    stop: async () =>
+      new Promise<void>(resolve => {
+        server.closeAllConnections()
+        server.close(() => resolve())
+      }),
+  }
+}
+
 export interface RunningServer {
   readonly url: string
+  /** What the server wrote to stderr so far (the last 64 KiB). */
+  readonly stderr: () => string
   /** Authenticated JSON request. `directory` selects the location. */
   readonly api: (
     method: string,
@@ -176,6 +230,8 @@ export async function startOpenCodeServer(options: {
   readonly sandbox: SandboxPaths
   readonly pluginDir: string
   readonly providerBaseURL: string
+  /** Extra server environment, applied last. */
+  readonly env?: Readonly<Record<string, string>>
 }): Promise<RunningServer> {
   const {binary, sandbox, pluginDir, providerBaseURL} = options
   const password = randomBytes(24).toString('base64url')
@@ -198,7 +254,7 @@ export async function startOpenCodeServer(options: {
   const child = spawn(binary, ['serve', '--stdio', '--port', '0'], {
     cwd: sandbox.repo,
     detached: true,
-    stdio: ['pipe', 'pipe', 'ignore'],
+    stdio: ['pipe', 'pipe', 'pipe'],
     env: {
       PATH: '/usr/bin:/bin:/usr/sbin:/sbin',
       HOME: sandbox.home,
@@ -212,7 +268,13 @@ export async function startOpenCodeServer(options: {
       OPENCODE_DISABLE_PROJECT_CONFIG: '1',
       OPENCODE_PASSWORD: password,
       OPENCODE_CONFIG_CONTENT: JSON.stringify(config),
+      ...options.env,
     },
+  })
+
+  let stderrText = ''
+  child.stderr.on('data', (chunk: Buffer) => {
+    stderrText = (stderrText + chunk.toString('utf8')).slice(-STDERR_KEEP)
   })
 
   const exited = new Promise<void>(resolve => child.once('exit', () => resolve()))
@@ -254,6 +316,7 @@ export async function startOpenCodeServer(options: {
   const auth = `Basic ${Buffer.from(`opencode:${password}`).toString('base64')}`
   return {
     url,
+    stderr: () => stderrText,
     api: async (method, pathname, requestOptions = {}) => {
       const response = await fetch(url + pathname, {
         method,
