@@ -121,7 +121,7 @@ describe('trace-relay-process', () => {
       // #and the log says so in fixed text, with no endpoint, host or header value
       expect(loggedAt(logger, 'info')).toEqual([
         ['Trace relay started', {pid: relay.pid}],
-        ['Trace relay stopped', {delivered: 1, retry: 1, dropped: 0}],
+        ['Trace relay stopped', {acknowledged: 1, retry: 1, dropped: 0}],
       ])
       expect(loggedAt(logger, 'warning')).toEqual([])
       const logged = serializeLoggerCalls(logger)
@@ -152,9 +152,31 @@ describe('trace-relay-process', () => {
       })
       expect(loggedAt(logger, 'info').at(-1)).toEqual([
         'Trace relay stopped',
-        {delivered: 2, retry: 0, dropped: 0, pluginReported: {exportedSpans: 30, droppedSpans: 4}},
+        {
+          acknowledged: 2,
+          retry: 0,
+          dropped: 0,
+          pluginReportedAtLastBatch: {exportedSpans: 30, droppedSpans: 4},
+        },
       ])
       expect(serializeLoggerCalls(logger)).not.toContain('CANARY')
+    })
+
+    it("does not say delivered or stored in the stop line: an acknowledgement is the collector's answer, not proof", async () => {
+      const upstream = await startHttpUpstream((_request, res) => res.end())
+      cleanups.push(upstream.close)
+      const {started, logger} = await startWith(realLauncher(), {
+        config: {url: `${upstream.origin}/v1/traces`, headers: HEADERS},
+      })
+      const relay = unwrapOk(started)
+      await postBatch(relay.port, {headers: {[TRACE_RELAY_COUNTS_HEADER]: 'exported=3;dropped=0'}})
+
+      await relay.stop()
+
+      const stopLine = JSON.stringify(loggedAt(logger, 'info').at(-1))
+      expect(stopLine).toContain('acknowledged')
+      expect(stopLine).toContain('pluginReportedAtLastBatch')
+      expect(stopLine).not.toMatch(/delivered|stored|pluginReported"/i)
     })
 
     it('answers a refused request locally while running, and keeps serving', async () => {
@@ -456,7 +478,7 @@ describe('trace-relay-process', () => {
       })
       expect(loggedAt(second.logger, 'info').at(-1)).toEqual([
         'Trace relay stopped',
-        {delivered: 4, retry: 2, dropped: 1},
+        {acknowledged: 4, retry: 2, dropped: 1},
       ])
       // nothing but the integers it picked reaches a log line
       expect(serializeLoggerCalls(first.logger)).not.toContain('CANARY')

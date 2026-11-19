@@ -324,7 +324,14 @@ export async function startTraceRelayProcess(
         state.plugin === null
           ? undefined
           : {exportedSpans: state.plugin.exportedSpans, droppedSpans: state.plugin.droppedSpans}
-      logger.info('Trace relay stopped', {...counts, ...(pluginReported === undefined ? {} : {pluginReported})})
+      // Labelled for what each number is. `acknowledged`: the collector answered 2xx, which is not proof every span was stored
+      // (a partial-success body is never read). The plugin's totals are as of the last batch it sent, not the run's end.
+      logger.info('Trace relay stopped', {
+        acknowledged: counts.delivered,
+        retry: counts.retry,
+        dropped: counts.dropped,
+        ...(pluginReported === undefined ? {} : {pluginReportedAtLastBatch: pluginReported}),
+      })
       return {outcome, counts, ...(pluginReported === undefined ? {} : {pluginReported})}
     } catch {
       return {outcome: 'unconfirmed', counts: 'incomplete'}

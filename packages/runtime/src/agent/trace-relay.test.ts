@@ -354,6 +354,51 @@ async function arrange() {
   return {upstream, relay}
 }
 
+describe('startTraceRelay: a 2xx that carries a partial-success body', () => {
+  it('counts it as acknowledged, never reads the body, and returns none of it to the sender', async () => {
+    // #given a collector that answers 200 with an OTLP partial-success message, then keeps streaming a large body
+    const partial = '{"partialSuccess":{"rejectedSpans":7,"errorMessage":"PARTIAL-SUCCESS-CANARY"}}'
+    const chunk = Buffer.alloc(64 * 1024, 0x20)
+    let written = 0
+    let finishedNormally = false
+    let closedEarly = false
+    const upstream = await startHttpUpstream((_request, res) => {
+      res.writeHead(200, {'content-type': 'application/json'})
+      res.write(partial)
+      const pump = (): void => {
+        if (res.destroyed) return
+        if (written >= 64 * 1024 * 1024) {
+          finishedNormally = true
+          res.end()
+          return
+        }
+        written += chunk.length
+        if (res.write(chunk)) setImmediate(pump)
+        else res.once('drain', pump)
+      }
+      res.once('close', () => {
+        closedEarly = !finishedNormally
+      })
+      pump()
+    })
+    cleanups.push(upstream.close)
+    const relay = await relayFor(`${upstream.origin}/v1/traces`)
+
+    // #when a batch is posted
+    const answer = await postBatch(relay.port)
+
+    // #then it is acknowledged (counted delivered), the sender gets 200 and nothing else, and the relay hung up on the body
+    expect(answer.status).toBe(200)
+    expect(answer.body.length).toBe(0)
+    expect(JSON.stringify(answer.headers)).not.toContain('PARTIAL-SUCCESS')
+    expect(answer.headers['content-type']).toBeUndefined()
+    expect(relay.counts()).toEqual({delivered: 1, retry: 0, dropped: 0})
+    await vi.waitFor(() => expect(closedEarly).toBe(true), {timeout: 3000})
+    // far less than the whole 64 MiB went out: the relay did not drain it into memory
+    expect(written).toBeLessThan(64 * 1024 * 1024)
+  })
+})
+
 describe('startTraceRelay: what it answers locally', () => {
   it.each([
     ['GET on the route', 'GET', '/v1/traces', 405],
