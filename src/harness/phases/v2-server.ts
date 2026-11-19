@@ -46,7 +46,7 @@ import {
 } from '../../services/setup/plugin-install-v2.js'
 import {admitRepoSkills, discardRepoSkillsStaging} from '../../services/setup/repo-skills.js'
 import {toErrorMessage} from '../../shared/errors.js'
-import {logDefaultModelNotice, suppliedProviderIds} from './default-model.js'
+import {logDefaultModelNotice, suppliedProviderIds, verifyDefaultModelProvider} from './default-model.js'
 import {probeKeyProxy} from './key-proxy-probe.js'
 import {startKeyProxyProcess} from './key-proxy-process.js'
 import {readV1DatabaseFacts, waitForV1Import} from './v1-import-wait.js'
@@ -256,7 +256,7 @@ export async function startActionOpenCodeV2(
   const deps = {...defaultDeps, ...options.deps}
   const stageError = (stage: V2StartStage, message: string): Result<never, V2StartError> => err({stage, message})
   // No `model` input: the session is created on `DEFAULT_MODEL` (`executeOpenCodeV2`), whatever the credentials and the
-  // config say. Decided once here.
+  // config say. Decided once here; the notice and the provider check below both read it.
   const usesDefaultModel = options.model == null
 
   // --- 1. Credentials ----------------------------------------------------------------------------------------
@@ -619,6 +619,19 @@ export async function startActionOpenCodeV2(
       if (!credentials.success) {
         return failAfterSpawn('credential-gate', `OpenCode credential gate failed: ${credentials.error.message}`)
       }
+    }
+
+    // --- 6c. Default model's provider ---------------------------------------------------------------------
+    //
+    // The credential gate above does not cover the default model (it is free and needs no credential), so a caller config
+    // that removes its provider would otherwise fail the first turn with a bare `provider.no-route`.
+    if (usesDefaultModel) {
+      const available = await verifyDefaultModelProvider({
+        handle,
+        requestTimeoutMs: GATE_REQUEST_TIMEOUT_MS,
+        ...(runSignal === undefined ? {} : {signal: runSignal}),
+      })
+      if (!available.success) return failAfterSpawn('config', available.error)
     }
 
     // --- 7. Import wait ----------------------------------------------------------------------------------------
