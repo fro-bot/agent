@@ -226,6 +226,20 @@ describe('release policy: opencode-plugin commits stay out of the Action release
     expect(notes).toContain('plugin setting renamed')
   })
 
+  it.each([
+    ['footer', 'feat(opencode-plugin): footer directive\n\nRelease-As: 9.9.9'],
+    ['body', 'feat(opencode-plugin): body directive\n\nA sentence in the body.\nRelease-As: 9.9.9\n\nRefs: #1'],
+  ])('lists a plugin commit with a Release-As line in its %s, without releasing', async (_where, message) => {
+    // #given/#when
+    const releaseType = await analyzeWithRealAnalyzer(message)
+    const notes = await notesFor([message, 'fix(action): action fix'])
+
+    // #then: the notes generator shows the commit, and it still triggers no Action release
+    expect(notes).toContain('directive')
+    expect(releaseType).toBeNull()
+    expect(analyzeReleaseType([message])).toBe('none')
+  })
+
   it('still lists the same types without a scope', async () => {
     // #given/#when
     const notes = await notesFor(['feat: unscoped feature', 'fix: unscoped fix'])
