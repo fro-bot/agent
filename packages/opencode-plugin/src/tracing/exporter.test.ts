@@ -1,6 +1,7 @@
+import type {Socket} from 'node:net'
 import type {ScrubbedSpan} from './content.js'
 import type {SpanExporter, SpanExporterOptions} from './exporter.js'
-
+import {createServer as createHttpServer} from 'node:http'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
 import {startOtlpSink, startTlsSink, type OtlpSink, type SinkRequest} from '../integration.fixture.js'
@@ -15,6 +16,7 @@ import {
 } from './exporter.js'
 
 const FAST = {batchIntervalMs: 15, requestTimeoutMs: 2_500, maxConsecutiveFailures: 3}
+const sleep = async (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 const hex = (n: number, length: number): string => n.toString(16).padStart(length, '0')
 const TRACE = hex(0xabc, 32)
 
@@ -342,6 +344,78 @@ describe('retry and refusal against the relay’s three answers', () => {
     expect(counts).toEqual({exported: 30, dropped: 0})
     expect(target.accepted().length).toBeGreaterThanOrEqual(15)
   }, 15_000)
+})
+
+describe('what happens to the request at the cleanup deadline', () => {
+  it('cancels a pending retry: after close returns, the destination gets nothing more, and the batch is counted dropped', async () => {
+    // #given a destination that always answers 503, so the SDK keeps scheduling retries (about 1 s, then about 1.5 s)
+    const target = await sink({respond: () => ({status: 503})})
+    const exporter = exporterFor({
+      url: target.url,
+      limits: {...FAST, requestTimeoutMs: 20_000, maxConsecutiveFailures: 100},
+    })
+    exporter.export(span())
+
+    // #when the deadline passes between the first retry and the second
+    const counts = await exporter.close(1_400)
+    const atClose = target.requests.length
+    await sleep(3_500)
+
+    // #then the batch was counted dropped, and no later request arrived (one that was merely abandoned would have retried)
+    expect(counts).toEqual({exported: 0, dropped: 1})
+    expect(atClose).toBeGreaterThanOrEqual(1)
+    expect(target.requests.length).toBe(atClose)
+  }, 20_000)
+
+  it('cancels a request the destination never answers: its connection is closed from our side at the deadline', async () => {
+    // #given a destination that accepts the connection and never answers
+    const sockets: Socket[] = []
+    let closedSockets = 0
+    const stalled = createHttpServer(() => {})
+    stalled.on('connection', socket => {
+      sockets.push(socket)
+      socket.on('close', () => {
+        closedSockets += 1
+      })
+    })
+    await new Promise<void>(resolve => stalled.listen(0, '127.0.0.1', resolve))
+    const address = stalled.address() as {port: number}
+    try {
+      const exporter = exporterFor({
+        url: `http://127.0.0.1:${address.port}/v1/traces`,
+        limits: {...FAST, requestTimeoutMs: 20_000},
+      })
+      exporter.export(span())
+      await sleep(300)
+      expect(sockets).toHaveLength(1)
+
+      // #when the deadline passes
+      const counts = await exporter.close(300)
+      await sleep(300)
+
+      // #then the batch is counted dropped and our side closed the connection (without the cancel it stays open until the
+      // 20 s request timeout)
+      expect(counts).toEqual({exported: 0, dropped: 1})
+      expect(closedSockets).toBe(1)
+    } finally {
+      for (const socket of sockets) socket.destroy()
+      await new Promise<void>(resolve => stalled.close(() => resolve()))
+    }
+  }, 20_000)
+
+  it('does not cancel anything that finished: a batch delivered before the deadline stays exported', async () => {
+    // #given
+    const target = await sink()
+    const exporter = exporterFor({url: target.url})
+    exporter.export(span())
+
+    // #when
+    const counts = await exporter.close(3_000)
+
+    // #then
+    expect(counts).toEqual({exported: 1, dropped: 0})
+    expect(target.accepted()).toHaveLength(1)
+  })
 })
 
 describe('certificate validation', () => {

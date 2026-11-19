@@ -168,20 +168,36 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
   const counts = (): SpanCounts => ({exported, dropped})
   const baseHeaders = {'Content-Type': 'application/json', ...options.headers}
 
+  // The SDK's delegate cannot be told to stop: its shutdown does nothing, and a retry is a timer it does not expose. Two
+  // things under our control cancel it: the agent (destroying it closes every open socket, so an in-flight request fails at
+  // once) and the headers function, which the transport awaits before EVERY request including each retry (once cancelled it
+  // throws, so no further request is made). Both are used at the cleanup deadline.
+  let cancelled = false
+  let agent: {readonly destroy: () => void} | undefined
+  const makeAgent = httpAgentFactoryFromOptions({keepAlive: true, rejectUnauthorized: true})
+
   const exporter = new OTLPExporterBase<ReadableSpan[]>(
     createOtlpHttpExportDelegate(
       {
         url: options.url,
         // Read on every request, so each batch carries the totals as of its start.
-        headers: async () =>
-          options.reportCounts ? {...baseHeaders, [TRACE_COUNTS_HEADER]: formatCountsHeader(counts())} : baseHeaders,
+        headers: async () => {
+          if (cancelled) throw new Error('export cancelled')
+          return options.reportCounts
+            ? {...baseHeaders, [TRACE_COUNTS_HEADER]: formatCountsHeader(counts())}
+            : baseHeaders
+        },
         timeoutMillis: limits.requestTimeoutMs,
         // One batch in flight is enforced here; the delegate's own limit is a second guard.
         concurrencyLimit: 1,
         compression: 'none',
         // Certificate validation is set here, for every https export, so a process-wide `NODE_TLS_REJECT_UNAUTHORIZED=0` cannot
         // turn it off: the credential in a local-mode header goes only to a destination whose certificate verified.
-        agentFactory: httpAgentFactoryFromOptions({keepAlive: true, rejectUnauthorized: true}),
+        agentFactory: async protocol => {
+          const made = await makeAgent(protocol)
+          agent = made
+          return made
+        },
       },
       JsonTraceSerializer,
     ),
@@ -362,7 +378,15 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
         if (waiting === undefined) break
         await Promise.race([waiting.done, sleep(remaining)])
       }
-      // Whatever is still queued or in flight is abandoned: counted dropped, and a late result is ignored.
+      // Whatever is still queued or in flight is cancelled and counted dropped (a request already fully received may still have
+      // been accepted: a dropped count is an upper bound, and the Action-mode counts header, which only has exported and
+      // dropped, reports it the same way).
+      cancelled = true
+      try {
+        agent?.destroy()
+      } catch {
+        // Nothing more can be done: the headers function stops every further request.
+      }
       if (inFlight !== undefined) {
         if (!inFlight.abandoned) dropped += inFlight.size
         inFlight.abandoned = true
