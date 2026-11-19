@@ -545,6 +545,29 @@ describe('startActionOpenCodeV2', () => {
     expect(unwrapErr(result).message).toContain('google')
   })
 
+  it('names the disabled default model before the credential gate asks for the config model provider', async () => {
+    // #given no model input, no key, and a config whose top-level model (never the session's model) names a provider
+    // with no credential while the config removes the default model's provider
+    const server = fakeServer({providers: ['anthropic']})
+    const probeKeyProxy = vi.fn()
+    const deps = recordingDeps(server, {probeKeyProxy})
+    const opencodeConfig = JSON.stringify({model: 'anthropic/claude-sonnet-4-6', disabled_providers: ['opencode']})
+
+    // #when
+    const result = await startActionOpenCodeV2(options({deps, model: null, authJson: '{}', opencodeConfig}))
+
+    // #then the start fails at the config stage, naming the default model and the model input
+    expect(result).toMatchObject({success: false, error: {stage: 'config'}})
+    const message = unwrapErr(result).message
+    expect(message).toContain('opencode/big-pickle')
+    expect(message).toContain('`model` input')
+    expect(message).not.toContain('credential')
+    // #and neither later gate was reached
+    expect(server.fetch.mock.calls.map(call => call[0])).not.toContain('/api/integration/anthropic')
+    expect(probeKeyProxy).not.toHaveBeenCalled()
+    expect(server.shutdown).toHaveBeenCalledTimes(1)
+  })
+
   it('checks the provider of every written key when no model is named at all', async () => {
     const server = fakeServer()
 

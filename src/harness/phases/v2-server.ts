@@ -73,8 +73,9 @@ import {readV1DatabaseFacts, waitForV1Import} from './v1-import-wait.js'
  *    no-ops.
  * 5. Spawn. `startOpenCodeV2Server` scrubs the environment itself (`filterAgentEnv`), so the process environment is
  *    passed as-is and not filtered twice. Its plugin gate requires `systematic` and `fro-bot.opencode-plugin` active.
- * 6. Permission gate over the effective per-agent rules, then the credential gate for the provider the run needs. A
- *    `{file:}` reference counts as authentication.
+ * 6. Permission gate over the effective per-agent rules; with no `model` input, a check that the default model's provider is
+ *    on the server; then the credential gate for the provider the run needs. A `{file:}` reference counts as
+ *    authentication.
  * 7. Import wait: no prompt until the V1 history import reports `completed`.
  *
  * Any failure after the spawn shuts the server down before returning, so a failed start leaves no process behind. The
@@ -563,7 +564,7 @@ export async function startActionOpenCodeV2(
   }
 
   const runGates = async (): Promise<Result<OpenCodeV2ServerHandle, V2StartError>> => {
-    // --- 6. Permission gate, then credential gate -------------------------------------------------------------
+    // --- 6. Permission gate, default model's provider, then credential gate ---------------------------------
     const permissions = await verifyPermissionRules(
       {
         // A 503 is not-ready, never "no agents" and never a pass: it is retried to the deadline and then fails.
@@ -575,6 +576,22 @@ export async function startActionOpenCodeV2(
     )
     if (!permissions.success) {
       return failAfterSpawn('permission-gate', `OpenCode permission gate failed: ${permissions.error.message}`)
+    }
+
+    // --- 6a. Default model's provider ---------------------------------------------------------------------
+    //
+    // Before the key proxy probe and the credential gate, which ask about `options.model ?? <config model>`: with no model
+    // input the session is created on the default model whatever the config's top-level `model` says, so a key for that
+    // provider cannot help when the default model's own provider is gone. This is the cause to report first. The default
+    // model is free and needs no credential, so no later gate covers it; without this check a caller config that removes
+    // its provider fails the first turn with a bare `provider.no-route`.
+    if (usesDefaultModel) {
+      const available = await verifyDefaultModelProvider({
+        handle,
+        requestTimeoutMs: GATE_REQUEST_TIMEOUT_MS,
+        ...(runSignal === undefined ? {} : {signal: runSignal}),
+      })
+      if (!available.success) return failAfterSpawn('config', available.error)
     }
 
     const spawnConfig = spawnConfigFromConfig(built.content)
@@ -619,19 +636,6 @@ export async function startActionOpenCodeV2(
       if (!credentials.success) {
         return failAfterSpawn('credential-gate', `OpenCode credential gate failed: ${credentials.error.message}`)
       }
-    }
-
-    // --- 6c. Default model's provider ---------------------------------------------------------------------
-    //
-    // The credential gate above does not cover the default model (it is free and needs no credential), so a caller config
-    // that removes its provider would otherwise fail the first turn with a bare `provider.no-route`.
-    if (usesDefaultModel) {
-      const available = await verifyDefaultModelProvider({
-        handle,
-        requestTimeoutMs: GATE_REQUEST_TIMEOUT_MS,
-        ...(runSignal === undefined ? {} : {signal: runSignal}),
-      })
-      if (!available.success) return failAfterSpawn('config', available.error)
     }
 
     // --- 7. Import wait ----------------------------------------------------------------------------------------
