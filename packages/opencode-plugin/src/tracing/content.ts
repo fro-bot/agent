@@ -106,20 +106,24 @@ function pemPattern(): ScrubPattern {
       let out = ''
       let cursor = 0
       header.lastIndex = 0
+      // The next end line and the next quote are searched forward once and only moved when a header passes them, so a
+      // text of many headers and no end line costs one scan, not one per header.
+      let nextEnd = text.indexOf('-----END ')
+      let nextQuote = text.indexOf('"')
       for (;;) {
         const match = header.exec(text)
         if (match === null) break
         const from = match.index
         if (from < cursor) continue
         const bodyStart = from + match[0].length
-        const end = text.indexOf('-----END ', bodyStart)
-        const quote = text.indexOf('"', bodyStart)
+        if (nextEnd !== -1 && nextEnd < bodyStart) nextEnd = text.indexOf('-----END ', bodyStart)
+        if (nextQuote !== -1 && nextQuote < bodyStart) nextQuote = text.indexOf('"', bodyStart)
         let stop = text.length
-        if (end !== -1 && (quote === -1 || end < quote)) {
-          const close = text.indexOf('-----', end + '-----END '.length)
+        if (nextEnd !== -1 && (nextQuote === -1 || nextEnd < nextQuote)) {
+          const close = text.indexOf('-----', nextEnd + '-----END '.length)
           stop = close === -1 ? text.length : close + '-----'.length
-        } else if (quote !== -1) {
-          stop = quote
+        } else if (nextQuote !== -1) {
+          stop = nextQuote
         }
         out += text.slice(cursor, from) + REDACTION
         cursor = stop

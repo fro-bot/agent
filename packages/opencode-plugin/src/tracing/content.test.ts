@@ -339,9 +339,11 @@ describe('adversarial timing: each pattern on its own worst input', () => {
   const N = 300_000
   const inputs: Readonly<Record<string, readonly string[]>> = {
     'pem-private-key': [
-      '-----BEGIN PRIVATE KEY-----'.repeat(12_000),
-      '-----BEGIN '.repeat(30_000),
-      `"${'-----BEGIN PRIVATE KEY-----"'.repeat(12_000)}`,
+      // Many headers and no end line: a scan to the end per header would be quadratic (1.6 MB took minutes).
+      '-----BEGIN PRIVATE KEY-----'.repeat(60_000),
+      '-----BEGIN '.repeat(150_000),
+      `"${'-----BEGIN PRIVATE KEY-----"'.repeat(60_000)}`,
+      `${'-----BEGIN PRIVATE KEY-----\n-----END '.repeat(40_000)}`,
     ],
     'github-token': ['ghp_'.repeat(N / 4), `ghp_${'a'.repeat(N)}`, 'github_pat_'.repeat(N / 11)],
     'aws-access-key-id': ['AKIA'.repeat(N / 4), `AKIA${'A'.repeat(N)}`],
