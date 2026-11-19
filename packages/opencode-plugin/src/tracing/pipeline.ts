@@ -115,6 +115,13 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
     else if (observation.kind === 'tool.after') ledger.release(observation.result)
   }
 
+  /** Snapshots the model dropped with no span (an expired session's prompts, a timed-out hook note): freed here. */
+  function releaseDiscarded(): void {
+    const dropped = model.takeDiscarded()
+    if (options.ledger === undefined) return
+    for (const snapshot of dropped) options.ledger.release(snapshot)
+  }
+
   function enqueue(spans: readonly SpanRecord[]): void {
     for (const record of spans) {
       if (records.length >= limits.maxRecords) {
@@ -142,6 +149,7 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
     if (next !== undefined) {
       try {
         enqueue(model.observe(next))
+        releaseDiscarded()
       } catch {
         // A model failure loses this observation, never the session.
         observationsDropped += 1
@@ -194,6 +202,7 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
       while (inbox.length > 0) step()
       try {
         enqueue(model.flush(now()))
+        releaseDiscarded()
       } catch {
         observationsDropped += 1
       }

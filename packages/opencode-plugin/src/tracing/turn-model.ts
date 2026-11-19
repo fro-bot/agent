@@ -162,6 +162,16 @@ export interface TurnModelLimits {
   readonly maxOutputChars: number
   /** The same, summed over every open request in the model: past it, parts are cut or omitted the same way. */
   readonly maxHeldOutputChars: number
+  /**
+   * A session with no trace, no running execution and nothing open is forgotten after this long without an observation, and
+   * its held snapshots are handed back. Independent of open traces: a prompt for a session that never starts an execution
+   * has no trace to close it.
+   */
+  readonly sessionIdleMs: number
+  /** Idle sessions kept at once; past it the least recently active is forgotten. A running session never counts. */
+  readonly maxIdleSessions: number
+  /** Prompts one session holds while waiting for an execution; past it the oldest is dropped. */
+  readonly maxPendingPromptsPerSession: number
   /** How long such a note waits for its event before it is dropped, silently. Checked on a tick and on the next note. */
   readonly toolNoteWaitMs: number
   /**
@@ -186,6 +196,9 @@ export const DEFAULT_LIMITS: TurnModelLimits = {
   maxPromptsPerSpan: 32,
   maxOutputChars: 128 * 1024,
   maxHeldOutputChars: 8 * 1024 * 1024,
+  sessionIdleMs: 10 * 60_000,
+  maxIdleSessions: 64,
+  maxPendingPromptsPerSession: 64,
   maxPendingToolNotes: 64,
   toolNoteWaitMs: 10_000,
   tombstoneTtlMs: 24 * 60 * 60_000,
@@ -211,6 +224,11 @@ export interface TurnModel {
   /** Closes everything still open as interrupted and incomplete, and releases all state. */
   readonly flush: (at: number) => SpanRecord[]
   readonly stats: () => TurnModelStats
+  /**
+   * The snapshots the model dropped without a span to carry them (an expired session's prompts, a hook note that timed out,
+   * a repeated terminal event). Returned once, for whoever counts them to release.
+   */
+  readonly takeDiscarded: () => unknown[]
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -388,6 +406,12 @@ export function createTurnModel(options: {
   /** Characters of model output held by open requests, against `maxHeldOutputChars`. */
   let heldOutputChars = 0
 
+  /** Snapshots dropped with no span to carry them, until `takeDiscarded` hands them back. */
+  let discarded: unknown[] = []
+  const discard = (value: unknown): void => {
+    if (typeof value === 'object' && value !== null) discarded.push(value)
+  }
+
   /** Child session id to the closed trace it belonged to, and when it closed. Oldest first. */
   const tombstones = new Map<string, {readonly traceId: string; readonly at: number}>()
   /** Marks to put on a root trace the moment it is opened for a session. */
@@ -478,7 +502,42 @@ export function createTurnModel(options: {
       lastActivity: at,
     }
     sessions.set(sessionId, node)
+    enforceIdleBound(node)
     return node
+  }
+
+  /** Nothing running, open or owed: only queued prompts and notes, which no trace will ever close. */
+  const isIdle = (node: SessionNode): boolean =>
+    node.childOf === undefined &&
+    node.traces.size === 0 &&
+    node.active === undefined &&
+    node.requests.length === 0 &&
+    node.tools.size === 0
+
+  /** Forgets an idle session and hands back what it held. */
+  function forgetSession(node: SessionNode): void {
+    for (const prompt of node.prompts.values()) discard(prompt.content)
+    for (const note of node.notes.values()) discardNote(note)
+    sessions.delete(node.id)
+  }
+
+  function discardNote(note: ToolNote): void {
+    discard(note.before?.input)
+    discard(note.after?.result)
+  }
+
+  /** Keeps the idle sessions within `maxIdleSessions`, forgetting the least recently active. `keep` is never forgotten. */
+  function enforceIdleBound(keep: SessionNode): void {
+    const idle = [...sessions.values()].filter(node => node !== keep && isIdle(node))
+    if (idle.length < limits.maxIdleSessions) return
+    idle.sort((a, b) => a.lastActivity - b.lastActivity)
+    for (const node of idle.slice(0, idle.length - limits.maxIdleSessions + 1)) forgetSession(node)
+  }
+
+  function expireIdleSessions(now: number): void {
+    for (const node of [...sessions.values()]) {
+      if (isIdle(node) && now - node.lastActivity > limits.sessionIdleMs) forgetSession(node)
+    }
   }
 
   const touch = (trace: TraceState, at: number): void => {
@@ -859,8 +918,17 @@ export function createTurnModel(options: {
     const node = route(o)
     if (node === undefined) return
     const active = node.active
-    if (active === undefined) node.prompts.set(o.messageId, o)
-    else {
+    if (active === undefined) {
+      node.prompts.set(o.messageId, o)
+      while (node.prompts.size > limits.maxPendingPromptsPerSession) {
+        const oldest = node.prompts.entries().next()
+        if (oldest.done === true) break
+        node.prompts.delete(oldest.value[0])
+        discard(oldest.value[1].content)
+        const queued = node.pending.findIndex(item => item.inboxId === oldest.value[0])
+        if (queued !== -1) node.pending.splice(queued, 1)
+      }
+    } else {
       // Mid-execution: it joins the running turn and opens no root of its own.
       addPrompt(invokeOf(node, active.trace), {
         messageId: o.messageId,
@@ -1146,9 +1214,10 @@ export function createTurnModel(options: {
       note = {at}
       node.notes.set(callId, note)
       while (node.notes.size > limits.maxPendingToolNotes) {
-        const oldest = node.notes.keys().next()
+        const oldest = node.notes.entries().next()
         if (oldest.done === true) break
-        node.notes.delete(oldest.value)
+        node.notes.delete(oldest.value[0])
+        discardNote(oldest.value[1])
       }
     }
     return note
@@ -1157,8 +1226,10 @@ export function createTurnModel(options: {
   function expireNotes(now: number): void {
     for (const node of sessions.values()) {
       for (const [callId, note] of node.notes) {
-        if (now - note.at > limits.toolNoteWaitMs) node.notes.delete(callId)
-        else break
+        if (now - note.at > limits.toolNoteWaitMs) {
+          node.notes.delete(callId)
+          discardNote(note)
+        } else break
       }
     }
   }
@@ -1386,6 +1457,7 @@ export function createTurnModel(options: {
 
   function sweep(now: number): void {
     expireBuffers(now)
+    expireIdleSessions(now)
     for (const trace of [...traces]) {
       if (trace.closed) continue
       const standalone = trace.root.standalone === 'generate'
@@ -1480,8 +1552,17 @@ export function createTurnModel(options: {
       out = []
       clock = Math.max(clock, observation.at)
       sweep(clock)
+      if ('sessionId' in observation) {
+        const known = sessions.get(observation.sessionId)
+        if (known !== undefined) known.lastActivity = clock
+      }
       dispatch(observation)
       return out
+    },
+    takeDiscarded: () => {
+      const taken = discarded
+      discarded = []
+      return taken
     },
     flush: at => {
       out = []
@@ -1492,6 +1573,7 @@ export function createTurnModel(options: {
         releaseBuffer(sessionId, entry.items, 'unattributed')
       }
       for (const trace of [...traces]) closeTrace(trace, clock, 'interrupted', {incomplete: true})
+      for (const node of sessions.values()) forgetSession(node)
       sessions.clear()
       tombstones.clear()
       bufferedBytes = 0

@@ -285,3 +285,49 @@ describe('the snapshot ledger in the pipeline', () => {
     expect(ledger.stats()).toMatchObject({pending: 0, pendingChars: 0})
   })
 })
+
+describe('snapshots the model drops without a span', () => {
+  it('are freed: a prompt for a session that never starts an execution gives its snapshot back once the session is idle', async () => {
+    // #given a ledger, a pipeline with a short idle limit and a fast tick, and a queued prompt that never runs
+    const ledger = createSnapshotLedger()
+    const {sink} = collectingSink()
+    let clock = 1_000
+    const pipeline = createTracePipeline({
+      sink,
+      scrubber,
+      ledger,
+      now: () => clock,
+      limits: {tickMs: 10},
+      modelLimits: {sessionIdleMs: 500},
+    })
+    const content = snapshotPrompt({text: 'a queued prompt'}, {ledger})
+    pipeline.observe({kind: 'prompt', at: clock, sessionId: 'ses_idle', messageId: 'm1', content})
+    pipeline.observe({kind: 'inbox.enqueued', at: clock, sessionId: 'ses_idle', inboxId: 'm1', item: 'user'})
+    await flush()
+    expect(ledger.stats().pending).toBe(1)
+
+    // #when time passes beyond the idle limit and a tick runs
+    clock += 600
+    await flush()
+
+    // #then the snapshot was released, with no span and no exit through a record
+    expect(ledger.stats()).toMatchObject({pending: 0, pendingChars: 0})
+    pipeline.stop()
+  })
+
+  it('are freed at stop', () => {
+    // #given an idle session holding a prompt snapshot
+    const ledger = createSnapshotLedger()
+    const {sink} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber, ledger})
+    const content = snapshotPrompt({text: 'held'}, {ledger})
+    pipeline.observe({kind: 'prompt', at: 1, sessionId: 'ses_idle', messageId: 'm1', content})
+    pipeline.observe({kind: 'inbox.enqueued', at: 2, sessionId: 'ses_idle', inboxId: 'm1', item: 'user'})
+
+    // #when
+    pipeline.stop()
+
+    // #then
+    expect(ledger.stats().pending).toBe(0)
+  })
+})

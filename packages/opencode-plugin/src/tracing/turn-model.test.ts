@@ -54,8 +54,11 @@ function script() {
       at = time
       return api
     },
-    prompt: (sessionId: string, messageId: string, extra: Partial<{at: number; bytes: number}> = {}) =>
-      add({kind: 'prompt', sessionId, messageId, delivery: 'steer', content: 'hi', ...extra}),
+    prompt: (
+      sessionId: string,
+      messageId: string,
+      extra: Partial<{at: number; bytes: number; content: unknown}> = {},
+    ) => add({kind: 'prompt', sessionId, messageId, delivery: 'steer', content: 'hi', ...extra}),
     enqueued: (
       sessionId: string,
       inboxId: string,
@@ -1495,5 +1498,169 @@ describe('the model holds a bounded amount of output while a request is open', (
 
     // #then
     expect(model.stats().heldOutputChars).toBe(0)
+  })
+})
+
+describe('sessions that never start an execution', () => {
+  const limits = {sessionIdleMs: 1_000, maxIdleSessions: 3, maxPendingPromptsPerSession: 2}
+  const queue = (s: ReturnType<typeof script>, session: string, tag: string, content: object = {text: tag}) => {
+    s.prompt(session, `m-${tag}`, {content})
+    s.enqueued(session, `m-${tag}`, 'user')
+    return content
+  }
+
+  it('forgets a session after the idle time with no trace, and hands back the snapshots it held', () => {
+    // #given a prompt and its inbox item, and no execution ever
+    const s = script()
+    const content = queue(s, 'a', '1')
+    const {model} = replay(s.out, {limits, flush: false})
+    expect(model.stats().sessions).toBe(1)
+
+    // #when time passes beyond the idle limit on a tick
+    model.observe({kind: 'tick', at: lastAt(s.out) + 1_001})
+
+    // #then the session is gone, and the prompt's snapshot is returned for release
+    expect(model.stats()).toMatchObject({sessions: 0, openTraces: 0})
+    expect(model.takeDiscarded()).toContain(content)
+    expect(model.takeDiscarded()).toEqual([])
+  })
+
+  it('keeps it at exactly the idle limit, and forgets it one millisecond after', () => {
+    // #given
+    const s = script()
+    queue(s, 'a', '1')
+    const {model} = replay(s.out, {limits, flush: false})
+    const last = lastAt(s.out)
+
+    // #when
+    model.observe({kind: 'tick', at: last + 1_000})
+    const atLimit = model.stats().sessions
+    model.observe({kind: 'tick', at: last + 1_001})
+
+    // #then
+    expect([atLimit, model.stats().sessions]).toEqual([1, 0])
+  })
+
+  it('counts activity: a session that keeps receiving prompts is not forgotten', () => {
+    // #given a prompt every 600 ms against an idle limit of 1,000
+    const s = script()
+    for (let index = 0; index < 5; index += 1) {
+      s.at(index * 600)
+      queue(s, 'a', String(index))
+    }
+    const {model} = replay(s.out, {limits: {...limits, maxPendingPromptsPerSession: 10}, flush: false})
+
+    // #when a tick comes 600 ms after the last
+    model.observe({kind: 'tick', at: lastAt(s.out) + 600})
+
+    // #then it is still there
+    expect(model.stats().sessions).toBe(1)
+  })
+
+  it('never forgets a session that is running, however long it has been quiet', () => {
+    // #given a running execution with an open request
+    const s = script()
+    s.prompt('a', 'm1')
+    s.enqueued('a', 'm1', 'user')
+    s.started('a')
+    s.delivered('a', 'm1')
+    s.request('a')
+    const {model} = replay(s.out, {limits: {...limits, rootInactivityMs: 1_000_000}, flush: false})
+
+    // #when a long time passes
+    model.observe({kind: 'tick', at: lastAt(s.out) + 100_000})
+
+    // #then it is still running
+    expect(model.stats()).toMatchObject({sessions: 1, openTraces: 1})
+  })
+
+  it('never forgets a session whose execution has started, though nothing else is open', () => {
+    // #given a started execution with no request, no tool and no trace-level activity afterwards
+    const s = script()
+    s.prompt('a', 'm1')
+    s.enqueued('a', 'm1', 'user')
+    s.started('a')
+    s.delivered('a', 'm1')
+    const {model} = replay(s.out, {limits: {...limits, rootInactivityMs: 1_000_000}, flush: false})
+
+    // #when a long time passes
+    model.observe({kind: 'tick', at: lastAt(s.out) + 100_000})
+
+    // #then it is still there
+    expect(model.stats()).toMatchObject({sessions: 1, openTraces: 1})
+  })
+
+  it('keeps at most the idle bound of sessions, forgetting the least recently active first', () => {
+    // #given five idle sessions, a to e, one more recent than the last
+    const s = script()
+    for (const [index, session] of ['a', 'b', 'c', 'd', 'e'].entries()) {
+      s.at(index * 10)
+      queue(s, session, session)
+    }
+
+    // #when
+    const {model} = replay(s.out, {limits, flush: false})
+
+    // #then three remain, and the two oldest were handed back
+    expect(model.stats().sessions).toBe(3)
+    expect(model.takeDiscarded()).toHaveLength(2)
+  })
+
+  it('does not count a running session against the idle bound, and never evicts it', () => {
+    // #given one running session and four idle ones
+    const s = script()
+    s.prompt('run', 'mr')
+    s.enqueued('run', 'mr', 'user')
+    s.started('run')
+    s.delivered('run', 'mr')
+    s.request('run')
+    for (const session of ['a', 'b', 'c', 'd']) queue(s, session, session)
+
+    // #when
+    const {model} = replay(s.out, {limits: {...limits, rootInactivityMs: 1_000_000}, flush: false})
+
+    // #then the running one and three idle ones are there
+    expect(model.stats()).toMatchObject({sessions: 4, openTraces: 1})
+  })
+
+  it('bounds the prompts one idle session holds, dropping the oldest and handing back its snapshot', () => {
+    // #given three prompts queued for one session with a bound of two
+    const s = script()
+    const first = queue(s, 'a', '1')
+    queue(s, 'a', '2')
+    queue(s, 'a', '3')
+
+    // #when
+    const {model} = replay(s.out, {limits, flush: false})
+
+    // #then the oldest is gone and was handed back
+    expect(model.takeDiscarded()).toContain(first)
+  })
+
+  it('starts a clean turn for a session that was forgotten and then runs', () => {
+    // #given a forgotten session, then a normal turn for the same id
+    const s = script()
+    queue(s, 'a', '1')
+    s.tick(5_000)
+    s.at(6_000)
+    s.turn('a', '2')
+
+    // #when
+    const {records, model} = replay(s.out, {limits})
+
+    // #then the turn is traced from its own prompt, and nothing is left
+    expect(roots(records)).toHaveLength(1)
+    expect(model.stats().sessions).toBe(0)
+  })
+
+  it('hands back everything it holds at flush', () => {
+    // #given an idle session holding a prompt
+    const s = script()
+    const content = queue(s, 'a', '1')
+    const {model} = replay(s.out, {limits})
+
+    // #then flush released it
+    expect(model.takeDiscarded()).toContain(content)
+    expect(model.stats().sessions).toBe(0)
   })
 })
