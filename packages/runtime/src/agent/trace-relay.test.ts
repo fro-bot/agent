@@ -1,3 +1,4 @@
+import type {ServerResponse} from 'node:http'
 import type {TraceRelayLimits} from './trace-relay-wire.js'
 import type {TraceRelayServer} from './trace-relay.js'
 import {Buffer} from 'node:buffer'
@@ -739,5 +740,193 @@ describe('startTraceRelay: the plugin counts header', () => {
     await postBatch(relay.port, {method: 'GET', body: '', ...withCounts('exported=1;dropped=2')})
 
     expect(relay.pluginCounts()).toBeNull()
+  })
+})
+
+interface SlowUpstream {
+  readonly upstream: Awaited<ReturnType<typeof startHttpUpstream>>
+  /** Requests the collector holds open right now, and the most it ever held at once. */
+  readonly open: () => number
+  readonly maxOpen: () => number
+  /** Answers every request still held. */
+  readonly release: (status: number) => void
+}
+
+async function slowUpstream(): Promise<SlowUpstream> {
+  let open = 0
+  let maxOpen = 0
+  const held: ServerResponse[] = []
+  const upstream = await startHttpUpstream((_request, res) => {
+    open++
+    maxOpen = Math.max(maxOpen, open)
+    held.push(res)
+    res.once('close', () => {
+      open--
+    })
+  })
+  cleanups.push(upstream.close)
+  return {
+    upstream,
+    open: () => open,
+    maxOpen: () => maxOpen,
+    release: status => {
+      for (const res of held.splice(0)) {
+        res.writeHead(status, {'content-length': 0})
+        res.end()
+      }
+    },
+  }
+}
+
+const EMPTY_POST =
+  'POST /v1/traces HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-protobuf\r\nContent-Length: 0\r\n\r\n'
+
+describe('startTraceRelay: forward limits', () => {
+  it('never holds more upstream requests than the forward cap when senders post empty batches and disconnect', async () => {
+    // #given a collector that never answers, a cap of 3 forwards, and room for plenty of inbound connections
+    const slow = await slowUpstream()
+    const relay = await relayFor(`${slow.upstream.origin}/v1/traces`, {
+      limits: {maxConnections: 64, maxConcurrentForwards: 3, upstreamTimeoutMs: 30_000},
+    })
+
+    // #when sixty senders each post an empty batch and disconnect
+    await Promise.all(Array.from({length: 60}, async () => rawExchange(relay.port, EMPTY_POST, {waitMs: 150})))
+
+    // #then the collector never held more than the cap, and what was held is torn down once its sender left
+    expect(slow.maxOpen()).toBeGreaterThan(0)
+    expect(slow.maxOpen()).toBeLessThanOrEqual(3)
+    await vi.waitFor(() => expect(slow.open()).toBe(0), {timeout: 2000})
+  })
+
+  it('refuses batches past the cap locally with the final dropped status, so the exporter does not retry them', async () => {
+    // #given a cap of 2 and a collector that holds both of them
+    const slow = await slowUpstream()
+    const relay = await relayFor(`${slow.upstream.origin}/v1/traces`, {
+      limits: {maxConcurrentForwards: 2, upstreamTimeoutMs: 30_000},
+    })
+
+    // #when six senders stay connected
+    const posts = Array.from({length: 6}, async () => postBatch(relay.port))
+    await vi.waitFor(() => expect(relay.counts().dropped).toBe(4), {timeout: 2000})
+    slow.release(200)
+    const statuses = (await Promise.all(posts)).map(answer => answer.status).sort((a, b) => a - b)
+
+    // #then four were refused at once with 422 (final, never 503), and the two forwarded were delivered
+    expect(statuses).toEqual([200, 200, 422, 422, 422, 422])
+    expect(slow.maxOpen()).toBe(2)
+    expect(relay.counts()).toEqual({delivered: 2, retry: 0, dropped: 4})
+  })
+
+  it('refuses a batch past the cap from its headers alone, without waiting for a body', async () => {
+    // #given the one allowed forward is held by the collector
+    const slow = await slowUpstream()
+    const relay = await relayFor(`${slow.upstream.origin}/v1/traces`, {
+      limits: {maxConcurrentForwards: 1, upstreamTimeoutMs: 30_000},
+    })
+    const holder = net.connect({host: '127.0.0.1', port: relay.port})
+    holder.on('error', () => undefined)
+    cleanups.push(async () => {
+      holder.destroy()
+    })
+    await new Promise<void>(resolve => holder.once('connect', resolve))
+    holder.write(EMPTY_POST)
+    await vi.waitFor(() => expect(slow.open()).toBe(1), {timeout: 2000})
+
+    // #when another sender declares a body and sends none of it
+    const exchange = await rawExchange(
+      relay.port,
+      'POST /v1/traces HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-protobuf\r\nContent-Length: 100\r\n\r\n',
+      {waitMs: 800},
+    )
+
+    // #then it was answered at once with the final status
+    expect(exchange.status).toBe(422)
+  })
+
+  it('checks the cap again when a body finishes, because other batches may have started meanwhile', async () => {
+    // #given a sender that has sent part of its body, while the one allowed forward is taken by another
+    const slow = await slowUpstream()
+    const relay = await relayFor(`${slow.upstream.origin}/v1/traces`, {
+      limits: {maxConcurrentForwards: 1, upstreamTimeoutMs: 30_000},
+    })
+    const slowSender = net.connect({host: '127.0.0.1', port: relay.port})
+    slowSender.on('error', () => undefined)
+    let reply = ''
+    slowSender.on('data', chunk => {
+      reply += chunk.toString('latin1')
+    })
+    cleanups.push(async () => {
+      slowSender.destroy()
+    })
+    await new Promise<void>(resolve => slowSender.once('connect', resolve))
+    slowSender.write(
+      'POST /v1/traces HTTP/1.1\r\nHost: x\r\nContent-Type: application/x-protobuf\r\nContent-Length: 4\r\n\r\nab',
+    )
+    const holder = net.connect({host: '127.0.0.1', port: relay.port})
+    holder.on('error', () => undefined)
+    cleanups.push(async () => {
+      holder.destroy()
+    })
+    await new Promise<void>(resolve => holder.once('connect', resolve))
+    holder.write(EMPTY_POST)
+    await vi.waitFor(() => expect(slow.open()).toBe(1), {timeout: 2000})
+
+    // #when the slow sender finishes its body
+    slowSender.write('cd')
+
+    // #then it is refused, and the collector still holds only one request
+    await vi.waitFor(() => expect(reply).toMatch(/^HTTP\/1\.1 422/), {timeout: 2000})
+    expect(slow.maxOpen()).toBe(1)
+  })
+
+  it('destroys the upstream request, and counts it as retry, when its sender disconnects before the answer', async () => {
+    const slow = await slowUpstream()
+    const relay = await relayFor(`${slow.upstream.origin}/v1/traces`, {limits: {upstreamTimeoutMs: 30_000}})
+    const socket = net.connect({host: '127.0.0.1', port: relay.port})
+    socket.on('error', () => undefined)
+    await new Promise<void>(resolve => socket.once('connect', resolve))
+    socket.write(EMPTY_POST)
+    await vi.waitFor(() => expect(slow.open()).toBe(1), {timeout: 2000})
+
+    socket.destroy()
+
+    await vi.waitFor(() => expect(slow.open()).toBe(0), {timeout: 2000})
+    await vi.waitFor(() => expect(relay.counts()).toEqual({delivered: 0, retry: 1, dropped: 0}), {timeout: 2000})
+  })
+
+  it('refuses every batch past the per-run batch count, even empty ones', async () => {
+    const upstream = await upstreamAnswering(200)
+    const relay = await relayFor(`${upstream.origin}/v1/traces`, {limits: {maxBatches: 2}})
+
+    const statuses: number[] = []
+    for (let i = 0; i < 4; i++) statuses.push((await postBatch(relay.port, {body: ''})).status)
+
+    expect(statuses).toEqual([200, 200, 422, 422])
+    expect(upstream.requests).toHaveLength(2)
+    expect(relay.counts()).toEqual({delivered: 2, retry: 0, dropped: 2})
+  })
+})
+
+describe('startTraceRelay: close', () => {
+  it('is one close: a second call waits for the first and both report the final counts, in-flight forwards included', async () => {
+    // #given a forward that is still waiting on the collector
+    const slow = await slowUpstream()
+    const started = await startTraceRelay({
+      url: `${slow.upstream.origin}/v1/traces`,
+      headers: [],
+      limits: {upstreamTimeoutMs: 30_000},
+    })
+    if (!started.success) throw new Error('fixture')
+    const relay = started.data
+    const waiting = postBatch(relay.port).catch(() => undefined)
+    await vi.waitFor(() => expect(slow.open()).toBe(1), {timeout: 2000})
+
+    // #when close is called twice at once
+    const [first, second] = await Promise.all([relay.close(), relay.close()])
+    await waiting
+
+    // #then neither returned before the cut-off forward was counted
+    expect(first).toEqual({delivered: 0, retry: 1, dropped: 0})
+    expect(second).toEqual(first)
   })
 })

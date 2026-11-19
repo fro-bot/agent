@@ -41,7 +41,10 @@ import {
  * 4. Nothing of the upstream's response reaches the sender but the fixed status: no body, no header. A `retry-after` is
  *    never forwarded, so the collector cannot stall the sender's exporter.
  * 5. Request size is refused from the declared length before anything is buffered, a total per run is enforced, and slow
- *    senders and a slow collector are cut off by timeouts.
+ *    senders and a slow collector are cut off by timeouts. Upstream requests in flight are capped on their own, and so is
+ *    the number of batches per run, because an empty batch costs no bytes and a sender that disconnects frees its inbound
+ *    connection while its forward runs on. A batch past either cap is refused locally with the final dropped status (a
+ *    retryable one would be sent again), and a forward whose sender went away is aborted.
  * 6. The request goes out through `https.request` (or `http.request` for a loopback collector), never `fetch`.
  */
 
@@ -70,6 +73,9 @@ export const DEFAULT_TRACE_RELAY_LIMITS: TraceRelayLimits = {
   maxRequestBodyBytes: 16 * 1024 * 1024,
   maxTotalBytes: 256 * 1024 * 1024,
   maxConnections: 32,
+  maxConcurrentForwards: 8,
+  // At one batch a second a six-hour run sends about 22,000; this stops a zero-byte flood the byte caps cannot see.
+  maxBatches: 50_000,
   headersTimeoutMs: 10_000,
   requestTimeoutMs: 30_000,
   connectTimeoutMs: 5000,
@@ -79,6 +85,9 @@ export const DEFAULT_TRACE_RELAY_LIMITS: TraceRelayLimits = {
 }
 
 const LOOPBACK = '127.0.0.1'
+
+/** Longest `close` waits for cut-off forwards to be counted. They settle within ticks; this only bounds a bug. */
+const CLOSE_SETTLE_BOUND_MS = 1000
 
 /** Longest a refused socket may take to flush its answer before it is destroyed. */
 const REJECT_FLUSH_BOUND_MS = 2000
@@ -139,7 +148,11 @@ export async function startTraceRelay(options: StartTraceRelayOptions): Promise<
   const counts = {delivered: 0, retry: 0, dropped: 0}
   let totalBytes = 0
   let pluginCounts: TraceRelayPluginCounts | null = null
-  let closing = false
+  // Forwards running, forwards ever started, and who is waiting for the running ones to finish (close).
+  let activeForwards = 0
+  let forwardsStarted = 0
+  const idleWaiters: (() => void)[] = []
+  let closed: Promise<TraceRelayBatchCounts> | undefined
 
   const snapshot = (): TraceRelayBatchCounts => ({...counts})
 
@@ -162,8 +175,17 @@ export async function startTraceRelay(options: StartTraceRelayOptions): Promise<
   }
 
   /** Sends one batch to the collector and says how it went. Never rejects. */
-  const forward = async (body: Buffer, mediaType: string, encoding: 'gzip' | null): Promise<Outcome> =>
+  const forward = async (
+    body: Buffer,
+    mediaType: string,
+    encoding: 'gzip' | null,
+    senderGone: AbortSignal,
+  ): Promise<Outcome> =>
     new Promise<Outcome>(resolve => {
+      if (senderGone.aborted) {
+        resolve('retry')
+        return
+      }
       let settled = false
       let connectTimer: ReturnType<typeof setTimeout> | undefined
       let upstreamTimer: ReturnType<typeof setTimeout> | undefined
@@ -200,6 +222,8 @@ export async function startTraceRelay(options: StartTraceRelayOptions): Promise<
       })
       inflight.add(request)
       const started = request
+      // A sender that went away before the answer takes its upstream request with it: nothing is waiting for the result.
+      senderGone.addEventListener('abort', () => abandon('retry'), {once: true})
       started.once('close', () => inflight.delete(started))
       connectTimer = setTimeout(() => abandon('retry'), limits.connectTimeoutMs)
       upstreamTimer = setTimeout(() => abandon('retry'), limits.upstreamTimeoutMs)
@@ -226,6 +250,9 @@ export async function startTraceRelay(options: StartTraceRelayOptions): Promise<
       started.end(body)
     })
 
+  const atForwardLimit = (): boolean =>
+    forwardsStarted >= limits.maxBatches || activeForwards >= limits.maxConcurrentForwards
+
   const handle = (req: IncomingMessage, res: ServerResponse): void => {
     if (req.headers.upgrade !== undefined) return refuse(res, 404, false)
 
@@ -239,6 +266,9 @@ export async function startTraceRelay(options: StartTraceRelayOptions): Promise<
     // From here on this is a batch: a refusal below counts as a dropped one.
     // The plugin's running totals: the last valid value wins, and any other value is ignored, never a reason to refuse.
     pluginCounts = parseTraceRelayCountsHeader(req.headers[TRACE_RELAY_COUNTS_HEADER]) ?? pluginCounts
+    // Past a cap the batch is refused before anything of it is buffered. 422, not 503: the exporter retries a 503 up to five
+    // times, which would turn overload into more load.
+    if (atForwardLimit()) return refuse(res, TRACE_RELAY_STATUS.dropped, true)
     const mediaType = mediaTypeOf(req.headers['content-type'])
     const encoding = encodingOf(req.headers['content-encoding'])
     if (mediaType === undefined || encoding === 'refused') return refuse(res, 415, true)
@@ -273,10 +303,28 @@ export async function startTraceRelay(options: StartTraceRelayOptions): Promise<
     })
     req.once('end', () => {
       if (refused) return
-      forward(Buffer.concat(chunks), mediaType, encoding).then(
-        outcome => answer(res, outcome),
-        () => answer(res, 'retry'),
-      )
+      // The check above ran when the headers arrived; other batches may have started forwarding while this body was read.
+      if (atForwardLimit()) {
+        answer(res, 'dropped')
+        return
+      }
+      // The sender may have disconnected while its body was read, or may do so any time before the answer.
+      const senderGone = new AbortController()
+      if (res.destroyed) senderGone.abort()
+      res.once('close', () => {
+        if (!res.writableFinished) senderGone.abort()
+      })
+      activeForwards++
+      forwardsStarted++
+      forward(Buffer.concat(chunks), mediaType, encoding, senderGone.signal)
+        .then(
+          outcome => answer(res, outcome),
+          () => answer(res, 'retry'),
+        )
+        .finally(() => {
+          activeForwards--
+          if (activeForwards === 0) for (const wake of idleWaiters.splice(0)) wake()
+        })
     })
     // A sender that goes away mid-body has sent no batch; its socket error must not become an uncaught exception.
     req.on('error', () => undefined)
@@ -360,17 +408,30 @@ export async function startTraceRelay(options: StartTraceRelayOptions): Promise<
     address: LOOPBACK,
     counts: snapshot,
     pluginCounts: () => pluginCounts,
+    // One close: a second call gets the first's promise, so nobody reports counts before the cut-off forwards are in them.
     close: async () => {
-      if (closing) return snapshot()
-      closing = true
-      for (const request of inflight) request.destroy()
-      for (const socket of detached) socket.destroy()
-      agent.destroy()
-      await new Promise<void>(resolve => {
-        server.close(() => resolve())
-        server.closeAllConnections()
-      })
-      return snapshot()
+      closed ??= (async () => {
+        for (const request of inflight) request.destroy()
+        for (const socket of detached) socket.destroy()
+        agent.destroy()
+        await new Promise<void>(resolve => {
+          server.close(() => resolve())
+          server.closeAllConnections()
+        })
+        // Destroyed forwards settle as retry on the next ticks; wait for them to be counted, bounded in case one never does.
+        if (activeForwards > 0) {
+          let bound: ReturnType<typeof setTimeout> | undefined
+          await Promise.race([
+            new Promise<void>(resolve => idleWaiters.push(resolve)),
+            new Promise<void>(resolve => {
+              bound = setTimeout(resolve, CLOSE_SETTLE_BOUND_MS)
+            }),
+          ])
+          clearTimeout(bound)
+        }
+        return snapshot()
+      })()
+      return closed
     },
   })
 }

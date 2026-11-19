@@ -108,7 +108,10 @@ describe('trace relay header rules', () => {
 describe('parseTraceRelayConfig', () => {
   it('accepts a valid config and carries the url, the headers and the limits', () => {
     // #given a valid frame body with some limits
-    const parsed = parseTraceRelayConfig({...validConfig(), limits: {maxConnections: 4, upstreamTimeoutMs: 1500}})
+    const parsed = parseTraceRelayConfig({
+      ...validConfig(),
+      limits: {maxConnections: 4, upstreamTimeoutMs: 1500, maxConcurrentForwards: 2, maxBatches: 10},
+    })
 
     // #then it parses to the same values
     expect(parsed).toMatchObject({
@@ -119,7 +122,7 @@ describe('parseTraceRelayConfig', () => {
           {name: 'Authorization', value: CANARY},
           {name: 'x-langfuse-ingestion-version', value: '4'},
         ],
-        limits: {maxConnections: 4, upstreamTimeoutMs: 1500},
+        limits: {maxConnections: 4, upstreamTimeoutMs: 1500, maxConcurrentForwards: 2, maxBatches: 10},
       },
     })
   })

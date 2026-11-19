@@ -1,7 +1,7 @@
 import type {TraceRelayWireConfig} from './trace-relay-wire.js'
 import {Buffer} from 'node:buffer'
 import {PassThrough} from 'node:stream'
-import {afterEach, describe, expect, it} from 'vitest'
+import {afterEach, describe, expect, it, vi} from 'vitest'
 
 import {err} from '../shared/types.js'
 import {runTraceRelayChild} from './trace-relay-child.js'
@@ -326,5 +326,39 @@ describe('runTraceRelayChild: the plugin counts in the report', () => {
       /^\{"report":\{"delivered":\d+,"retry":\d+,"dropped":\d+,"plugin":\{"exportedSpans":\d{1,12},"droppedSpans":\d{1,12}\}\}\}$/,
     )
     expect(Buffer.byteLength(lines[1] ?? '')).toBeLessThan(200)
+  })
+})
+
+describe('runTraceRelayChild: shutdown', () => {
+  it('prints exactly one report, with the final counts, however many shutdown signals arrive during an in-flight forward', async () => {
+    // #given a collector that never answers and a forward in flight through the child
+    const held: {destroy: () => void}[] = []
+    const upstream = await startHttpUpstream((_request, res) => {
+      held.push(res)
+    })
+    cleanups.push(upstream.close)
+    const r = run()
+    r.stdin.write(
+      encodeTraceRelayConfig({
+        version: 1,
+        url: `${upstream.origin}/v1/traces`,
+        headers: [],
+        limits: {upstreamTimeoutMs: 30_000},
+      }),
+    )
+    const ready = JSON.parse(await r.waitForLines(1)) as {port: number}
+    const waiting = postBatch(ready.port).catch(() => undefined)
+    await vi.waitFor(() => expect(held).toHaveLength(1), {timeout: 2000})
+
+    // #when a shutdown request, then stdin ending, then another request arrive
+    r.child.requestShutdown()
+    r.stdin.end()
+    r.child.requestShutdown()
+    expect(await r.waitForExit()).toBe(0)
+    await waiting
+
+    // #then one report line with the cut-off forward counted, and one exit
+    expect(r.output()).toBe(`{"ready":true,"port":${ready.port}}\n{"report":{"delivered":0,"retry":1,"dropped":0}}\n`)
+    expect(r.exits()).toEqual([0])
   })
 })

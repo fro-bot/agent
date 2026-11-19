@@ -85,6 +85,13 @@ export interface TraceRelayLimits {
   /** Total request body bytes accepted over the relay's life. Once reached, further batches are refused. */
   readonly maxTotalBytes: number
   readonly maxConnections: number
+  /**
+   * Upstream requests in flight at once, independent of inbound connections: a sender that posts and disconnects frees its
+   * connection but not its forward. A batch past this is refused locally with the final dropped status.
+   */
+  readonly maxConcurrentForwards: number
+  /** Batches forwarded over the relay's life, whatever their size. A batch past this is refused locally, like one past a byte cap. */
+  readonly maxBatches: number
   /** For a sender to finish its request headers. */
   readonly headersTimeoutMs: number
   /** For a sender to finish its whole request. */
@@ -102,6 +109,8 @@ const LIMIT_NAMES: readonly (keyof TraceRelayLimits)[] = [
   'maxRequestBodyBytes',
   'maxTotalBytes',
   'maxConnections',
+  'maxConcurrentForwards',
+  'maxBatches',
   'headersTimeoutMs',
   'requestTimeoutMs',
   'connectTimeoutMs',

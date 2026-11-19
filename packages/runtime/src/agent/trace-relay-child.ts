@@ -69,8 +69,11 @@ export function runTraceRelayChild(io: TraceRelayChildIo, deps: TraceRelayChildD
     finish(EXIT_CODES[code], JSON.stringify({error: code}))
   }
 
+  let shuttingDown = false
   const requestShutdown = (): void => {
-    if (finished) return
+    // Stdin ending and then closing, a signal, and a caller's request all land here: the first one runs the shutdown.
+    if (finished || shuttingDown) return
+    shuttingDown = true
     const stopping = relay
     const closing = stopping?.close() ?? Promise.resolve(undefined)
     closing.then(
