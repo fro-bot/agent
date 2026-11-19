@@ -179,7 +179,9 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
         // One batch in flight is enforced here; the delegate's own limit is a second guard.
         concurrencyLimit: 1,
         compression: 'none',
-        agentFactory: httpAgentFactoryFromOptions({keepAlive: true}),
+        // Certificate validation is set here, for every https export, so a process-wide `NODE_TLS_REJECT_UNAUTHORIZED=0` cannot
+        // turn it off: the credential in a local-mode header goes only to a destination whose certificate verified.
+        agentFactory: httpAgentFactoryFromOptions({keepAlive: true, rejectUnauthorized: true}),
       },
       JsonTraceSerializer,
     ),

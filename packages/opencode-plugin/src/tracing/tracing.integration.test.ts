@@ -21,6 +21,7 @@ import {
   startFakeProvider,
   startOpenCodeServer,
   startOtlpSink,
+  startTlsSink,
 } from '../integration.fixture.js'
 import {TRACING_LAUNCHER_ENV, userSettingsFilePath} from './settings.js'
 import {
@@ -75,6 +76,8 @@ interface HarnessOptions {
   readonly sink?: OtlpSinkOptions
   /** Use this URL instead of the sink's (for a refused connection). */
   readonly localMode?: boolean
+  /** Plain `opencode serve`, not `--stdio`. */
+  readonly plain?: boolean
   readonly beforeStart?: (sandbox: SandboxPaths, sink: OtlpSink) => void
   readonly config?: Record<string, unknown>
 }
@@ -94,6 +97,7 @@ async function harness(options: HarnessOptions): Promise<Harness> {
     providerBaseURL: provider.baseURL,
     env: options.env?.(sink.url, sandbox) ?? launcherOn(sink.url),
     ...(options.localMode === true ? {localMode: true} : {}),
+    ...(options.plain === true ? {plain: true} : {}),
     ...(options.config === undefined ? {} : {config: options.config}),
   })
   let stopped = false
@@ -505,6 +509,113 @@ describe.skipIf(!runnable)('tracing in a real opencode V2', () => {
       expect(h.server.stderr()).toMatch(/tracing stopped, exported [1-9]\d* spans/)
     })
   }, 90_000)
+
+  it('refuses an untrusted https certificate in the compiled host, with certificate validation switched off in the environment', async () => {
+    // #given a collector over https with a self-signed certificate, a local-mode file pointing at it, and the process-wide switch off
+    const tls = await startTlsSink()
+    if (tls === undefined) return
+    try {
+      await run(
+        {
+          steps: [{all: ['V-ONE'], text: 'tls answer'}],
+          // Plain serve: `serve --stdio` is treated as embedded, so a local file would not apply there.
+          plain: true,
+          env: () => ({NODE_TLS_REJECT_UNAUTHORIZED: '0'}),
+          beforeStart: sandbox => {
+            const file = userSettingsFilePath({XDG_CONFIG_HOME: path.join(sandbox.home, 'config')})
+            mkdirSync(path.dirname(file), {recursive: true})
+            writeFileSync(
+              file,
+              JSON.stringify({
+                version: 1,
+                endpoint: tls.url,
+                hosts: [os.hostname()],
+                headers: {authorization: 'Basic never-sent'},
+              }),
+              {mode: 0o600},
+            )
+          },
+        },
+        async h => {
+          const session = await h.session()
+
+          // #when a turn runs and the server stops
+          await prompt(h.api, session, 'V-ONE hello')
+          await sleep(4_000)
+          await h.server.stop()
+
+          // #then no request, no header and no body reached the collector, no handshake completed, and the spans were counted dropped
+          expect(tls.requests).toEqual([])
+          expect(tls.handshakes()).toBe(0)
+          expect(h.server.stderr()).toMatch(/tracing stopped, exported 0 spans, dropped [1-9]/)
+        },
+      )
+    } finally {
+      await tls.stop()
+    }
+  }, 120_000)
+
+  describe('the user file in a plain `opencode serve`', () => {
+    const writeFor = (hosts: string[]) => (sandbox: SandboxPaths, sink: OtlpSink) => {
+      const file = userSettingsFilePath({XDG_CONFIG_HOME: path.join(sandbox.home, 'config')})
+      mkdirSync(path.dirname(file), {recursive: true})
+      writeFileSync(file, JSON.stringify({version: 1, endpoint: sink.url, hosts}), {mode: 0o600})
+    }
+
+    it('exports a traced turn when the file names this machine, with no launcher variable and no headless marker', async () => {
+      // #given a user a file naming this machine, a plain serve (not stdio), and nothing that marks it headless
+      await run(
+        {
+          steps: [{all: ['P-ONE'], text: 'plain answer'}],
+          plain: true,
+          env: () => ({}),
+          beforeStart: writeFor([os.hostname()]),
+        },
+        async h => {
+          const session = await h.session()
+
+          // #when a turn runs
+          await prompt(h.api, session, 'P-ONE hello')
+          await waitUntil('the root span', () => h.spans().some(isRoot), 60_000)
+          const stopped = await h.server.stop()
+
+          // #then the trace reached the sink and the server left on SIGTERM
+          const spans = h.spans()
+          expect(spans.some(isRoot)).toBe(true)
+          expect(spans.some(span => span.attrs['gen_ai.operation.name'] === 'chat')).toBe(true)
+          expect(spans.every(span => span.attrs['fro_bot.repository'] === undefined)).toBe(true)
+          expect(stopped.exitedOnItsOwn).toBe(true)
+        },
+      )
+    }, 120_000)
+
+    it('sends nothing when the file names another machine, and logs nothing about it', async () => {
+      // #given the same, naming a machine that is not this one
+      await run(
+        {
+          steps: [{all: ['P-TWO'], text: 'plain answer'}],
+          plain: true,
+          env: () => ({}),
+          beforeStart: writeFor(['some-other-machine.invalid']),
+        },
+        async h => {
+          const session = await h.session()
+
+          // #when a turn runs to its end
+          await prompt(h.api, session, 'P-TWO hello')
+          // The same wait the other cases use: long enough for the turn to finish and for any export to have happened.
+          await sleep(5_000)
+          const answered = JSON.stringify(await idleMessages(h.api, session))
+          await h.server.stop()
+          expect(answered).toContain('plain answer')
+
+          // #then nothing reached the sink, and the plugin said nothing about tracing
+          expect(h.sink.requests).toEqual([])
+          expect(h.server.stderr()).not.toMatch(/tracing/)
+        },
+      )
+    }, 120_000)
+  })
 
   it('stays off in a server started with `serve` that shows no headless marker, whatever a user file says', async () => {
     // #given a server whose plugin sees neither OPENCODE_PASSWORD nor OPENCODE_CONFIG_CONTENT (the stdio server deletes

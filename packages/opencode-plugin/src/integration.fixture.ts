@@ -1,10 +1,11 @@
 /** Harness for `integration.test.ts`: a scripted OpenAI-compatible provider and a real `opencode serve --stdio` process. */
 
 import {Buffer} from 'node:buffer'
-import {spawn} from 'node:child_process'
+import {execFileSync, spawn} from 'node:child_process'
 import {randomBytes} from 'node:crypto'
-import {mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync} from 'node:fs'
+import {mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync} from 'node:fs'
 import {createServer} from 'node:http'
+import {createServer as createHttpsServer} from 'node:https'
 import {tmpdir} from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
@@ -269,6 +270,106 @@ export async function startOtlpSink(options: OtlpSinkOptions = {}): Promise<Otlp
   }
 }
 
+export interface TlsSink {
+  /** The full traces URL over https, for example `https://127.0.0.1:4318/v1/traces`. */
+  readonly url: string
+  /** HTTP requests that got through TLS. A client that refuses the certificate never produces one. */
+  readonly requests: SinkRequest[]
+  /** TCP connections accepted, and TLS handshakes that completed or were refused by the client. */
+  readonly connections: () => number
+  readonly handshakes: () => number
+  readonly tlsErrors: () => number
+  readonly stop: () => Promise<void>
+}
+
+/**
+ * A loopback HTTPS collector with a self-signed certificate nothing trusts, made with `openssl` at run time (no key is
+ * committed). Undefined when `openssl` is not available. A client that validates certificates refuses it.
+ */
+export async function startTlsSink(options: OtlpSinkOptions = {}): Promise<TlsSink | undefined> {
+  const dir = mkdtempSync(path.join(tmpdir(), 'tls-sink-'))
+  const keyFile = path.join(dir, 'key.pem')
+  const certFile = path.join(dir, 'cert.pem')
+  try {
+    execFileSync(
+      'openssl',
+      [
+        'req',
+        '-x509',
+        '-newkey',
+        'rsa:2048',
+        '-nodes',
+        '-keyout',
+        keyFile,
+        '-out',
+        certFile,
+        '-days',
+        '2',
+        '-subj',
+        '/CN=127.0.0.1',
+        '-addext',
+        'subjectAltName=IP:127.0.0.1',
+      ],
+      {stdio: 'ignore'},
+    )
+  } catch {
+    rmSync(dir, {recursive: true, force: true})
+    return undefined
+  }
+  const requests: SinkRequest[] = []
+  let connections = 0
+  let handshakes = 0
+  let tlsErrors = 0
+  let count = 0
+  const server = createHttpsServer({key: readFileSync(keyFile), cert: readFileSync(certFile)}, (req, res) => {
+    const chunks: Buffer[] = []
+    req.on('data', (chunk: Buffer) => chunks.push(chunk))
+    req.on('end', () => {
+      const text = Buffer.concat(chunks).toString('utf8')
+      count += 1
+      const seen = {
+        method: req.method ?? '',
+        path: req.url ?? '',
+        contentType: req.headers['content-type'] ?? '',
+        headers: {...req.headers},
+        body: text,
+        text,
+      }
+      const answer = options.respond?.(count, seen) ?? {status: 200, body: '{}'}
+      requests.push({...seen, status: answer.status})
+      res.writeHead(answer.status, {'content-type': 'application/json'})
+      res.end(answer.body ?? '{}')
+    })
+  })
+  server.on('connection', () => {
+    connections += 1
+  })
+  server.on('secureConnection', () => {
+    handshakes += 1
+  })
+  server.on('tlsClientError', () => {
+    tlsErrors += 1
+  })
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  if (address == null || typeof address === 'string') throw new Error('TLS sink did not bind a TCP port')
+  return {
+    url: `https://127.0.0.1:${address.port}/v1/traces`,
+    requests,
+    connections: () => connections,
+    handshakes: () => handshakes,
+    tlsErrors: () => tlsErrors,
+    stop: async () =>
+      new Promise<void>(resolve => {
+        server.closeAllConnections()
+        server.close(() => {
+          rmSync(dir, {recursive: true, force: true})
+          resolve()
+        })
+      }),
+  }
+}
+
 export interface RunningServer {
   readonly url: string
   /** What the server wrote to stderr so far (the last 64 KiB). */
@@ -326,6 +427,12 @@ export async function startOpenCodeServer(options: {
    * the process environment before any plugin loads (measured on 2.3.2). The command line still says `serve`.
    */
   readonly localMode?: boolean
+  /**
+   * Start plain `opencode serve` on a loopback port, not `serve --stdio`: what a user runs by hand. It implies `localMode`.
+   * Its password stays in `OPENCODE_SERVER_PASSWORD` (only `--stdio` deletes it), which is not a headless marker. It has no
+   * stdin protocol, so `stop` sends SIGTERM instead of closing stdin.
+   */
+  readonly plain?: boolean
 }): Promise<RunningServer> {
   const {binary, sandbox, pluginDir, providerBaseURL} = options
   const password = randomBytes(24).toString('base64url')
@@ -346,33 +453,39 @@ export async function startOpenCodeServer(options: {
     ...options.config,
   }
 
-  if (options.localMode === true) {
+  const plain = options.plain === true
+  const localMode = options.localMode === true || plain
+  if (localMode) {
     const configDir = path.join(sandbox.home, 'config', 'opencode')
     mkdirSync(configDir, {recursive: true})
     writeFileSync(path.join(configDir, 'opencode.json'), JSON.stringify(config))
   }
 
-  const child = spawn(binary, ['serve', '--stdio', '--port', '0'], {
-    cwd: sandbox.repo,
-    detached: true,
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: {
-      PATH: '/usr/bin:/bin:/usr/sbin:/sbin',
-      HOME: sandbox.home,
-      XDG_CONFIG_HOME: path.join(sandbox.home, 'config'),
-      XDG_DATA_HOME: path.join(sandbox.home, 'data'),
-      XDG_CACHE_HOME: path.join(sandbox.home, 'cache'),
-      XDG_STATE_HOME: path.join(sandbox.home, 'state'),
-      TMPDIR: sandbox.root,
-      OPENCODE_DISABLE_AUTOUPDATE: '1',
-      OPENCODE_DISABLE_MODELS_FETCH: '1',
-      OPENCODE_DISABLE_PROJECT_CONFIG: '1',
-      ...(options.localMode === true
-        ? {OPENCODE_SERVER_PASSWORD: password}
-        : {OPENCODE_PASSWORD: password, OPENCODE_CONFIG_CONTENT: JSON.stringify(config)}),
-      ...options.env,
+  const child = spawn(
+    binary,
+    plain ? ['serve', '--hostname', '127.0.0.1', '--port', '0'] : ['serve', '--stdio', '--port', '0'],
+    {
+      cwd: sandbox.repo,
+      detached: true,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: {
+        PATH: '/usr/bin:/bin:/usr/sbin:/sbin',
+        HOME: sandbox.home,
+        XDG_CONFIG_HOME: path.join(sandbox.home, 'config'),
+        XDG_DATA_HOME: path.join(sandbox.home, 'data'),
+        XDG_CACHE_HOME: path.join(sandbox.home, 'cache'),
+        XDG_STATE_HOME: path.join(sandbox.home, 'state'),
+        TMPDIR: sandbox.root,
+        OPENCODE_DISABLE_AUTOUPDATE: '1',
+        OPENCODE_DISABLE_MODELS_FETCH: '1',
+        OPENCODE_DISABLE_PROJECT_CONFIG: '1',
+        ...(localMode
+          ? {OPENCODE_SERVER_PASSWORD: password}
+          : {OPENCODE_PASSWORD: password, OPENCODE_CONFIG_CONTENT: JSON.stringify(config)}),
+        ...options.env,
+      },
     },
-  })
+  )
 
   let stderrText = ''
   child.stderr.on('data', (chunk: Buffer) => {
@@ -397,6 +510,13 @@ export async function startOpenCodeServer(options: {
     child.stdout.on('data', (chunk: Buffer) => {
       buffered += chunk.toString('utf8')
       for (const line of buffered.split('\n')) {
+        // Plain `serve` prints `server listening on <url>`; `serve --stdio` prints a JSON line.
+        const listening = /^server listening on (http:\/\/\S+)/.exec(line)
+        if (listening?.[1] !== undefined) {
+          clearTimeout(timer)
+          resolve(listening[1])
+          return
+        }
         try {
           const parsed = JSON.parse(line) as {url?: unknown}
           if (typeof parsed.url === 'string') {
@@ -440,7 +560,8 @@ export async function startOpenCodeServer(options: {
     },
     stop: async () => {
       const started = Date.now()
-      child.stdin.end()
+      if (plain) killGroup('SIGTERM')
+      else child.stdin.end()
       const winner = await Promise.race([
         exited.then(() => 'exited' as const),
         new Promise<'timeout'>(resolve => setTimeout(() => resolve('timeout'), EXIT_TIMEOUT_MS)),

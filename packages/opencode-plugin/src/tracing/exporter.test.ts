@@ -3,7 +3,7 @@ import type {SpanExporter, SpanExporterOptions} from './exporter.js'
 
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
-import {startOtlpSink, type OtlpSink, type SinkRequest} from '../integration.fixture.js'
+import {startOtlpSink, startTlsSink, type OtlpSink, type SinkRequest} from '../integration.fixture.js'
 import {scrubbedBrand} from './content.js'
 import {
   createSpanExporter,
@@ -342,6 +342,33 @@ describe('retry and refusal against the relay’s three answers', () => {
     expect(counts).toEqual({exported: 30, dropped: 0})
     expect(target.accepted().length).toBeGreaterThanOrEqual(15)
   }, 15_000)
+})
+
+describe('certificate validation', () => {
+  it.each([[undefined], ['0']])(
+    'refuses an untrusted certificate and sends nothing, with NODE_TLS_REJECT_UNAUTHORIZED=%s, and counts the batch dropped',
+    async setting => {
+      // #given an https destination with a self-signed certificate, and the process-wide switch that turns validation off
+      const target = await startTlsSink()
+      if (target === undefined) return
+      try {
+        if (setting !== undefined) vi.stubEnv('NODE_TLS_REJECT_UNAUTHORIZED', setting)
+        const exporter = exporterFor({url: target.url, headers: {authorization: 'Basic credential-never-sent'}})
+        exporter.export(span())
+
+        // #when the batch is exported
+        const counts = await exporter.close(3_000)
+
+        // #then no HTTP request reached the sink (so no body and no header), the handshake was refused, and the span is dropped
+        expect(target.requests).toEqual([])
+        expect(target.handshakes()).toBe(0)
+        expect(counts).toEqual({exported: 0, dropped: 1})
+      } finally {
+        await target.stop()
+      }
+    },
+    20_000,
+  )
 })
 
 describe('redirects', () => {
