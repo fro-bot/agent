@@ -3,6 +3,8 @@
 import type {Plugin} from '@opencode/plugin'
 import type {PluginSessionApi} from './session-client.js'
 import type {ToolCallBefore} from './task-reuse-guard.js'
+import process from 'node:process'
+import {logPluginLine} from './log.js'
 import {createPluginSessionClient} from './session-client.js'
 import {createSessionTools} from './session-tools.js'
 import {rejectSubagentReuse} from './task-reuse-guard.js'
@@ -17,6 +19,23 @@ export interface HostSurface {
   readonly tool: {
     transform: (callback: (editor: Pick<ToolEditor, 'add'>) => void) => Promise<unknown>
     hook: (name: 'execute.before', callback: (event: ToolCallBefore) => Promise<void> | void) => Promise<unknown>
+  }
+}
+
+/** Feasibility-stage switch: a traces URL turns the tracing stub on. Replaced by real settings resolution. */
+const TRACING_STUB_URL_ENV = 'OPENCODE_FROBOT_TRACING_STUB_URL'
+
+/**
+ * The only way into the tracing chunk. With the switch off the `import()` never runs, so the chunk and the SDK inside it
+ * are never evaluated. Any failure leaves the plugin exactly as it was.
+ */
+async function runTracingStub(url: string): Promise<void> {
+  try {
+    const tracing = await import('./tracing/index.js')
+    await tracing.exportStubSpan({url})
+  } catch (error) {
+    // Tracing must never fail the plugin. The line names the failure class only: an error message can carry a path or URL.
+    logPluginLine(`tracing could not start (${error instanceof Error ? error.name : 'unknown error'})`)
   }
 }
 
@@ -43,4 +62,6 @@ export async function setupFroBotPlugin(host: HostSurface): Promise<void> {
       editor.add(tool)
     }
   })
+  const stubUrl = process.env[TRACING_STUB_URL_ENV]
+  if (stubUrl != null && stubUrl.length > 0) await runTracingStub(stubUrl)
 }
