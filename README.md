@@ -72,7 +72,10 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
+          model: anthropic/claude-sonnet-4-6
 ```
+
+`model` picks the provider and model the run uses, so it must name a provider you put in the secret. Leave it out and the run uses `opencode/big-pickle`, a free model that needs no credentials, whatever the secret holds. To try the Action with no provider account, pass `auth-json: '{}'` and no `model`.
 
 ### 3. Mention the agent
 
