@@ -275,6 +275,80 @@ const isIdentifierCode = (code: number): boolean =>
   code === 0x2e ||
   code === 0x2d
 
+/** The most a bracketed value (`{...}` or `[...]`) is scanned for its balanced close. Past it, the value runs to the end of the line. */
+const MAX_STRUCTURE_VALUE_CHARS = 256 * 1024
+
+/**
+ * A value that begins with `{` or `[`, read by one forward scan to its balanced close: brackets count outside strings only, a
+ * string ends at its own closing quote, and quotes are read at the escape depth the document is written in. Returns the index
+ * after the close, or -1 when there is none within `MAX_STRUCTURE_VALUE_CHARS` or the shared `budget` (then the caller redacts
+ * to the end of the line). `budget.left` is the work all such scans of one text may do together, so a text of many
+ * unterminated openers costs a constant multiple of its length, not a scan each.
+ *
+ * Escape depth: the first quote inside the value is preceded by `r` backslashes, and `r = 2^d - 1` for a document encoded `d`
+ * times as a JSON string (0, 1, 3, 7, ...). A quote after a run `n` is a delimiter when peeling `d` layers off `n`
+ * (`n = 2m + 1` each time) leaves an even run, and an escaped quote when it leaves an odd one. A first run that is not of that
+ * form is not a document the scan can read: -1.
+ */
+function structureEnd(text: string, from: number, budget: {left: number}): number {
+  const limit = Math.min(text.length, from + MAX_STRUCTURE_VALUE_CHARS)
+  let layers = -1
+  let depth = 0
+  const layerOf = (run: number): number => {
+    for (let candidate = 0; candidate <= 4; candidate += 1) if (run === 2 ** candidate - 1) return candidate
+    return -1
+  }
+  /** Whether a quote after `run` backslashes delimits a string (true) or is escaped inside one (false); undefined: not at this depth. */
+  const delimits = (run: number): boolean | undefined => {
+    let remaining = run
+    for (let layer = 0; layer < layers; layer += 1) {
+      if (remaining % 2 === 0) return undefined
+      remaining = (remaining - 1) / 2
+    }
+    return remaining % 2 === 0
+  }
+  let index = from
+  let inString = false
+  while (index < limit) {
+    budget.left -= 1
+    if (budget.left < 0) return -1
+    const code = text.charCodeAt(index)
+    if (code === 0x5c) {
+      let run = 1
+      while (text.charCodeAt(index + run) === 0x5c) run += 1
+      if (text.charCodeAt(index + run) === 0x22) {
+        if (layers === -1) {
+          layers = layerOf(run)
+          if (layers === -1) return -1
+        }
+        const delimiter = delimits(run)
+        if (delimiter === true) inString = !inString
+        index += run + 1
+        budget.left -= run
+        continue
+      }
+      index += run
+      budget.left -= run
+      continue
+    }
+    if (code === 0x22) {
+      if (layers === -1) layers = 0
+      if (layers === 0 && delimits(0) === true) inString = !inString
+    } else if (!inString) {
+      if (code === 0x7b || code === 0x5b) depth += 1
+      else if ((code === 0x7d || code === 0x5d) && --depth === 0) return index + 1
+    }
+    index += 1
+  }
+  return -1
+}
+
+/** The end of the line `from` is on, or the end of the text. */
+function lineEnd(text: string, from: number): number {
+  const newline = text.indexOf('\n', from)
+  return newline === -1 ? text.length : newline
+}
+
 /** The most a quoted value is searched for its closing quote. Past it the value is redacted to the end of the line. */
 const MAX_QUOTED_VALUE_CHARS = 8192
 
@@ -321,6 +395,19 @@ function nameValueMatcher(): ScrubMatcher {
     id: 'name-value-pair',
     find: (text, lower, emit) => {
       if (!SECRET_NEEDLES.some(needle => lower.includes(needle))) return
+      // The work every value of this text may spend scanning for its close, all together: a text of many unterminated openers
+      // costs a constant multiple of its length, not a scan each. Once it is spent a value runs to the end of its line.
+      const budget = {left: 4 * text.length + 65_536}
+      // The next line end at or after a position, found once per line: positions only move forward.
+      let lineFrom = 0
+      let lineAt = -1
+      const endOfLine = (position: number): number => {
+        if (lineAt === -1 || position < lineFrom || position > lineAt) {
+          lineAt = lineEnd(text, position)
+          lineFrom = position
+        }
+        return lineAt
+      }
       prefix.lastIndex = 0
       for (;;) {
         const match = prefix.exec(text)
@@ -335,7 +422,15 @@ function nameValueMatcher(): ScrubMatcher {
         const counter = isCounterName(text.slice(from, match.index) + name)
 
         let valueEnd: number
-        if (opener === undefined) {
+        // Whether the end was found (a closing quote, a balanced close, a delimiter) or is the fallback, the end of the line.
+        let found = true
+        const first = text.charCodeAt(valueStart)
+        if (opener === undefined && (first === 0x7b || first === 0x5b)) {
+          // A whole object or array after a sensitive name: consumed to its balanced close, or to the end of the line.
+          const close = structureEnd(text, valueStart, budget)
+          found = close !== -1
+          valueEnd = found ? close : endOfLine(valueStart)
+        } else if (opener === undefined) {
           valueEnd = unquotedEnd(text, valueStart)
           if (SCHEME_WORD.test(text.slice(valueStart, valueEnd))) valueEnd = schemeCredentialEnd(text, valueEnd)
           const value = text.slice(valueStart, valueEnd)
@@ -343,19 +438,25 @@ function nameValueMatcher(): ScrubMatcher {
           // A counter name keeps the old floor of three characters; a credential name has none.
           if (value.length < (counter ? 3 : 1)) continue
         } else {
-          valueEnd = closingQuote(text, valueStart, opener)
+          const close = budget.left > MAX_QUOTED_VALUE_CHARS ? closingQuote(text, valueStart, opener) : -1
+          found = close !== -1
+          valueEnd = found ? close : endOfLine(valueStart)
+          budget.left -= found ? valueEnd - valueStart : MAX_QUOTED_VALUE_CHARS
           if (valueEnd === valueStart) continue
         }
         emit(valueStart, valueEnd)
-        prefix.lastIndex = Math.max(prefix.lastIndex, valueEnd)
+        // Scanning resumes after a value whose end was found. A value that ran to the end of its line did not prove where it ends:
+        // a longer value that starts inside it (one that continues on the next line) must still be found, so scanning resumes
+        // inside it.
+        prefix.lastIndex = found ? Math.max(prefix.lastIndex, valueEnd) : Math.max(prefix.lastIndex, valueStart)
       }
     },
   }
 }
 
 /**
- * Where a quoted value that starts at `from` ends: the index of its closing delimiter, or the end of the line when none is
- * found within the bound. `opener` is the quote and any backslashes before it (`"`, `'`, `\"`, `\\\"`): the run of backslashes
+ * Where a quoted value that starts at `from` ends: the index of its closing delimiter, or -1 when none is found within the
+ * bound (the caller then runs the value to the end of its line). `opener` is the quote and any backslashes before it (`"`, `'`, `\"`, `\\\"`): the run of backslashes
  * says how many layers of JSON escaping the text is in. In a layer, the delimiter is exactly that run and a quote; a quote
  * of the value itself is written with a longer run and does not close it.
  */
@@ -386,9 +487,7 @@ function closingQuote(text: string, from: number, opener: string): number {
     if (delimiterRun === 0 && code === quote) return index
     index += 1
   }
-  // Not closed within the bound: redact to the end of the line.
-  const newline = text.indexOf('\n', from)
-  return newline === -1 ? text.length : newline
+  return -1
 }
 
 /** URL userinfo: everything between `scheme://` and the `@`. */
@@ -535,6 +634,14 @@ export interface Scrubber {
   readonly scrub: (text: string) => ScrubResult
   /** The longest string `scrub` accepts; a content attribute whose serialization is longer is omitted unscanned. */
   readonly inputCeilingChars?: number
+  /**
+   * The safety net, run on every string about to be exported: whether `text` still holds one of the environment's literal
+   * secrets (raw or JSON-escaped, the set the literal matcher uses). When it does the caller withholds the whole value. A
+   * pure search of the final text: nothing it finds is fed back into the matchers. Each `true` is counted.
+   */
+  readonly survived?: (text: string) => boolean
+  /** How many values `survived` has reported so far. Normally 0: a non-zero count means a matcher missed a known literal. */
+  readonly survivalCount?: () => number
 }
 
 export interface ScrubberOptions {
@@ -604,12 +711,21 @@ export function scrubWithMatchers(
 
 export function createScrubber(options: ScrubberOptions = {}): Scrubber {
   const ceiling = options.limits?.inputCeilingChars ?? DEFAULT_CONTENT_LIMITS.inputCeilingChars
-  const matchers = [
-    ...(options.patterns ?? SCRUB_PATTERNS),
-    literalMatcher(collectLiterals(options.env ?? {}, options.extraSecrets)),
-  ]
+  const literals = collectLiterals(options.env ?? {}, options.extraSecrets)
+  const matchers = [...(options.patterns ?? SCRUB_PATTERNS), literalMatcher(literals)]
+  let survivals = 0
   return {
     inputCeilingChars: ceiling,
+    survived: text => {
+      for (const literal of literals) {
+        if (text.includes(literal)) {
+          survivals += 1
+          return true
+        }
+      }
+      return false
+    },
+    survivalCount: () => survivals,
     scrub: text => {
       if (text.length > ceiling) return {ok: false, reason: 'over-input-ceiling'}
       try {
@@ -809,6 +925,11 @@ function scrubPlain(text: string, label: string, scrubber: Scrubber, limits: Con
     return OMITTED_TEXT
   }
   tally.redactions += result.redactions
+  // The safety net: a known literal that is still here is withheld whole, never rewritten (see `Scrubber.survived`).
+  if (scrubber.survived?.(result.text) === true) {
+    tally.omitted.push(`${label}:literal-survived`)
+    return OMITTED_TEXT
+  }
   if (result.text.length <= limits.plainStringChars) return result.text
   tally.truncated.push(label)
   return cutString(result.text, limits.plainStringChars - TRUNCATION_OVERHEAD)
@@ -832,8 +953,6 @@ const MAX_KEY_CHARS = 200
 /** Nodes visited and depth reached in one structured pass. Past either, the attribute is omitted, not exported. */
 const MAX_REDACTION_NODES = 500_000
 const MAX_REDACTION_DEPTH = 64
-/** A string that is itself JSON is parsed (and re-serialized if anything in it was redacted) up to this length. */
-const MAX_EMBEDDED_JSON_CHARS = 256 * 1024
 
 /** Whether a key's value is removed whole. A counter or limit name keeps a number. */
 function isSensitiveKey(key: string, value: unknown): boolean {
@@ -870,7 +989,10 @@ function scrubLeaf(text: string, scrubber: Scrubber, walk: TreeWalk): string {
 function scrubNode(value: unknown, depth: number, scrubber: Scrubber, walk: TreeWalk): unknown {
   walk.nodes += 1
   if (walk.nodes > MAX_REDACTION_NODES || depth > MAX_REDACTION_DEPTH) throw new TreeFailure('scrub-failed')
-  if (typeof value === 'string') return scrubString(value, depth, scrubber, walk)
+  // THE INVARIANT: every string, key or value, is scrubbed from its ORIGINAL text, in full, before anything is decided about it,
+  // and what is returned is that scrubbed text (or the fixed marker): never the source, never a parse of it. A string that
+  // happens to look like JSON is just a string; whole-value redaction inside it is the name/value matcher's job.
+  if (typeof value === 'string') return scrubLeaf(value, scrubber, walk)
   if (Array.isArray(value)) return value.map(item => scrubNode(item, depth + 1, scrubber, walk))
   if (typeof value === 'object' && value !== null) {
     const copy: Record<string, unknown> = {}
@@ -891,37 +1013,11 @@ function scrubNode(value: unknown, depth: number, scrubber: Scrubber, walk: Tree
 }
 
 /**
- * A string leaf. When it holds a JSON document (a tool argument carrying one) it is parsed and walked like any other part
- * of the structure, so its sensitive keys go whole and each of its own string leaves is scrubbed from its original text; if
- * anything in it was redacted it is written back as the compact serialization of those already-scrubbed parts, and that
- * text is NOT scanned again. Otherwise (not JSON, truncated JSON, a bare string) the text matchers read the original string.
- */
-function scrubString(text: string, depth: number, scrubber: Scrubber, walk: TreeWalk): string {
-  const parsed = parseEmbeddedJson(text)
-  if (parsed === undefined) return scrubLeaf(text, scrubber, walk)
-  const before = walk.redactions
-  const inner = scrubNode(parsed, depth + 1, scrubber, walk)
-  return walk.redactions === before ? text : JSON.stringify(inner)
-}
-
-function parseEmbeddedJson(text: string): object | undefined {
-  if (text.length < 2 || text.length > MAX_EMBEDDED_JSON_CHARS) return undefined
-  const first = text.trimStart()[0]
-  if (first !== '{' && first !== '[') return undefined
-  try {
-    const parsed: unknown = JSON.parse(text)
-    return typeof parsed === 'object' && parsed !== null ? parsed : undefined
-  } catch {
-    return undefined
-  }
-}
-
-/**
- * Scrubs a structured value in ONE walk. Sensitive-named keys have their entire value replaced, whatever its type, at any
- * depth, including inside strings that hold JSON; every other string (and every key) goes through the text matchers once,
- * from its original text. The two never feed each other: a marker the walk inserts is a node of the output tree, built from
- * the original, and no matcher ever reads it, so a marker cannot hide a match or split one. The caller serializes the result
- * and does not scan that text again.
+ * Scrubs a structured value (the objects and arrays the plugin itself builds) in ONE walk. A sensitive-named key has its
+ * entire value replaced, whatever its type, without reading it; every other string and every key goes through the text
+ * matchers once, from its original text. A string that holds JSON is not parsed: it is a string. The two never feed each other:
+ * a marker the walk inserts is a node of the output tree, and no matcher ever reads it. The caller serializes the result and
+ * does not scan that text again.
  */
 export function scrubStructured(
   value: unknown,
@@ -987,6 +1083,11 @@ export function scrubSpan(
       const bounded = boundJson(parsed, Math.min(value.maxChars, Math.max(0, budget)), value.dropOldest === true)
       if (bounded === undefined) {
         tally.omitted.push(`${name}:over-budget`)
+        continue
+      }
+      // The safety net, on the exact text that would be exported.
+      if (scrubber.survived?.(bounded.json) === true) {
+        tally.omitted.push(`${name}:literal-survived`)
         continue
       }
       budget -= bounded.json.length

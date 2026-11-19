@@ -273,7 +273,7 @@ function nameValuePattern(): ScrubPattern {
           from -= 1
         const counter = isCounterName(text.slice(from, match.index) + name)
 
-        let valueEnd = valueStart
+        let valueEnd: number
         if (opener === undefined) {
           valueEnd = unquotedEnd(text, valueStart)
           // `Authorization: Bearer <credential>`: the first token is the scheme, the credential is the second.

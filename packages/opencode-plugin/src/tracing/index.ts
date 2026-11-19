@@ -9,7 +9,7 @@
 
 import type {TracingSettings} from './settings.js'
 
-import {createScrubber} from './content.js'
+import {createScrubber, type Scrubber} from './content.js'
 import {createSpanExporter} from './exporter.js'
 import {createTracePipeline} from './pipeline.js'
 import {registerObservers, type ObserverHost} from './record-observations.js'
@@ -47,6 +47,8 @@ export interface StartTracingOptions {
   readonly pending?: Partial<PendingLimits>
   /** The most of the cleanup bound the pipeline may spend on what is left. Tests lower it; production uses `DRAIN_BOUND_MS`. */
   readonly drainBoundMs?: number
+  /** Replaces the scrubber (tests that force the safety net). Production builds its own from `env`. */
+  readonly scrubber?: Scrubber
 }
 
 export async function startTracing(
@@ -56,11 +58,13 @@ export async function startTracing(
 ): Promise<TracingHandle> {
   const {log} = options
   const local = settings.host === 'local'
-  const scrubber = createScrubber({
-    env: options.env,
-    // The collector credential is a literal secret too: it must not come back in a tool result or an error message.
-    extraSecrets: local ? Object.values(settings.headers) : [],
-  })
+  const scrubber =
+    options.scrubber ??
+    createScrubber({
+      env: options.env,
+      // The collector credential is a literal secret too: it must not come back in a tool result or an error message.
+      extraSecrets: local ? Object.values(settings.headers) : [],
+    })
   const exporter = createSpanExporter({
     url: settings.endpoint,
     headers: local ? settings.headers : {},
@@ -116,7 +120,10 @@ export async function startTracing(
         }
         const {observationsDropped} = pipeline.stats()
         const lost = observationsDropped > 0 ? `, ${observationsDropped} observations lost` : ''
-        log(`tracing stopped, exported ${counts.exported} spans, dropped ${counts.dropped}${lost}`)
+        // Normally absent: a number here means a known literal got past the matchers and the safety net withheld the value.
+        const withheld = scrubber.survivalCount?.() ?? 0
+        const survived = withheld > 0 ? `, ${withheld} values withheld (literal survived)` : ''
+        log(`tracing stopped, exported ${counts.exported} spans, dropped ${counts.dropped}${lost}${survived}`)
       })()
       await stopping
     },

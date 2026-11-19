@@ -476,9 +476,10 @@ describe('passes do not interact: an earlier marker never makes a later pass ski
     const bare = withEnv.scrub(`password: ${REDACTION} next ${ENV_LITERAL}`)
 
     // #then nothing is skipped as "already redacted" (there is no such concept: the matchers see only original text), the
-    // secret beside it is gone, and the bare marker is read as a value that ends at its `]` like any other
+    // secret beside it is gone, and the bare marker (which begins with `[`) is read as an array value, balanced at its `]`, and
+    // replaced whole
     expect(quoted).toBe(`password: "${REDACTION}" and token: "${REDACTION}" and ${REDACTION}`)
-    expect(bare).toEqual({ok: true, text: `password: ${REDACTION}] next ${REDACTION}`, redactions: 2})
+    expect(bare).toEqual({ok: true, text: `password: ${REDACTION} next ${REDACTION}`, redactions: 2})
   })
 
   it('reads an unquoted value that contains marker text as the first token, up to its `]` like any other delimiter', () => {
@@ -717,6 +718,18 @@ describe('adversarial timing: growth, not a ceiling', () => {
     ],
     'name-value-pair': [
       ['dense matches, one every 19 characters', rep('password=abcdefgh ')],
+      ['a long run of openers, no close', n => `password: ${'{['.repeat(Math.ceil(n / 2))}`],
+      ['unbalanced openers, one per line', rep('password: {[ x\n')],
+      ['unbalanced openers, all on one line', rep('secret: {[ pad ')],
+      [
+        'deeply nested brackets, closed',
+        n => `password: ${'['.repeat(Math.ceil(n / 2))}${']'.repeat(Math.ceil(n / 2))}`,
+      ],
+      ['balanced objects, repeated', rep('token: {"a": [1, {"b": "c"}]} ')],
+      ['alternating quotes and backslashes after a name', rep(String.raw`password: {\"a\\"\"b `)],
+      ['quotes and backslashes inside a bracket value', n => `password: {${'"\\'.repeat(Math.ceil(n / 2))}`],
+      ['escaped layers, three deep, never closed', rep('password: {\\\\\\\\\\\\\\\"a ')],
+      ['a bracket value after every kind of name', rep('api_key: [client_secret: {authorization: [')],
       ['dense quoted matches', rep('secret: "ab cd" ')],
       ['the word alone', rep('password')],
       ['the word and 20 name chars', run('password', 'a', 20)],

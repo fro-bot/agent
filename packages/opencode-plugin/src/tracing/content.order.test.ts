@@ -43,8 +43,10 @@ const NAMES = [
 /** A multi-word literal the plugin's environment holds (the reviewer's case): spaces inside it, so a rule that reads one token cannot cover it. */
 const ENV_MULTI = join('zqxv env ', '7f3a9c21 kwjd')
 const ENV_ONE = join('kwjd-env-', 'zqxv-1d8e5b04')
-const ENV = {API_TOKEN: ENV_ONE, DB_PASSWORD: ENV_MULTI}
-const LITERALS = [ENV_ONE, ENV_MULTI]
+/** A credential that is itself a JSON document: its quotes, colons and braces are part of the literal. */
+const ENV_JSON = JSON.stringify({user: 'alice-zqxv', key: join('kwjd', '-7f3a9c21-qzvx')})
+const ENV = {API_TOKEN: ENV_ONE, DB_PASSWORD: ENV_MULTI, APP_CREDENTIAL: ENV_JSON}
+const LITERALS = [ENV_ONE, ENV_MULTI, ENV_JSON]
 
 /** Token shapes: the whole string is the secret. */
 const TOKENS = {
@@ -84,12 +86,12 @@ function prng(seed: number): () => number {
 const pick = <T>(random: () => number, items: readonly T[]): T => items[Math.floor(random() * items.length)] as T
 
 /** One piece of an input: a shape from one rule, or a composition of several (a token inside a quoted password, and so on). */
-function piece(random: () => number): Piece {
+function piece(random: () => number, brackets: boolean): Piece {
   const token = pick(random, Object.values(TOKENS))
   const atom = pick(random, ATOMS)
   const name = pick(random, NAMES)
   const sep = pick(random, [': ', '=', ':', ' = '])
-  switch (Math.floor(random() * 16)) {
+  switch (Math.floor(random() * (brackets ? 24 : 16))) {
     case 0:
       return {text: token, secrets: [token]}
     case 1:
@@ -121,6 +123,32 @@ function piece(random: () => number): Piece {
       return {text: `${PEM}`, secrets: [PEM_BODY]}
     case 14:
       return {text: `${name}${sep}${token}${token}`, secrets: [token]}
+    case 16:
+      // A whole object after a sensitive name, with quotes, escaped quotes and brackets inside its strings.
+      return {
+        text: String.raw`{"${name}": {"inner": "${atom} \"${token}\" ]}", "n": [1, {"x": "y"}]}, "ok": 1}`,
+        secrets: [atom, token],
+      }
+    case 17:
+      return {text: `${name}${sep}["${atom}", 2, {"a": "${token}"}] tail`, secrets: [atom, token]}
+    case 18:
+      // The same one level down a JSON-in-JSON string: every quote gains a backslash.
+      return {text: JSON.stringify({v: `{"${name}": {"inner": "${atom}", "t": "${token}"}}`}), secrets: [atom, token]}
+    case 19:
+      // Unterminated: runs to the end of the line, taking whatever is after it on that line.
+      return {text: `${name}${sep}{"inner": "${atom} unfinished`, secrets: [atom]}
+    case 20:
+      // JSON with a duplicate key: the first value is the secret, the second is benign (JSON.parse keeps only the second).
+      return {text: `{"note": "${token}", "note": "benign"}`, secrets: [token]}
+    case 21:
+      // A credential that is itself a JSON document, alone and after a name.
+      return {text: pick(random, [ENV_JSON, `${name}${sep}${ENV_JSON}`]), secrets: ['alice-zqxv', 'kwjd-7f3a9c21-qzvx']}
+    case 22:
+      // A long run of openers with no close, then a secret on the same line.
+      return {text: `${name}${sep}${'{['.repeat(40)} ${atom}`, secrets: [atom]}
+    case 23:
+      // Alternating quotes and backslashes after a sensitive name.
+      return {text: String.raw`${name}${sep}{\"a\\"\"b ${atom}`, secrets: [atom]}
     default:
       return {text: `${name}${sep}"${PEM} ${atom}"`, secrets: [PEM_BODY, atom]}
   }
@@ -128,11 +156,15 @@ function piece(random: () => number): Piece {
 
 const SEPARATORS = [' ', '\n', ' | ', ', ', '\t', ' and ', ' 😀 ', '; ', ' (', ') ']
 
-function corpus(seed: number, count: number): {readonly text: string; readonly secrets: readonly string[]}[] {
+function corpus(
+  seed: number,
+  count: number,
+  brackets = true,
+): {readonly text: string; readonly secrets: readonly string[]}[] {
   const random = prng(seed)
   const inputs: {text: string; secrets: string[]}[] = []
   for (let index = 0; index < count; index += 1) {
-    const pieces = Array.from({length: 1 + Math.floor(random() * 5)}, () => piece(random))
+    const pieces = Array.from({length: 1 + Math.floor(random() * 5)}, () => piece(random, brackets))
     // Repeats make overlapping and adjacent candidates: the same piece twice, and one piece glued after another.
     if (random() < 0.3) pieces.push(pieces[0] as Piece)
     let text = pick(random, FILLER)
@@ -275,7 +307,8 @@ describe('order independence', () => {
 })
 
 describe('against the sequential design it replaced (inputs with no overlapping matches)', () => {
-  const inputs = corpus(0x0d1f_f00d, 6_000)
+  // The frozen design has no notion of a bracketed value, so the corpus for the comparison leaves those shapes out.
+  const inputs = corpus(0x0d1f_f00d, 6_000, false)
   const legacy = createLegacyScrubber(LITERALS)
 
   /** True when no two ranges of any rule overlap or touch: the one case where the old design was already right. */

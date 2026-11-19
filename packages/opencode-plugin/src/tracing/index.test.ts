@@ -4,6 +4,7 @@ import type {ObserverHost} from './record-observations.js'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
 import {startOtlpSink, type OtlpSink} from '../integration.fixture.js'
+import {createScrubber} from './content.js'
 import {CLEANUP_BOUND_MS, DRAIN_BOUND_MS, startTracing} from './index.js'
 
 /** A fake host: records every registered hook and exposes a pushable event stream. */
@@ -174,6 +175,38 @@ describe('startTracing', () => {
     expect(request?.text).not.toContain('fro_bot.repository')
     expect(request?.text).not.toContain('sk-never-exported')
     expect(lines).toEqual(['tracing stopped, exported 2 spans, dropped 0'])
+  })
+
+  it('says how many values the safety net withheld, as a number, and exports none of them', async () => {
+    // #given a scrubber whose matchers miss a known literal (the safety net's own check is the real one), and a turn that holds it
+    const secret = 'literal-that-slipped-0123456789'
+    const real = createScrubber({env: {DB_PASSWORD: secret}})
+    const blind = {...real, scrub: (text: string) => ({ok: true as const, text, redactions: 0})}
+    const target = await sink()
+    const fake = fakeObserverHost()
+    const lines: string[] = []
+    const handle = await startTracing(fake.host, LOCAL(target.url), {
+      env: {},
+      log: line => lines.push(line),
+      scrubber: blind,
+    })
+
+    // #when the turn runs and the server stops
+    textTurn(fake, secret)
+    await vi.waitFor(() => {
+      expect(fake.hooks.size).toBeGreaterThan(0)
+    })
+    await new Promise(resolve => setTimeout(resolve, 50))
+    await handle.stop()
+    fake.end()
+
+    // #then the literal was exported nowhere, and the log line carries the count (never the value)
+    expect(target.requests.map(request => request.text).join('')).not.toContain(secret)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toMatch(
+      /^tracing stopped, exported \d+ spans, dropped 0, [1-9]\d* values withheld \(literal survived\)$/,
+    )
+    expect(lines[0]).not.toContain(secret)
   })
 
   it('sends the counts header and the run identity in Action mode, and never a header of its own choosing', async () => {
