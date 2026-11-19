@@ -9,7 +9,11 @@ import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {postBatch, rawExchange, startHttpUpstream} from '../../../packages/runtime/src/agent/trace-relay-test-kit.js'
 import {TRACE_RELAY_COUNTS_HEADER} from '../../../packages/runtime/src/agent/trace-relay-wire.js'
 import {createMockLogger, serializeLoggerCalls, unwrapErr, unwrapOk} from '../../shared/test-helpers.js'
-import {startTraceRelayProcess, TRACE_RELAY_BUNDLE_CHECK_TIMEOUT_MS} from './trace-relay-process.js'
+import {
+  createTraceRelayLaunch,
+  startTraceRelayProcess,
+  TRACE_RELAY_BUNDLE_CHECK_TIMEOUT_MS,
+} from './trace-relay-process.js'
 
 const CREDENTIAL = 'Basic c3VwZXJ2aXNvci1jYW5hcnktMDA0Mjpzcw=='
 const COLLECTOR_HOST_CANARY = 'collector-canary.example.com'
@@ -479,6 +483,152 @@ describe('trace-relay-process', () => {
       )
 
       expect(unwrapErr(started).kind).toBe('invalid-config')
+    })
+
+    describe('cancelled by its owner (the signal teardown)', () => {
+      const WEDGED_PID_FILE = (dir: string) => path.join(dir, 'wedged.pid')
+
+      async function wedgedChild() {
+        // Prints nothing and ignores stdin closing, as a child stuck before its ready line would.
+        return fakeChild(
+          `import {writeFileSync} from 'node:fs'; writeFileSync(${JSON.stringify(WEDGED_PID_FILE(dir))}, String(process.pid)); process.stdin.resume(); process.stdin.on('end', () => {}); setInterval(() => {}, 1000)`,
+        )
+      }
+
+      it('spawns nothing, and says so once, when the signal was already aborted', async () => {
+        const controller = new AbortController()
+        controller.abort()
+
+        const {started, logger} = await startWith(
+          {command: path.join(dir, 'must-not-spawn'), args: []},
+          {signal: controller.signal},
+        )
+
+        expect(unwrapErr(started).kind).toBe('cancelled')
+        expect(loggedAt(logger, 'warning')).toEqual([
+          ['The trace relay did not start; this run is not traced', {reason: 'cancelled'}],
+        ])
+      })
+
+      it('removes its listener from the signal on every way out of the start', async () => {
+        const controller = new AbortController()
+        const added = vi.spyOn(controller.signal, 'addEventListener')
+        const removed = vi.spyOn(controller.signal, 'removeEventListener')
+        const launcher = await fakeChild(
+          String.raw`process.stdout.write('{"ready":true,"port":4321}\n'); process.stdin.resume(); setInterval(() => {}, 1000)`,
+        )
+
+        const {started} = await startWith(launcher, {signal: controller.signal})
+
+        expect(unwrapOk(started).port).toBe(4321)
+        expect(added.mock.calls.filter(([type]) => type === 'abort')).toHaveLength(1)
+        expect(removed.mock.calls.filter(([type]) => type === 'abort')).toHaveLength(1)
+      })
+
+      it('does not wait for a bundle check that is still running when the signal aborts', async () => {
+        const controller = new AbortController()
+        const began = Date.now()
+        const pending = startWith(
+          {command: path.join(dir, 'must-not-spawn'), args: []},
+          {signal: controller.signal, bundleCheck: async () => new Promise<never>(() => undefined)},
+        )
+        setTimeout(() => controller.abort(), 50)
+
+        const {started} = await pending
+
+        expect(unwrapErr(started).kind).toBe('cancelled')
+        expect(Date.now() - began).toBeLessThan(TRACE_RELAY_BUNDLE_CHECK_TIMEOUT_MS)
+      })
+
+      it('stops waiting for readiness, and reaps a child that ignores stdin closing, when the signal aborts', async () => {
+        // #given a child that never gets ready and ignores a closed stdin, and a start that would wait five seconds
+        const launcher = await wedgedChild()
+        const controller = new AbortController()
+        const began = Date.now()
+        const pending = startWith(launcher, {
+          signal: controller.signal,
+          timeouts: {readyMs: 5000, exitGraceMs: 300, killConfirmMs: 1500},
+        })
+        await vi.waitFor(async () => fs.access(WEDGED_PID_FILE(dir)), {timeout: 3000})
+        const pid = Number(await fs.readFile(WEDGED_PID_FILE(dir), 'utf8'))
+        trackedPids.push(pid)
+
+        // #when the signal aborts
+        controller.abort()
+        const {started, logger} = await pending
+
+        // #then the start gave up at once with its own reason, the child is gone, and nothing outlasted grace plus kill
+        expect(unwrapErr(started).kind).toBe('cancelled')
+        expect(Date.now() - began).toBeLessThan(3500)
+        expect(alive(pid)).toBe(false)
+        expect(loggedAt(logger, 'warning')).toEqual([
+          ['The trace relay did not start; this run is not traced', {reason: 'cancelled'}],
+        ])
+      })
+    })
+
+    describe('a launch the signal teardown owns before anything is spawned', () => {
+      it('refuses to start once it has been stopped, and stopping with nothing started resolves', async () => {
+        const launch = createTraceRelayLaunch(startTraceRelayProcess)
+
+        await launch.stop()
+        const logger = createMockLogger()
+        const started = await launch.start({
+          config: {url: 'https://collector.example.com/v1/traces', headers: HEADERS},
+          logger,
+          launcher: {command: path.join(dir, 'must-not-spawn'), args: []},
+        })
+
+        expect(unwrapErr(started).kind).toBe('cancelled')
+      })
+
+      it('cancels a pending start and reaps its wedged child, and a second stop is the same stop', async () => {
+        const pidFile = path.join(dir, 'owned.pid')
+        const launcher = await fakeChild(
+          `import {writeFileSync} from 'node:fs'; writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); process.stdin.resume(); process.stdin.on('end', () => {}); setInterval(() => {}, 1000)`,
+        )
+        const launch = createTraceRelayLaunch(startTraceRelayProcess)
+        const logger = createMockLogger()
+        const pending = launch.start({
+          config: {url: 'https://collector.example.com/v1/traces', headers: HEADERS},
+          logger,
+          launcher,
+          timeouts: {readyMs: 5000, exitGraceMs: 300, killConfirmMs: 1500},
+        })
+        await vi.waitFor(async () => fs.access(pidFile), {timeout: 3000})
+        const pid = Number(await fs.readFile(pidFile, 'utf8'))
+        trackedPids.push(pid)
+
+        const first = launch.stop()
+        const second = launch.stop()
+        await Promise.all([first, second])
+
+        expect(unwrapErr(await pending).kind).toBe('cancelled')
+        expect(alive(pid)).toBe(false)
+        expect(loggedAt(logger, 'warning')).toHaveLength(1)
+      })
+
+      it('stops a relay that is already ready, as one whose count cannot be complete', async () => {
+        const launcher = await fakeChild(
+          String.raw`process.stdout.write('{"ready":true,"port":4321}\n'); process.stdin.resume(); process.stdin.on('end', () => { process.stdout.write('{"report":{"delivered":4,"retry":2,"dropped":1}}\n'); process.exit(0) })`,
+        )
+        const launch = createTraceRelayLaunch(startTraceRelayProcess)
+        const logger = createMockLogger()
+        const started = await launch.start({
+          config: {url: 'https://collector.example.com/v1/traces', headers: HEADERS},
+          logger,
+          launcher,
+        })
+        const relay = unwrapOk(started)
+
+        await launch.stop()
+        await launch.stop()
+
+        expect(await relay.stop()).toEqual({outcome: 'stopped', counts: 'incomplete'})
+        expect(loggedAt(logger, 'info').filter(([message]) => message === 'Trace relay stopped')).toEqual([
+          ['Trace relay stopped', {countIncomplete: true}],
+        ])
+      })
     })
 
     it('refuses a config too large for the frame before it spawns anything', async () => {

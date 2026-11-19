@@ -170,7 +170,9 @@ export interface SandboxLifecycle {
    * `run.ts`'s `finally`, so without this the relay would be left to notice its stdin closing. It is a bounded extra, not part
    * of the teardown's outcome: it never changes what the sandbox reports, a throw or a rejection is swallowed, and one that
    * outlasts the budget is cut off with the rest. A normal `release` does not call it (the run stops the process itself), and
-   * it takes no part in the key proxy's slot. Registered after a signal began, it runs at once.
+   * it takes no part in the key proxy's slot. Registered after a signal began, it runs at once. Registering installs the signal
+   * handlers (like `startKeyProxy`) unless the teardown has begun, so a stop can be registered before the process it owns is
+   * spawned and still be reached by a signal.
    */
   readonly registerSignalStop: (stop: () => Promise<unknown>) => void
 }
@@ -1369,6 +1371,10 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       signalStopRuns.push(runSignalStop(stop))
       return
     }
+    // Signal ownership before the caller spawns anything, the same rule `startKeyProxy` follows: the trace relay starts before
+    // the server, the key proxy and the account, so without this a signal in that window reaches no handler of ours and the
+    // process ends with a child still starting. Not once the teardown has begun or finished: nothing would remove them.
+    if (!admissionClosed && !cancelled && released === undefined) installSignalHandlers()
     signalStops.push(stop)
   }
 

@@ -87,6 +87,12 @@ export interface StartTraceRelayProcessOptions {
    * which is for tests that inject their own launcher.
    */
   readonly bundleCheck?: () => Promise<boolean>
+  /**
+   * Aborts the start: the bundle check and the readiness wait give up at once, nothing is spawned if it was not yet, and a
+   * child that was is reaped (stdin closed, grace, process group killed, exit confirmed) before the start returns the
+   * `cancelled` error. Used by the signal teardown through {@link createTraceRelayLaunch}.
+   */
+  readonly signal?: AbortSignal
   readonly deps?: {readonly killGroup?: (pid: number, signal: NodeJS.Signals) => void}
 }
 
@@ -145,19 +151,46 @@ function killProcessGroup(pid: number, signal: NodeJS.Signals): void {
   }
 }
 
+/** Resolves `'cancelled'` when the signal aborts (at once when it already has); `dispose` removes the listener. */
+function onAbort(signal: AbortSignal | undefined): {
+  readonly cancelled: Promise<'cancelled'>
+  readonly dispose: () => void
+} {
+  if (signal === undefined) return {cancelled: new Promise<never>(() => undefined), dispose: () => undefined}
+  if (signal.aborted) return {cancelled: Promise.resolve('cancelled'), dispose: () => undefined}
+  let listener: (() => void) | undefined
+  const cancelled = new Promise<'cancelled'>(resolve => {
+    listener = () => resolve('cancelled')
+    signal.addEventListener('abort', listener, {once: true})
+  })
+  return {
+    cancelled,
+    dispose: () => {
+      if (listener !== undefined) signal.removeEventListener('abort', listener)
+    },
+  }
+}
+
 /**
  * Runs the bundle check inside its own `try`, so a synchronous throw and a rejection are the same failed check, and bounds it,
- * so a check that never settles cannot hold up the server start. True only when it answered true in time.
+ * so a check that never settles cannot hold up the server start. `usable` only when it answered true in time; `cancelled`
+ * when the owner aborted first.
  */
-async function runBundleCheck(check: () => Promise<boolean>, boundMs: number): Promise<boolean> {
+async function runBundleCheck(
+  check: () => Promise<boolean>,
+  boundMs: number,
+  cancelled: Promise<'cancelled'>,
+): Promise<'cancelled' | 'unusable' | 'usable'> {
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
     const timedOut = new Promise<false>(resolve => {
       timer = setTimeout(() => resolve(false), boundMs)
     })
-    return (await Promise.race([check(), timedOut])) === true
+    const answer = await Promise.race([check(), timedOut, cancelled])
+    if (answer === 'cancelled') return 'cancelled'
+    return answer === true ? 'usable' : 'unusable'
   } catch {
-    return false
+    return 'unusable'
   } finally {
     clearTimeout(timer)
   }
@@ -177,6 +210,19 @@ async function settlesWithin(promise: Promise<unknown>, ms: number): Promise<boo
 
 export async function startTraceRelayProcess(
   options: StartTraceRelayProcessOptions,
+): Promise<Result<TraceRelayProcess, TraceRelayStartError>> {
+  // The owner's abort is watched from here to the ready line, and the listener is removed on every way out.
+  const abort = onAbort(options.signal)
+  try {
+    return await startTraceRelayProcessUnwatched(options, abort.cancelled)
+  } finally {
+    abort.dispose()
+  }
+}
+
+async function startTraceRelayProcessUnwatched(
+  options: StartTraceRelayProcessOptions,
+  cancelled: Promise<'cancelled'>,
 ): Promise<Result<TraceRelayProcess, TraceRelayStartError>> {
   const {logger} = options
   const timeouts: TraceRelayProcessTimeouts = {...DEFAULT_TIMEOUTS, ...options.timeouts}
@@ -201,12 +247,17 @@ export async function startTraceRelayProcess(
     return err({kind: 'invalid-config'})
   }
 
+  if (options.signal?.aborted === true) {
+    warnNotStarted('cancelled')
+    return err({kind: 'cancelled'})
+  }
   if (options.bundleCheck !== undefined) {
     // The bundle is optional for the Action as a whole, so it is checked only now that a relay is about to start.
-    const usable = await runBundleCheck(options.bundleCheck, timeouts.bundleCheckMs)
-    if (!usable) {
-      warnNotStarted('bundle-invalid')
-      return err({kind: 'bundle-invalid'})
+    const bundle = await runBundleCheck(options.bundleCheck, timeouts.bundleCheckMs, cancelled)
+    if (bundle !== 'usable') {
+      const reason = bundle === 'cancelled' ? 'cancelled' : 'bundle-invalid'
+      warnNotStarted(reason)
+      return err({kind: reason})
     }
   }
 
@@ -325,13 +376,15 @@ export async function startTraceRelayProcess(
     readyTimer = setTimeout(() => resolve('timeout'), timeouts.readyMs)
   })
 
-  let first: Ready | 'exited' | 'spawn-failed' | 'timeout'
+  let first: Ready | 'cancelled' | 'exited' | 'spawn-failed' | 'timeout'
   try {
-    first = await Promise.race([ready, exited.then(() => 'exited' as const), spawnFailure, readyTimeout])
+    first = await Promise.race([ready, exited.then(() => 'exited' as const), spawnFailure, readyTimeout, cancelled])
   } finally {
     clearTimeout(readyTimer)
   }
 
+  // The owner gave up while the child was still starting: reap it (close stdin, grace, kill the group, confirm) and say so.
+  if (first === 'cancelled') return failStart('cancelled')
   if (first === 'exited') return failStart('exited-early')
   if (first === 'spawn-failed') return failStart('spawn-failed')
   if (first === 'timeout') return failStart('ready-timeout')
@@ -382,4 +435,42 @@ export async function startTraceRelayProcess(
       return stopped
     },
   })
+}
+
+/**
+ * What the signal teardown owns of a relay launch from before the spawn to after the stop. One abort signal, one stop path:
+ * `stop` cancels a start that has not finished (nothing is spawned if it had not begun; a child that had is reaped) and stops
+ * a relay that is ready, as one whose count cannot be complete. It is idempotent and never rejects. `start` is the supervisor,
+ * handed this launch's signal; the caller registers `stop` with the signal teardown before it calls `start`.
+ */
+export interface TraceRelayLaunch {
+  readonly start: (
+    options: Omit<StartTraceRelayProcessOptions, 'signal'>,
+  ) => Promise<Result<TraceRelayProcess, TraceRelayStartError>>
+  readonly stop: () => Promise<void>
+}
+
+export function createTraceRelayLaunch(
+  startRelay: typeof startTraceRelayProcess = startTraceRelayProcess,
+): TraceRelayLaunch {
+  const controller = new AbortController()
+  let starting: ReturnType<typeof startTraceRelayProcess> | undefined
+  let stopping: Promise<void> | undefined
+  return {
+    // A launch starts once. Started after a stop, it sees the aborted signal and spawns nothing.
+    start: async options => {
+      starting ??= startRelay({...options, signal: controller.signal})
+      return starting
+    },
+    // Every call runs the one stop: a second call waits for the first, and what it stops is idempotent in turn.
+    stop: async () => {
+      stopping ??= (async () => {
+        controller.abort()
+        const started = await starting?.catch(() => null)
+        // A relay that got ready before the abort is stopped through its own memoized stop, like any other.
+        if (started?.success === true) await started.data.stop({serverKilled: true})
+      })()
+      return stopping
+    },
+  }
 }
