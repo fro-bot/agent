@@ -7,7 +7,7 @@ import type {SandboxLifecycle} from './phases/sandbox-lifecycle.js'
 import type {TraceRelayProcess, TraceRelayStopResult} from './phases/trace-relay-process.js'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {serializeLoggerCalls} from '../shared/test-helpers.js'
-import {run} from './run.js'
+import {run, TRACE_RELAY_STOP_WAIT_MS} from './run.js'
 
 const ENDPOINT_HOST_CANARY = 'collector-canary.example.com'
 const CREDENTIAL_CANARY = 'Basic cnVuLXRyYWNpbmctY2FuYXJ5LTAwMDc6c2VjcmV0'
@@ -230,6 +230,14 @@ function fakeRelay(options: {crashed?: boolean; stop?: () => Promise<TraceRelayS
   return {relay, stop}
 }
 
+function deferredStop() {
+  let resolve!: () => void
+  const promise = new Promise<TraceRelayStopResult>(settle => {
+    resolve = () => settle({outcome: 'stopped', counts: {delivered: 1, retry: 0, dropped: 0}})
+  })
+  return {promise, resolve}
+}
+
 function fakeSandbox() {
   const registerSignalStop = vi.fn<SandboxLifecycle['registerSignalStop']>()
   const release = vi.fn(async () => ({stop: 'stopped', restore: 'restored'}))
@@ -348,6 +356,23 @@ const saveCacheStates = (core: typeof import('@actions/core')): unknown[] =>
 const orderOf = (mock: {mock: {invocationCallOrder: number[]}}): number =>
   mock.mock.invocationCallOrder[0] ?? Number.NaN
 
+/** The calls the run made, in the order it made them, for the mocks that mark its sequence. */
+async function sequence(sandboxRelease: {mock: {invocationCallOrder: number[]}}): Promise<string[]> {
+  const {runReleaseV2} = await import('./phases/release-v2.js')
+  const {runFinalizeWithResult} = await import('./phases/finalize.js')
+  const {runCleanup} = await import('./phases/cleanup.js')
+  const marks: [string, {mock: {invocationCallOrder: number[]}}][] = [
+    ['server-release', vi.mocked(runReleaseV2)],
+    ['sandbox-release', sandboxRelease],
+    ['finalize', vi.mocked(runFinalizeWithResult)],
+    ['cleanup', vi.mocked(runCleanup)],
+  ]
+  return marks
+    .map(([name, mock]) => [name, mock.mock.invocationCallOrder[0] ?? Number.NaN] as const)
+    .toSorted((a, b) => a[1] - b[1])
+    .map(([name]) => name)
+}
+
 describe('run with tracing', () => {
   beforeEach(async () => {
     vi.clearAllMocks()
@@ -388,21 +413,6 @@ describe('run with tracing', () => {
     expect(stop).toHaveBeenCalledWith({serverKilled: false})
   })
 
-  it('stops the relay as soon as the server has exited, before anything is published', async () => {
-    // #given a traced run
-    const {startTraceRelayProcess} = await import('./phases/trace-relay-process.js')
-    const {runFinalizeWithResult} = await import('./phases/finalize.js')
-    await arrange()
-    const {relay, stop} = fakeRelay()
-    vi.mocked(startTraceRelayProcess).mockResolvedValue({success: true, data: relay})
-
-    // #when
-    await run({traceRelay: TRACE_RELAY})
-
-    // #then the stop came before the response was finalized, not at the end of the run
-    expect(orderOf(stop)).toBeLessThan(orderOf(vi.mocked(runFinalizeWithResult)))
-  })
-
   it('hands the supervisor the validated config and a trace-relay logger, and nothing else about the run', async () => {
     const {startTraceRelayProcess} = await import('./phases/trace-relay-process.js')
     await arrange()
@@ -427,6 +437,25 @@ describe('run with tracing', () => {
     expect(registerSignalStop).not.toHaveBeenCalled()
     const messages = [...everyLogged('warning'), ...everyLogged('info')].map(call => String(call[0]))
     expect(messages.filter(message => /trace|tracing/i.test(message))).toEqual([])
+  })
+
+  it('leaves no timer behind and awaits nothing extra when no relay config is passed', async () => {
+    // #given fake timers, so a timer the relay path started and did not clear would be counted
+    vi.useFakeTimers()
+    try {
+      const {sandbox, registerSignalStop} = fakeSandbox()
+      await arrange({sandbox})
+
+      // #when an untraced run finishes without the clock moving
+      const exitCode = await run()
+
+      // #then it finished on microtasks alone and no timer or signal stop exists
+      expect(exitCode).toBe(0)
+      expect(vi.getTimerCount()).toBe(0)
+      expect(registerSignalStop).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('starts no relay for a run that is skipped before the server start', async () => {
@@ -502,7 +531,6 @@ describe('run with tracing', () => {
   it('still stops the relay, after the server release, when a phase throws after it started', async () => {
     const {startTraceRelayProcess} = await import('./phases/trace-relay-process.js')
     const {runReleaseV2} = await import('./phases/release-v2.js')
-    const {runCleanup} = await import('./phases/cleanup.js')
     await arrange({executeError: new Error('boom')})
     const {relay, stop} = fakeRelay()
     vi.mocked(startTraceRelayProcess).mockResolvedValue({success: true, data: relay})
@@ -512,7 +540,6 @@ describe('run with tracing', () => {
     expect(exitCode).toBe(1)
     expect(stop).toHaveBeenCalledTimes(1)
     expect(orderOf(stop)).toBeGreaterThan(orderOf(vi.mocked(runReleaseV2)))
-    expect(orderOf(stop)).toBeLessThan(orderOf(vi.mocked(runCleanup)))
   })
 
   it('stops the relay when the server never started', async () => {
@@ -561,11 +588,91 @@ describe('run with tracing', () => {
     expect(vi.mocked(core.setFailed)).not.toHaveBeenCalled()
   })
 
+  describe('a relay that is slow to stop', () => {
+    async function untracedBaseline(executeError?: Error) {
+      const {runCleanup} = await import('./phases/cleanup.js')
+      const {sandbox, release} = fakeSandbox()
+      await arrange({sandbox, ...(executeError === undefined ? {} : {executeError})})
+      const exitCode = await run()
+      const cleanup = vi.mocked(runCleanup).mock.calls[0]?.[0]
+      return {
+        exitCode,
+        order: await sequence(release),
+        skip: cleanup?.skipSessionPersistence,
+        reason: cleanup?.persistenceDeclineReason,
+      }
+    }
+
+    it.each([
+      ['on the normal path', undefined],
+      ['when a phase throws', new Error('boom')],
+    ])('does not hold the sandbox release, the result or the persistence decision %s', async (_name, executeError) => {
+      // #given what an untraced isolated run does
+      const baseline = await untracedBaseline(executeError)
+      vi.clearAllMocks()
+      loggers.all.length = 0
+
+      // #and the same run with a relay whose stop never returns
+      vi.useFakeTimers()
+      try {
+        const {startTraceRelayProcess} = await import('./phases/trace-relay-process.js')
+        const {runCleanup} = await import('./phases/cleanup.js')
+        const {sandbox, release} = fakeSandbox()
+        await arrange({sandbox, ...(executeError === undefined ? {} : {executeError})})
+        const {relay, stop} = fakeRelay({stop: async () => new Promise<never>(() => undefined)})
+        vi.mocked(startTraceRelayProcess).mockResolvedValue({success: true, data: relay})
+
+        // #when the run goes on
+        let finished: number | undefined
+        const running = run({traceRelay: TRACE_RELAY}).then(code => {
+          finished = code
+        })
+        await vi.advanceTimersByTimeAsync(10)
+
+        // #then the sandbox was released although the stop is still pending, and the run is still waiting only for it
+        expect(stop).toHaveBeenCalledTimes(1)
+        expect(release).toHaveBeenCalledTimes(1)
+        expect(finished).toBeUndefined()
+
+        // #when the bound passes the run ends, and nothing about it differs from the untraced run
+        await vi.advanceTimersByTimeAsync(TRACE_RELAY_STOP_WAIT_MS + 100)
+        await running
+        const cleanup = vi.mocked(runCleanup).mock.calls[0]?.[0]
+        expect(finished).toBe(baseline.exitCode)
+        expect(await sequence(release)).toEqual(baseline.order)
+        expect(cleanup?.skipSessionPersistence).toBe(baseline.skip)
+        expect(cleanup?.persistenceDeclineReason).toBe(baseline.reason)
+      } finally {
+        vi.useRealTimers()
+      }
+    })
+
+    it('waits for a stop that finishes, so its log line lands before the run ends', async () => {
+      const {startTraceRelayProcess} = await import('./phases/trace-relay-process.js')
+      await arrange()
+      const finishedStop = deferredStop()
+      const {relay, stop} = fakeRelay({stop: async () => finishedStop.promise})
+      vi.mocked(startTraceRelayProcess).mockResolvedValue({success: true, data: relay})
+      let finished = false
+      const running = run({traceRelay: TRACE_RELAY}).then(code => {
+        finished = true
+        return code
+      })
+
+      await vi.waitFor(() => expect(stop).toHaveBeenCalled())
+      await new Promise(resolve => setTimeout(resolve, 30))
+      expect(finished).toBe(false)
+      finishedStop.resolve()
+
+      expect(await running).toBe(0)
+    })
+  })
+
   describe('isolation', () => {
     it('registers one extra stop with the sandbox lifecycle, which stops the relay on a signal, and leaves the key proxy slot alone', async () => {
       // #given an isolated, traced run
       const {startTraceRelayProcess} = await import('./phases/trace-relay-process.js')
-      const {sandbox, registerSignalStop, release, startKeyProxy} = fakeSandbox()
+      const {sandbox, registerSignalStop, startKeyProxy} = fakeSandbox()
       await arrange({sandbox})
       const {relay, stop} = fakeRelay()
       vi.mocked(startTraceRelayProcess).mockResolvedValue({success: true, data: relay})
@@ -576,7 +683,6 @@ describe('run with tracing', () => {
       // #then exactly one stop was registered, and calling it (what the signal teardown does) stops the relay as killed
       expect(registerSignalStop).toHaveBeenCalledTimes(1)
       expect(startKeyProxy).not.toHaveBeenCalled()
-      expect(orderOf(stop)).toBeLessThan(orderOf(release))
       stop.mockClear()
       await registerSignalStop.mock.calls[0]?.[0]()
       expect(stop).toHaveBeenCalledWith({serverKilled: true})

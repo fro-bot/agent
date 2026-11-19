@@ -67,6 +67,9 @@ export interface RunOptions {
   readonly traceRelay?: TraceRelayConfig | undefined
 }
 
+/** Longest the run waits, at its very end, for the relay's stop to finish. The supervisor's own worst case is about 4.5 s. */
+export const TRACE_RELAY_STOP_WAIT_MS = 6000
+
 const TRACE_EXPOSURE_WARNING =
   'Tracing is on without isolate-agent: the agent can read the collector credential and the content of every span'
 
@@ -240,21 +243,35 @@ export async function run(options: RunOptions = {}): Promise<number> {
   }
 
   /**
-   * Stops the trace relay once, after the server has exited, and lets the supervisor log what it counted. Called on the
-   * normal path and again from the `finally` block; the second call waits for the first. It never throws and nothing it
-   * learns reaches the run's result, its persistence decision or its exit code: tracing is best-effort.
+   * Begins stopping the trace relay, once, after the server has exited; the supervisor logs what it counted. It does not wait:
+   * the stop can take its grace plus its kill confirmation, and neither the sandbox release nor the persistence decision may
+   * wait for a relay. Called on the normal path and again from the `finally` block, which guarantees no orphan. Synchronous,
+   * so a run with no relay has no new await anywhere. Nothing it learns reaches the run's result or exit code.
    */
-  const stopTraceRelay = async (): Promise<void> => {
+  const startTraceRelayStop = (): void => {
     const relay = traceRelay
-    if (relay === null) return
-    traceRelayStopped ??= (async () => {
+    if (relay === null || traceRelayStopped !== undefined) return
+    traceRelayStopped = (async () => {
       try {
         await relay.stop({serverKilled: await serverWasKilled()})
       } catch {
         // Fail-soft: a relay that cannot be stopped cleanly has already been logged by its supervisor.
       }
     })()
-    await traceRelayStopped
+  }
+
+  /** Waits, bounded, for a started relay stop, so its log line and its process confirmation land before the run ends. */
+  const settleTraceRelayStop = async (): Promise<void> => {
+    const stopping = traceRelayStopped
+    if (stopping === undefined) return
+    let bound: ReturnType<typeof setTimeout> | undefined
+    await Promise.race([
+      stopping,
+      new Promise<void>(resolve => {
+        bound = setTimeout(resolve, TRACE_RELAY_STOP_WAIT_MS)
+      }),
+    ])
+    clearTimeout(bound)
   }
 
   core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'false')
@@ -435,8 +452,9 @@ export async function run(options: RunOptions = {}): Promise<number> {
     serverReleasedV2 = true
     const drainResult = release.drain
     serverExitUnconfirmed = release.serverExitUnconfirmed === true
-    // The server has exited, so whatever its plugin was going to send is sent: the relay can go.
-    await stopTraceRelay()
+    // The server has exited, so whatever its plugin was going to send is sent: the relay can go. Not awaited: the sandbox is
+    // released below without waiting for it.
+    startTraceRelayStop()
     // The server is shut down. Before anything below reads what the sandbox wrote (the response file, the checkout,
     // the database), kill and verify every process of the sandbox user and take its files back. An unconfirmed stop or an
     // unsafe restore fails the run here: no response is read, nothing is pushed, nothing is checkpointed or saved.
@@ -612,8 +630,8 @@ export async function run(options: RunOptions = {}): Promise<number> {
       }
     }
     // The relay outlives nothing: a path that left the try block before the normal stop (an exception, a server that never
-    // started) stops it here, after the server release above.
-    await stopTraceRelay()
+    // started) begins stopping it here, after the server release above, without holding what follows.
+    startTraceRelayStop()
     // Any path that left the try block before the normal release (an exception, a failed phase) still owns a live
     // sandbox. Stop and restore it before cleanup checkpoints or saves anything.
     if (sandboxLifecycle !== null && !sandboxSettled) {
@@ -672,6 +690,8 @@ export async function run(options: RunOptions = {}): Promise<number> {
       // uses the Action's Octokit client, never `gh`. Setup recorded the directory when it created it, so this covers a
       // bootstrap that threw after setup too.
       await releaseRunGhConfig({sandboxTrusted: !sandboxRestoreUnsafe, logger: bootstrapLogger})
+      // Last, and only for a run that traced: the relay's stop has had the whole cleanup to finish.
+      if (traceRelayStopped !== undefined) await settleTraceRelayStop()
     })
 
     // FINAL assessment: the single call to this pure function, made only now that
