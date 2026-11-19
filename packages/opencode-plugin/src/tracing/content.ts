@@ -135,6 +135,80 @@ function pemPattern(): ScrubPattern {
   }
 }
 
+/** `[\w-]`: what a JWT segment is made of. */
+const isSegmentChar = (code: number): boolean =>
+  (code >= 0x30 && code <= 0x39) ||
+  (code >= 0x41 && code <= 0x5a) ||
+  (code >= 0x61 && code <= 0x7a) ||
+  code === 0x5f ||
+  code === 0x2d
+
+/** `\w`, for the boundary before `eyJ`. */
+const isWordChar = (code: number): boolean => code !== 0x2d && isSegmentChar(code)
+
+/**
+ * A JSON Web Token: `eyJ`, a header of at least 8 segment characters, a dot, a payload of at least 8, a dot, a signature
+ * of at least 4. The same language as `\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{4,}`, found by one forward walk.
+ *
+ * Why not the regex: `[\w-]` takes the dash, so in `eyJ-eyJ-eyJ-…` every `eyJ` starts inside the previous one's run, each
+ * attempt walks to the end of the run and backtracks over it, and the whole is quadratic (0.18 s at 20 KB, 2.9 s at 80 KB).
+ * Here a run's end is found once and remembered, and a candidate inside a run that already failed is skipped, so no
+ * position is walked more than three times (once as each segment).
+ */
+function jwtPattern(): ScrubPattern {
+  return {
+    id: 'jwt',
+    apply: (text, lower) => {
+      if (!lower.includes('eyj')) return {text, count: 0}
+      const length = text.length
+      // The most recent maximal run of segment characters, so a start inside it does not walk it again.
+      let runFrom = -1
+      let runTo = -1
+      const runEnd = (start: number): number => {
+        if (start >= runFrom && start <= runTo && runFrom !== -1) return runTo
+        let end = start
+        while (end < length && isSegmentChar(text.charCodeAt(end))) end += 1
+        runFrom = start
+        runTo = end
+        return end
+      }
+      let count = 0
+      let out = ''
+      let cursor = 0
+      let from = 0
+      for (;;) {
+        const start = text.indexOf('eyJ', from)
+        if (start === -1) break
+        from = start + 3
+        // `\b` before `e`: the character before is not a word character. A dash is not one, but is a segment character.
+        if (start > 0 && isWordChar(text.charCodeAt(start - 1))) continue
+        const headerEnd = runEnd(start + 3)
+        // Every start inside this run has the same end and a shorter header: if this one fails on the dot, they all do.
+        if (headerEnd - (start + 3) < 8 || text.charCodeAt(headerEnd) !== 0x2e) {
+          from = Math.max(from, headerEnd)
+          continue
+        }
+        const payloadEnd = runEnd(headerEnd + 1)
+        if (payloadEnd - (headerEnd + 1) < 8 || text.charCodeAt(payloadEnd) !== 0x2e) {
+          // Later starts inside the header run reach the same payload and fail alike; the payload itself may hold starts.
+          from = Math.max(from, headerEnd + 1)
+          continue
+        }
+        const signatureEnd = runEnd(payloadEnd + 1)
+        if (signatureEnd - (payloadEnd + 1) < 4) {
+          from = Math.max(from, headerEnd + 1)
+          continue
+        }
+        out += text.slice(cursor, start) + REDACTION
+        cursor = signatureEnd
+        from = signatureEnd
+        count += 1
+      }
+      return count === 0 ? {text, count: 0} : {text: out + text.slice(cursor), count}
+    },
+  }
+}
+
 /** Words that make a name secret-like. Matched inside a name, so `X_API_KEY` and `dbPassword` both qualify. */
 const SECRET_WORDS =
   'password|passwd|pwd|passphrase|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential|authorization|auth[_-]?key|session[_-]?key|client[_-]?secret|signature|bearer'
@@ -213,7 +287,7 @@ export const SCRUB_PATTERNS: readonly ScrubPattern[] = [
       'dop_v1_',
     ],
   ),
-  replacing('jwt', /\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{4,}/g, whole, ['eyj']),
+  jwtPattern(),
   // `Bearer` is a credential marker on its own; the other schemes are also English words, so their value must contain a
   // digit or a base64 or token punctuation character.
   replacing(

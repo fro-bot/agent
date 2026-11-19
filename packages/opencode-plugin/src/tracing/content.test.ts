@@ -334,52 +334,127 @@ describe('scrub patterns', () => {
   })
 })
 
-describe('adversarial timing: each pattern on its own worst input', () => {
-  const CEILING_MS = 2_000
-  const N = 300_000
-  const inputs: Readonly<Record<string, readonly string[]>> = {
+/**
+ * Why this block replaced the one before it. The old one gave each pattern a few inputs (a prefix repeated, a prefix and a
+ * long run of one letter) and failed a pattern only when one run passed 2 s at 300 KB. The JWT pattern was quadratic on
+ * `eyJ-` repeated (0.18 s at 20 KB, 0.72 s at 40 KB, 2.9 s at 80 KB) and no input in the table had a `-` in it, so nothing
+ * hit the class that lets a near-match start inside its own run. Absolute ceilings also cannot tell a quadratic from a
+ * linear pattern at small sizes. This block (1) gives every pattern inputs built from repeated NEAR-matches of its own
+ * prefix, with the characters its classes accept, (2) measures through the whole `scrubSpan` path, and (3) compares the
+ * time at two sizes eight times apart: linear is about 8x, quadratic 64x, and the limit is 24x.
+ */
+describe('adversarial timing: growth, not a ceiling', () => {
+  const SMALL = 20_000
+  const LARGE = 160_000
+  const GROWTH_LIMIT = 24
+  /** Below this, a timing is noise and only the absolute ceiling applies. */
+  const NOISE_MS = 3
+  const CEILING_MS = 3_000
+  const rep = (unit: string) => (n: number) => unit.repeat(Math.ceil(n / unit.length)).slice(0, n)
+  const run = (head: string, char: string, count: number) => rep(head + char.repeat(count))
+
+  type Input = readonly [name: string, make: (n: number) => string]
+  const inputs: Readonly<Record<string, readonly Input[]>> = {
     'pem-private-key': [
-      // Many headers and no end line: a scan to the end per header would be quadratic (1.6 MB took minutes).
-      '-----BEGIN PRIVATE KEY-----'.repeat(60_000),
-      '-----BEGIN '.repeat(150_000),
-      `"${'-----BEGIN PRIVATE KEY-----"'.repeat(60_000)}`,
-      `${'-----BEGIN PRIVATE KEY-----\n-----END '.repeat(40_000)}`,
+      ['headers, no end line', rep('-----BEGIN PRIVATE KEY-----')],
+      ['half headers', rep('-----BEGIN ')],
+      ['headers in quotes', rep('"-----BEGIN PRIVATE KEY-----"')],
+      ['header then a partial end line', rep('-----BEGIN PRIVATE KEY-----\n-----END ')],
+      ['header glued to its own prefix', rep('-----BEGIN -----BEGIN PRIVATE KEY-----')],
     ],
-    'github-token': ['ghp_'.repeat(N / 4), `ghp_${'a'.repeat(N)}`, 'github_pat_'.repeat(N / 11)],
-    'aws-access-key-id': ['AKIA'.repeat(N / 4), `AKIA${'A'.repeat(N)}`],
+    'github-token': [
+      ['prefix, 35 chars (one short)', run('ghp_', 'a', 35)],
+      ['prefix, 300 chars (over the bound)', run('ghp_', 'a', 300)],
+      ['prefix, 40 chars, glued', run('ghp_', 'a', 40)],
+      ['fine-grained, 21 chars', run('github_pat_', 'a', 21)],
+      ['prefix repeated', rep('ghp_')],
+    ],
+    'aws-access-key-id': [
+      ['prefix, 15 chars', run('AKIA', 'A', 15)],
+      ['prefix, 17 chars', run('AKIA', 'A', 17)],
+      ['prefix repeated', rep('AKIA')],
+    ],
     'vendor-key-prefix': [
-      'sk-'.repeat(N / 3),
-      `sk-${'a'.repeat(N)}`,
-      `SG.${'a'.repeat(N)}`,
-      'SG.aaaaaaaaaaaaaaaaaaaa'.repeat(N / 24),
-      `AIza${'a'.repeat(N)}`,
+      ['sk- run of 19', run('sk-', 'a', 19)],
+      ['sk- dashes', rep('sk-')],
+      ['SG. with no second dot', run('SG.', 'a', 20)],
+      ['SG. dashes', run('SG.', '-', 20)],
+      ['AIza one short', run('AIza', 'a', 34)],
+      ['dop_v1_ one short', run('dop_v1_', 'a', 39)],
+      ['one long run after the prefix', n => `sk-${'a'.repeat(n)}`],
     ],
-    jwt: [`eyJ${'a'.repeat(N)}`, 'eyJaaaaaaaa.'.repeat(N / 12), `eyJaaaaaaaa.${'a'.repeat(N)}`],
+    jwt: [
+      ['eyJ- repeated (the class takes the dash)', rep('eyJ-')],
+      ['eyJ, a dash, repeated, then a dot', n => `${rep('eyJ-')(n)}.`],
+      ['eyJ-  with a dash run', run('eyJ', '-', 7)],
+      ['header of 7 then a dot', rep('eyJaaaaaaa.')],
+      ['two segments, never a third', rep('eyJaaaaaaaa.aaaaaaaa')],
+      ['third segment of 3', rep('eyJaaaaaaaa.aaaaaaaa.aaa ')],
+      ['eyJ run of 8 then dashes', rep('eyJ--------')],
+      ['one long header run', n => `eyJ${'a'.repeat(n)}`],
+    ],
     'auth-scheme-value': [
-      'Bearer '.repeat(N / 7),
-      `Basic ${'a'.repeat(N)}`,
-      'Basic aaaaaaaa'.repeat(N / 14),
-      `Token${' '.repeat(N)}a`,
+      ['Basic, a short run', rep('Basic aaaaaaa')],
+      ['Bearer, a short run', rep('Bearer aaaaaaa')],
+      ['Token, letters only (the lookahead fails)', run('Token ', 'a', 30)],
+      ['Digest, letters only, glued', run('Digest ', 'a', 100)],
+      ['one long letter run', n => `Basic ${'a'.repeat(n)}`],
+      ['scheme then spaces', n => `Token${' '.repeat(n)}a`],
     ],
-    'connection-string': ['postgres://'.repeat(N / 11), `redis://${'a'.repeat(N)}`],
-    'url-userinfo': ['a://'.repeat(N / 4), `http://${'a'.repeat(N)}`, `http://${'a:'.repeat(N / 2)}`],
+    'connection-string': [
+      ['scheme repeated', rep('postgres://')],
+      ['scheme, two chars', rep('redis://ab')],
+      ['scheme, one long run', n => `mongodb+srv://${'a'.repeat(n)}`],
+    ],
+    'url-userinfo': [
+      ['255 chars and no @', run('a://', 'b', 255)],
+      ['257 chars and no @', run('a://', 'b', 257)],
+      ['scheme repeated', rep('a://')],
+      ['16-char scheme', rep('abcdefghijklmnop://')],
+    ],
     'url-query-secret': [
-      '?key='.repeat(N / 5),
-      `&${'a'.repeat(N)}`,
-      '&aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'.repeat(N / 31),
-      `?token=${'a'.repeat(N)}`,
+      ['30 chars and no secret word', run('?', 'a', 30)],
+      ['29 chars then key, no equals', rep(`?${'a'.repeat(29)}key`)],
+      ['key with no equals', rep('?key')],
+      ['key= with a short value', rep('&key=ab')],
+      ['semicolons', rep(';password')],
     ],
     'name-value-pair': [
-      'password'.repeat(N / 8),
-      `password${' '.repeat(N)}`,
-      'token: '.repeat(N / 7),
-      `secret=${'a'.repeat(N)}`,
-      'api_key"'.repeat(N / 8),
-      'passwordaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'.repeat(N / 52),
+      ['the word alone', rep('password')],
+      ['the word and 20 name chars', run('password', 'a', 20)],
+      ['the word, 19 chars and a quote', rep(`password${'a'.repeat(19)}"`)],
+      ['a colon and an eight-digit value', rep('token: 12345678 ')],
+      ['an equals and a short value', rep('secret=ab ')],
+      ['quote forms', rep('api_key"')],
+      ['escaped quotes', rep(String.raw`token\": \"`)],
+      ['one long value', n => `secret=${'a'.repeat(n)}`],
     ],
   }
 
-  it('has an adversarial input for every pattern', () => {
+  /** A span whose one content attribute carries `text` the way a tool result does, scrubbed through the whole path. */
+  const through = (scrubber: ReturnType<typeof createScrubber>, text: string): number => {
+    const span: PendingSpan = {
+      traceId: 't',
+      spanId: 's',
+      parentSpanId: undefined,
+      name: 'x',
+      kind: 'internal',
+      startMs: 1,
+      endMs: 2,
+      attributes: {'gen_ai.tool.call.result': contentAttribute({content: [{type: 'text', text}]}, 64 * 1024)},
+      status: {code: 'unset'},
+      events: [],
+    }
+    let best = Number.POSITIVE_INFINITY
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const started = performance.now()
+      scrubSpan(span, scrubber)
+      best = Math.min(best, performance.now() - started)
+    }
+    return best
+  }
+
+  it('has adversarial inputs for every pattern', () => {
     // #given the pattern list and the input table
     // #when / #then every pattern is exercised
     expect(SCRUB_PATTERNS.map(pattern => pattern.id).toSorted((a, b) => a.localeCompare(b))).toEqual(
@@ -388,36 +463,96 @@ describe('adversarial timing: each pattern on its own worst input', () => {
   })
 
   for (const pattern of SCRUB_PATTERNS) {
-    it(`${pattern.id} stays under the ceiling on every adversarial input`, () => {
-      // #given its inputs
-      for (const input of inputs[pattern.id] ?? []) {
-        // #when the pattern alone runs over them
-        const started = performance.now()
-        pattern.apply(input, input.toLowerCase())
-        const elapsed = performance.now() - started
+    it(`${pattern.id} grows linearly on every adversarial input, through the whole scrub path`, () => {
+      // #given its inputs and a scrubber with every pattern
+      const scrubber = createScrubber({env: {}})
+      const offenders: string[] = []
+      for (const [name, make] of inputs[pattern.id] ?? []) {
+        // #when the same shape is scrubbed at two sizes eight times apart
+        const small = through(scrubber, make(SMALL))
+        const large = through(scrubber, make(LARGE))
 
-        // #then it finishes well inside a generous ceiling (linear time, not exponential or quadratic)
-        expect({id: pattern.id, length: input.length, slow: elapsed > CEILING_MS}).toEqual({
-          id: pattern.id,
-          length: input.length,
-          slow: false,
-        })
+        // #then the time grew about eight-fold, not sixty-four-fold, and stayed under the ceiling
+        const grew = large / Math.max(small, NOISE_MS)
+        if (large > CEILING_MS || (large > NOISE_MS * GROWTH_LIMIT && grew > GROWTH_LIMIT)) {
+          offenders.push(`${name}: ${small.toFixed(1)} ms at ${SMALL}, ${large.toFixed(1)} ms at ${LARGE}`)
+        }
       }
+      expect(offenders).toEqual([])
     })
   }
 
+  it('the literal pass grows linearly with a long literal whose near-matches fill the text', () => {
+    // #given 128 secret values of 4,000 characters each that differ from the text only in their last character
+    const env: Record<string, string> = {}
+    for (let index = 0; index < 128; index += 1)
+      env[`SECRET_${index}`] = `${'a'.repeat(3_999)}${String.fromCodePoint(98 + (index % 20))}`
+    const scrubber = createScrubber({env})
+    const make = (n: number): string => 'a'.repeat(n)
+
+    // #when / #then
+    const small = through(scrubber, make(SMALL))
+    const large = through(scrubber, make(LARGE))
+    expect(large).toBeLessThan(CEILING_MS)
+    expect(large / Math.max(small, NOISE_MS)).toBeLessThan(GROWTH_LIMIT)
+  })
+
   it('scrubs a hostile mixed megabyte in bounded time', () => {
     // #given every adversarial input at once
-    const text = Object.values(inputs).flat().join('\n').slice(0, 1_000_000)
+    const text = Object.values(inputs)
+      .flat()
+      .map(([, make]) => make(20_000))
+      .join('\n')
+      .slice(0, 1_000_000)
 
     // #when
     const started = performance.now()
-    const result = scrubber.scrub(text)
+    const result = createScrubber({env: {}}).scrub(text)
     const elapsed = performance.now() - started
 
     // #then
     expect(result.ok).toBe(true)
     expect(elapsed).toBeLessThan(10_000)
+  })
+})
+
+describe('the JWT scanner agrees with the pattern it replaced', () => {
+  /** The pattern the scanner replaced, kept here as the oracle. */
+  const ORACLE = /\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{4,}/g
+  const jwt = SCRUB_PATTERNS.find(pattern => pattern.id === 'jwt')
+
+  it('gives the same text and the same count as the regex on a thousand random strings', () => {
+    // #given strings over the characters the pattern's shape is made of, from a fixed seed
+    let seed = 0x2f6e2b1
+    const next = (): number => {
+      seed = (Math.imul(seed, 1_664_525) + 1_013_904_223) >>> 0
+      return seed / 2 ** 32
+    }
+    const alphabet = ['eyJ', 'eyJ', 'a', 'B', '-', '_', '.', '.', ' ', '1', 'e', 'y', 'J', '=', 'eyJ-', 'aaaa', 'ey']
+    for (let round = 0; round < 1_000; round += 1) {
+      const length = 1 + Math.floor(next() * 40)
+      let text = ''
+      for (let index = 0; index < length; index += 1) text += alphabet[Math.floor(next() * alphabet.length)]
+      let count = 0
+      const expected = text.replaceAll(ORACLE, () => {
+        count += 1
+        return REDACTION
+      })
+
+      // #when
+      const got = jwt?.apply(text, text.toLowerCase())
+
+      // #then
+      expect({text: got?.text, count: got?.count}).toEqual({text: count === 0 ? text : expected, count})
+    }
+  })
+
+  it('does not match a token that has no word boundary before it', () => {
+    // #given
+    const glued = `xeyJ${'a'.repeat(8)}.${'b'.repeat(8)}.${'c'.repeat(4)}`
+
+    // #when / #then
+    expect(jwt?.apply(glued, glued.toLowerCase()).count).toBe(0)
   })
 })
 
