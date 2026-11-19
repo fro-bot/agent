@@ -258,6 +258,35 @@ const isIdentifierCode = (code: number): boolean =>
 const MAX_QUOTED_VALUE_CHARS = 8192
 
 /**
+ * Where an unquoted value that starts at `from` ends. A marker inside it is part of the value, not the end of it (the marker
+ * holds a closing bracket, which is also a delimiter): `pre-[REDACTED]-tail` is one value.
+ */
+function unquotedEnd(text: string, from: number): number {
+  let end = from
+  while (end < text.length) {
+    if (text.startsWith(REDACTION, end)) {
+      end += REDACTION.length
+      continue
+    }
+    if (UNQUOTED_STOP.has(text.charCodeAt(end))) break
+    end += 1
+  }
+  return end
+}
+
+const SCHEME_WORD = /^(?:bearer|basic|token|digest)$/i
+
+/** After an authorization scheme word ending at `end`: up to eight blanks and the credential token that follows it, if any. */
+function schemeCredentialEnd(text: string, end: number): number {
+  let index = end
+  while (index < text.length && index - end < 8 && (text.charCodeAt(index) === 0x20 || text.charCodeAt(index) === 0x09))
+    index += 1
+  if (index === end) return end
+  const tokenEnd = unquotedEnd(text, index)
+  return tokenEnd === index ? end : tokenEnd
+}
+
+/**
  * `name=value` and `name: value`, in plain text and in JSON text (`\"name\": \"value\"`). The match starts at the secret word
  * itself, so nothing before it is scanned or kept; every gap is a bounded class, so adjacent optional parts cannot trade
  * characters. The value is then read by hand, once, forward:
@@ -270,7 +299,8 @@ const MAX_QUOTED_VALUE_CHARS = 8192
  */
 function nameValuePattern(): ScrubPattern {
   const prefix = new RegExp(
-    String.raw`((?:${SECRET_WORDS})[\w.-]{0,20})(?:\\?["'])?[ \t]{0,4}[:=][ \t]{0,4}(\\?["'])?`,
+    // The quote around a name or a value may sit in an escaped layer: any run of backslashes (JSON in JSON in JSON) before it.
+    String.raw`((?:${SECRET_WORDS})[\w.-]{0,20})(?:\\{0,15}["'])?[ \t]{0,4}[:=][ \t]{0,4}(\\{0,15}["'])?`,
     'gi',
   )
   return {
@@ -287,7 +317,6 @@ function nameValuePattern(): ScrubPattern {
         const name = match[1] ?? ''
         const opener = match[2]
         const valueStart = match.index + match[0].length
-        if (text.startsWith(REDACTION, valueStart)) continue
         // The identifier the name belongs to: what precedes the secret word (`max_` of `max_tokens`) counts.
         let from = match.index
         while (from > 0 && match.index - from < MAX_IDENTIFIER_CHARS && isIdentifierCode(text.charCodeAt(from - 1)))
@@ -296,7 +325,9 @@ function nameValuePattern(): ScrubPattern {
 
         let valueEnd = valueStart
         if (opener === undefined) {
-          while (valueEnd < text.length && !UNQUOTED_STOP.has(text.charCodeAt(valueEnd))) valueEnd += 1
+          valueEnd = unquotedEnd(text, valueStart)
+          // `Authorization: Bearer <credential>`: the first token is the scheme, the credential is the second.
+          if (SCHEME_WORD.test(text.slice(valueStart, valueEnd))) valueEnd = schemeCredentialEnd(text, valueEnd)
           const value = text.slice(valueStart, valueEnd)
           if (counter && isShortNumber(value)) continue
           // A counter name keeps the old floor of three characters; a credential name has none.
@@ -305,6 +336,8 @@ function nameValuePattern(): ScrubPattern {
           valueEnd = closingQuote(text, valueStart, opener)
           if (valueEnd === valueStart) continue
         }
+        // Only a value that is exactly the marker counts as already redacted (an earlier pass, or the structured pass).
+        if (text.slice(valueStart, valueEnd) === REDACTION) continue
         if (valueStart < cursor) continue
         out += text.slice(cursor, valueStart) + REDACTION
         cursor = valueEnd
@@ -317,12 +350,14 @@ function nameValuePattern(): ScrubPattern {
 }
 
 /**
- * Where a quoted value that starts at `from` ends: the index of its closing quote, or the end of the line when none is
- * found within the bound. `opener` is the quote and any backslash before it (`"`, `'`, `\"`, `\'`).
+ * Where a quoted value that starts at `from` ends: the index of its closing delimiter, or the end of the line when none is
+ * found within the bound. `opener` is the quote and any backslashes before it (`"`, `'`, `\"`, `\\\"`): the run of backslashes
+ * says how many layers of JSON escaping the text is in. In a layer, the delimiter is exactly that run and a quote; a quote
+ * of the value itself is written with a longer run and does not close it.
  */
 function closingQuote(text: string, from: number, opener: string): number {
   const quote = opener.endsWith('"') ? 0x22 : 0x27
-  const escapedLayer = opener.length === 2
+  const delimiterRun = opener.length - 1
   const limit = Math.min(text.length, from + MAX_QUOTED_VALUE_CHARS)
   let index = from
   while (index < limit) {
@@ -331,17 +366,20 @@ function closingQuote(text: string, from: number, opener: string): number {
       let run = 1
       while (text.charCodeAt(index + run) === 0x5c) run += 1
       const next = text.charCodeAt(index + run)
-      if (escapedLayer) {
-        // A single backslash before the quote closes the value; a longer run escapes the quote and is skipped with it.
-        if (run === 1 && next === quote) return index
-        index += next === quote ? run + 1 : run
+      if (delimiterRun > 0) {
+        if (next === quote) {
+          if (run === delimiterRun) return index
+          index += run + 1
+        } else {
+          index += run
+        }
       } else {
-        // An odd run escapes the character after it; an even run is escaped backslashes only.
+        // Not in an escaped layer: an odd run escapes the character after it; an even run is escaped backslashes only.
         index += run + (run % 2 === 1 ? 1 : 0)
       }
       continue
     }
-    if (!escapedLayer && code === quote) return index
+    if (delimiterRun === 0 && code === quote) return index
     index += 1
   }
   // Not closed within the bound: redact to the end of the line.
@@ -478,16 +516,35 @@ export interface ScrubberOptions {
   readonly patterns?: readonly ScrubPattern[]
 }
 
+/** The patterns that run before the literals, in this order: they must see a value whole, over the original text. */
+const LEADING_PATTERN_IDS: readonly string[] = ['pem-private-key', 'name-value-pair']
+
 export function createScrubber(options: ScrubberOptions = {}): Scrubber {
   const ceiling = options.limits?.inputCeilingChars ?? DEFAULT_CONTENT_LIMITS.inputCeilingChars
   const literals = collectLiterals(options.env ?? {}, options.extraSecrets)
   const patterns = options.patterns ?? SCRUB_PATTERNS
+  const isLeading = (pattern: ScrubPattern): boolean => LEADING_PATTERN_IDS.includes(pattern.id)
+  const leading = LEADING_PATTERN_IDS.flatMap(id => patterns.filter(pattern => pattern.id === id))
+  const trailing = patterns.filter(pattern => !isLeading(pattern))
   return {
     scrub: text => {
       if (text.length > ceiling) return {ok: false, reason: 'over-input-ceiling'}
       try {
         let current = text
         let redactions = 0
+        // The order matters. A pass that inserts a marker can make a later pass skip or split what it would have matched, so
+        // the passes that must see a value whole run first, over the original text:
+        // 1. a private-key block (multi-line, consumed whole);
+        // 2. a secret-named assignment, which consumes its entire value from the original text;
+        // 3. the literal secrets from the environment;
+        // 4. every other token shape.
+        const lower0 = current.toLowerCase()
+        for (const pattern of leading) {
+          const result = pattern.apply(current, lower0)
+          if (result.count === 0) continue
+          current = result.text
+          redactions += result.count
+        }
         for (const literal of literals) {
           if (!current.includes(literal)) continue
           const parts = current.split(literal)
@@ -495,7 +552,7 @@ export function createScrubber(options: ScrubberOptions = {}): Scrubber {
           current = parts.join(REDACTION)
         }
         const lower = current.toLowerCase()
-        for (const pattern of patterns) {
+        for (const pattern of trailing) {
           const result = pattern.apply(current, lower)
           if (result.count === 0) continue
           current = result.text

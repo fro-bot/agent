@@ -334,6 +334,188 @@ describe('scrub patterns', () => {
   })
 })
 
+describe('passes do not interact: an earlier marker never makes a later pass skip or split a value', () => {
+  /** A literal the plugin's own environment holds, and token shapes, each also the FIRST word of a longer password. */
+  const ENV_LITERAL = join('envsecret', '-value-7f3a9c21')
+  const withEnv = createScrubber({env: {API_TOKEN: ENV_LITERAL}})
+  const text = (input: string, using = withEnv): string => {
+    const result = using.scrub(input)
+    if (!result.ok) throw new Error(result.reason)
+    return result.text
+  }
+  const FIRST_WORDS: Readonly<Record<string, string>> = {
+    'an environment literal': ENV_LITERAL,
+    'a GitHub token': SECRETS.githubClassic,
+    'an AWS key id': SECRETS.aws,
+    'an OpenAI-style key': SECRETS.openai,
+    'a JWT': SECRETS.jwt,
+    'a Slack token': SECRETS.slack,
+    'a bearer value': SECRETS.bearer,
+  }
+  const TAIL = 'second third fourth-word'
+
+  it.each(Object.entries(FIRST_WORDS))(
+    'removes a quoted multi-word password whose first word is %s, in plain text',
+    (_label, first) => {
+      // #given a quoted password that starts with something an earlier pass would recognise, then more words
+      const input = `login ok password: "${first} ${TAIL}" and then done`
+
+      // #when
+      const out = text(input)
+
+      // #then no word of the value survives, and what follows the closing quote does
+      for (const word of ['second', 'third', 'fourth-word'])
+        expect({word, found: out.includes(word)}).toEqual({word, found: false})
+      expect(out).toContain('and then done')
+    },
+  )
+
+  it.each(Object.entries(FIRST_WORDS))(
+    'removes the same with single quotes and an escaped layer, first word %s',
+    (_label, first) => {
+      // #given
+      const single = `secret='${first} ${TAIL}' end`
+      const escaped = String.raw`client_secret: \"${first} ${TAIL}\" end`
+
+      // #when / #then
+      for (const input of [single, escaped]) {
+        const out = text(input)
+        for (const word of ['second', 'third', 'fourth-word'])
+          expect({input, word, found: out.includes(word)}).toEqual({input, word, found: false})
+      }
+    },
+  )
+
+  it.each(Object.entries(FIRST_WORDS))(
+    'exports no part of such a password, in a JSON string and in a tool argument, first word %s',
+    (_label, first) => {
+      // #given the password inside the text of a tool result, inside a JSON string, and inside a nested tool argument
+      const result = scrubSpan(
+        spanWith({
+          attributes: {
+            'gen_ai.tool.call.result': contentAttribute(
+              {content: [{type: 'text', text: JSON.stringify({log: `password: "${first} ${TAIL}" tail`})}]},
+              65_536,
+            ),
+            'gen_ai.tool.call.arguments': contentAttribute(
+              {command: `curl -d 'password: "${first} ${TAIL}"'`, nested: [{note: `secret="${first} ${TAIL}"`}]},
+              65_536,
+            ),
+          },
+        }),
+        withEnv,
+      )
+
+      // #then
+      const exported = JSON.stringify(allStrings(result))
+      for (const word of ['second', 'third', 'fourth-word'])
+        expect({word, found: exported.includes(word)}).toEqual({word, found: false})
+      expect(() => {
+        JSON.parse(String(result.attributes['gen_ai.tool.call.result']))
+      }).not.toThrow()
+    },
+  )
+
+  it.each([
+    ['Authorization: Bearer abcdef123456uvw'],
+    ['authorization=Basic dXNlcjpwYXNzd29yZA=='],
+    ['"authorization": "Bearer abcdef123456uvw"'],
+    ['token: Token abcdef123456uvw9'],
+    ['access_token=Digest abc123def456ghi'],
+  ])('removes the credential after a scheme word: %s', input => {
+    // #given an unquoted value whose first token is the scheme word and whose second is the credential
+    const out = text(input)
+
+    // #then the credential is gone, not just the scheme word
+    expect(out).not.toMatch(/abcdef123456|dXNlcjpw|abc123def456/)
+  })
+
+  it('removes a PEM block inside a quoted password, with the words after it', () => {
+    // #given
+    const input = `password: "${SECRETS.pem} trailing words" end`
+
+    // #when
+    const out = text(input)
+
+    // #then
+    expect(out).not.toMatch(/MIIEowIBAAKC|trailing|words/)
+  })
+
+  it.each([
+    [`?api_key=${SECRETS.githubClassic}&page=2`],
+    [`https://x.test/?token=${SECRETS.openai}`],
+    [`password: ${SECRETS.connection}`],
+    [`token=${SECRETS.jwt} more`],
+  ])('removes a token that is the value of a secret-named assignment: %s', input => {
+    // #given / #when
+    const out = text(input)
+
+    // #then none of the token body is left
+    for (const needle of ['aB3dE5fG7hJ9', 'Q9x8W7e6R5', 'eyJzdWIiOiIx', 'pw12345']) expect(out).not.toContain(needle)
+  })
+
+  it('removes a password at every depth of JSON-in-JSON escaping, with spaces and an inner quote', () => {
+    // #given one, two and three layers of encoding of an object holding a multi-word password
+    const layer1 = JSON.stringify({password: String.raw`correct horse \"battery\" staple`, ok: 'fine'})
+    const layer2 = JSON.stringify(layer1)
+    const layer3 = JSON.stringify(layer2)
+
+    // #when / #then none of the words survive, and the rest does
+    for (const input of [layer1, layer2, layer3]) {
+      const out = text(input)
+      for (const word of ['correct', 'horse', 'battery', 'staple'])
+        expect({input, word, found: out.includes(word)}).toEqual({input, word, found: false})
+      expect(out).toContain('fine')
+    }
+  })
+
+  it.each(Object.entries(FIRST_WORDS).filter(([, middle]) => !middle.includes(' ')))(
+    'removes an unquoted password with %s in its middle, and what follows it in the same token',
+    (_label, middle) => {
+      // #given an unquoted value, one token, with a recognisable piece in the middle (the marker an earlier pass would insert
+      // contains a closing bracket, which also ends an unquoted value)
+      const out = text(`password=pre-${middle}-tailword and more`)
+
+      // #then
+      expect(out).not.toContain('tailword')
+      expect(out).not.toContain('pre-')
+      expect(out).toContain('and more')
+    },
+  )
+
+  it('reads an unquoted value past a marker that is already in it', () => {
+    // #given a value an earlier stage already partly redacted
+    const out = text(`password=pre-${REDACTION}-tailword and more`)
+
+    // #then the suffix goes too
+    expect(out).not.toContain('tailword')
+  })
+
+  it('leaves a value that is exactly the marker alone, and does not count it again', () => {
+    // #given text that was already redacted upstream
+    const result = withEnv.scrub(`password: ${REDACTION} and token: "${REDACTION}"`)
+
+    // #then
+    expect(result).toEqual({ok: true, text: `password: ${REDACTION} and token: "${REDACTION}"`, redactions: 0})
+  })
+
+  it('redacts a value that merely starts with the marker, in full', () => {
+    // #given
+    const out = text(`password: ${REDACTION}leftover-suffix next`)
+
+    // #then
+    expect(out).not.toContain('leftover')
+  })
+
+  it('does not count one value twice when a literal and an assignment both match it', () => {
+    // #given the environment literal as a whole password value
+    const result = withEnv.scrub(`password: ${ENV_LITERAL}`)
+
+    // #then one redaction
+    expect(result).toMatchObject({ok: true, text: `password: ${REDACTION}`, redactions: 1})
+  })
+})
+
 describe('a secret-named field is removed whole, not in part', () => {
   const attribute = (value: unknown): string => {
     const span = scrubSpan(
@@ -562,6 +744,10 @@ describe('adversarial timing: growth, not a ceiling', () => {
         rep('password: "\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\"'),
       ],
       ['a numeric value at the exemption edge', rep('password: 12345678 ')],
+      ['deep escaped layers that never close', rep(String.raw`password: \\\"aaaaaaaaaaaaaaaaaaaaaaaaaaaa`)],
+      ['deep escaped layers with mismatched runs', rep(String.raw`password: \\\"aa\\"aa\\\\\\"`)],
+      ['a scheme word then blanks, repeated', rep('authorization: Bearer        ')],
+      ['a marker that starts a value, repeated', rep('password: [REDACTED]x ')],
       ['a counter name then a long number', rep('max_tokens: 123456789012 ')],
       ['a long line with no quote at all', n => `password: "${'x '.repeat(n / 2)}`],
     ],
