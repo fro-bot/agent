@@ -1156,13 +1156,15 @@ describe("writeJobSummary", () => {
 
 This section addresses F83: Telemetry Policy Enforcement, ensuring privacy-first telemetry across all modalities.
 
+**Amended:** 2026-11-19. The `telemetry` input and `TelemetryConfig` sketched below were never built. Run tracing replaces them: the `trace-endpoint` and `trace-headers` inputs send OpenTelemetry traces, with prompt and tool content, to a collector the operator chooses. That is a deliberate exception to "no raw content" below. It is off by default, has no default destination, only the operator can turn it on, and the project never receives the data. Everything else in this policy stands. See [Tracing a run](../docs/wiki/Setup%20and%20Configuration.md#tracing-a-run).
+
 ### Policy Requirements
 
 Per PRD v1.4, the telemetry policy mandates:
 
 1. **Opt-in only**: No external telemetry aggregation by default
 2. **Local-first**: Metrics derived from run summaries and structured JSON logs only
-3. **No raw content**: Never log code, comments, or prompts to external systems
+3. **No raw content**: Never log code, comments, or prompts to external systems, except by operator-enabled run tracing (see the amendment above)
 4. **Transparent**: User controls what data leaves the system
 
 ### Implementation

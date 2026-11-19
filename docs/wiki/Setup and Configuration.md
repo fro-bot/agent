@@ -329,6 +329,78 @@ Treat everything the agent produces as untrusted, including restored session sta
 
 Independently of whether a credential is provisioned, the OpenCode child process is spawned under a **deny-by-default environment filter** (`packages/runtime/src/agent/filter-env.ts`, applied via `with-scrubbed-env.ts`). Only an enumerated allowlist of keys survives — GitHub Actions context, a handful of standard shell and locale variables, proxy/CA-bundle settings (including `NODE_EXTRA_CA_CERTS`, admitted by exact name), and the `OPENCODE_*`, `RUNNER_*`, `XDG_*`, and `LC_*` prefixes. No other `NODE_*` key is admitted. Anything ending in a credential-shaped suffix (`_TOKEN`, `_API_KEY`, `_SECRET`, `_KEY`, and similar), the `AWS_*` and `INPUT_*` prefixes, and `GITHUB_TOKEN`, `GH_TOKEN`, `OPENCODE_PURE`, and `NODE_OPTIONS` by exact name are stripped even if they would otherwise match. The reduction is scoped: the harness restores its own environment immediately after the spawn so it can still reach the S3 backend, and it fails closed — if the scrub cannot complete, the child is never spawned.
 
+## Tracing a run
+
+The Action can send an OpenTelemetry trace of each run to a collector you operate. Tracing is off unless you set `trace-endpoint`. There is no default destination, and the project never receives trace data.
+
+```yaml
+- uses: fro-bot/agent@<ref>
+  with:
+    trace-endpoint: https://collector.example.com/v1/traces
+    trace-headers: ${{ secrets.TRACE_HEADERS }}
+```
+
+- `trace-endpoint` is the full URL of the collector's OTLP/HTTP traces route. It must be `https`. Plain `http` is accepted only for a loopback IP address such as `127.0.0.1`, for a collector running in the same job.
+- `trace-headers` holds the collector credential, one `Name: value` header per line. Keep it in a secret. It is refused with an `http` endpoint, because a loopback collector cannot prove who it is. For the same reason, do not put a token in the path or query of an `http` endpoint.
+- A value that is not accepted turns tracing off with one warning. It never fails the run.
+
+### What a trace contains
+
+Each turn of the session is one trace. It has a span for the agent, one for each model request and one for each tool call. A subagent's spans sit under the tool call that started it. Span names and attributes follow the OpenTelemetry GenAI conventions.
+
+The spans carry content:
+
+- the system instructions, the messages and the tool definitions of each model request, as the Fro Bot plugin saw them before the request was sent;
+- the model's reply, its token usage and its finish reason;
+- each tool call's arguments and the result the model received.
+
+The messages of a request include the session's earlier history. So the first traced request of a restored session exports turns from before tracing was turned on.
+
+A trace can hold private repository content, text written by other people (issue and comment bodies, fetched web pages) and secrets. Treat the collector like a store of CI logs with secrets in them: limit who can read it and how long it keeps data.
+
+Every span also carries the session id, the repository, the run id and attempt, the job and the trigger.
+
+### What a trace leaves out
+
+- Title, compaction and other helper requests are retried by OpenCode where a plugin cannot see, so each is one span with its attempt count marked unknown.
+- Calls made inside a code-execution tool are not separate spans.
+- A subagent that reports back after the turn has been idle for 30 minutes starts a second trace that names the first. Both carry the same root session id.
+- Content the plugin could not capture is absent. Content it redacted, shortened or left out is marked on the span.
+
+### Scrubbing
+
+Before a span is sent, the plugin removes values that look like credentials: known token formats, private keys, connection strings, the values of secret-named fields, and the values of its own secret-named environment variables. Large values are shortened after that.
+
+This is best-effort. A secret with no recognisable shape, in a field with an ordinary name, is not found.
+
+### How the credential is kept
+
+The Action starts a small relay process before the agent. The relay holds the collector URL and credential, listens on a loopback port, and forwards trace batches to that one URL. The agent's server is given only the relay's loopback address.
+
+- With `isolate-agent: true`, the agent cannot read the collector credential.
+- Without it, the agent runs as the same user as the Action and can read the credential and every span. The run logs a warning saying so.
+
+In both cases the agent, or anything else on the runner, can post to the relay. It can therefore write misleading spans, and it can use up the run's trace quota so that real spans are dropped. Read a trace as evidence of what the agent's process reported, not as an audit log.
+
+Use a credential that can only write traces, scoped to one project, so a leaked one cannot read anything.
+
+### What the run log shows
+
+Tracing never fails or delays a run's result. The log has these lines, with counts only:
+
+- `Trace relay started`.
+- `Trace relay stopped`, with the batches the collector acknowledged, the batches to retry and the batches dropped, and the span totals the plugin reported with its last batch. `countIncomplete` means the server or the relay was killed before the counts were final.
+- A warning when the relay could not start or exited early. The run continues untraced.
+
+An acknowledged batch is the collector's HTTP answer. It is not proof that every span in it was stored.
+
+### Other things to know
+
+- With tracing on, the Fro Bot plugin is listed after your own `opencode-config` plugins, so it sees the prompt after they have changed it. With tracing off the order is unchanged.
+- OpenCode has its own OpenTelemetry exporter, which carries no prompt or tool content. It is separate from this feature and stays off in the Action, which removes `OTEL_*` variables from the agent's environment.
+- A fork pull request has no access to your secrets. With `trace-endpoint` set and `trace-headers` empty, the Action logs a notice and sends spans with no credential, which a collector that needs one will refuse.
+- Tracing a local OpenCode session uses a settings file instead of these inputs. See the [plugin README](../../packages/opencode-plugin/README.md).
+
 ## Action Inputs
 
 The action accepts over 20 inputs defined in `action.yaml`, grouped into core, agent, S3, and configuration categories. The most important ones:
@@ -342,6 +414,7 @@ The action accepts over 20 inputs defined in `action.yaml`, grouped into core, a
 - `isolate-agent` (default `false`) runs the OpenCode server and its tools as a separate local user on GitHub-hosted Linux runners with passwordless `sudo`, from a published `fro-bot/agent@<ref>`; any other runner or install fails the run before setup. See [Withholding is not an OS boundary](#withholding-is-not-an-os-boundary).
 - `repo-skills` (default `false`, OpenCode V2 only) loads the repository's `.agents/skills` on trusted runs while project config stays disabled. Trust is an allow list, not the credential disposition: `schedule` and `workflow_dispatch`, or `pull_request`, `issue_comment` and `issues` from an `OWNER`, `MEMBER` or `COLLABORATOR`, with PR-scoped events also requiring the head repository to equal the run's repository (a maintainer commenting on a fork PR is denied, as is anything with missing facts). Every eligible run reads the default branch, fetched fresh from the base repository into a throwaway repository and written to disk as raw stored blobs with `git cat-file --batch` (never `git archive`, which would apply committed `.gitattributes` such as `export-subst` and expand a blob past the budget); the checkout, a dispatched branch and a PR head are never a source, and no ref or config in the checkout is read. The fetched tree is listed from raw `-z` bytes with a strict UTF-8 decode and refused if any path is invalid UTF-8, duplicated (case- and normalization-folded), or both a file and a directory; symlinks are never written to disk (a skill that contains one is rejected by id at admission). It is then checked against a size budget before anything is extracted, one skill (`.agents/skills/<id>/`) at a time: a skill with more than 1000 entries (files, symlinks and directories alike), more than 5 MiB of blobs, or a file more than 6 directories below its own directory is dropped, and so is any skill that would take the running total of the skills already admitted (taken in id order) past 1000 entries or 5 MiB. Each dropped skill gets one warning naming its id and the limit it broke (never a file path), and the other skills still load: one oversized generated skill no longer takes the rest down with it. A submodule or an unsafe path anywhere, a tree listing too large to read (4 MiB), or anything the blob read finds inconsistent still refuses the whole source. Only the blobs of admitted skills are read and written. An admission filter copies only real `<id>/SKILL.md` directories into a run-scoped directory under `RUNNER_TEMP`, publishing each skill by rename only once its copy is complete: symlinks reject the skill, size and file count are bounded, and a skill whose directory name collides with a bundled Systematic skill or an OpenCode built-in is skipped (OpenCode keys skills by directory name; the frontmatter `name` is display text). The copy is named in `skills.paths`, gets the bundled-skills `external_directory` allow and `edit` deny, and is removed when the run ends. See `src/services/setup/repo-skills.ts` and `src/features/agent/repo-skills-trust.ts`.
 - `model` sets the LLM model in `provider/model` format. The default is `opencode/big-pickle`, a free model that needs no credentials; supplying `auth-json` does not change it, so set `model` to run on your own provider. See [Choosing a model and restricting providers](#choosing-a-model-and-restricting-providers).
+- `trace-endpoint` / `trace-headers` send an OpenTelemetry trace of the run, with prompt and tool content, to a collector you operate. Off unless `trace-endpoint` is set. See [Tracing a run](#tracing-a-run).
 - `timeout` controls the execution timeout (default: 30 minutes, 0 for no limit).
 - `s3-backup` / `s3-bucket` / `aws-region` / `s3-endpoint` / `s3-prefix` / `s3-expected-bucket-owner` / `s3-allow-insecure-endpoint` / `s3-sse-encryption` / `s3-sse-kms-key-id` enable and configure the durable S3-compatible object store (see [[Session Persistence]]). Input validation always rejects these metadata targets: `169.254.169.254`, `169.254.170.2`, `100.100.100.200`, `fd00:ec2::254`, their IPv4-mapped and translated forms, and `metadata.google.internal`. It also rejects loopback, private, link-local, unspecified, CGNAT, and documentation addresses unless `s3-allow-insecure-endpoint` is `true`. It enforces HTTPS unless that flag is set. Known limits: hostnames are not DNS-resolved, and NAT64, IPv4-compatible IPv6, the benchmarking range `198.18.0.0/15`, `.internal` and `.local` names, and the bare single-label name `metadata` are not classified.
 - `session-retention` controls how many sessions to keep before pruning (default: 50).

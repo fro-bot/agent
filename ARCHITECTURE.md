@@ -381,6 +381,17 @@ With `isolate-agent`, the Action creates a per-run local user, hands it only the
 
 > See also: [Setup and Configuration](docs/wiki/Setup%20and%20Configuration.md#withholding-is-not-an-os-boundary), [key proxy](docs/wiki/Setup%20and%20Configuration.md#isolate-agent-the-key-proxy)
 
+### Run Tracing (Action + Plugin)
+
+Opt-in OpenTelemetry tracing of a run. `@fro.bot/opencode-plugin` (`packages/opencode-plugin/src/tracing/`) turns hook calls and session events into GenAI-convention spans with content, and exports them over OTLP/HTTP. In the Action, a relay child (`dist/trace-relay.js`, `packages/runtime/src/agent/trace-relay.ts`, supervised by `src/harness/phases/trace-relay-process.ts`) holds the collector URL and credential from the `trace-endpoint` and `trace-headers` inputs.
+
+- Only the operator turns tracing on or chooses the destination: Action inputs, or a user-owned settings file for a local session. Plugin options, project config and repository content never do.
+- The server gets a launcher variable with the relay's loopback address and the run identity, written at spawn (`packages/runtime/src/agent/tracing-launcher.ts`). It holds no credential and no collector host. A relay that is not alive at spawn means the plugin is told off.
+- Tracing is fail-soft: the relay never joins the server's abort signal, the sandbox outcome or the persistence decision.
+- The plugin loads its tracing code and the bundled SDK through one dynamic `import()`, only when tracing is on.
+
+> See also: [Setup and Configuration](docs/wiki/Setup%20and%20Configuration.md#tracing-a-run)
+
 ### Operator Ingress Trust Policy (Gateway)
 
 `packages/gateway/src/web/ingress/` decides which address on an operator request is the client behind the TLS proxy. One explicit `OperatorIngressPolicy` (`policy.ts`) is `direct` or `trusted-proxy` with a non-empty tuple of **exact** peers from `GATEWAY_OPERATOR_TRUSTED_PROXIES` (`packages/gateway/src/config.ts`); invalid values fail at startup.
