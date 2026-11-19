@@ -2592,6 +2592,128 @@ describe('createSandboxLifecycle', () => {
     })
   })
 
+  describe('an extra stop registered for the signal teardown', () => {
+    const prepareInput = {keyFilePaths: [], ghConfigDir: null, repoSkills: null}
+
+    async function preparedWith(overrides: Partial<Parameters<typeof createSandboxLifecycle>[0]> = {}) {
+      const harness = createHarness()
+      const host = fakeHost()
+      const states: string[] = []
+      const lifecycle = create(harness, {signals: host, recordState: state => states.push(state), ...overrides})
+      expect((await lifecycle.prepare(prepareInput)).success).toBe(true)
+      return {harness, host, states, lifecycle}
+    }
+
+    it('runs beside the sandbox teardown on a signal, and the signal is re-raised only after both finished', async () => {
+      // #given a sandbox stop that is still pending, and a registered extra stop
+      const {harness, host, lifecycle} = await preparedWith()
+      const sandboxStop = deferred<'stopped'>()
+      harness.mocks.stop.mockImplementation(async () => sandboxStop.promise)
+      const extraStop = deferred<void>()
+      const extra = vi.fn(async () => extraStop.promise)
+      lifecycle.registerSignalStop(extra)
+
+      // #when SIGTERM arrives
+      host.emitter.emit('SIGTERM')
+
+      // #then the extra stop started without waiting for the sandbox, and nothing was re-raised yet
+      await vi.waitFor(() => {
+        expect(extra).toHaveBeenCalledTimes(1)
+      })
+      expect(host.killed).toEqual([])
+
+      // #when the sandbox finishes first
+      sandboxStop.resolve('stopped')
+      await vi.waitFor(() => {
+        expect(harness.mocks.deleteAccount).toHaveBeenCalled()
+      })
+      await new Promise(resolve => setTimeout(resolve, 20))
+
+      // #then the re-raise still waits for the extra stop
+      expect(host.killed).toEqual([])
+      extraStop.resolve()
+      await vi.waitFor(() => {
+        expect(host.killed).toEqual(['4242:SIGTERM'])
+      })
+    })
+
+    it('is cut at the teardown budget, and a slow extra stop alone does not mark the sandbox unsafe', async () => {
+      // #given an extra stop that never returns, and a sandbox teardown that completes
+      const {host, states, lifecycle} = await preparedWith({signalTeardownBudgetMs: 60})
+      lifecycle.registerSignalStop(async () => new Promise<never>(() => undefined))
+
+      // #when SIGINT arrives
+      host.emitter.emit('SIGINT')
+
+      // #then the signal is re-raised at the budget, and the sandbox was recorded restored, not unsafe
+      await vi.waitFor(() => {
+        expect(host.killed).toEqual(['4242:SIGINT'])
+      })
+      expect(states.at(-1)).toBe('restored')
+    })
+
+    it('does not stop the sandbox teardown or the re-raise when it throws or rejects', async () => {
+      const {harness, host, lifecycle} = await preparedWith()
+      lifecycle.registerSignalStop(() => {
+        throw new Error('sync boom')
+      })
+      lifecycle.registerSignalStop(async () => {
+        throw new Error('async boom')
+      })
+      const second = vi.fn(async () => undefined)
+      lifecycle.registerSignalStop(second)
+
+      host.emitter.emit('SIGTERM')
+
+      await vi.waitFor(() => {
+        expect(host.killed).toEqual(['4242:SIGTERM'])
+      })
+      expect(second).toHaveBeenCalledTimes(1)
+      expect(harness.mocks.deleteAccount).toHaveBeenCalledTimes(1)
+    })
+
+    it('is not called by a normal release, which the run stops it for itself', async () => {
+      const {lifecycle} = await preparedWith()
+      const extra = vi.fn(async () => undefined)
+      lifecycle.registerSignalStop(extra)
+
+      await lifecycle.release()
+
+      expect(extra).not.toHaveBeenCalled()
+    })
+
+    it('runs at once when it is registered after a signal began', async () => {
+      const {host, lifecycle} = await preparedWith()
+      host.emitter.emit('SIGTERM')
+      await vi.waitFor(() => {
+        expect(host.killed).toEqual(['4242:SIGTERM'])
+      })
+      const late = vi.fn(async () => undefined)
+
+      lifecycle.registerSignalStop(late)
+
+      expect(late).toHaveBeenCalledTimes(1)
+    })
+
+    it('leaves the key proxy slot as it was', async () => {
+      // #given an extra stop registered before the proxy starts
+      const {lifecycle} = await preparedWith()
+      lifecycle.registerSignalStop(async () => undefined)
+      const died = new AbortController()
+      const stop = vi.fn(async () => ({outcome: 'stopped' as const, crashed: false}))
+
+      // #when the key proxy starts, and a second one is attempted
+      const first = await lifecycle.startKeyProxy(async () => ({proxy: {died: died.signal, stop}, unconfirmed: false}))
+      const second = await lifecycle.startKeyProxy(async () => ({proxy: {died: died.signal, stop}, unconfirmed: false}))
+
+      // #then the first took the slot and the second was refused, exactly as without an extra stop
+      expect(first.success).toBe(true)
+      expect(second.success).toBe(false)
+      await lifecycle.release()
+      expect(stop).toHaveBeenCalledTimes(1)
+    })
+  })
+
   describe('the key proxy the lifecycle owns', () => {
     type StopOutcome = 'already-exited' | 'killed' | 'stopped' | 'unconfirmed'
 

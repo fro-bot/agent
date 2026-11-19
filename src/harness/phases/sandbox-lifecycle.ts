@@ -164,6 +164,15 @@ export interface SandboxLifecycle {
   readonly startKeyProxy: <T extends OwnedKeyProxy>(
     start: (context: {readonly signal: AbortSignal}) => Promise<KeyProxyStartReport<T>>,
   ) => Promise<Result<T | null, string>>
+  /**
+   * Registers a stop the signal teardown runs beside the sandbox's own, inside the same budget (`SIGNAL_TEARDOWN_BUDGET_MS`),
+   * for a process the run owns that the lifecycle does not: the trace relay. A cancellation ends the process without running
+   * `run.ts`'s `finally`, so without this the relay would be left to notice its stdin closing. It is a bounded extra, not part
+   * of the teardown's outcome: it never changes what the sandbox reports, a throw or a rejection is swallowed, and one that
+   * outlasts the budget is cut off with the rest. A normal `release` does not call it (the run stops the process itself), and
+   * it takes no part in the key proxy's slot. Registered after a signal began, it runs at once.
+   */
+  readonly registerSignalStop: (stop: () => Promise<unknown>) => void
 }
 
 /** Longest `release` waits for an in-flight launch to settle after aborting it, before it fails closed as unconfirmed. */
@@ -552,6 +561,16 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   }
   // Bound once `release` is defined below; the handlers only run after `prepare`, so it is always set by then.
   let releaseRef: () => Promise<SandboxReleaseResult> = async () => ({stop: 'never-started', restore: 'not-needed'})
+  // Extra stops the signal teardown runs beside the sandbox's (the trace relay's). Not part of the teardown's outcome.
+  const signalStops: (() => Promise<unknown>)[] = []
+  /** Runs one extra stop. Never rejects and never throws: a failing extra stop must not touch the sandbox teardown. */
+  const runSignalStop = async (stop: () => Promise<unknown>): Promise<void> => {
+    try {
+      await stop()
+    } catch {
+      // The sandbox's own teardown decides the outcome; an extra stop that failed has nothing to add.
+    }
+  }
   const onSignal = async (signal: 'SIGINT' | 'SIGTERM'): Promise<void> => {
     if (signalled) return
     signalled = true
@@ -562,7 +581,11 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     const timedOut = new Promise<'timeout'>(resolve => {
       timer = setTimeout(() => resolve('timeout'), options.signalTeardownBudgetMs ?? SIGNAL_TEARDOWN_BUDGET_MS)
     })
+    // The extra stops start now, beside the sandbox teardown, so both fit the one budget.
+    const extraStops = Promise.all(signalStops.map(runSignalStop))
     const outcome = await Promise.race([releaseRef().catch(() => 'failed' as const), timedOut])
+    // Whatever budget is left is theirs too; the sandbox's outcome above is decided without them.
+    await Promise.race([extraStops, timedOut])
     if (timer !== undefined) clearTimeout(timer)
     if (outcome === 'timeout' || outcome === 'failed') {
       logger.error('The sandbox was not confirmed stopped and restored before exiting on a signal')
@@ -1328,5 +1351,13 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   }
 
   // False from the moment a signal begins the teardown (not when it ends), so a caller about to spawn the server sees it.
-  return {prepare, launch, release, startKeyProxy}
+  const registerSignalStop = (stop: () => Promise<unknown>): void => {
+    if (signalled) {
+      runSignalStop(stop).catch(() => undefined)
+      return
+    }
+    signalStops.push(stop)
+  }
+
+  return {prepare, launch, release, startKeyProxy, registerSignalStop}
 }
