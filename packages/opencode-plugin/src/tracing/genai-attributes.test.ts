@@ -42,6 +42,7 @@ const chat = (overrides: Partial<ChatRecord> = {}): ChatRecord => ({
   usage: {input: 70, output: 13, reasoning: 7, cacheRead: 30, cacheWrite: 0},
   cost: 0.5,
   followOnOf: [],
+  attemptCountUnknown: false,
   ...overrides,
 })
 
@@ -54,6 +55,8 @@ const tool = (overrides: Partial<ToolRecord> = {}): ToolRecord => ({
   outcome: 'success',
   input: {path: 'README.md'},
   result: {content: [{type: 'text', text: 'file body'}], metadata: {truncated: false}},
+  providerExecuted: false,
+  discarded: [],
   ...overrides,
 })
 
@@ -633,5 +636,39 @@ describe('what a hook-time snapshot could not take', () => {
     for (const name of ['gen_ai.system_instructions', 'gen_ai.tool.definitions', 'gen_ai.input.messages']) {
       expect(fromSnapshot.attributes[name]).toBe(fromRaw.attributes[name])
     }
+  })
+})
+
+describe('what the tool lifecycle and unobservable retries add to a span', () => {
+  it('marks a provider-executed tool, and a rejected one, and sets nothing for an ordinary call', () => {
+    // #given
+    const hosted = exported(tool({providerExecuted: true}))
+    const rejected = exported(tool({outcome: 'rejected', status: 'error', errorType: 'plugin.reuse-guard'}))
+    const ordinary = exported(tool())
+
+    // #then
+    expect(hosted.attributes['fro_bot.tool.provider_executed']).toBe(true)
+    expect(rejected.attributes['fro_bot.tool.outcome']).toBe('rejected')
+    expect(rejected.attributes['fro_bot.tool.error_type']).toBe('plugin.reuse-guard')
+    expect(ordinary.attributes['fro_bot.tool.provider_executed']).toBeUndefined()
+  })
+
+  it.each(['title', 'compaction', 'generate'] as const)(
+    'marks a %s request’s attempt count as unknown, and sets no attempt number',
+    requestKind => {
+      // #given
+      const span = exported(chat({requestKind, attemptCountUnknown: true}))
+
+      // #then
+      expect(span.attributes['fro_bot.request.attempt_count_unknown']).toBe(true)
+      expect(span.attributes['fro_bot.request.attempt']).toBeUndefined()
+    },
+  )
+
+  it('sets no unknown-attempts marker on a session model step, which has a retry hook and an attempt number', () => {
+    // #given / #then
+    const span = exported(chat({attempt: 2}))
+    expect(span.attributes['fro_bot.request.attempt_count_unknown']).toBeUndefined()
+    expect(span.attributes['fro_bot.request.attempt']).toBe(2)
   })
 })

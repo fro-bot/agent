@@ -112,6 +112,29 @@ export type Observation = ObservationBase &
         readonly text: string
       }
     | {
+        /** `session.tool.input.started`: the call's name, known before the call itself. */
+        readonly kind: 'tool.named'
+        readonly sessionId: string
+        readonly callId: string
+        readonly tool: string
+      }
+    | {
+        /**
+         * `session.tool.called`: the call is published, before any local execution (v2.3.2 `step.ts`: "A local execution
+         * starts only after its Tool.Called publication completes"). This opens the tool span. A provider-executed call
+         * (`executed`) never reaches the local path, so it has no before or after hook.
+         */
+        readonly kind: 'tool.called'
+        readonly sessionId: string
+        readonly callId: string
+        /** The step (assistant message) whose response asked for this call. */
+        readonly messageId?: string | undefined
+        readonly executed: boolean
+        /** A snapshot of the model's arguments. */
+        readonly input?: unknown
+      }
+    | {
+        /** The `execute.before` hook. Adds the agent and the arguments the tool will receive; never opens a span. */
         readonly kind: 'tool.before'
         readonly sessionId: string
         readonly callId: string
@@ -142,6 +165,10 @@ export type Observation = ObservationBase &
         /** The tool cut its own output (not the plugin's truncation). */
         readonly truncated?: boolean | undefined
         readonly childSessionId?: string | undefined
+        /** The provider ran the tool, not this server. */
+        readonly executed?: boolean | undefined
+        /** A snapshot of the success event's content: what the model saw. The `execute.after` hook's result wins when it fired. */
+        readonly result?: unknown
       }
     | {
         readonly kind: 'compaction.started'

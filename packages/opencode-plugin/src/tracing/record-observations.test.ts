@@ -1,6 +1,7 @@
 import {describe, expect, it, vi} from 'vitest'
 
-import {observeEvent, observeHook, registerObservers, reportStateOf} from './record-observations.js'
+import {TASK_REUSE_REJECTION} from '../task-reuse-guard.js'
+import {GUARD_REFUSAL_TEXT, observeEvent, observeHook, registerObservers, reportStateOf} from './record-observations.js'
 
 const SES = 'ses_abc'
 
@@ -129,6 +130,104 @@ describe('observeEvent', () => {
       errorType: 'permission.rejected',
       message: 'no',
     })
+  })
+
+  it('names a call from the input-started event and opens it from the called event, with a snapshot of its arguments', () => {
+    // #given the two events a tool call publishes before it runs (verified against v2.3.2 `publish-llm-event.ts`)
+    const args = {path: 'README.md'}
+    const named = observeEvent(
+      event('session.tool.input.started', {assistantMessageID: 'm', id: 'call_1', name: 'read'}),
+    )
+    const called = observeEvent(
+      event('session.tool.called', {assistantMessageID: 'm', id: 'call_1', input: args, executed: false}),
+    )
+    args.path = 'EDITED'
+
+    // #then the name is known before the call, and the call carries the step, whether the provider ran it, and the arguments as they were
+    expect(named).toEqual({
+      kind: 'tool.named',
+      at: 1000,
+      sessionId: 'ses_abc',
+      callId: 'call_1',
+      tool: 'read',
+    })
+    expect(called).toMatchObject({
+      kind: 'tool.called',
+      callId: 'call_1',
+      messageId: 'm',
+      executed: false,
+      input: {path: 'README.md'},
+    })
+  })
+
+  it('marks a provider-executed call, and gives a call with no input an empty-object input', () => {
+    // #given
+    const called = observeEvent(
+      event('session.tool.called', {assistantMessageID: 'm', id: 'call_2', input: {}, executed: true}),
+    )
+
+    // #then
+    expect(called).toMatchObject({kind: 'tool.called', executed: true, input: {}})
+  })
+
+  it('carries a successful tool event’s content as a result snapshot, and a failed one none', () => {
+    // #given
+    const content = [{type: 'text', text: 'file body'}]
+    const ok = observeEvent(
+      event('session.tool.success', {
+        assistantMessageID: 'm',
+        id: 'call_1',
+        content,
+        metadata: {truncated: true},
+        executed: false,
+      }),
+    )
+    const failed = observeEvent(
+      event('session.tool.failed', {
+        assistantMessageID: 'm',
+        id: 'call_2',
+        error: {type: 'tool.execution', message: 'no'},
+        executed: true,
+      }),
+    )
+    content[0] = {type: 'text', text: 'EDITED'}
+
+    // #then
+    expect(ok).toMatchObject({
+      kind: 'tool.ended',
+      succeeded: true,
+      executed: false,
+      result: {content: [{type: 'text', text: 'file body'}], metadata: {truncated: true}},
+    })
+    expect(failed).toMatchObject({kind: 'tool.ended', succeeded: false, executed: true})
+    expect(Reflect.get(failed ?? {}, 'result')).toBeUndefined()
+  })
+
+  it('keeps its copy of the guard’s refusal text equal to the guard’s', () => {
+    // #given / #when / #then
+    expect(GUARD_REFUSAL_TEXT).toBe(TASK_REUSE_REJECTION)
+  })
+
+  it('tags a failed call whose message is this plugin’s own reuse-guard refusal, and no other', () => {
+    // #given the guard's fixed text, and a failure that merely resembles it
+    const guard = observeEvent(
+      event('session.tool.failed', {
+        assistantMessageID: 'm',
+        id: 'c1',
+        error: {type: 'unknown', message: TASK_REUSE_REJECTION},
+      }),
+    )
+    const other = observeEvent(
+      event('session.tool.failed', {
+        assistantMessageID: 'm',
+        id: 'c2',
+        error: {type: 'unknown', message: `${TASK_REUSE_REJECTION} `},
+      }),
+    )
+
+    // #then
+    expect(guard).toMatchObject({kind: 'tool.ended', succeeded: false, errorType: 'plugin.reuse-guard'})
+    expect(other).toMatchObject({kind: 'tool.ended', errorType: 'unknown'})
   })
 
   it('yields no observation, and never throws, for a drifted or unrelated shape', () => {

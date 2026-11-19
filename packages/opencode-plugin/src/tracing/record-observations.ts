@@ -10,7 +10,7 @@
 import type {ErrorInfo, Observation, RequestKind, Usage} from './observation.js'
 import type {SnapshotContext} from './snapshot.js'
 
-import {snapshotPrompt, snapshotRequest, snapshotToolArguments, snapshotToolResult} from './snapshot.js'
+import {snapshotPrompt, snapshotRequest, snapshotSize, snapshotToolArguments, snapshotToolResult} from './snapshot.js'
 
 type Json = Record<string, unknown>
 
@@ -153,6 +153,23 @@ export function observeHook(
   return undefined
 }
 
+/**
+ * The error type a failed tool event carries, or `plugin.reuse-guard` when the message is this plugin's own guard's fixed
+ * refusal. The guard throws in the `execute.before` hook; the server publishes that as a failed call whose error type is
+ * `unknown` (measured on 2.3.2), so the fixed text is the only thing that says who refused it.
+ */
+/**
+ * The guard's fixed refusal text, copied here, not imported: a module shared with the entry would make the bundler hoist
+ * it into a chunk the entry imports statically, and the entry may import nothing but host modules. `record-observations.test.ts`
+ * pins this copy to `TASK_REUSE_REJECTION`.
+ */
+export const GUARD_REFUSAL_TEXT =
+  'Session reuse is disabled in this environment. Start a new task and include the context it needs.'
+
+function toolErrorType(type: string | undefined, message: string | undefined): string | undefined {
+  return message === GUARD_REFUSAL_TEXT ? 'plugin.reuse-guard' : type
+}
+
 /** How far into a report's text the `<subagent …>` header is looked for. */
 const REPORT_HEADER_WINDOW = 400
 
@@ -181,7 +198,7 @@ function itemKind(item: Json | undefined): 'user' | 'synthetic' | 'compaction' |
 }
 
 /** One bus event as an observation. Events the model does not read (deltas, config updates, usage detail) yield none. */
-export function observeEvent(raw: unknown): Observation | undefined {
+export function observeEvent(raw: unknown, snapshot: SnapshotContext = {}): Observation | undefined {
   const event = asRecord(raw)
   const type = asString(event?.type)
   const data = asRecord(event?.data)
@@ -265,19 +282,42 @@ export function observeEvent(raw: unknown): Observation | undefined {
         bytes: text.length,
       }
     }
+    case 'session.tool.input.started': {
+      const callId = asString(data.id)
+      const tool = asString(data.name)
+      return callId === undefined || tool === undefined ? undefined : {kind: 'tool.named', at, sessionId, callId, tool}
+    }
+    case 'session.tool.called': {
+      const callId = asString(data.id)
+      if (callId === undefined) return undefined
+      const input = snapshotToolArguments(data.input, snapshot)
+      return {
+        kind: 'tool.called',
+        at,
+        sessionId,
+        callId,
+        messageId,
+        executed: data.executed === true,
+        input,
+        bytes: snapshotSize(input),
+      }
+    }
     case 'session.tool.success':
     case 'session.tool.failed': {
       const callId = asString(data.id)
       if (callId === undefined) return undefined
       const metadata = asRecord(data.metadata)
       const error = asRecord(data.error)
+      const succeeded = type === 'session.tool.success'
       return {
         kind: 'tool.ended',
         at,
         sessionId,
         callId,
-        succeeded: type === 'session.tool.success',
-        errorType: asString(error?.type),
+        executed: data.executed === true,
+        result: succeeded ? snapshotToolResult({content: data.content, metadata}, snapshot) : undefined,
+        succeeded,
+        errorType: toolErrorType(asString(error?.type), asString(error?.message)),
         message: asString(error?.message),
         truncated: typeof metadata?.truncated === 'boolean' ? metadata.truncated : undefined,
         // Only the stock `subagent` tool puts a child session id here; the model checks the tool when it links.
@@ -372,7 +412,7 @@ export async function registerObservers(
       for await (const event of host.event.subscribe()) {
         if (stopped) break
         try {
-          deliver(observeEvent(event))
+          deliver(observeEvent(event, snapshot))
         } catch {
           // See above.
         }

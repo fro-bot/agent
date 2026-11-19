@@ -441,6 +441,43 @@ describe.skipIf(!runnable)('tracing in a real opencode V2', () => {
     }
   }, 90_000)
 
+  it('exports a tool span, outcome rejected, for a call this plugin’s own reuse guard refused', async () => {
+    // #given a model that tries to resume a subagent session, which the built plugin's guard refuses in the before hook
+    const steps: FakeStep[] = [
+      {
+        all: ['G-ONE'],
+        none: [NOT_TOOL],
+        tools: [
+          {
+            name: 'subagent',
+            args: {
+              agent: 'general',
+              description: 'resume',
+              prompt: 'G-CHILD again',
+              sessionID: 'ses_00000000000000000000000000',
+            },
+          },
+        ],
+      },
+      {all: ['G-ONE', NOT_TOOL], text: 'guard handled'},
+    ]
+    await run({steps}, async h => {
+      const session = await h.session()
+
+      // #when the turn runs and the server stops
+      await prompt(h.api, session, 'G-ONE resume a session')
+      await waitUntil('the root span', () => h.spans().some(isRoot), 30_000)
+      await h.stop()
+
+      // #then the call is one tool span, rejected, with the guard's error type, and it started no child
+      const calls = h.spans().filter(span => span.name === 'execute_tool subagent')
+      expect(calls).toHaveLength(1)
+      expect(calls[0]?.attrs['fro_bot.tool.outcome']).toBe('rejected')
+      expect(calls[0]?.attrs['fro_bot.tool.error_type']).toBe('plugin.reuse-guard')
+      expect(h.spans().filter(span => span.name === 'invoke_agent general')).toHaveLength(0)
+    })
+  }, 90_000)
+
   it('stays off in a server started with `serve` that shows no headless marker, whatever a user file says', async () => {
     // #given a server whose plugin sees neither OPENCODE_PASSWORD nor OPENCODE_CONFIG_CONTENT (the stdio server deletes
     // the password before plugins load), no launcher variable, and a valid user file naming this machine

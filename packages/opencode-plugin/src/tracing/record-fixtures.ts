@@ -23,6 +23,8 @@ export interface Recording {
   readonly name: string
   readonly description: string
   readonly observations: readonly Observation[]
+  /** Counts read off the scripted provider, which the observations cannot show (for example provider attempts). */
+  readonly facts?: Readonly<Record<string, number>>
 }
 
 interface Scenario {
@@ -31,6 +33,8 @@ interface Scenario {
   readonly steps: readonly FakeStep[]
   readonly config?: Record<string, unknown>
   readonly run: (c: Context) => Promise<void>
+  /** Read after the run, from the provider's own record, and checked here so a recording that did not do what it says fails. */
+  readonly facts?: (c: Context) => Record<string, number>
 }
 
 interface Context {
@@ -48,6 +52,8 @@ interface Context {
   readonly waitFor: (label: string, done: () => boolean, timeoutMs?: number) => Promise<void>
   readonly executionsEnded: (sessionId: string) => number
   readonly permission: (sessionId: string) => Promise<string>
+  /** Provider requests whose body names `needle`: one per attempt. */
+  readonly providerRequests: (needle: string) => number
 }
 
 /** Builds the recorder as a standalone plugin: the real normalizers and registration, bundled with Bun. */
@@ -108,6 +114,11 @@ const subagent = (description: string, prompt: string, agent = 'general'): {name
 })
 
 const readTool = (file: string): {name: string; args: unknown} => ({name: 'read', args: {path: file}})
+
+/** The built plugin in this package: its reuse guard is what the guard scenario exercises. */
+function guardPluginDir(): string {
+  return path.resolve(here, '../..')
+}
 
 function scenarios(): Scenario[] {
   return [
@@ -341,6 +352,49 @@ function scenarios(): Scenario[] {
       },
     },
     {
+      name: 'tool-rejected-by-reuse-guard',
+      description:
+        "A subagent call that carries a session id: this plugin's own reuse guard throws in the before hook (the built plugin is loaded beside the recorder).",
+      steps: [
+        {
+          all: ['M-GUARD'],
+          none: [NOT_TOOL],
+          tools: [
+            {
+              name: 'subagent',
+              args: {
+                agent: 'general',
+                description: 'resume',
+                prompt: 'M-CHILD again',
+                sessionID: 'ses_00000000000000000000000000',
+              },
+            },
+          ],
+        },
+        {all: ['M-GUARD', NOT_TOOL], text: 'guard handled'},
+      ],
+      config: {plugins: [guardPluginDir(), 'RECORDER']},
+      run: async c => {
+        await c.turn(await c.create(), 'M-GUARD resume a session')
+      },
+    },
+    {
+      name: 'tool-calls-inside-code-execution',
+      description:
+        'The model runs JavaScript in the code-execution tool; the code calls a tool that is not in its catalog. One tool call, one set of events and hooks: no nested call is published (the built-in tools are not in the catalog on 2.3.2).',
+      steps: [
+        {
+          all: ['N-EXEC'],
+          none: [NOT_TOOL],
+          tools: [{name: 'execute', args: {code: 'return await tools.read({path: "README.md"})'}}],
+        },
+        {all: ['N-EXEC', NOT_TOOL], text: 'execute handled'},
+      ],
+      run: async c => {
+        await c.turn(await c.create(), 'N-EXEC run code that reads a file')
+      },
+    },
+    {
       name: 'compaction-manual',
       description: 'A manual compaction outside any turn: its own execution with no prompt.',
       steps: [
@@ -370,6 +424,26 @@ function scenarios(): Scenario[] {
         await c.api('POST', `/api/session/${session}/generate`, {prompt: 'J2-GEN write something'})
         await sleep(1500)
       },
+    },
+    {
+      name: 'generate-retry',
+      description:
+        'A generate request whose first provider attempt fails with a 503 and whose second succeeds: the retry happens below request preparation, where no hook sees it.',
+      steps: [
+        {all: ['J3-ONE'], text: 'answer one'},
+        {all: ['J3-GEN'], status: 503},
+        {all: ['J3-GEN'], text: 'GENERATED AFTER RETRY'},
+      ],
+      run: async c => {
+        const session = await c.create()
+        await c.turn(session, 'J3-ONE first')
+        await sleep(1000)
+        await c.api('POST', `/api/session/${session}/generate`, {prompt: 'J3-GEN write something'})
+        // The retry waits about two seconds before the second attempt.
+        await c.waitFor('both provider attempts', () => c.providerRequests('J3-GEN') >= 2, 30_000)
+        await sleep(2500)
+      },
+      facts: c => ({providerAttempts: c.providerRequests('J3-GEN')}),
     },
     {
       name: 'long-session',
@@ -417,7 +491,21 @@ async function record(scenario: Scenario, recorderDir: string, binary: string, w
     pluginDir: recorderDir,
     providerBaseURL: provider.baseURL,
     env: {OPENCODE_FROBOT_RECORD_FILE: file},
-    ...(scenario.config === undefined ? {} : {config: scenario.config}),
+    ...(scenario.config === undefined
+      ? {}
+      : {
+          config: {
+            ...scenario.config,
+            // `RECORDER` stands for the recorder plugin's directory, which is only known here.
+            ...(Array.isArray(scenario.config.plugins)
+              ? {
+                  plugins: (scenario.config.plugins as unknown[]).map(entry =>
+                    entry === 'RECORDER' ? recorderDir : entry,
+                  ),
+                }
+              : {}),
+          },
+        }),
   })
   const observations = (): Observation[] =>
     readFileSync(file, 'utf8')
@@ -438,6 +526,7 @@ async function record(scenario: Scenario, recorderDir: string, binary: string, w
   }
   const context: Context = {
     repo: sandbox.repo,
+    providerRequests: needle => provider.requests.filter(request => request.body.includes(needle)).length,
     observations,
     api,
     executionsEnded,
@@ -481,7 +570,13 @@ async function record(scenario: Scenario, recorderDir: string, binary: string, w
     await provider.stop()
     removeSandbox(sandbox)
   }
-  return {name: scenario.name, description: scenario.description, observations: observations()}
+  const facts = scenario.facts?.(context)
+  return {
+    name: scenario.name,
+    description: scenario.description,
+    observations: observations(),
+    ...(facts === undefined ? {} : {facts}),
+  }
 }
 
 /** The restored-session scenario needs two servers on one sandbox: history without the recorder, then a new turn with it. */
@@ -541,12 +636,16 @@ async function recordRestored(recorderDir: string, binary: string, workDir: stri
   }
 }
 
-export async function recordAll(binary: string, workDir: string): Promise<Recording[]> {
+/** Records every scenario, or only those named in `only`. */
+export async function recordAll(binary: string, workDir: string, only?: readonly string[]): Promise<Recording[]> {
   mkdirSync(workDir, {recursive: true})
   const recorderDir = buildRecorderPlugin(path.join(workDir, 'recorder'))
+  const wanted = (name: string): boolean => only === undefined || only.includes(name)
   const recordings: Recording[] = []
-  for (const scenario of scenarios()) recordings.push(await record(scenario, recorderDir, binary, workDir))
-  recordings.push(await recordRestored(recorderDir, binary, workDir))
+  for (const scenario of scenarios()) {
+    if (wanted(scenario.name)) recordings.push(await record(scenario, recorderDir, binary, workDir))
+  }
+  if (wanted('restored-session')) recordings.push(await recordRestored(recorderDir, binary, workDir))
   return recordings
 }
 
@@ -607,6 +706,7 @@ export function renderFixturesModule(recordings: readonly Recording[]): string {
       return [
         `  ${JSON.stringify(recording.name)}: {`,
         `    description: ${JSON.stringify(recording.description)},`,
+        ...(recording.facts === undefined ? [] : [`    facts: ${JSON.stringify(recording.facts)},`]),
         '    observations: [',
         ...lines,
         '    ],',
@@ -625,6 +725,8 @@ import type {Observation} from './observation.js'
 
 export interface RecordedFixture {
   readonly description: string
+  /** Counts the observations cannot show, read off the scripted provider when recording. */
+  readonly facts?: Readonly<Record<string, number>>
   readonly observations: readonly Observation[]
 }
 

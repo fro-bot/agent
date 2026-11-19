@@ -95,8 +95,18 @@ function script() {
       add({kind: 'step.ended', sessionId, messageId, finish: 'stop', rawFinish: 'stop', usage: USAGE, cost: 0}),
     text: (sessionId: string, messageId: string) =>
       add({kind: 'output', sessionId, messageId, part: 'text', text: 'ok'}),
-    toolBefore: (sessionId: string, callId: string, tool = 'read', messageId?: string) =>
-      add({kind: 'tool.before', sessionId, callId, tool, messageId, agent: 'build', input: {}}),
+    toolNamed: (sessionId: string, callId: string, tool = 'read') => add({kind: 'tool.named', sessionId, callId, tool}),
+    toolCalled: (sessionId: string, callId: string, extra: Partial<Extract<Observation, {kind: 'tool.called'}>> = {}) =>
+      add({kind: 'tool.called', sessionId, callId, executed: false, input: {from: 'event'}, ...extra}),
+    /** The before hook alone: what a hook sees when its session events are missing or late. */
+    hookBefore: (sessionId: string, callId: string, tool = 'read', messageId?: string, input: unknown = {}) =>
+      add({kind: 'tool.before', sessionId, callId, tool, messageId, agent: 'build', input}),
+    /** A call as it happens: the name, the called event, then the before hook. */
+    toolBefore: (sessionId: string, callId: string, tool = 'read', messageId?: string) => {
+      api.toolNamed(sessionId, callId, tool)
+      api.toolCalled(sessionId, callId, {messageId})
+      api.hookBefore(sessionId, callId, tool, messageId)
+    },
     toolAfter: (sessionId: string, callId: string, tool = 'read', child?: string) =>
       add({kind: 'tool.after', sessionId, callId, tool, status: 'completed', result: 'r', childSessionId: child}),
     toolEnded: (sessionId: string, callId: string, extra: Partial<Extract<Observation, {kind: 'tool.ended'}>> = {}) =>
@@ -926,8 +936,8 @@ describe('turn model on constructed orderings', () => {
     expect(tools(records)[0]?.toolTruncated).toBe(true)
   })
 
-  it('records a tool that ended with no before hook as a span with its gaps named', () => {
-    // #given a tool event with no hook before it
+  it('records a tool that ended with neither a call event nor a hook as a span with its gaps named', () => {
+    // #given a tool event with nothing before it
     const s = script()
     s.prompt('a', 'm1')
     s.enqueued('a', 'm1', 'user')
@@ -943,7 +953,7 @@ describe('turn model on constructed orderings', () => {
     const {records} = replay(s.out)
 
     // #then the span exists and says what it lacks
-    expect(tools(records)[0]?.gaps).toEqual(expect.arrayContaining(['before-hook', 'input']))
+    expect(tools(records)[0]?.gaps).toEqual(expect.arrayContaining(['call-event', 'input']))
   })
 
   it('cleanup with spans open closes them as interrupted and leaves no state', () => {
@@ -1036,5 +1046,327 @@ describe('turn model on constructed orderings', () => {
 
     // #then only one chat names the first trace
     expect(chats(records).filter(chat => chat.followOnOf.length > 0)).toHaveLength(1)
+  })
+})
+
+describe('the tool span lifecycle comes from session tool events', () => {
+  /** A turn up to the model's step, ready for a tool call. */
+  const openTurn = () => {
+    const s = script()
+    s.prompt('a', 'm1')
+    s.enqueued('a', 'm1', 'user')
+    s.started('a')
+    s.delivered('a', 'm1')
+    s.request('a')
+    s.stepStarted('a', 's1')
+    return s
+  }
+  const finish = (s: ReturnType<typeof script>) => {
+    s.stepEnded('a', 's1')
+    s.ended('a')
+    return replay(s.out)
+  }
+
+  it('yields a span from the events alone when no hook fires for the call', () => {
+    // #given a call with input-started, called and success events, and no before or after hook (a provider-executed one, or a hook that never fired)
+    const s = openTurn()
+    s.at(99)
+    s.toolNamed('a', 'c1', 'websearch')
+    s.at(109)
+    s.toolCalled('a', 'c1', {messageId: 's1', executed: true, input: {query: 'q'}})
+    s.at(149)
+    s.toolEnded('a', 'c1', {executed: true, result: {content: 'found'}})
+
+    // #when replayed
+    const {records} = finish(s)
+
+    // #then the span opened at the called event and closed at the success event, with the name, the input and the result
+    const [span] = tools(records)
+    expect(tools(records)).toHaveLength(1)
+    expect([span?.tool, span?.outcome, span?.start, span?.end]).toEqual(['websearch', 'success', 110, 150])
+    expect(span?.input).toEqual({query: 'q'})
+    expect(span?.result).toEqual({content: 'found'})
+    expect(span?.providerExecuted).toBe(true)
+    expect(span?.gaps).toEqual([])
+    expect(span?.parentSpanId).toBe(roots(records)[0]?.spanId)
+  })
+
+  it('adds the hooks’ view to the span the events opened: the arguments the tool received, and the result', () => {
+    // #given a call whose before hook saw edited arguments and whose after hook saw its own result
+    const s = openTurn()
+    s.toolNamed('a', 'c1', 'read')
+    s.toolCalled('a', 'c1', {input: {path: 'model-wrote-this'}})
+    s.hookBefore('a', 'c1', 'read', undefined, {path: 'tool-received-this'})
+    s.toolAfter('a', 'c1')
+    s.toolEnded('a', 'c1', {result: {content: 'event content'}})
+
+    // #when
+    const {records} = finish(s)
+
+    // #then one span, with the hook's arguments and the hook's result
+    expect(tools(records)).toHaveLength(1)
+    expect(tools(records)[0]?.input).toEqual({path: 'tool-received-this'})
+    expect(tools(records)[0]?.result).toBe('r')
+    expect(tools(records)[0]?.agent).toBe('build')
+  })
+
+  it('merges a before hook that arrives ahead of its called event into the one span, and does not open a second', () => {
+    // #given the hook delivered before the event stream catches up
+    const s = openTurn()
+    s.at(100)
+    s.hookBefore('a', 'c1', 'read', undefined, {path: 'p'})
+    s.toolAfter('a', 'c1')
+    s.at(95)
+    s.toolNamed('a', 'c1', 'read')
+    s.toolCalled('a', 'c1', {input: {path: 'model'}})
+    s.toolEnded('a', 'c1')
+
+    // #when
+    const {records} = finish(s)
+
+    // #then
+    expect(tools(records)).toHaveLength(1)
+    expect(tools(records)[0]).toMatchObject({input: {path: 'p'}, result: 'r', agent: 'build', outcome: 'success'})
+  })
+
+  it('opens no span from a hook alone, holds it only briefly and boundedly, and leaks nothing', () => {
+    // #given hooks for calls whose events never come, more of them than the bound
+    const s = openTurn()
+    for (let index = 0; index < 5; index += 1) {
+      s.hookBefore('a', `ghost-${index}`)
+      s.toolAfter('a', `ghost-${index}`)
+    }
+    const {model, records} = replay(s.out, {limits: {maxPendingToolNotes: 3, toolNoteWaitMs: 10_000}, flush: false})
+
+    // #then no span for any of them, and no more than the bound is held
+    expect(tools(records)).toHaveLength(0)
+    expect(model.stats().pendingToolNotes).toBe(3)
+
+    // #when time passes beyond the wait, on a tick
+    model.observe({kind: 'tick', at: lastAt(s.out) + 10_001})
+
+    // #then they are gone
+    expect(model.stats().pendingToolNotes).toBe(0)
+
+    // #and a flush leaves no state and no span for them
+    const flushed = model.flush(lastAt(s.out) + 20_000)
+    expect(tools(flushed)).toHaveLength(0)
+    expect(model.stats()).toMatchObject({openTraces: 0, sessions: 0, pendingToolNotes: 0})
+  })
+
+  it('does not drop a note at exactly the wait, and drops it after', () => {
+    // #given one hook note, taken at 101, and a wait of 1000
+    const s = openTurn()
+    s.at(100)
+    s.hookBefore('a', 'ghost')
+    const {model} = replay(s.out, {limits: {toolNoteWaitMs: 1_000}, flush: false})
+
+    // #when a tick comes at exactly the wait, then past it
+    model.observe({kind: 'tick', at: 1_101})
+    const atBound = model.stats().pendingToolNotes
+    model.observe({kind: 'tick', at: 1_102})
+
+    // #then
+    expect([atBound, model.stats().pendingToolNotes]).toEqual([1, 0])
+  })
+
+  it('opens a span from the success or failed event alone, using the name from the input-started event', () => {
+    // #given a call that failed before it was ever called (its input did not parse): a name event, then a failure
+    const s = openTurn()
+    s.toolNamed('a', 'c1', 'write')
+    s.toolEnded('a', 'c1', {succeeded: false, errorType: 'tool.input-json', message: 'bad json'})
+
+    // #when
+    const {records} = finish(s)
+
+    // #then
+    expect(tools(records)[0]).toMatchObject({tool: 'write', outcome: 'error', errorType: 'tool.input-json'})
+    expect(tools(records)[0]?.gaps).toEqual(expect.arrayContaining(['call-event', 'input']))
+  })
+
+  it('a call this plugin’s own reuse guard rejected yields a span with outcome rejected', () => {
+    // #given the events of a rejected subagent call: named, called, then failed with the guard's error type, and no hooks
+    const s = openTurn()
+    s.toolNamed('a', 'c1', 'subagent')
+    s.toolCalled('a', 'c1', {messageId: 's1', input: {sessionID: 'ses_x'}})
+    s.toolEnded('a', 'c1', {succeeded: false, errorType: 'plugin.reuse-guard', message: 'Session reuse is disabled'})
+
+    // #when
+    const {records} = finish(s)
+
+    // #then it is a rejected tool span with no result, and it opened no child
+    expect(tools(records)[0]).toMatchObject({tool: 'subagent', outcome: 'rejected', errorType: 'plugin.reuse-guard'})
+    expect(tools(records)[0]?.status).toBe('error')
+    expect(invokes(records).filter(record => record.role === 'child')).toHaveLength(0)
+  })
+
+  it('an interrupted or declined call is closed by its failed event with that outcome', () => {
+    // #given
+    const s = openTurn()
+    s.toolBefore('a', 'c1')
+    s.toolEnded('a', 'c1', {succeeded: false, errorType: 'aborted', message: 'Tool execution interrupted'})
+    s.toolBefore('a', 'c2')
+    s.toolEnded('a', 'c2', {succeeded: false, errorType: 'permission.rejected', message: 'declined'})
+
+    // #when
+    const {records} = finish(s)
+
+    // #then
+    expect(tools(records).map(span => span.outcome)).toEqual(['interrupted', 'rejected'])
+  })
+
+  it('closes a call with an open span at cleanup as interrupted, whether a hook ever fired or not', () => {
+    // #given one call with a hook and one with events only, both unfinished
+    const s = openTurn()
+    s.toolBefore('a', 'c1')
+    s.toolNamed('a', 'c2', 'shell')
+    s.toolCalled('a', 'c2')
+
+    // #when cleanup runs
+    const {records} = replay(s.out)
+
+    // #then both closed as interrupted, incomplete
+    expect(tools(records).map(span => [span.outcome, span.marks])).toEqual([
+      ['interrupted', ['incomplete']],
+      ['interrupted', ['incomplete']],
+    ])
+  })
+
+  it('a code-execution call is one span: no nested call is published in this release', () => {
+    // #given the recording of a code-execution tool whose code called a tool
+    const {records} = run('tool-calls-inside-code-execution')
+
+    // #then one tool span, the execution tool itself, and nothing nested under it
+    expect(tools(records).map(span => span.tool)).toEqual(['execute'])
+    expect(records.filter(record => record.parentSpanId === tools(records)[0]?.spanId)).toEqual([])
+  })
+
+  it('the recorded reuse-guard rejection is a rejected tool span, with no hook before or after', () => {
+    // #given the recording of a subagent call carrying a session id, refused by this plugin's guard in the before hook
+    const observations = fixture('tool-rejected-by-reuse-guard')
+    expect(observations.some(observation => observation.kind === 'tool.before')).toBe(false)
+
+    // #when
+    const {records} = run('tool-rejected-by-reuse-guard')
+
+    // #then
+    expect(tools(records)[0]).toMatchObject({tool: 'subagent', outcome: 'rejected', errorType: 'plugin.reuse-guard'})
+  })
+})
+
+describe('requests whose attempts cannot be seen', () => {
+  it.each(['title', 'compaction', 'generate'] as const)(
+    'one %s request is one span that says its attempt count is unknown',
+    requestKind => {
+      // #given
+      const s = script()
+      s.prompt('a', 'm1')
+      s.enqueued('a', 'm1', 'user')
+      s.started('a')
+      s.delivered('a', 'm1')
+      s.request('a', requestKind)
+      s.request('a')
+      s.stepStarted('a', 's1')
+      s.stepEnded('a', 's1')
+      s.ended('a')
+
+      // #when
+      const {records} = replay(s.out)
+
+      // #then the auxiliary span says so, and the session model step does not
+      const auxiliary = chats(records).filter(record => record.requestKind === requestKind)
+      expect(auxiliary).toHaveLength(1)
+      expect(auxiliary[0]?.attemptCountUnknown).toBe(true)
+      expect(chats(records).find(record => record.requestKind === 'primary')?.attemptCountUnknown).toBeFalsy()
+    },
+  )
+
+  it('two real provider attempts for one generate request are one span with the attempt count unknown', () => {
+    // #given the recording of a generate request whose first provider attempt failed with a 503 and whose second succeeded
+    const recorded = recordedFixtures['generate-retry']
+    expect(recorded?.facts?.providerAttempts).toBe(2)
+    const requests = fixture('generate-retry').filter(
+      observation => observation.kind === 'request' && observation.requestKind === 'generate',
+    )
+
+    // #when replayed
+    const {records} = run('generate-retry')
+
+    // #then the hook fired once, and so there is exactly one generate span, and it says the attempts are unknown
+    expect(requests).toHaveLength(1)
+    const generated = chats(records).filter(record => record.requestKind === 'generate')
+    expect(generated).toHaveLength(1)
+    expect(generated[0]?.attemptCountUnknown).toBe(true)
+    expect(generated[0]?.status).toBe('ok')
+    // the retry's wait is inside the span: it started at the request and ended at the usage event, seconds later
+    expect((generated[0]?.end ?? 0) - (generated[0]?.start ?? 0)).toBeGreaterThan(1_500)
+  })
+
+  it('keeps per-attempt spans for session model steps, where the retry hook exists', () => {
+    // #given the recorded retry
+    const {records} = run('model-failure-retry')
+
+    // #then two attempts for the retried step, neither marked unknown
+    const primary = chats(records).filter(record => record.requestKind === 'primary')
+    expect(primary.filter(record => record.attempt > 1).length).toBeGreaterThan(0)
+    expect(primary.every(record => record.attemptCountUnknown !== true)).toBe(true)
+  })
+})
+
+describe('the tombstone of a closed root', () => {
+  /** A dispatch that never reports, closed by the inactivity bound, then a late report. */
+  const lateReport = (reportAfterMs: number, limits: Partial<typeof DEFAULT_LIMITS>) => {
+    const s = script()
+    s.prompt('p', 'mp')
+    s.enqueued('p', 'mp', 'user')
+    s.started('p')
+    s.delivered('p', 'mp')
+    s.request('p')
+    s.stepStarted('p', 'sp')
+    s.toolBefore('p', 'c1', 'subagent')
+    s.toolAfter('p', 'c1', 'subagent', 'kid')
+    s.stepEnded('p', 'sp')
+    s.ended('p')
+    const closedAt = lastAt(s.out) + limits.rootInactivityMs! + 1
+    s.tick(closedAt)
+    s.at(closedAt + reportAfterMs - 1)
+    s.enqueued('p', 'report', 'synthetic', 'kid', 'completed')
+    s.started('p')
+    s.delivered('p', 'report')
+    s.request('p')
+    s.stepStarted('p', 'sp2')
+    s.stepEnded('p', 'sp2')
+    s.ended('p')
+    return replay(s.out, {limits})
+  }
+  const limits = {rootInactivityMs: 1_000, tombstoneTtlMs: 5_000}
+
+  it('names the first trace in a continuation while the tombstone is fresh, at exactly the ttl', () => {
+    // #given a late report exactly at the tombstone's age limit
+    const {records} = lateReport(5_000, limits)
+
+    // #then it continues the first trace
+    const [first, second] = roots(records)
+    expect(second?.marks).toContain('continuation')
+    expect(second?.continuationOf).toBe(first?.traceId)
+  })
+
+  it('treats a report after the tombstone expired as an unattributed trace, with nothing naming the first', () => {
+    // #given a late report one millisecond past the ttl
+    const {records} = lateReport(5_001, limits)
+
+    // #then the report starts a trace that is unattributed, not a continuation
+    const second = roots(records)[1]
+    expect(second?.marks).toContain('unattributed')
+    expect(second?.marks).not.toContain('continuation')
+    expect(second?.continuationOf).toBeUndefined()
+  })
+
+  it('holds only the trace id, and releases it on expiry', () => {
+    // #given a closed trace
+    const {model} = lateReport(10_000, limits)
+
+    // #then the model remembers no more than its bound, and the expired entry is gone
+    expect(model.stats().tombstones).toBeLessThanOrEqual(DEFAULT_LIMITS.maxTombstones)
   })
 })

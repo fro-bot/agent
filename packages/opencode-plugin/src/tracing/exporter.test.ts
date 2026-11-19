@@ -265,11 +265,13 @@ describe('retry and refusal against the relay’s three answers', () => {
   it('retries a 503 and delivers once: the batch arrives exactly once at the destination', async () => {
     // #given a sink that answers retry twice, then delivered, with no retry-after
     const target = await sink({respond: n => ({status: n <= 2 ? 503 : 200})})
-    const exporter = exporterFor({url: target.url})
+    // The delegate retries after about 1 s, then about 1.5 s (each with 20% jitter) and gives up when the next wait would
+    // pass the request's own deadline: the deadline has to be well past the two waits, or this test is a coin flip.
+    const exporter = exporterFor({url: target.url, limits: {...FAST, requestTimeoutMs: 8_000}})
     exporter.export(span())
 
     // #when
-    const counts = await exporter.close(6_000)
+    const counts = await exporter.close(7_000)
 
     // #then three requests went out, one was accepted, and the span counts once as exported
     expect(target.requests.map(request => request.status)).toEqual([503, 503, 200])

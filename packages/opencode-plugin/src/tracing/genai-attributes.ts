@@ -134,6 +134,8 @@ function chatSpan(record: ChatRecord, options: AttributeOptions): PendingSpan {
   set(attributes, 'gen_ai.provider.name', record.provider)
   set(attributes, 'gen_ai.request.model', record.model)
   if (record.requestKind === 'primary') attributes['fro_bot.request.attempt'] = record.attempt
+  // Retried below the hook where nothing observes it: one span stands for however many provider attempts there were.
+  if (record.attemptCountUnknown) attributes['fro_bot.request.attempt_count_unknown'] = true
   set(attributes, 'gen_ai.response.finish_reasons', finishReasons(record))
   Object.assign(attributes, usageAttributes(record.usage))
   if (record.cost !== undefined) attributes['fro_bot.usage.cost_usd'] = record.cost
@@ -193,6 +195,7 @@ function toolSpan(record: ToolRecord, options: AttributeOptions): PendingSpan {
   }
   set(attributes, 'fro_bot.tool.error_type', record.errorType)
   set(attributes, 'fro_bot.subagent.session_id', record.childSessionId)
+  if (record.providerExecuted) attributes['fro_bot.tool.provider_executed'] = true
 
   const omitted: string[] = []
   const args = extractToolArguments(noting(record.input, 'gen_ai.tool.call.arguments', omitted))

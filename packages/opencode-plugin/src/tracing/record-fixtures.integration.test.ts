@@ -12,6 +12,7 @@ import {fileURLToPath} from 'node:url'
 import {describe, expect, it} from 'vitest'
 
 import {normalizeRecording, recordAll, renderFixturesModule} from './record-fixtures.js'
+import {recordedFixtures} from './turn-model.fixtures.js'
 
 const binary = process.env.FRO_BOT_OPENCODE_V2_BIN
 const runnable =
@@ -24,9 +25,25 @@ describe.skipIf(!runnable)('recording the turn model fixtures from a real openco
     const workDir = mkdtempSync(path.join(tmpdir(), 'fro-bot-record-fixtures-'))
     try {
       // #when every scenario is driven against it
-      const recordings = (await recordAll(binary ?? '', workDir)).map(normalizeRecording)
+      // `FRO_BOT_RECORD_ONLY=name,name` records just those scenarios and keeps every other recording as committed, so adding a
+      // scenario does not rewrite the timings of all the rest.
+      const only = process.env.FRO_BOT_RECORD_ONLY?.split(',').filter(name => name.length > 0)
+      const fresh = (await recordAll(binary ?? '', workDir, only)).map(normalizeRecording)
+      const recordings =
+        only === undefined
+          ? fresh
+          : [
+              // Committed order is kept: a re-recorded scenario replaces its entry in place, a new one is appended.
+              ...Object.entries(recordedFixtures).map(
+                ([name, fixture]) => fresh.find(recording => recording.name === name) ?? {name, ...fixture},
+              ),
+              ...fresh.filter(recording => !(recording.name in recordedFixtures)),
+            ]
 
-      // #then each scenario recorded observations, and the module can be written
+      // #then the generate retry really made two provider attempts for its one request (the whole point of that scenario)
+      expect(fresh.find(recording => recording.name === 'generate-retry')?.facts?.providerAttempts ?? 2).toBe(2)
+
+      // #and each scenario recorded observations, and the module can be written
       for (const recording of recordings)
         expect({name: recording.name, count: recording.observations.length}).not.toEqual({
           name: recording.name,

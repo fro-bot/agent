@@ -86,6 +86,11 @@ export interface ChatRecord extends RecordBase {
   readonly cost?: number | undefined
   /** Traces whose subagent report this request carried while running inside another turn's execution. */
   readonly followOnOf: readonly string[]
+  /**
+   * A title, compaction or generate request is prepared once and retried below the hook (v2.3.2 `generate.ts`,
+   * `compaction.ts` `deliver`), so how many provider attempts it took cannot be seen: this one span stands for all of them.
+   */
+  readonly attemptCountUnknown: boolean
 }
 
 export interface RequestedToolCall {
@@ -104,6 +109,10 @@ export interface ToolRecord extends RecordBase {
   readonly errorType?: string | undefined
   readonly toolTruncated?: boolean | undefined
   readonly childSessionId?: string | undefined
+  /** The provider ran the tool: the session events are all there is, no hook fires for it. */
+  readonly providerExecuted: boolean
+  /** Snapshots this span replaced (the call event's arguments, when a hook's replaced them). For whoever counts them. */
+  readonly discarded: readonly unknown[]
 }
 
 export type SpanRecord = InvokeRecord | ChatRecord | ToolRecord
@@ -138,6 +147,18 @@ export interface TurnModelLimits {
   readonly maxOutputParts: number
   /** Prompts kept per span. */
   readonly maxPromptsPerSpan: number
+  /**
+   * Per session: tool names and hook observations held while the session event that opens or closes the call has not
+   * arrived. Past this the oldest is dropped, silently.
+   */
+  readonly maxPendingToolNotes: number
+  /** How long such a note waits for its event before it is dropped, silently. Checked on a tick and on the next note. */
+  readonly toolNoteWaitMs: number
+  /**
+   * How long a closed trace's id is remembered so a late subagent report can name it. After it, the report is an
+   * unattributed trace. The count bound (`maxTombstones`) applies too.
+   */
+  readonly tombstoneTtlMs: number
 }
 
 export const DEFAULT_LIMITS: TurnModelLimits = {
@@ -153,6 +174,9 @@ export const DEFAULT_LIMITS: TurnModelLimits = {
   maxOpenSpansPerTrace: 1_024,
   maxOutputParts: 64,
   maxPromptsPerSpan: 32,
+  maxPendingToolNotes: 64,
+  toolNoteWaitMs: 10_000,
+  tombstoneTtlMs: 24 * 60 * 60_000,
 }
 
 export interface TurnModelStats {
@@ -162,6 +186,8 @@ export interface TurnModelStats {
   readonly bufferedBytes: number
   readonly tombstones: number
   readonly unresolvedDispatches: number
+  /** Tool names and hook observations waiting for their session event. */
+  readonly pendingToolNotes: number
   readonly droppedSpans: number
 }
 
@@ -255,16 +281,30 @@ interface ToolState {
   readonly sessionId: string
   readonly parentSpanId: string
   readonly callId: string
-  readonly tool: string
+  tool: string
   readonly start: number
-  readonly agent: string | undefined
-  readonly input: unknown
+  agent: string | undefined
+  input: unknown
+  /** The call event's arguments, kept until a hook's replace them. */
+  callInput: unknown
+  inputFromHook: boolean
   result: unknown
+  resultFromHook: boolean
+  providerExecuted: boolean
   afterStatus: 'completed' | 'error' | undefined
   afterError: unknown
   interrupted: boolean
   childSessionId: string | undefined
+  discarded: unknown[]
   gaps: Set<string>
+}
+
+/** What the hooks and the input-started event told us about a call, held until its session event arrives. */
+interface ToolNote {
+  readonly at: number
+  tool?: string | undefined
+  before?: Extract<Observation, {kind: 'tool.before'}> | undefined
+  after?: Extract<Observation, {kind: 'tool.after'}> | undefined
 }
 
 interface SessionNode {
@@ -278,6 +318,8 @@ interface SessionNode {
   readonly prompts: Map<string, Extract<Observation, {kind: 'prompt'}>>
   readonly requests: RequestState[]
   readonly tools: Map<string, ToolState>
+  /** Calls with no span yet, by call id, oldest first. */
+  readonly notes: Map<string, ToolNote>
   readonly stepOwner: Map<string, RequestState>
   /** Steps still to start for requests a `retry` hook already closed. */
   skipStepStarts: number
@@ -300,6 +342,17 @@ const CREATING_KINDS: ReadonlySet<Observation['kind']> = new Set([
   'request',
 ])
 
+function applyBefore(tool: ToolState, o: Extract<Observation, {kind: 'tool.before'}>): void {
+  tool.agent = o.agent ?? tool.agent
+  if (tool.tool === 'unknown') tool.tool = o.tool
+  if (o.input !== undefined) {
+    // The arguments the tool received win over the ones the model wrote; the superseded snapshot is handed back.
+    if (tool.input !== undefined) tool.discarded.push(tool.input)
+    tool.input = o.input
+    tool.inputFromHook = true
+  }
+}
+
 export function createTurnModel(options: {
   readonly ids: IdSource
   readonly limits?: Partial<TurnModelLimits>
@@ -316,7 +369,8 @@ export function createTurnModel(options: {
   const unresolved = new Set<string>()
   /** Child sessions that have been placed under a dispatch. */
   const linked = new Set<string>()
-  const tombstones = new Map<string, string>()
+  /** Child session id to the closed trace it belonged to, and when it closed. Oldest first. */
+  const tombstones = new Map<string, {readonly traceId: string; readonly at: number}>()
   /** Marks to put on a root trace the moment it is opened for a session. */
   const pendingMarks = new Map<string, string>()
   let droppedSpans = 0
@@ -398,6 +452,7 @@ export function createTurnModel(options: {
       prompts: new Map(),
       requests: [],
       tools: new Map(),
+      notes: new Map(),
       stepOwner: new Map(),
       skipStepStarts: 0,
       nextAttempt: 1,
@@ -492,6 +547,7 @@ export function createTurnModel(options: {
       usage: request.usage,
       cost: request.cost,
       followOnOf: request.followOnOf,
+      attemptCountUnknown: request.requestKind !== 'primary',
     })
   }
 
@@ -531,6 +587,8 @@ export function createTurnModel(options: {
       errorType: extra.errorType,
       toolTruncated: extra.truncated,
       childSessionId: tool.childSessionId,
+      providerExecuted: tool.providerExecuted,
+      discarded: tool.discarded,
     })
   }
 
@@ -590,7 +648,7 @@ export function createTurnModel(options: {
 
   function rememberTombstone(childId: string, traceId: string): void {
     tombstones.delete(childId)
-    tombstones.set(childId, traceId)
+    tombstones.set(childId, {traceId, at: clock})
     while (tombstones.size > limits.maxTombstones) {
       const oldest = tombstones.keys().next()
       if (oldest.done === true) break
@@ -801,7 +859,10 @@ export function createTurnModel(options: {
     let reportTombstone: string | undefined
     if (o.item === 'synthetic' && o.childSessionId !== undefined) {
       for (const trace of traces) if (trace.outstanding.has(o.childSessionId)) reportTrace = trace
-      reportTombstone = tombstones.get(o.childSessionId)
+      const remembered = tombstones.get(o.childSessionId)
+      // At exactly the ttl it is still remembered; one millisecond later it is not.
+      reportTombstone =
+        remembered !== undefined && o.at - remembered.at <= limits.tombstoneTtlMs ? remembered.traceId : undefined
     }
     const item: PendingItem = {
       inboxId: o.inboxId,
@@ -1025,41 +1086,134 @@ export function createTurnModel(options: {
     else parts.push(o.text)
   }
 
-  function onToolBefore(o: Extract<Observation, {kind: 'tool.before'}>): void {
-    const node = sessions.get(o.sessionId)
-    const trace = node?.active?.trace ?? node?.childOf?.trace
-    if (node === undefined || trace === undefined) return
+  // ------------------------------------------------------------------ tool calls
+  //
+  // A call's lifecycle comes from the session events: `session.tool.called` opens the span (published before any local
+  // execution, v2.3.2 `step.ts`) and `session.tool.success` or `.failed` closes it, keyed by call id. A provider-executed
+  // call never reaches the local path, so it has no hook at all. The `execute.before` and `execute.after` hooks only add
+  // what the events do not carry: the agent, the arguments the tool received, and the result the hook saw. A hook that
+  // arrives before its event is a note, held briefly and boundedly; one whose event never comes opens nothing.
+
+  function noteFor(node: SessionNode, callId: string, at: number): ToolNote {
+    let note = node.notes.get(callId)
+    if (note === undefined) {
+      note = {at}
+      node.notes.set(callId, note)
+      while (node.notes.size > limits.maxPendingToolNotes) {
+        const oldest = node.notes.keys().next()
+        if (oldest.done === true) break
+        node.notes.delete(oldest.value)
+      }
+    }
+    return note
+  }
+
+  function expireNotes(now: number): void {
+    for (const node of sessions.values()) {
+      for (const [callId, note] of node.notes) {
+        if (now - note.at > limits.toolNoteWaitMs) node.notes.delete(callId)
+        else break
+      }
+    }
+  }
+
+  /** Opens the span for a call, or returns the one already open. Undefined when no trace can hold it. */
+  function openTool(
+    node: SessionNode,
+    callId: string,
+    at: number,
+    init: {tool?: string | undefined; gaps?: readonly string[]},
+  ): ToolState | undefined {
+    const existing = node.tools.get(callId)
+    if (existing !== undefined) return existing
+    const trace = node.active?.trace ?? node.childOf?.trace
+    if (trace === undefined) return undefined
     if (trace.openSpans >= limits.maxOpenSpansPerTrace) {
       droppedSpans += 1
       invokeOf(node, trace).gaps.add('spans-over-limit')
-      return
+      return undefined
     }
     trace.openSpans += 1
+    const note = node.notes.get(callId)
     const tool: ToolState = {
       spanId: ids.span(),
       trace,
       sessionId: node.id,
       parentSpanId: invokeOf(node, trace).spanId,
-      callId: o.callId,
-      tool: o.tool,
-      start: o.at,
-      agent: o.agent,
-      input: o.input,
+      callId,
+      tool: init.tool ?? note?.tool ?? note?.before?.tool ?? note?.after?.tool ?? 'unknown',
+      start: at,
+      agent: undefined,
+      input: undefined,
+      callInput: undefined,
+      inputFromHook: false,
       result: undefined,
+      resultFromHook: false,
+      providerExecuted: false,
       afterStatus: undefined,
       afterError: undefined,
       interrupted: false,
       childSessionId: undefined,
-      gaps: new Set(),
+      discarded: [],
+      gaps: new Set(init.gaps ?? []),
     }
-    node.tools.set(o.callId, tool)
+    node.tools.set(callId, tool)
+    if (tool.tool === 'unknown') tool.gaps.add('tool-name')
+    if (note?.before !== undefined) applyBefore(tool, note.before)
+    if (note?.after !== undefined) applyAfter(node, tool, note.after)
+    node.notes.delete(callId)
+    touch(trace, at)
+    return tool
+  }
+
+  function applyAfter(node: SessionNode, tool: ToolState, o: Extract<Observation, {kind: 'tool.after'}>): void {
+    tool.afterStatus = o.status
+    tool.afterError = o.error
+    tool.interrupted = o.interrupted === true
+    if (o.status === 'completed' && o.result !== undefined) {
+      if (tool.result !== undefined) tool.discarded.push(tool.result)
+      tool.result = o.result
+      tool.resultFromHook = true
+    }
+    if (o.childSessionId !== undefined) link(node, tool, o.childSessionId, o.at)
+  }
+
+  function onToolNamed(o: Extract<Observation, {kind: 'tool.named'}>): void {
+    const node = sessions.get(o.sessionId)
+    if (node === undefined) return
+    expireNotes(o.at)
+    noteFor(node, o.callId, o.at).tool = o.tool
+  }
+
+  function onToolCalled(o: Extract<Observation, {kind: 'tool.called'}>): void {
+    const node = sessions.get(o.sessionId)
+    if (node === undefined) return
+    const tool = openTool(node, o.callId, o.at, {})
+    if (tool === undefined) return
+    tool.providerExecuted = o.executed
+    tool.callInput = o.input
+    if (!tool.inputFromHook) tool.input = o.input
+    else if (o.input !== undefined) tool.discarded.push(o.input)
     const asked = o.messageId === undefined ? undefined : node.stepOwner.get(o.messageId)
     if (asked !== undefined) {
       if (asked.toolCalls.length >= limits.maxOutputParts) asked.gaps.add('tool-calls-over-limit')
-      else asked.toolCalls.push({callId: o.callId, tool: o.tool, input: o.input})
+      else asked.toolCalls.push({callId: o.callId, tool: tool.tool, input: o.input})
     }
-    if (o.tool === 'subagent') unresolved.add(`${node.id}/${o.callId}`)
-    touch(trace, o.at)
+    if (tool.tool === 'subagent') unresolved.add(`${node.id}/${o.callId}`)
+  }
+
+  function onToolBefore(o: Extract<Observation, {kind: 'tool.before'}>): void {
+    const node = sessions.get(o.sessionId)
+    if (node === undefined) return
+    const tool = node.tools.get(o.callId)
+    if (tool !== undefined) {
+      applyBefore(tool, o)
+      if (tool.tool === 'subagent') unresolved.add(`${node.id}/${o.callId}`)
+      return
+    }
+    // The hook came first: hold it for the event, boundedly. If the event never comes this opens nothing.
+    expireNotes(o.at)
+    noteFor(node, o.callId, o.at).before = o
   }
 
   /** The dispatch link: this tool call started that child session. */
@@ -1093,54 +1247,42 @@ export function createTurnModel(options: {
 
   function onToolAfter(o: Extract<Observation, {kind: 'tool.after'}>): void {
     const node = sessions.get(o.sessionId)
-    const tool = node?.tools.get(o.callId)
     if (node === undefined) return
+    const tool = node.tools.get(o.callId)
     if (tool !== undefined) {
-      tool.result = o.result
-      tool.afterStatus = o.status
-      tool.afterError = o.error
-      tool.interrupted = o.interrupted === true
-      if (o.status === 'error' && o.error !== undefined) tool.result = undefined
+      applyAfter(node, tool, o)
+      return
     }
-    if (o.childSessionId !== undefined) link(node, tool, o.childSessionId, o.at)
+    expireNotes(o.at)
+    noteFor(node, o.callId, o.at).after = o
   }
+
+  /** Error types that mean the call was refused before it ran, by the user's rules or by this plugin's own guard. */
+  const REFUSED_ERROR_TYPES: ReadonlySet<string> = new Set(['permission.rejected', 'plugin.reuse-guard'])
 
   function onToolEnded(o: Extract<Observation, {kind: 'tool.ended'}>): void {
     const node = sessions.get(o.sessionId)
     if (node === undefined) return
-    let tool = node.tools.get(o.callId)
-    if (tool === undefined) {
-      const trace = node.active?.trace ?? node.childOf?.trace
-      if (trace === undefined) return
-      trace.openSpans += 1
-      tool = {
-        spanId: ids.span(),
-        trace,
-        sessionId: node.id,
-        parentSpanId: invokeOf(node, trace).spanId,
-        callId: o.callId,
-        tool: 'unknown',
-        start: o.at,
-        agent: undefined,
-        input: undefined,
-        result: undefined,
-        afterStatus: undefined,
-        afterError: undefined,
-        interrupted: false,
-        childSessionId: undefined,
-        gaps: new Set(['before-hook', 'input']),
-      }
-    }
+    // A call can end with no called event: its input never parsed, or the events were lost. The end event is the authority.
+    const tool = node.tools.get(o.callId) ?? openTool(node, o.callId, o.at, {gaps: ['call-event', 'input']})
+    if (tool === undefined) return
+    if (o.executed === true) tool.providerExecuted = true
     if (o.childSessionId !== undefined) link(node, tool, o.childSessionId, o.at)
+    // What the hook saw wins; the event's content is what the model saw, for a call no hook fired for.
+    if (!tool.resultFromHook && o.result !== undefined) {
+      if (tool.result !== undefined) tool.discarded.push(tool.result)
+      tool.result = o.result
+    } else if (o.result !== undefined) {
+      tool.discarded.push(o.result)
+    }
     const outcome: ToolOutcome = o.succeeded
       ? 'success'
-      : o.errorType === 'permission.rejected'
+      : o.errorType !== undefined && REFUSED_ERROR_TYPES.has(o.errorType)
         ? 'rejected'
         : o.errorType === 'aborted' || tool.interrupted
           ? 'interrupted'
           : 'error'
-    if (outcome !== 'success') tool.gaps.add('result')
-    else if (tool.afterStatus === undefined) tool.gaps.add('result')
+    if (outcome !== 'success' || tool.result === undefined) tool.gaps.add('result')
     node.tools.delete(o.callId)
     unresolved.delete(`${node.id}/${o.callId}`)
     emitTool(tool, o.at, outcome, {errorType: o.errorType, message: o.message, truncated: o.truncated})
@@ -1254,6 +1396,12 @@ export function createTurnModel(options: {
       case 'output':
         onOutput(observation)
         break
+      case 'tool.named':
+        onToolNamed(observation)
+        break
+      case 'tool.called':
+        onToolCalled(observation)
+        break
       case 'tool.before':
         onToolBefore(observation)
         break
@@ -1276,6 +1424,7 @@ export function createTurnModel(options: {
         onUsage(observation)
         break
       case 'tick':
+        expireNotes(observation.at)
         break
     }
   }
@@ -1313,6 +1462,7 @@ export function createTurnModel(options: {
       bufferedBytes,
       tombstones: tombstones.size,
       unresolvedDispatches: unresolved.size,
+      pendingToolNotes: [...sessions.values()].reduce((sum, node) => sum + node.notes.size, 0),
       droppedSpans,
     }),
   }

@@ -100,6 +100,7 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
     else if (record.kind === 'execute_tool') {
       ledger.release(record.input)
       ledger.release(record.result)
+      for (const replaced of record.discarded) ledger.release(replaced)
     } else for (const prompt of record.prompts) ledger.release(prompt.content)
     if (record.kind === 'chat') for (const call of record.toolCalls) ledger.release(call.input)
   }
@@ -109,7 +110,8 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
     const {ledger} = options
     if (ledger === undefined || typeof observation !== 'object' || observation === null) return
     if (observation.kind === 'prompt' || observation.kind === 'request') ledger.release(observation.content)
-    else if (observation.kind === 'tool.before') ledger.release(observation.input)
+    else if (observation.kind === 'tool.before' || observation.kind === 'tool.called') ledger.release(observation.input)
+    else if (observation.kind === 'tool.ended') ledger.release(observation.result)
     else if (observation.kind === 'tool.after') ledger.release(observation.result)
   }
 
