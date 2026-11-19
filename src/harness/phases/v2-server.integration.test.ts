@@ -1397,7 +1397,11 @@ describe.skipIf(!hasBinary)('provider restriction against the real stock binary'
   }, 120_000)
 
   /** Starts the Action's server with the stub provider, the caller's `restriction` and the `model` input (or none). */
-  async function start(restriction: object, model: string | null) {
+  async function start(
+    restriction: object,
+    model: string | null,
+    overrides: {readonly authJson?: string; readonly baseConfig?: object} = {},
+  ) {
     const box = createSandbox(sharedCacheHome)
     restrictionBoxes.push(box)
     const provider = await startProvider()
@@ -1406,8 +1410,11 @@ describe.skipIf(!hasBinary)('provider restriction against the real stock binary'
     const started = await startActionOpenCodeV2({
       binaryPath: BINARY as string,
       workspacePath: box.repo,
-      authJson: JSON.stringify({fake: {type: 'api', key: CANARY}}),
-      opencodeConfig: JSON.stringify({...JSON.parse(operatorConfig(provider.baseURL)), ...restriction}),
+      authJson: overrides.authJson ?? JSON.stringify({fake: {type: 'api', key: CANARY}}),
+      opencodeConfig: JSON.stringify({
+        ...(overrides.baseConfig ?? JSON.parse(operatorConfig(provider.baseURL))),
+        ...restriction,
+      }),
       credential: 'provision',
       systematicVersion: 'latest',
       model,
@@ -1466,6 +1473,30 @@ describe.skipIf(!hasBinary)('provider restriction against the real stock binary'
     // #then both the built-in provider and the caller's are on the server
     const handle = unwrapOk(started)
     expect(await providerIds(handle)).toEqual(expect.arrayContaining(['opencode', 'fake']))
+  }, 240_000)
+
+  it('starts with no model input and no credentials when nothing is restricted, through the default model check', async () => {
+    // #given the free default: auth-json is `{}`, no model input, and a config with no provider and no restriction
+    const {started} = await start({}, null, {authJson: '{}', baseConfig: {share: 'disabled'}})
+
+    // #then the start succeeds: the default model's provider is on the server, so the guard lets it through
+    const handle = unwrapOk(started)
+    expect(await providerIds(handle)).toContain('opencode')
+    // (no turn is run: it would go to the hosted free model)
+  }, 240_000)
+
+  it('names the disabled default model, not a missing key, when the config model has no credential', async () => {
+    // #given no model input, no key, a config model on a provider with no key, and the built-in provider disabled
+    const {started} = await start({disabled_providers: ['opencode']}, null, {
+      authJson: '{}',
+      baseConfig: {share: 'disabled', model: 'anthropic/claude-sonnet-4-6'},
+    })
+
+    // #then the start fails at the config stage on the default model, not at the credential gate on anthropic
+    const error = unwrapErr(started)
+    expect(error.stage).toBe('config')
+    expect(error.message).toContain('opencode/big-pickle')
+    expect(error.message).not.toContain('anthropic')
   }, 240_000)
 
   it.each(RESTRICTIONS)(
