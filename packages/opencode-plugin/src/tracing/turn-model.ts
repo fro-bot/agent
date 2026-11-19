@@ -170,6 +170,11 @@ export interface TurnModelLimits {
   readonly sessionIdleMs: number
   /** Idle sessions kept at once; past it the least recently active is forgotten. A running session never counts. */
   readonly maxIdleSessions: number
+  /**
+   * Finished call ids remembered per session, so a repeated terminal event (or a late hook) for a call that already ended
+   * is ignored instead of opening a second span. Past it the oldest id is forgotten.
+   */
+  readonly maxCompletedCallsPerSession: number
   /** Prompts one session holds while waiting for an execution; past it the oldest is dropped. */
   readonly maxPendingPromptsPerSession: number
   /** How long such a note waits for its event before it is dropped, silently. Checked on a tick and on the next note. */
@@ -198,6 +203,7 @@ export const DEFAULT_LIMITS: TurnModelLimits = {
   maxHeldOutputChars: 8 * 1024 * 1024,
   sessionIdleMs: 10 * 60_000,
   maxIdleSessions: 64,
+  maxCompletedCallsPerSession: 256,
   maxPendingPromptsPerSession: 64,
   maxPendingToolNotes: 64,
   toolNoteWaitMs: 10_000,
@@ -354,6 +360,8 @@ interface SessionNode {
   readonly tools: Map<string, ToolState>
   /** Calls with no span yet, by call id, oldest first. */
   readonly notes: Map<string, ToolNote>
+  /** Call ids that have ended, oldest first. */
+  readonly completed: Set<string>
   readonly stepOwner: Map<string, RequestState>
   /** Steps still to start for requests a `retry` hook already closed. */
   skipStepStarts: number
@@ -496,6 +504,7 @@ export function createTurnModel(options: {
       requests: [],
       tools: new Map(),
       notes: new Map(),
+      completed: new Set(),
       stepOwner: new Map(),
       skipStepStarts: 0,
       nextAttempt: 1,
@@ -1304,9 +1313,19 @@ export function createTurnModel(options: {
 
   function onToolCalled(o: Extract<Observation, {kind: 'tool.called'}>): void {
     const node = sessions.get(o.sessionId)
-    if (node === undefined) return
+    if (node === undefined) {
+      discard(o.input)
+      return
+    }
+    if (node.completed.has(o.callId)) {
+      discard(o.input)
+      return
+    }
     const tool = openTool(node, o.callId, o.at, {})
-    if (tool === undefined) return
+    if (tool === undefined) {
+      discard(o.input)
+      return
+    }
     tool.providerExecuted = o.executed
     tool.callInput = o.input
     if (!tool.inputFromHook) tool.input = o.input
@@ -1321,7 +1340,10 @@ export function createTurnModel(options: {
 
   function onToolBefore(o: Extract<Observation, {kind: 'tool.before'}>): void {
     const node = sessions.get(o.sessionId)
-    if (node === undefined) return
+    if (node === undefined || node.completed.has(o.callId)) {
+      discard(o.input)
+      return
+    }
     const tool = node.tools.get(o.callId)
     if (tool !== undefined) {
       applyBefore(tool, o)
@@ -1364,7 +1386,10 @@ export function createTurnModel(options: {
 
   function onToolAfter(o: Extract<Observation, {kind: 'tool.after'}>): void {
     const node = sessions.get(o.sessionId)
-    if (node === undefined) return
+    if (node === undefined || node.completed.has(o.callId)) {
+      discard(o.result)
+      return
+    }
     const tool = node.tools.get(o.callId)
     if (tool !== undefined) {
       applyAfter(node, tool, o)
@@ -1379,7 +1404,11 @@ export function createTurnModel(options: {
 
   function onToolEnded(o: Extract<Observation, {kind: 'tool.ended'}>): void {
     const node = sessions.get(o.sessionId)
-    if (node === undefined) return
+    if (node === undefined || node.completed.has(o.callId)) {
+      // A repeat of a terminal event (or one for a session we do not hold): ignored, its snapshot handed back.
+      discard(o.result)
+      return
+    }
     // A call can end with no called event: its input never parsed, or the events were lost. The end event is the authority.
     const tool = node.tools.get(o.callId) ?? openTool(node, o.callId, o.at, {gaps: ['call-event', 'input']})
     if (tool === undefined) return
@@ -1402,6 +1431,12 @@ export function createTurnModel(options: {
     if (outcome !== 'success' || tool.result === undefined) tool.gaps.add('result')
     node.tools.delete(o.callId)
     unresolved.delete(`${node.id}/${o.callId}`)
+    node.completed.add(o.callId)
+    while (node.completed.size > limits.maxCompletedCallsPerSession) {
+      const oldest = node.completed.values().next()
+      if (oldest.done === true) break
+      node.completed.delete(oldest.value)
+    }
     emitTool(tool, o.at, outcome, {errorType: o.errorType, message: o.message, truncated: o.truncated})
     touch(tool.trace, o.at)
   }

@@ -1664,3 +1664,135 @@ describe('sessions that never start an execution', () => {
     expect(model.stats().sessions).toBe(0)
   })
 })
+
+describe('a repeated tool terminal event', () => {
+  const openTurn = () => {
+    const s = script()
+    s.prompt('a', 'm1')
+    s.enqueued('a', 'm1', 'user')
+    s.started('a')
+    s.delivered('a', 'm1')
+    s.request('a')
+    s.stepStarted('a', 's1')
+    return s
+  }
+  const spansFor = (s: ReturnType<typeof script>, limits: Partial<typeof DEFAULT_LIMITS> = {}) => {
+    s.stepEnded('a', 's1')
+    s.ended('a')
+    return tools(replay(s.out, {limits}).records)
+  }
+
+  it('does not emit a second span for the same call id', () => {
+    // #given a call that succeeded, and then a repeat of its success event
+    const s = openTurn()
+    s.toolBefore('a', 'c1')
+    s.toolEnded('a', 'c1')
+    s.toolEnded('a', 'c1')
+
+    // #when / #then one span
+    expect(spansFor(s)).toHaveLength(1)
+  })
+
+  it('ignores a failure that follows a success, and a success that follows a failure', () => {
+    // #given
+    const s = openTurn()
+    s.toolBefore('a', 'c1')
+    s.toolEnded('a', 'c1')
+    s.toolEnded('a', 'c1', {succeeded: false, errorType: 'aborted'})
+    s.toolBefore('a', 'c2')
+    s.toolEnded('a', 'c2', {succeeded: false, errorType: 'tool.execution'})
+    s.toolEnded('a', 'c2')
+
+    // #when
+    const spans = spansFor(s)
+
+    // #then the first outcome stands for each
+    expect(spans.map(span => [span.callId, span.outcome])).toEqual([
+      ['c1', 'success'],
+      ['c2', 'error'],
+    ])
+  })
+
+  it('ignores a repeated called event and a late hook for a call that already ended, and hands the snapshots back', () => {
+    // #given a finished call, then its events and hooks again
+    const s = openTurn()
+    s.toolBefore('a', 'c1')
+    s.toolEnded('a', 'c1')
+    const input = {again: true}
+    const result = {again: 'late'}
+    s.toolCalled('a', 'c1', {input})
+    s.hookBefore('a', 'c1', 'read', undefined, input)
+    s.out.push({
+      kind: 'tool.after',
+      at: lastAt(s.out),
+      sessionId: 'a',
+      callId: 'c1',
+      tool: 'read',
+      status: 'completed',
+      result,
+    })
+    s.toolEnded('a', 'c1', {result})
+    s.stepEnded('a', 's1')
+    s.ended('a')
+
+    // #when
+    const {records, model} = replay(s.out)
+
+    // #then still one span, and the repeats' snapshots were handed back
+    expect(tools(records)).toHaveLength(1)
+    const handed = model.takeDiscarded()
+    expect(handed).toContain(input)
+    expect(handed).toContain(result)
+    expect(model.stats().pendingToolNotes).toBe(0)
+  })
+
+  it('remembers a bounded number of finished calls per session: the oldest is forgotten past the bound', () => {
+    // #given a bound of three, four calls, then repeats of the newest and of the oldest
+    const s = openTurn()
+    for (const id of ['c1', 'c2', 'c3', 'c4']) {
+      s.toolBefore('a', id)
+      s.toolEnded('a', id)
+    }
+    s.toolEnded('a', 'c4')
+    s.toolEnded('a', 'c1')
+
+    // #when
+    const spans = spansFor(s, {maxCompletedCallsPerSession: 3})
+
+    // #then the newest repeat was ignored, and the forgotten oldest came back as a span of its own
+    expect(spans.map(span => span.callId)).toEqual(['c1', 'c2', 'c3', 'c4', 'c1'])
+  })
+
+  it('does not treat a call id reused in another session as a repeat', () => {
+    // #given the same call id in two sessions
+    const s = script()
+    for (const session of ['a', 'b']) {
+      s.prompt(session, `m-${session}`)
+      s.enqueued(session, `m-${session}`, 'user')
+      s.started(session)
+      s.delivered(session, `m-${session}`)
+      s.request(session)
+      s.stepStarted(session, `s-${session}`)
+      s.toolBefore(session, 'c1')
+      s.toolEnded(session, 'c1')
+      s.stepEnded(session, `s-${session}`)
+      s.ended(session)
+    }
+
+    // #when / #then
+    expect(tools(replay(s.out).records)).toHaveLength(2)
+  })
+
+  it('holds nothing at flush', () => {
+    // #given finished calls
+    const s = openTurn()
+    s.toolBefore('a', 'c1')
+    s.toolEnded('a', 'c1')
+
+    // #when
+    const {model} = replay(s.out)
+
+    // #then
+    expect(model.stats().sessions).toBe(0)
+  })
+})
