@@ -405,6 +405,30 @@ describe.skipIf(!isPosix)('local session', () => {
     expect(settings).toEqual({mode: 'off', reason: 'settings-file-unsafe'})
   })
 
+  it.each(['..config', '...', '..', '..a'])(
+    'refuses a user file under a project child named %s: a name that starts with two dots is still inside',
+    name => {
+      // #given the config directory is a project child whose name starts with two dots (`path.relative` gives `..config/...`)
+      const inside = path.join(project, name === '..' ? 'x' : name)
+      writeSettings(undefined, 0o600, userSettingsFilePath({XDG_CONFIG_HOME: inside}))
+
+      // #when
+      const settings = resolve({XDG_CONFIG_HOME: inside})
+
+      // #then it is refused, as any other path inside the project is
+      expect(settings).toEqual({mode: 'off', reason: 'settings-file-unsafe'})
+    },
+  )
+
+  it('still accepts a config directory beside the project whose name starts with two dots', () => {
+    // #given a sibling of the project directory named `..cfg` (outside it)
+    const outside = path.join(path.dirname(project), '..cfg')
+    writeSettings(undefined, 0o600, userSettingsFilePath({XDG_CONFIG_HOME: outside}))
+
+    // #when / #then
+    expect(resolve({XDG_CONFIG_HOME: outside})).toMatchObject({mode: 'on', host: 'local'})
+  })
+
   it('accepts a symlinked user file whose target passes every check', () => {
     // #given the file is a link to a safe file elsewhere in the user's home
     const target = writeSettings(undefined, 0o600, path.join(home, 'dotfiles', 'tracing.json'))

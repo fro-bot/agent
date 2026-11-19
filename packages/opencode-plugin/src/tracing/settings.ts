@@ -282,7 +282,11 @@ function errorCode(error: unknown): string | undefined {
 
 function isInside(child: string, parent: string): boolean {
   const relative = path.relative(parent, child)
-  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative))
+  if (relative === '') return true
+  // Outside means a way up (`..` alone, or `..` and a separator) or another root. A child NAMED `..config` is inside:
+  // `startsWith('..')` alone would let a checkout choose the settings file.
+  const goesUp = relative === '..' || relative.startsWith(`..${path.sep}`)
+  return !goesUp && !path.isAbsolute(relative)
 }
 
 /**
