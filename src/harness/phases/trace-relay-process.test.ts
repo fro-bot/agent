@@ -319,6 +319,55 @@ describe('trace-relay-process', () => {
       expect(logged).not.toContain(CREDENTIAL)
     })
 
+    it.each([
+      ['says no', async () => false],
+      [
+        'throws',
+        async () => {
+          throw new Error(`the check broke on ${COLLECTOR_HOST_CANARY}`)
+        },
+      ],
+    ])('spawns nothing when the bundle check %s, and logs one fixed warning', async (_name, bundleCheck) => {
+      // #given a launcher that fails loudly if it is ever spawned
+      const {started, logger} = await startWith({command: path.join(dir, 'must-not-spawn'), args: []}, {bundleCheck})
+
+      // #then the start fails on the bundle, not on the spawn, and the warning names no path
+      expect(unwrapErr(started).kind).toBe('bundle-invalid')
+      expect(loggedAt(logger, 'warning')).toEqual([
+        ['The trace relay did not start; this run is not traced', {reason: 'bundle-invalid'}],
+      ])
+      expect(loggedAt(logger, 'info')).toEqual([])
+      expect(serializeLoggerCalls(logger)).not.toContain(COLLECTOR_HOST_CANARY)
+    })
+
+    it('does not run the bundle check for a config it refuses, and runs it once, before the spawn, for one it accepts', async () => {
+      const calls: string[] = []
+      const bad = await startWith(
+        {command: path.join(dir, 'must-not-spawn'), args: []},
+        {
+          config: {url: 'http://collector.example.com/v1/traces', headers: HEADERS},
+          bundleCheck: async () => {
+            calls.push('bad')
+            return true
+          },
+        },
+      )
+      expect(unwrapErr(bad.started).kind).toBe('invalid-config')
+
+      const launcher = await fakeChild(
+        String.raw`process.stdout.write('{"ready":true,"port":4321}\n'); process.stdin.resume(); setInterval(() => {}, 1000)`,
+      )
+      const good = await startWith(launcher, {
+        bundleCheck: async () => {
+          calls.push('good')
+          return true
+        },
+      })
+
+      expect(unwrapOk(good.started).port).toBe(4321)
+      expect(calls).toEqual(['good'])
+    })
+
     it('refuses a config too large for the frame before it spawns anything', async () => {
       // #given ten headers of 8000 characters each: every one is valid, the frame is not
       const headers = Array.from({length: 10}, (_, i) => ({name: `x-big-${i}`, value: 'v'.repeat(8000)}))

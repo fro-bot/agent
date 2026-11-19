@@ -71,11 +71,17 @@ export interface StartTraceRelayProcessOptions {
   /** Defaults to {@link defaultTraceRelayLauncher}. */
   readonly launcher?: TraceRelayLauncher
   readonly timeouts?: Partial<TraceRelayProcessTimeouts>
+  /**
+   * Whether the relay bundle is fit to run (`checkTraceRelayBundle`). Asked once, after the config is accepted and before
+   * anything is spawned; false, or a throw, starts nothing and warns once with a fixed reason. Left out, nothing is asked,
+   * which is for tests that inject their own launcher.
+   */
+  readonly bundleCheck?: () => Promise<boolean>
   readonly deps?: {readonly killGroup?: (pid: number, signal: NodeJS.Signals) => void}
 }
 
 export type TraceRelayStartErrorKind =
-  'bad-ready' | 'child-error' | 'exited-early' | 'invalid-config' | 'ready-timeout' | 'spawn-failed'
+  'bad-ready' | 'bundle-invalid' | 'child-error' | 'exited-early' | 'invalid-config' | 'ready-timeout' | 'spawn-failed'
 
 export interface TraceRelayStartError {
   /** A fixed reason. Never a URL, a header, a path or anything the child printed. */
@@ -157,6 +163,15 @@ export async function startTraceRelayProcess(
   } catch {
     warnNotStarted('invalid-config')
     return err({kind: 'invalid-config'})
+  }
+
+  if (options.bundleCheck !== undefined) {
+    // The bundle is optional for the Action as a whole, so it is checked only now that a relay is about to start.
+    const usable = await options.bundleCheck().catch(() => false)
+    if (!usable) {
+      warnNotStarted('bundle-invalid')
+      return err({kind: 'bundle-invalid'})
+    }
   }
 
   let child: ChildProcess
