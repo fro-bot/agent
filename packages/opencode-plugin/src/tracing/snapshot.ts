@@ -232,7 +232,10 @@ function copyValue(value: unknown, meter: Meter, depth: number): unknown {
       spend(meter, 24, 1)
       return value.toString()
     case 'object': {
-      if (value === null) return null
+      if (value === null) {
+        spend(meter, 4, 1)
+        return meter.over ? undefined : null
+      }
       if (depth >= meter.maxDepth) {
         meter.over = true
         return undefined
@@ -240,7 +243,10 @@ function copyValue(value: unknown, meter: Meter, depth: number): unknown {
       if (!spend(meter, 8, 1)) return undefined
       if (Array.isArray(value)) {
         const items: unknown[] = []
+        // Every slot is charged BEFORE it is read or allocated, holes and nulls included, so a huge sparse or null-filled
+        // array stops at the budget instead of being walked and copied.
         for (const element of value) {
+          if (!spend(meter, 4, 1)) return undefined
           items.push(copyValue(element, meter, depth + 1) ?? null)
           if (meter.over) return undefined
         }

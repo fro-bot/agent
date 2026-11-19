@@ -620,3 +620,80 @@ describe('the ledger’s counted ownership', () => {
     expect(ledger.stats().pending).toBe(0)
   })
 })
+
+describe('slots that hold nothing still cost something', () => {
+  const limits = {maxNodes: 1_000}
+  const isOmitted = (value: unknown): boolean => omittedReason(value) === 'snapshot-bound'
+
+  it('stops a null-filled array at the node budget, and allocates only what it charged', () => {
+    // #given a million nulls and a budget of a thousand nodes, with a proxy that counts the slots read
+    let reads = 0
+    const nulls = new Proxy(
+      Array.from({length: 1_000_000}, () => null),
+      {
+        get(target, key, receiver) {
+          if (typeof key === 'string' && /^\d+$/.test(key)) reads += 1
+          return Reflect.get(target, key, receiver) as unknown
+        },
+      },
+    )
+
+    // #when
+    const snapshot = snapshotToolArguments({list: nulls}, {limits})
+
+    // #then it is omitted, and no more than the budget's worth of slots were read
+    expect(isOmitted(snapshot)).toBe(true)
+    expect(reads).toBeLessThanOrEqual(1_100)
+  })
+
+  it('stops a sparse array of a hundred million holes, without visiting them', () => {
+    // #given
+    const holes: unknown[] = []
+    holes.length = 100_000_000
+
+    // #when
+    const started = performance.now()
+    const snapshot = snapshotToolArguments({list: holes}, {limits})
+    const elapsed = performance.now() - started
+
+    // #then it is omitted, quickly
+    expect(isOmitted(snapshot)).toBe(true)
+    expect(elapsed).toBeLessThan(250)
+  })
+
+  it('charges a null that is a value in an object, and an undefined slot in an array', () => {
+    // #given an object of ten thousand null-valued keys and an array of ten thousand undefined slots
+    const object = Object.fromEntries(Array.from({length: 10_000}, (_, index) => [`k${index}`, null]))
+    const undefinedSlots = Array.from({length: 10_000}, () => undefined)
+
+    // #when / #then both exceed a budget of a thousand nodes
+    expect(isOmitted(snapshotToolArguments({object}, {limits}))).toBe(true)
+    expect(isOmitted(snapshotToolArguments({list: undefinedSlots}, {limits}))).toBe(true)
+  })
+
+  it('still copies a small array with nulls and holes whole, null in place of a hole', () => {
+    // #given
+    const small: unknown[] = [1, null]
+    small.length = 3
+    small.push('x')
+
+    // #when
+    const snapshot = snapshotToolArguments({list: small}, {limits}) as {list: unknown[]}
+
+    // #then
+    expect(snapshot.list).toEqual([1, null, null, 'x'])
+  })
+
+  it('charges the slots of a result and of a request’s tool schema the same way', () => {
+    // #given nulls in a tool result's content and in a request's message parts
+    const result = snapshotToolResult({content: Array.from({length: 100_000}, () => null)}, {limits})
+    const request = snapshotRequest(
+      {system: [], tools: {}, messages: [{role: 'user', content: Array.from({length: 100_000}, () => null)}]},
+      {limits},
+    )
+
+    // #then neither walked the whole array
+    expect(JSON.stringify(result).length).toBeLessThan(5_000)
+    expect(JSON.stringify(request).length).toBeLessThan(5_000)
+  })
+})

@@ -36,11 +36,23 @@ export interface PipelineLimits {
   readonly maxRecords: number
   /** Time one scheduled turn of the loop may spend before yielding to the host. */
   readonly sliceMs: number
+  /**
+   * Raw text (model output, a title, a compaction summary, error messages) the inbox may hold at once, in characters. An
+   * observation that would pass it is replaced by its structure with the text omitted and marked, never clipped: a cut
+   * before redaction could split a secret. Snapshots (prompt, request and tool content) have their own ledger.
+   */
+  readonly maxInboxChars: number
   /** How often the model is told the time, so its inactivity bounds fire with no traffic. */
   readonly tickMs: number
 }
 
-export const DEFAULT_PIPELINE_LIMITS: PipelineLimits = {maxInbox: 8_192, maxRecords: 2_048, sliceMs: 8, tickMs: 60_000}
+export const DEFAULT_PIPELINE_LIMITS: PipelineLimits = {
+  maxInbox: 8_192,
+  maxRecords: 2_048,
+  sliceMs: 8,
+  maxInboxChars: 8 * 1024 * 1024,
+  tickMs: 60_000,
+}
 
 export interface TracePipelineOptions {
   readonly sink: SpanSink
@@ -60,6 +72,10 @@ export interface PipelineStats {
   readonly observationsDropped: number
   /** Records that could not be mapped or scrubbed. */
   readonly recordsFailed: number
+  /** Observations whose text was replaced by its structure because the inbox's text budget was spent. */
+  readonly observationsOmitted: number
+  /** Characters of raw text the inbox holds right now. */
+  readonly inboxChars: number
 }
 
 export interface TracePipeline {
@@ -80,6 +96,69 @@ export const randomIds = (): IdSource => ({
   span: () => randomBytes(8).toString('hex'),
 })
 
+/** The raw text an observation carries (not its snapshots, which the ledger bounds), in characters. */
+function textSize(observation: Observation): number {
+  if (typeof observation !== 'object' || observation === null) return 0
+  // Only the kinds that carry raw text are listed; everything else carries none.
+  // eslint-disable-next-line @typescript-eslint/switch-exhaustiveness-check
+  switch (observation.kind) {
+    case 'output':
+      return observation.text.length
+    case 'title':
+      return observation.title.length
+    case 'compaction.ended':
+      return (observation.text?.length ?? 0) + (observation.error?.message?.length ?? 0)
+    case 'execution.ended':
+      return (observation.error?.message?.length ?? 0) + (observation.reason?.length ?? 0)
+    case 'retry':
+    case 'step.failed':
+      return observation.error.message?.length ?? 0
+    case 'tool.ended':
+      return observation.message?.length ?? 0
+    default:
+      return 0
+  }
+}
+
+const OMITTED_MESSAGE = '[omitted]'
+const withoutMessage = <E extends {readonly message?: string | undefined}>(error: E): E => ({
+  ...error,
+  message: error.message === undefined ? undefined : OMITTED_MESSAGE,
+})
+
+/** The same observation without its raw text, marked omitted: its place in the sequence and everything else are kept. */
+function withoutText(observation: Observation): Observation {
+  // Only the kinds that carry raw text are listed; everything else is returned as it is.
+  // eslint-disable-next-line @typescript-eslint/switch-exhaustiveness-check
+  switch (observation.kind) {
+    case 'output':
+      return {...observation, text: '', omitted: true}
+    case 'title':
+      return {...observation, title: '', omitted: true}
+    case 'compaction.ended':
+      return {
+        ...observation,
+        text: undefined,
+        error: observation.error === undefined ? undefined : withoutMessage(observation.error),
+        omitted: true,
+      }
+    case 'execution.ended':
+      return {
+        ...observation,
+        reason: undefined,
+        error: observation.error === undefined ? undefined : withoutMessage(observation.error),
+        omitted: true,
+      }
+    case 'retry':
+    case 'step.failed':
+      return {...observation, error: withoutMessage(observation.error), omitted: true}
+    case 'tool.ended':
+      return {...observation, message: observation.message === undefined ? undefined : OMITTED_MESSAGE, omitted: true}
+    default:
+      return observation
+  }
+}
+
 export function createTracePipeline(options: TracePipelineOptions): TracePipeline {
   const limits: PipelineLimits = {...DEFAULT_PIPELINE_LIMITS, ...options.limits}
   const now = options.now ?? Date.now
@@ -88,7 +167,10 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
     ...(options.modelLimits === undefined ? {} : {limits: options.modelLimits}),
   })
   const attributeOptions = options.identity === undefined ? {} : {identity: options.identity}
-  const inbox: Observation[] = []
+  /** Observations waiting for the model, each with the raw text it holds against `maxInboxChars`. */
+  const inbox: {readonly observation: Observation; readonly chars: number}[] = []
+  let inboxChars = 0
+  let observationsOmitted = 0
   const records: SpanRecord[] = []
   let scheduled = false
   let stopped = false
@@ -167,8 +249,10 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
   }
 
   function step(): boolean {
-    const next = inbox.shift()
-    if (next !== undefined) {
+    const queued = inbox.shift()
+    if (queued !== undefined) {
+      inboxChars -= queued.chars
+      const next = queued.observation
       try {
         enqueue(model.observe(next))
         retainShared()
@@ -203,7 +287,7 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
   }
 
   tick = setInterval(() => {
-    inbox.push({kind: 'tick', at: now()})
+    inbox.push({observation: {kind: 'tick', at: now()}, chars: 0})
     schedule()
   }, limits.tickMs)
   tick.unref()
@@ -216,7 +300,18 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
         releaseObservation(observation)
         return
       }
-      inbox.push(observation)
+      // Raw text over the remaining budget is replaced by its structure with the text omitted and marked.
+      const chars = textSize(observation)
+      let held = observation
+      let heldChars = chars
+      if (chars > 0 && inboxChars + chars > limits.maxInboxChars) {
+        releaseObservation(observation)
+        held = withoutText(observation)
+        heldChars = 0
+        observationsOmitted += 1
+      }
+      inboxChars += heldChars
+      inbox.push({observation: held, chars: heldChars})
       schedule()
     },
     stop: (budgetMs = Number.POSITIVE_INFINITY) => {
@@ -230,8 +325,9 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
       // Out of time: what was never processed is lost, and says so. Its snapshots go back to the ledger.
       for (const unprocessed of inbox.splice(0)) {
         observationsDropped += 1
-        releaseObservation(unprocessed)
+        releaseObservation(unprocessed.observation)
       }
+      inboxChars = 0
       try {
         enqueue(model.flush(now()))
         retainShared()
@@ -248,6 +344,6 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
         release(left)
       }
     },
-    stats: () => ({observationsDropped, recordsFailed}),
+    stats: () => ({observationsDropped, recordsFailed, observationsOmitted, inboxChars}),
   }
 }

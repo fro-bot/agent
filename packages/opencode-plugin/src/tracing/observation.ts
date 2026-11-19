@@ -28,6 +28,11 @@ interface ObservationBase {
   readonly at: number
   /** Approximate size of the content this observation carries, for the buffer bound. */
   readonly bytes?: number | undefined
+  /**
+   * The pipeline's inbox was full of raw text, so this observation's text was replaced by its structure: the model records
+   * that the content is missing and does not invent any. Set only by the pipeline, at ingress.
+   */
+  readonly omitted?: boolean | undefined
 }
 
 export type Observation = ObservationBase &

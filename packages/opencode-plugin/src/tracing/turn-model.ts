@@ -21,8 +21,6 @@
 
 import type {ErrorInfo, InboxItemKind, Observation, RequestKind, Usage} from './observation.js'
 
-import {Buffer} from 'node:buffer'
-
 export type {ErrorInfo, ExecutionOutcome, InboxItemKind, Observation, RequestKind, Usage} from './observation.js'
 
 export type ToolOutcome = 'success' | 'error' | 'rejected' | 'interrupted'
@@ -155,9 +153,9 @@ export interface TurnModelLimits {
    */
   readonly maxPendingToolNotes: number
   /**
-   * Characters of model output (text and reasoning, a compaction summary, a title) one open request keeps. A part that
-   * crosses it is cut to what is left (a copy, so the larger string is not kept alive) and the span says so; later parts are
-   * omitted and the span says so. Equal to the span's own output bound.
+   * Characters of model output (text and reasoning, a compaction summary, a title) one open request keeps. A part that does
+   * not fit is omitted whole, never clipped (a cut before redaction could split a secret), and the span says so. Equal to the
+   * span's own output bound.
    */
   readonly maxOutputChars: number
   /** The same, summed over every open request in the model: past it, parts are cut or omitted the same way. */
@@ -1207,13 +1205,17 @@ export function createTurnModel(options: {
   function onOutput(o: Extract<Observation, {kind: 'output'}>): void {
     const request = sessions.get(o.sessionId)?.stepOwner.get(o.messageId)
     if (request === undefined) return
+    if (o.omitted === true) {
+      // The pipeline's inbox was full of raw text: the text is not here, and the span says so.
+      request.gaps.add('output-omitted')
+      return
+    }
     addOutput(request, o.part === 'text' ? request.texts : request.reasoning, o.text)
   }
 
   /**
    * Keeps one output part, within the per-request and the aggregate character budgets and the part-count limit. A part that
-   * crosses a budget is cut to what is left, as a fresh copy (a slice would keep the whole string alive); a part that
-   * arrives when nothing is left is omitted. Either way the request says so.
+   * does not fit is omitted whole, never clipped: a cut before redaction could split a secret. The request says so.
    */
   function addOutput(request: RequestState, parts: string[], text: string): void {
     if (request.closed) return
@@ -1226,11 +1228,13 @@ export function createTurnModel(options: {
       request.gaps.add('output-omitted')
       return
     }
-    let kept = text
+    // Raw text is never clipped before redaction (a cut could split a secret and leave its prefix): a part that does not fit
+    // is omitted whole, and the span says so.
     if (text.length > room) {
-      kept = Buffer.from(text.slice(0, room), 'utf8').toString('utf8')
-      request.gaps.add('output-truncated')
+      request.gaps.add('output-omitted')
+      return
     }
+    const kept = text
     parts.push(kept)
     request.outputChars += kept.length
     heldOutputChars += kept.length
@@ -1483,7 +1487,8 @@ export function createTurnModel(options: {
     const request = node === undefined ? undefined : oldestPending(node, 'compaction')
     if (node === undefined || request === undefined) return
     if (o.ok) {
-      if (o.text !== undefined) addOutput(request, request.texts, o.text)
+      if (o.omitted === true) request.gaps.add('output-omitted')
+      else if (o.text !== undefined) addOutput(request, request.texts, o.text)
       request.usage = o.usage
       request.cost = o.cost
       request.gaps.delete('usage')
@@ -1498,7 +1503,8 @@ export function createTurnModel(options: {
     const node = sessions.get(o.sessionId)
     const request = node === undefined ? undefined : oldestPending(node, 'title')
     if (node === undefined || request === undefined) return
-    addOutput(request, request.texts, o.title)
+    if (o.omitted === true) request.gaps.add('output-omitted')
+    else addOutput(request, request.texts, o.title)
     emitRequest(request, o.at, 'ok')
     removeRequest(node, request)
     touch(request.trace, o.at)

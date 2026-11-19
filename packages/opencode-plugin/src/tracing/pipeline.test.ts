@@ -664,3 +664,149 @@ describe('stop against a deadline', () => {
     expect(spans).toHaveLength(0)
   })
 })
+
+describe('the inbox holds a bounded amount of raw text', () => {
+  const MIB = 1024 * 1024
+  const turnStart = (pipeline: ReturnType<typeof createTracePipeline>, session = 'a'): void => {
+    pipeline.observe({kind: 'prompt', at: 1, sessionId: session, messageId: 'm1', delivery: 'steer', content: 'hi'})
+    pipeline.observe({kind: 'inbox.enqueued', at: 2, sessionId: session, inboxId: 'm1', item: 'user'})
+    pipeline.observe({kind: 'execution.started', at: 3, sessionId: session})
+    pipeline.observe({kind: 'inbox.delivered', at: 4, sessionId: session, inboxId: 'm1'})
+    pipeline.observe({
+      kind: 'request',
+      at: 5,
+      sessionId: session,
+      requestKind: 'primary',
+      agent: 'build',
+      model: 'm',
+      provider: 'p',
+      content: {},
+    })
+    pipeline.observe({
+      kind: 'step.started',
+      at: 6,
+      sessionId: session,
+      messageId: 's1',
+      agent: 'build',
+      model: 'm',
+      provider: 'p',
+    })
+  }
+  const output = (pipeline: ReturnType<typeof createTracePipeline>, at: number, text: string): void =>
+    pipeline.observe({kind: 'output', at, sessionId: 'a', messageId: 's1', part: 'text', text})
+  const turnEnd = (pipeline: ReturnType<typeof createTracePipeline>): void => {
+    pipeline.observe({
+      kind: 'step.ended',
+      at: 900,
+      sessionId: 'a',
+      messageId: 's1',
+      finish: 'stop',
+      usage: {input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0},
+      cost: 0,
+    })
+    pipeline.observe({kind: 'execution.ended', at: 901, sessionId: 'a', outcome: 'succeeded'})
+  }
+  const chatOf = (spans: readonly ScrubbedSpan[]) => spans.find(span => span.name.startsWith('chat'))
+
+  it('replaces an observation over the remaining budget by its structure, with the content marked omitted, never clipped', async () => {
+    // #given a budget of 3 MiB and five 1 MiB outputs queued before the pipeline has drained anything
+    const {sink, spans} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber, limits: {maxInboxChars: 3 * MIB}})
+    turnStart(pipeline)
+    for (let index = 0; index < 5; index += 1) output(pipeline, 10 + index, `${String(index)}`.repeat(MIB))
+    turnEnd(pipeline)
+    expect(pipeline.stats().inboxChars).toBeLessThanOrEqual(3 * MIB)
+
+    // #when it drains
+    await flush()
+    pipeline.stop()
+
+    // #then the turn is still one model span with its usage; the content that did not fit is omitted whole (no part of it),
+    // and the span says so
+    const chat = chatOf(spans)
+    expect(chat).toBeDefined()
+    const attributes = JSON.stringify(chat?.attributes)
+    expect(attributes).toContain('output-omitted')
+    expect(attributes).not.toMatch(/4{1000}/)
+    expect(pipeline.stats().inboxChars).toBe(0)
+  })
+
+  it('keeps what fits, whole, and counts the omitted observations', async () => {
+    // #given a budget that holds two of three outputs
+    const {sink, spans} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber, limits: {maxInboxChars: 2_500}})
+    turnStart(pipeline)
+    output(pipeline, 10, 'a'.repeat(1_000))
+    output(pipeline, 11, 'b'.repeat(1_000))
+    output(pipeline, 12, 'c'.repeat(1_000))
+    turnEnd(pipeline)
+
+    // #when
+    await flush()
+    pipeline.stop()
+
+    // #then the first two are whole in the span, the third is not there at all
+    const text = JSON.stringify(chatOf(spans)?.attributes['gen_ai.output.messages'])
+    expect(text).toContain('a'.repeat(1_000))
+    expect(text).toContain('b'.repeat(1_000))
+    expect(text).not.toContain('c'.repeat(10))
+    expect(pipeline.stats().observationsOmitted).toBe(1)
+  })
+
+  it('gives the budget back as the loop drains, so later observations are kept', async () => {
+    // #given a budget of one output at a time
+    const {sink, spans} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber, limits: {maxInboxChars: 1_500}})
+    turnStart(pipeline)
+    output(pipeline, 10, 'a'.repeat(1_000))
+    await flush()
+
+    // #when the inbox has drained and another arrives
+    expect(pipeline.stats().inboxChars).toBe(0)
+    output(pipeline, 11, 'b'.repeat(1_000))
+    turnEnd(pipeline)
+    await flush()
+    pipeline.stop()
+
+    // #then both were kept
+    const text = JSON.stringify(chatOf(spans)?.attributes['gen_ai.output.messages'])
+    expect(text).toContain('a'.repeat(1_000))
+    expect(text).toContain('b'.repeat(1_000))
+    expect(pipeline.stats().observationsOmitted).toBe(0)
+  })
+
+  it('counts a title, a compaction summary and an error message the same way', async () => {
+    // #given a budget of 500 and observations that carry 1,000 characters each of the three kinds
+    const {sink} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber, limits: {maxInboxChars: 500}})
+    pipeline.observe({kind: 'title', at: 1, sessionId: 'a', title: 't'.repeat(1_000)})
+    pipeline.observe({kind: 'compaction.ended', at: 2, sessionId: 'a', ok: true, text: 's'.repeat(1_000)})
+    pipeline.observe({
+      kind: 'execution.ended',
+      at: 3,
+      sessionId: 'a',
+      outcome: 'failed',
+      error: {type: 'x', message: 'e'.repeat(1_000)},
+    })
+
+    // #then none of it is held
+    expect(pipeline.stats().inboxChars).toBeLessThanOrEqual(500)
+    expect(pipeline.stats().observationsOmitted).toBe(3)
+    pipeline.stop()
+  })
+
+  it('counts a budget exactly at the limit as fitting, and one character more as omitted', async () => {
+    // #given
+    const {sink} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber, limits: {maxInboxChars: 1_000}})
+    turnStart(pipeline)
+
+    // #when
+    output(pipeline, 10, 'a'.repeat(1_000))
+    output(pipeline, 11, 'b')
+
+    // #then the first fit exactly, and the second did not
+    expect(pipeline.stats().observationsOmitted).toBe(1)
+    pipeline.stop()
+  })
+})

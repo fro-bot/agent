@@ -1390,7 +1390,7 @@ describe('the model holds a bounded amount of output while a request is open', (
   }
   const outputOf = (records: readonly SpanRecord[]) => chats(records)[0]
 
-  it('keeps output up to the per-request budget whole, and cuts the part that crosses it, saying so', () => {
+  it('keeps output up to the per-request budget whole, and omits the part that crosses it, saying so', () => {
     // #given two parts, the second crossing the 100-character budget
     const s = script()
     open(s, 'a', '1')
@@ -1401,13 +1401,13 @@ describe('the model holds a bounded amount of output while a request is open', (
     // #when
     const {records} = replay(s.out, {limits})
 
-    // #then the first is whole, the second is cut to what remains, and the span says output was truncated
+    // #then the first is whole, the second is omitted whole (raw text is never clipped before redaction), and the span says so
     const chat = outputOf(records)
-    expect(chat?.texts.map(text => text.length)).toEqual([60, 40])
-    expect(chat?.gaps).toContain('output-truncated')
+    expect(chat?.texts.map(text => text.length)).toEqual([60])
+    expect(chat?.gaps).toContain('output-omitted')
   })
 
-  it('does not cut output that is exactly at the budget, and cuts one character over', () => {
+  it('keeps output exactly at the budget whole, and omits one character over it', () => {
     // #given
     const at = script()
     open(at, 'a', '1')
@@ -1423,8 +1423,8 @@ describe('the model holds a bounded amount of output while a request is open', (
     const cut = outputOf(replay(over.out, {limits}).records)
 
     // #then
-    expect([exact?.texts[0]?.length, exact?.gaps.includes('output-truncated')]).toEqual([100, false])
-    expect([cut?.texts[0]?.length, cut?.gaps.includes('output-truncated')]).toEqual([100, true])
+    expect([exact?.texts[0]?.length, exact?.gaps.includes('output-omitted')]).toEqual([100, false])
+    expect([cut?.texts.length, cut?.gaps.includes('output-omitted')]).toEqual([0, true])
   })
 
   it('omits a part that arrives when the budget is spent, and counts reasoning in the same budget', () => {
@@ -1451,9 +1451,9 @@ describe('the model holds a bounded amount of output while a request is open', (
     for (const session of ['a', 'b', 'c']) s.text(session, `s-${session}`, 'x'.repeat(90))
     const {model, records} = replay(s.out, {limits, flush: false})
 
-    // #then the third request found the aggregate spent: it holds a cut part, and the total never passed the bound
+    // #then the third request found too little of the aggregate left: its part was omitted, and the total never passed the bound
     expect(model.stats().heldOutputChars).toBeLessThanOrEqual(250)
-    expect(model.stats().heldOutputChars).toBe(250)
+    expect(model.stats().heldOutputChars).toBe(180)
 
     // #when everything closes
     for (const session of ['a', 'b', 'c']) close(s, session, session)
@@ -1461,7 +1461,7 @@ describe('the model holds a bounded amount of output while a request is open', (
 
     // #then all three spans exist, the aggregate-limited one says so, and nothing is held afterwards
     expect(chats(closed.records)).toHaveLength(3)
-    expect(chats(closed.records).filter(chat => chat.gaps.includes('output-truncated'))).toHaveLength(1)
+    expect(chats(closed.records).filter(chat => chat.gaps.includes('output-omitted'))).toHaveLength(1)
     expect(closed.model.stats().heldOutputChars).toBe(0)
     expect(records).toHaveLength(0)
   })
@@ -1483,8 +1483,8 @@ describe('the model holds a bounded amount of output while a request is open', (
 
     // #then
     const compaction = chats(records).find(chat => chat.requestKind === 'compaction')
-    expect(compaction?.texts.join('').length).toBe(100)
-    expect(compaction?.gaps).toContain('output-truncated')
+    expect(compaction?.texts).toEqual([])
+    expect(compaction?.gaps).toContain('output-omitted')
   })
 
   it('holds nothing at flush', () => {
@@ -1976,5 +1976,67 @@ describe('a child that finishes before its dispatch link arrives', () => {
     expect(kidRoot?.marks).toContain('unattributed')
     expect(kidRoot?.status).toBe('ok')
     expect(chats(records).find(chat => chat.sessionId === 'kid')?.texts).toEqual(['orphan answer'])
+  })
+})
+
+describe('an observation whose text the pipeline omitted', () => {
+  const open = (s: ReturnType<typeof script>, kind: 'primary' | 'compaction' | 'title' = 'primary') => {
+    s.prompt('a', 'm1')
+    s.enqueued('a', 'm1', 'user')
+    s.started('a')
+    s.delivered('a', 'm1')
+    s.request('a', kind)
+  }
+
+  it('adds no text part and marks the request, for output', () => {
+    // #given an output observation the pipeline emptied and marked omitted
+    const s = script()
+    open(s)
+    s.stepStarted('a', 's1')
+    s.out.push({
+      kind: 'output',
+      at: lastAt(s.out),
+      sessionId: 'a',
+      messageId: 's1',
+      part: 'text',
+      text: '',
+      omitted: true,
+    })
+    s.text('a', 's1', 'kept')
+    s.stepEnded('a', 's1')
+    s.ended('a')
+
+    // #when
+    const chat = chats(replay(s.out).records)[0]
+
+    // #then only the kept part is there, and the span says output is missing
+    expect(chat?.texts).toEqual(['kept'])
+    expect(chat?.gaps).toContain('output-omitted')
+  })
+
+  it('does the same for a compaction summary and a title', () => {
+    // #given
+    const compaction = script()
+    open(compaction, 'compaction')
+    compaction.out.push({kind: 'compaction.ended', at: 50, sessionId: 'a', ok: true, text: undefined, omitted: true})
+    compaction.ended('a')
+    const title = script()
+    title.prompt('a', 'm1')
+    title.enqueued('a', 'm1', 'user')
+    title.started('a')
+    title.delivered('a', 'm1')
+    title.request('a', 'title')
+    title.out.push({kind: 'title', at: 60, sessionId: 'a', title: '', omitted: true})
+    title.ended('a')
+
+    // #when
+    const summarized = chats(replay(compaction.out).records).find(chat => chat.requestKind === 'compaction')
+    const titled = chats(replay(title.out).records).find(chat => chat.requestKind === 'title')
+
+    // #then neither carries a text, both say so
+    expect(summarized?.texts).toEqual([])
+    expect(summarized?.gaps).toContain('output-omitted')
+    expect(titled?.texts).toEqual([])
+    expect(titled?.gaps).toContain('output-omitted')
   })
 })
