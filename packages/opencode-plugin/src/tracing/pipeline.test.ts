@@ -417,3 +417,97 @@ describe('spans the model refuses at its open-span limit', () => {
     expect(dropped()).toBe(0)
   })
 })
+
+describe('a snapshot shared by a model span and a tool span', () => {
+  const USAGE = {input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0}
+
+  it('stays held until both owners have been exported, whichever goes first', async () => {
+    // #given a request whose response asked for a call, and the call's argument snapshot (the same object is in the model's
+    // record of what was asked and in the open tool span)
+    const ledger = createSnapshotLedger()
+    const {sink, spans} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber, ledger})
+    const args = snapshotToolArguments({path: 'a.txt'}, {ledger})
+    const at = (n: number) => n
+    pipeline.observe({kind: 'prompt', at: at(1), sessionId: 'a', messageId: 'm1', delivery: 'steer', content: 'hi'})
+    pipeline.observe({kind: 'inbox.enqueued', at: at(2), sessionId: 'a', inboxId: 'm1', item: 'user'})
+    pipeline.observe({kind: 'execution.started', at: at(3), sessionId: 'a'})
+    pipeline.observe({kind: 'inbox.delivered', at: at(4), sessionId: 'a', inboxId: 'm1'})
+    pipeline.observe({
+      kind: 'request',
+      at: at(5),
+      sessionId: 'a',
+      requestKind: 'primary',
+      agent: 'build',
+      model: 'm',
+      provider: 'p',
+      content: {},
+    })
+    pipeline.observe({
+      kind: 'step.started',
+      at: at(6),
+      sessionId: 'a',
+      messageId: 's1',
+      agent: 'build',
+      model: 'm',
+      provider: 'p',
+    })
+    pipeline.observe({kind: 'tool.named', at: at(7), sessionId: 'a', callId: 'c1', tool: 'read'})
+    pipeline.observe({
+      kind: 'tool.called',
+      at: at(8),
+      sessionId: 'a',
+      callId: 'c1',
+      messageId: 's1',
+      executed: false,
+      input: args,
+    })
+
+    // #when the model's span goes out first: the step ends while the tool is still running
+    pipeline.observe({
+      kind: 'step.ended',
+      at: at(9),
+      sessionId: 'a',
+      messageId: 's1',
+      finish: 'tool-calls',
+      usage: USAGE,
+      cost: 0,
+    })
+    await flush()
+
+    // #then the model span was exported and the tool span still holds the snapshot
+    expect(spans.some(span => span.name.startsWith('chat'))).toBe(true)
+    expect(ledger.stats().pending).toBeGreaterThanOrEqual(1)
+    const stillHeld = ledger.stats().pending
+
+    // #when the tool ends and its span goes out
+    pipeline.observe({kind: 'tool.ended', at: at(10), sessionId: 'a', callId: 'c1', succeeded: true})
+    pipeline.observe({kind: 'execution.ended', at: at(11), sessionId: 'a', outcome: 'succeeded'})
+    await flush()
+
+    // #then it is released, and nothing is left
+    expect(stillHeld).toBeGreaterThan(ledger.stats().pending)
+    expect(ledger.stats().pending).toBe(0)
+    pipeline.stop()
+  })
+
+  it('is released once when only one owner exists', async () => {
+    // #given a tool call with no model request to share it
+    const ledger = createSnapshotLedger()
+    const {sink} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber, ledger})
+    const args = snapshotToolArguments({path: 'b.txt'}, {ledger})
+    pipeline.observe({kind: 'prompt', at: 1, sessionId: 'a', messageId: 'm1', delivery: 'steer', content: 'hi'})
+    pipeline.observe({kind: 'inbox.enqueued', at: 2, sessionId: 'a', inboxId: 'm1', item: 'user'})
+    pipeline.observe({kind: 'execution.started', at: 3, sessionId: 'a'})
+    pipeline.observe({kind: 'inbox.delivered', at: 4, sessionId: 'a', inboxId: 'm1'})
+    pipeline.observe({kind: 'tool.called', at: 5, sessionId: 'a', callId: 'c1', executed: false, input: args})
+    pipeline.observe({kind: 'tool.ended', at: 6, sessionId: 'a', callId: 'c1', succeeded: true})
+    pipeline.observe({kind: 'execution.ended', at: 7, sessionId: 'a', outcome: 'succeeded'})
+    await flush()
+
+    // #then
+    expect(ledger.stats().pending).toBe(0)
+    pipeline.stop()
+  })
+})

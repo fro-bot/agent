@@ -551,6 +551,7 @@ describe('what a hook-time snapshot could not take', () => {
         ledger: {
           room: () => undefined,
           hold: () => {},
+          retain: () => {},
           release: () => {},
           refuse: () => {},
           stats: () => ({pending: 0, pendingChars: 0, refused: 0}),

@@ -235,6 +235,11 @@ export interface TurnModel {
    * a repeated terminal event). Returned once, for whoever counts them to release.
    */
   readonly takeDiscarded: () => unknown[]
+  /**
+   * The snapshots that now have a second owner (a tool call's arguments are in the model's record of what was asked and in
+   * the tool span). Returned once; each needs one more release.
+   */
+  readonly takeRetained: () => unknown[]
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -416,6 +421,8 @@ export function createTurnModel(options: {
 
   /** Snapshots dropped with no span to carry them, until `takeDiscarded` hands them back. */
   let discarded: unknown[] = []
+  /** Snapshots that gained a second owner, until `takeRetained` hands them over. */
+  let retained: unknown[] = []
   const discard = (value: unknown): void => {
     if (typeof value === 'object' && value !== null) discarded.push(value)
   }
@@ -1334,7 +1341,11 @@ export function createTurnModel(options: {
     const asked = o.messageId === undefined ? undefined : node.stepOwner.get(o.messageId)
     if (asked !== undefined) {
       if (asked.toolCalls.length >= limits.maxOutputParts) asked.gaps.add('tool-calls-over-limit')
-      else asked.toolCalls.push({callId: o.callId, tool: tool.tool, input: o.input})
+      else {
+        asked.toolCalls.push({callId: o.callId, tool: tool.tool, input: o.input})
+        // The same object is now held by the request's record and by the tool span: two owners.
+        if (typeof o.input === 'object' && o.input !== null) retained.push(o.input)
+      }
     }
     if (tool.tool === 'subagent') unresolved.add(`${node.id}/${o.callId}`)
   }
@@ -1594,6 +1605,11 @@ export function createTurnModel(options: {
       }
       dispatch(observation)
       return out
+    },
+    takeRetained: () => {
+      const taken = retained
+      retained = []
+      return taken
     },
     takeDiscarded: () => {
       const taken = discarded

@@ -108,7 +108,9 @@ export interface SnapshotLedger {
   readonly room: () => number | undefined
   /** Records a snapshot as pending. Idempotent per snapshot. */
   readonly hold: (snapshot: object, chars: number) => void
-  /** Frees a snapshot. Safe on anything: a value the ledger does not hold is ignored. */
+  /** Gives a held snapshot one more owner: it is freed when every owner has released it. Ignored if not held. */
+  readonly retain: (snapshot: unknown) => void
+  /** One owner lets go; the last frees it. Safe on anything: a value the ledger does not hold is ignored. */
   readonly release: (snapshot: unknown) => void
   /** Notes a snapshot refused for lack of room. */
   readonly refuse: () => void
@@ -122,7 +124,8 @@ export interface SnapshotLedger {
  */
 export function createSnapshotLedger(options: Partial<PendingLimits> = {}): SnapshotLedger {
   const limits: PendingLimits = {...DEFAULT_PENDING_LIMITS, ...options}
-  const held = new WeakMap<object, number>()
+  /** Characters and the number of owners that have not released it yet. */
+  const held = new WeakMap<object, {readonly chars: number; owners: number}>()
   let pending = 0
   let pendingChars = 0
   let refused = 0
@@ -139,18 +142,25 @@ export function createSnapshotLedger(options: Partial<PendingLimits> = {}): Snap
     },
     hold: (snapshot, chars) => {
       if (held.has(snapshot)) return
-      held.set(snapshot, chars)
+      held.set(snapshot, {chars, owners: 1})
       pending += 1
       pendingChars += chars
       backstop.register(snapshot, chars, snapshot)
     },
+    retain: snapshot => {
+      if (typeof snapshot !== 'object' || snapshot === null) return
+      const entry = held.get(snapshot)
+      if (entry !== undefined) entry.owners += 1
+    },
     release: snapshot => {
       if (typeof snapshot !== 'object' || snapshot === null) return
-      const chars = held.get(snapshot)
-      if (chars === undefined) return
+      const entry = held.get(snapshot)
+      if (entry === undefined) return
+      entry.owners -= 1
+      if (entry.owners > 0) return
       held.delete(snapshot)
       backstop.unregister(snapshot)
-      free(chars)
+      free(entry.chars)
     },
     refuse: () => {
       refused += 1

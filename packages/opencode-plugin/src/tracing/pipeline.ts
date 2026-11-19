@@ -116,6 +116,13 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
   }
 
   /** Snapshots the model dropped with no span (an expired session's prompts, a timed-out hook note): freed here. */
+  /** A snapshot the model now holds twice needs two releases: the ledger counts its owners. */
+  function retainShared(): void {
+    const shared = model.takeRetained()
+    if (options.ledger === undefined) return
+    for (const snapshot of shared) options.ledger.retain(snapshot)
+  }
+
   function releaseDiscarded(): void {
     const dropped = model.takeDiscarded()
     if (options.ledger === undefined) return
@@ -160,6 +167,7 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
     if (next !== undefined) {
       try {
         enqueue(model.observe(next))
+        retainShared()
         releaseDiscarded()
         forwardDrops()
       } catch {
@@ -214,6 +222,7 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
       while (inbox.length > 0) step()
       try {
         enqueue(model.flush(now()))
+        retainShared()
         releaseDiscarded()
         forwardDrops()
       } catch {

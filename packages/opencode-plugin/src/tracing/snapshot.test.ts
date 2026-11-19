@@ -593,3 +593,30 @@ describe('the work a snapshot does does not scale with the history', () => {
     expect(kept + (snapshot.droppedMessages ?? 0)).toBe(10)
   })
 })
+
+describe('the ledger’s counted ownership', () => {
+  it('holds a retained snapshot until every owner has released it', () => {
+    // #given a snapshot with a second owner
+    const ledger = createSnapshotLedger()
+    const prompt = snapshotPrompt({text: 'shared'}, {ledger})
+    ledger.retain(prompt)
+
+    // #when one owner releases
+    ledger.release(prompt)
+
+    // #then it is still held; the second release frees it, and a third is ignored
+    expect(ledger.stats().pending).toBe(1)
+    ledger.release(prompt)
+    expect(ledger.stats()).toMatchObject({pending: 0, pendingChars: 0})
+    ledger.release(prompt)
+    expect(ledger.stats().pending).toBe(0)
+  })
+
+  it('ignores a retain on something the ledger does not hold', () => {
+    // #given / #when / #then
+    const ledger = createSnapshotLedger()
+    ledger.retain({})
+    ledger.retain(undefined)
+    expect(ledger.stats().pending).toBe(0)
+  })
+})
