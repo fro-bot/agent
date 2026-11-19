@@ -254,7 +254,7 @@ Span shape for one turn:
 
 ### Stage 1: capture and local export
 
-- [ ] **Unit 1: Bundle the SDK behind a lazy entry**
+- [x] **Unit 1: Bundle the SDK behind a lazy entry**
 
 **Goal:** The plugin can carry OpenTelemetry code that loads inside the real plugin host, without changing what an install or a tracing-off start does.
 
@@ -288,7 +288,7 @@ Span shape for one turn:
 
 **Verification:** The real binary loads the lazy chunk from an installed copy of the plugin. Tarball size and cold-import time are recorded before and after.
 
-- [ ] **Unit 2: Host mode and settings**
+- [x] **Unit 2: Host mode and settings**
 
 **Goal:** One function decides whether tracing is on and where spans go, and fails closed.
 
@@ -331,7 +331,7 @@ Span shape for one turn:
 
 **Verification:** No input a checkout or project config can supply turns tracing on. A host with a headless marker and no launcher variable stays off. An unmarked process under the operator's account on a machine the file names is a local session and traces.
 
-- [ ] **Unit 3: Turn model**
+- [x] **Unit 3: Turn model**
 
 **Goal:** A pure module turns hook calls and bus events into span records with correct parents and end states.
 
@@ -386,7 +386,7 @@ Span shape for one turn:
 
 **Verification:** Every recorded fixture replays to the expected span tree with exact parents. A closed root leaves only a bounded record of its trace id, kept so a continuation can name it. When that record has expired, a late report starts an unattributed trace.
 
-- [ ] **Unit 4: Content and GenAI attributes**
+- [x] **Unit 4: Content and GenAI attributes**
 
 **Goal:** Span records become GenAI-convention attributes with scrubbed, bounded, marked content.
 
@@ -430,7 +430,7 @@ Span shape for one turn:
 
 **Verification:** A recursive walk of every string in the exported payload finds no fixture secret, and every bounded value parses.
 
-- [ ] **Unit 5: Wire tracing into the plugin**
+- [x] **Unit 5: Wire tracing into the plugin**
 
 **Goal:** A local session with tracing on exports a turn's trace, and nothing tracing does can break a session.
 
