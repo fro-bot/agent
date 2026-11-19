@@ -237,7 +237,14 @@ export async function run(options: RunOptions = {}): Promise<number> {
     try {
       // Memoized by the handle: after a release this is the result of the shutdown that already happened.
       const {exit} = await serverHandleV2.shutdown()
-      return exit.outcome === 'forced' || exit.outcome === 'unconfirmed'
+      // Forced or unconfirmed, or any exit on a signal or with a non-zero code, even one the handle reads as already-exited or
+      // graceful: the plugin may not have flushed its last batch. The code and signal ride on the same shutdown result.
+      return (
+        exit.outcome === 'forced' ||
+        exit.outcome === 'unconfirmed' ||
+        exit.signal !== null ||
+        (exit.code !== null && exit.code !== 0)
+      )
     } catch {
       return true
     }

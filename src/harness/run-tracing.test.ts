@@ -213,12 +213,15 @@ const QUIET_RELEASE = {
 
 type ExitOutcome = 'already-exited' | 'forced' | 'graceful' | 'unconfirmed'
 
-function serverHandle(exitOutcome: ExitOutcome = 'graceful'): OpenCodeV2ServerHandle {
+function serverHandle(
+  exitOutcome: ExitOutcome = 'graceful',
+  info: {readonly code: number | null; readonly signal: NodeJS.Signals | null} = {code: 0, signal: null},
+): OpenCodeV2ServerHandle {
   return {
     url: 'http://127.0.0.1:1',
     shutdown: vi.fn(async () => ({
       interrupts: {stopped: [], notRunning: [], unconfirmed: []},
-      exit: {outcome: exitOutcome, code: 0, signal: null},
+      exit: {outcome: exitOutcome, ...info},
     })),
   } as unknown as OpenCodeV2ServerHandle
 }
@@ -637,6 +640,35 @@ describe('run with tracing', () => {
 
     expect(stop).toHaveBeenCalledWith({serverKilled: true})
   })
+
+  it.each([
+    [
+      'the server had already exited on a signal',
+      serverHandle('already-exited', {code: null, signal: 'SIGKILL'}),
+      true,
+    ],
+    ['the server stopped gracefully on a signal', serverHandle('graceful', {code: null, signal: 'SIGTERM'}), true],
+    [
+      'the server had already exited with a non-zero code',
+      serverHandle('already-exited', {code: 1, signal: null}),
+      true,
+    ],
+    ['the server stopped gracefully with a non-zero code', serverHandle('graceful', {code: 137, signal: null}), true],
+    ['the server had already exited cleanly', serverHandle('already-exited', {code: 0, signal: null}), false],
+    ['the server stopped gracefully and cleanly', serverHandle('graceful', {code: 0, signal: null}), false],
+  ])(
+    'tells the supervisor the count may be short, or not, from how the server exited (%s)',
+    async (_name, handle, killed) => {
+      const {startTraceRelayProcess} = await import('./phases/trace-relay-process.js')
+      await arrange({handle})
+      const {relay, stop} = fakeRelay()
+      vi.mocked(startTraceRelayProcess).mockResolvedValue({success: true, data: relay})
+
+      await run({traceRelay: TRACE_RELAY})
+
+      expect(stop).toHaveBeenCalledWith({serverKilled: killed})
+    },
+  )
 
   it('does not let a relay stop that rejects change the run', async () => {
     const {startTraceRelayProcess} = await import('./phases/trace-relay-process.js')
