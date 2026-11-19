@@ -1,7 +1,7 @@
 import type {Buffer} from 'node:buffer'
 import type {ChildProcess} from 'node:child_process'
 import type {Result} from '@bfra.me/es/result'
-import type {TraceRelayBatchCounts, TraceRelayHeader} from '@fro-bot/runtime'
+import type {TraceRelayBatchCounts, TraceRelayHeader, TraceRelayPluginCounts} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
 import {spawn} from 'node:child_process'
 import process from 'node:process'
@@ -90,6 +90,11 @@ export interface TraceRelayStopResult {
   readonly outcome: TraceRelayStopOutcome
   /** What the relay counted, or `incomplete` when it was killed, crashed, printed no report, or the server was killed. */
   readonly counts: TraceRelayBatchCounts | 'incomplete'
+  /**
+   * The span totals the plugin itself reported in its counts header (the last valid value the relay saw), as numbers. Absent
+   * when the plugin never sent one and whenever the count is incomplete. Untrusted: it is what a loopback sender said.
+   */
+  readonly pluginReported?: TraceRelayPluginCounts
 }
 
 export interface TraceRelayStopOptions {
@@ -173,7 +178,8 @@ export async function startTraceRelayProcess(
     started: boolean
     crashed: boolean
     report: TraceRelayBatchCounts | null
-  } = {exit: null, stopping: false, started: false, crashed: false, report: null}
+    plugin: TraceRelayPluginCounts | null
+  } = {exit: null, stopping: false, started: false, crashed: false, report: null, plugin: null}
 
   // Registered now, before anything can declare the child ready: an exit at any later point is seen.
   const exited = new Promise<void>(resolve => {
@@ -255,6 +261,7 @@ export async function startTraceRelayProcess(
           else resolve({kind: line.kind === 'error' ? 'error' : 'bad'})
         } else if (line.kind === 'report') {
           state.report = line.counts
+          state.plugin = line.plugin ?? null
         }
       }
     })
@@ -290,9 +297,17 @@ export async function startTraceRelayProcess(
       const outcome = await terminate()
       const complete = (outcome === 'stopped' || outcome === 'already-exited') && stopOptions.serverKilled !== true
       const counts = complete && state.report !== null ? state.report : 'incomplete'
-      if (counts === 'incomplete') logger.info('Trace relay stopped', {countIncomplete: true})
-      else logger.info('Trace relay stopped', {...counts})
-      return {outcome, counts}
+      if (counts === 'incomplete') {
+        logger.info('Trace relay stopped', {countIncomplete: true})
+        return {outcome, counts}
+      }
+      // The plugin's own totals ride beside the relay's counts, under a name that says who reported them.
+      const pluginReported =
+        state.plugin === null
+          ? undefined
+          : {exportedSpans: state.plugin.exportedSpans, droppedSpans: state.plugin.droppedSpans}
+      logger.info('Trace relay stopped', {...counts, ...(pluginReported === undefined ? {} : {pluginReported})})
+      return {outcome, counts, ...(pluginReported === undefined ? {} : {pluginReported})}
     } catch {
       return {outcome: 'unconfirmed', counts: 'incomplete'}
     }

@@ -7,6 +7,7 @@ import process from 'node:process'
 import {fileURLToPath} from 'node:url'
 import {afterEach, beforeEach, describe, expect, it} from 'vitest'
 import {postBatch, rawExchange, startHttpUpstream} from '../../../packages/runtime/src/agent/trace-relay-test-kit.js'
+import {TRACE_RELAY_COUNTS_HEADER} from '../../../packages/runtime/src/agent/trace-relay-wire.js'
 import {createMockLogger, serializeLoggerCalls, unwrapErr, unwrapOk} from '../../shared/test-helpers.js'
 import {startTraceRelayProcess} from './trace-relay-process.js'
 
@@ -127,6 +128,33 @@ describe('trace-relay-process', () => {
       for (const canary of [CREDENTIAL, COLLECTOR_HOST_CANARY, upstream.origin, 'Basic', 'Authorization']) {
         expect(logged).not.toContain(canary)
       }
+    })
+
+    it('carries the span totals the plugin reported, from the header to the stop result and the log', async () => {
+      // #given a running relay and a sender that reports totals twice, the second time with a hostile value
+      const upstream = await startHttpUpstream((_request, res) => res.end())
+      cleanups.push(upstream.close)
+      const {started, logger} = await startWith(realLauncher(), {
+        config: {url: `${upstream.origin}/v1/traces`, headers: HEADERS},
+      })
+      const relay = unwrapOk(started)
+      await postBatch(relay.port, {headers: {[TRACE_RELAY_COUNTS_HEADER]: 'exported=30;dropped=4'}})
+      await postBatch(relay.port, {headers: {[TRACE_RELAY_COUNTS_HEADER]: 'exported=CANARY-SPANS;dropped=1'}})
+
+      // #when it is stopped
+      const stopped = await relay.stop()
+
+      // #then the last valid totals come back, labelled as the plugin's, beside the relay's own counts
+      expect(stopped).toEqual({
+        outcome: 'stopped',
+        counts: {delivered: 2, retry: 0, dropped: 0},
+        pluginReported: {exportedSpans: 30, droppedSpans: 4},
+      })
+      expect(loggedAt(logger, 'info').at(-1)).toEqual([
+        'Trace relay stopped',
+        {delivered: 2, retry: 0, dropped: 0, pluginReported: {exportedSpans: 30, droppedSpans: 4}},
+      ])
+      expect(serializeLoggerCalls(logger)).not.toContain('CANARY')
     })
 
     it('answers a refused request locally while running, and keeps serving', async () => {
@@ -356,6 +384,47 @@ describe('trace-relay-process', () => {
 
       expect(await first.stop()).toEqual({outcome: 'stopped', counts: {delivered: 4, retry: 2, dropped: 1}})
       expect(await second.stop()).toEqual({outcome: 'stopped', counts: 'incomplete'})
+    })
+
+    it('reads the plugin totals from the report, and drops a malformed field without losing the batch counts', async () => {
+      const good = await fakeChild(
+        String.raw`process.stdout.write('{"ready":true,"port":4321}\n'); process.stdin.resume(); process.stdin.on('end', () => { process.stdout.write('{"report":{"delivered":4,"retry":2,"dropped":1,"plugin":{"exportedSpans":90,"droppedSpans":6},"note":"CANARY-NOTE"}}\n'); process.exit(0) })`,
+      )
+      const garbled = await fakeChild(
+        String.raw`process.stdout.write('{"ready":true,"port":4321}\n'); process.stdin.resume(); process.stdin.on('end', () => { process.stdout.write('{"report":{"delivered":4,"retry":2,"dropped":1,"plugin":{"exportedSpans":"CANARY-SPANS","droppedSpans":6}}}\n'); process.exit(0) })`,
+      )
+      const first = await startWith(good)
+      const second = await startWith(garbled)
+
+      expect(await unwrapOk(first.started).stop()).toEqual({
+        outcome: 'stopped',
+        counts: {delivered: 4, retry: 2, dropped: 1},
+        pluginReported: {exportedSpans: 90, droppedSpans: 6},
+      })
+      expect(await unwrapOk(second.started).stop()).toEqual({
+        outcome: 'stopped',
+        counts: {delivered: 4, retry: 2, dropped: 1},
+      })
+      expect(loggedAt(second.logger, 'info').at(-1)).toEqual([
+        'Trace relay stopped',
+        {delivered: 4, retry: 2, dropped: 1},
+      ])
+      // nothing but the integers it picked reaches a log line
+      expect(serializeLoggerCalls(first.logger)).not.toContain('CANARY')
+      expect(serializeLoggerCalls(second.logger)).not.toContain('CANARY')
+    })
+
+    it('logs neither the batch counts nor the plugin totals when the count is incomplete', async () => {
+      const reporting = await fakeChild(
+        String.raw`process.stdout.write('{"ready":true,"port":4321}\n'); process.stdin.resume(); process.stdin.on('end', () => { process.stdout.write('{"report":{"delivered":4,"retry":2,"dropped":1,"plugin":{"exportedSpans":90,"droppedSpans":6}}}\n'); process.exit(0) })`,
+      )
+      const {started, logger} = await startWith(reporting)
+
+      const stopped = await unwrapOk(started).stop({serverKilled: true})
+
+      expect(stopped).toEqual({outcome: 'stopped', counts: 'incomplete'})
+      expect(stopped).not.toHaveProperty('pluginReported')
+      expect(loggedAt(logger, 'info').at(-1)).toEqual(['Trace relay stopped', {countIncomplete: true}])
     })
 
     it('says the count is incomplete when the caller knows the server was killed before its last flush', async () => {
