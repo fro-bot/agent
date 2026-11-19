@@ -510,6 +510,32 @@ describe.skipIf(!runnable)('tracing in a real opencode V2', () => {
     })
   }, 90_000)
 
+  it.each([
+    ['a collector that accepts the connection and never answers', {respond: () => ({status: 200, delayMs: 120_000})}],
+    ['a collector that keeps answering 503', {respond: () => ({status: 503})}],
+  ] as const)(
+    'stops inside the Action’s 5 s window when stdin closes against %s, and cleanup stays inside its own bound',
+    async (label, sinkOptions) => {
+      // #given a finished turn whose spans are being exported to a collector that will not take them
+      await run({steps: [{all: ['W-ONE'], text: 'answer'}], sink: sinkOptions}, async h => {
+        const session = await h.session()
+        await prompt(h.api, session, 'W-ONE hello')
+        await sleep(4_000)
+
+        // #when the server is stopped the way the Action stops it
+        const stopped = await h.server.stop()
+        if (process.env.FRO_BOT_TIMING === '1') process.stdout.write(`STOP-TIMING ${label}: ${String(stopped.ms)} ms\n`)
+
+        // #then it left on its own inside the Action's window (the assertion is at 5 s, not the fixture's 8 s), the plugin
+        // reported what it could not deliver, and a stalled or failing collector never kept the process alive
+        expect(stopped.exitedOnItsOwn).toBe(true)
+        expect(stopped.ms).toBeLessThan(5_000)
+        expect(h.server.stderr()).toMatch(/tracing stopped, exported 0 spans, dropped [1-9]/)
+      })
+    },
+    90_000,
+  )
+
   it('refuses an untrusted https certificate in the compiled host, with certificate validation switched off in the environment', async () => {
     // #given a collector over https with a self-signed certificate, a local-mode file pointing at it, and the process-wide switch off
     const tls = await startTlsSink()
