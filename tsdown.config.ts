@@ -73,6 +73,7 @@ export default defineConfig([
       'apps/action/src/main.ts',
       'apps/action/src/post.ts',
       'apps/action/src/key-proxy.ts',
+      'apps/action/src/trace-relay.ts',
       'apps/action/src/sandbox-view.ts',
     ],
     fixedExtension: false,
