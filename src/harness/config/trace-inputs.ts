@@ -147,6 +147,21 @@ function parseHeaderLines(raw: string): HeaderLines {
   return {ok: true, headers}
 }
 
+/**
+ * Registers every form the two inputs could appear as, and nothing else: no validation, no message. The caller runs this first
+ * of everything in input parsing, so a required input that fails afterwards cannot leave a header unmasked. It never throws.
+ */
+export function maskTraceInputs(
+  raw: {readonly endpoint: string; readonly headers: string},
+  io: Pick<TraceInputIo, 'mask'>,
+): void {
+  try {
+    maskInputs(io, raw.endpoint.trim(), raw.headers)
+  } catch {
+    // Masking is best effort here; the parse masks again.
+  }
+}
+
 export function parseTraceInputs(
   raw: {readonly endpoint: string; readonly headers: string},
   io: TraceInputIo,

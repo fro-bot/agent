@@ -17,7 +17,7 @@ import {
 import {err, ok} from '../../shared/types.js'
 import {validateJsonString, validatePositiveInteger} from '../../shared/validation.js'
 import {resolveAgentStateHome} from './agent-state-home.js'
-import {parseTraceInputs} from './trace-inputs.js'
+import {maskTraceInputs, parseTraceInputs} from './trace-inputs.js'
 
 /**
  * Parse model input string in "provider/model" format.
@@ -116,6 +116,14 @@ function isForkPullRequestPayload(payload: unknown): boolean {
  * @returns Result containing validated ActionInputs or an Error
  */
 export function parseActionInputs(): Result<ActionInputs, Error> {
+  // Tracing credentials first of everything: read, masked and removed from the environment before any required input can fail
+  // and return, so a run that fails early still leaves no header unmasked and no `INPUT_TRACE-*` copy for a child to inherit.
+  // The hyphen is preserved by @actions/core, as for auth-json: `trace-headers` is read from `INPUT_TRACE-HEADERS`.
+  const traceInputs = {endpoint: core.getInput('trace-endpoint'), headers: core.getInput('trace-headers')}
+  delete process.env['INPUT_TRACE-ENDPOINT']
+  delete process.env['INPUT_TRACE-HEADERS']
+  maskTraceInputs(traceInputs, {mask: value => core.setSecret(value)})
+
   try {
     const awsAccessKeyId = process.env.AWS_ACCESS_KEY_ID?.trim() ?? ''
     if (awsAccessKeyId.length > 0) {
@@ -154,22 +162,15 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     // not inherited by the OpenCode server child (spawned with `{ ...process.env }`).
     delete process.env['INPUT_AUTH-JSON']
 
-    // Tracing: the endpoint and the credential headers. Read, masked and removed from the environment before anything else
-    // can fail on them, and never allowed to fail the run: a refused value is tracing off with one warning (trace-inputs.ts).
-    // Same hyphen-key gotcha as auth-json: `trace-headers` is read from `INPUT_TRACE-HEADERS`.
-    const traceEndpointRaw = core.getInput('trace-endpoint')
-    const traceHeadersRaw = core.getInput('trace-headers')
-    delete process.env['INPUT_TRACE-ENDPOINT']
-    delete process.env['INPUT_TRACE-HEADERS']
-    const tracing = parseTraceInputs(
-      {endpoint: traceEndpointRaw, headers: traceHeadersRaw},
-      {
-        warning: message => core.warning(message),
-        notice: message => core.notice(message),
-        info: message => core.info(message),
-        mask: value => core.setSecret(value),
-      },
-    )
+    // Tracing: the endpoint and the credential headers were read, masked and removed from the environment at the top, so
+    // nothing above can leave them behind. Never allowed to fail the run: a refused value is tracing off with one warning
+    // (trace-inputs.ts). Masking is not repeated here.
+    const tracing = parseTraceInputs(traceInputs, {
+      warning: message => core.warning(message),
+      notice: message => core.notice(message),
+      info: message => core.info(message),
+      mask: () => undefined,
+    })
 
     // Optional string inputs (null if empty)
     const trustedHeadSha = core.getInput('trusted-head-sha').trim()

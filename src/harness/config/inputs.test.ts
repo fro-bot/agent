@@ -1710,4 +1710,56 @@ describe('parseActionInputs tracing inputs', () => {
     expect(mocks.notice).toHaveBeenCalledTimes(1)
     expect(mocks.warning).not.toHaveBeenCalled()
   })
+
+  describe('when a required input fails before the tracing inputs are reached', () => {
+    const BASIC = 'Basic cGstbGYtY2FuYXJ5LTAwMDE6c2stbGYtY2FuYXJ5LTAwMDItc2VjcmV0'
+    const HEADERS = `Authorization: ${BASIC}\nx-langfuse-ingestion-version: 4`
+
+    it.each([
+      ['an empty github-token', {'github-token': ''}],
+      ['an empty auth-json', {'auth-json': ''}],
+      ['an auth-json that is not JSON', {'auth-json': 'not json'}],
+    ])('still masks every form of the headers and removes both variables, for %s', (_name, bad) => {
+      // #given both tracing inputs set (as the runner exports them) and a required input that fails
+      vi.stubEnv('INPUT_TRACE-ENDPOINT', ENDPOINT)
+      vi.stubEnv('INPUT_TRACE-HEADERS', HEADERS)
+      mockInputs({'trace-endpoint': ENDPOINT, 'trace-headers': HEADERS, ...bad})
+
+      // #when
+      const result = parseActionInputs()
+
+      // #then the run fails on the required input, and nothing of the tracing inputs is left unmasked or in the environment
+      expect(result.success).toBe(false)
+      const masked = mocks.setSecret.mock.calls.map(call => String(call[0]))
+      for (const form of [
+        ENDPOINT,
+        HEADERS,
+        BASIC,
+        'cGstbGYtY2FuYXJ5LTAwMDE6c2stbGYtY2FuYXJ5LTAwMDItc2VjcmV0',
+        'sk-lf-canary-0002-secret',
+      ]) {
+        expect(masked).toContain(form)
+      }
+      expect(process.env['INPUT_TRACE-ENDPOINT']).toBeUndefined()
+      expect(process.env['INPUT_TRACE-HEADERS']).toBeUndefined()
+    })
+
+    it('masks each value once on a run that goes on, and logs no tracing message for a run that fails early', () => {
+      // #given a good run, and then a failing one
+      mockInputs({'trace-endpoint': ENDPOINT, 'trace-headers': HEADERS})
+      parseActionInputs()
+      const maskedOnce = mocks.setSecret.mock.calls.map(call => String(call[0])).filter(value => value === ENDPOINT)
+      vi.clearAllMocks()
+      mockInputs({
+        'trace-endpoint': 'http://collector.example.test/v1/traces',
+        'trace-headers': HEADERS,
+        'github-token': '',
+      })
+      parseActionInputs()
+
+      // #then the endpoint is registered once for a run that parses, and a run that fails early warns about nothing
+      expect(maskedOnce).toEqual([ENDPOINT])
+      expect(mocks.warning).not.toHaveBeenCalled()
+    })
+  })
 })
