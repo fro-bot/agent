@@ -4,7 +4,7 @@ import type {ObserverHost} from './record-observations.js'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
 import {startOtlpSink, type OtlpSink} from '../integration.fixture.js'
-import {CLEANUP_BOUND_MS, startTracing} from './index.js'
+import {CLEANUP_BOUND_MS, DRAIN_BOUND_MS, startTracing} from './index.js'
 
 /** A fake host: records every registered hook and exposes a pushable event stream. */
 function fakeObserverHost() {
@@ -246,6 +246,36 @@ describe('startTracing', () => {
     expect(Date.now() - started).toBeLessThan(CLEANUP_BOUND_MS + 1_500)
     expect(lines).toEqual(['tracing stopped, exported 0 spans, dropped 2'])
   }, 15_000)
+
+  it('spends at most its drain share on the backlog, and reports what it could not do', async () => {
+    // #given a turn waiting to be processed and a drain share of nothing
+    const target = await sink()
+    const fake = fakeObserverHost()
+    const lines: string[] = []
+    const handle = await startTracing(fake.host, LOCAL(target.url), {
+      env: {},
+      log: line => lines.push(line),
+      drainBoundMs: 0,
+    })
+    textTurn(fake)
+
+    // #when stop runs at once
+    const started = Date.now()
+    await handle.stop()
+    fake.end()
+
+    // #then it did not wait for the backlog, exported nothing, said so, and left the exporter its time
+    expect(Date.now() - started).toBeLessThan(500)
+    expect(target.accepted()).toHaveLength(0)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toMatch(/^tracing stopped, exported 0 spans, dropped 0, \d+ observations lost$/)
+  })
+
+  it('gives the pipeline a minority of the cleanup bound, so the exporter keeps the rest', () => {
+    // #given / #when / #then
+    expect(DRAIN_BOUND_MS).toBeGreaterThan(0)
+    expect(DRAIN_BOUND_MS).toBeLessThanOrEqual(CLEANUP_BOUND_MS / 2)
+  })
 
   it('keeps the cleanup bound shorter than the Action’s 5 s kill window', () => {
     // #given / #when / #then

@@ -511,3 +511,156 @@ describe('a snapshot shared by a model span and a tool span', () => {
     pipeline.stop()
   })
 })
+
+describe('stop against a deadline', () => {
+  /** A scrubber that burns about `ms` per string, standing in for a large backlog of expensive spans. */
+  const slowScrubber = (ms: number) =>
+    createScrubber({
+      patterns: [
+        {
+          id: 'slow',
+          apply: text => {
+            const until = performance.now() + ms
+            while (performance.now() < until) {
+              // Busy wait: the cost is synchronous, as a big scrub is.
+            }
+            return {text, count: 0}
+          },
+        },
+      ],
+    })
+
+  /** `turns` complete one-step turns in as many sessions, all observed and none yet processed. */
+  const backlog = (
+    pipeline: ReturnType<typeof createTracePipeline>,
+    turns: number,
+    ledger: ReturnType<typeof createSnapshotLedger>,
+  ) => {
+    for (let index = 0; index < turns; index += 1) {
+      const session = `s${index}`
+      const at = index * 10
+      pipeline.observe({
+        kind: 'prompt',
+        at: at + 1,
+        sessionId: session,
+        messageId: 'm',
+        delivery: 'steer',
+        content: snapshotPrompt({text: 'hi'}, {ledger}),
+      })
+      pipeline.observe({kind: 'inbox.enqueued', at: at + 2, sessionId: session, inboxId: 'm', item: 'user'})
+      pipeline.observe({kind: 'execution.started', at: at + 3, sessionId: session})
+      pipeline.observe({kind: 'inbox.delivered', at: at + 4, sessionId: session, inboxId: 'm'})
+      pipeline.observe({
+        kind: 'request',
+        at: at + 5,
+        sessionId: session,
+        requestKind: 'primary',
+        agent: 'build',
+        model: 'm',
+        provider: 'p',
+        content: snapshotRequest({system: [{text: 's'}], messages: [], tools: {}}, {ledger}),
+      })
+      pipeline.observe({
+        kind: 'step.started',
+        at: at + 6,
+        sessionId: session,
+        messageId: 's',
+        agent: 'build',
+        model: 'm',
+        provider: 'p',
+      })
+      pipeline.observe({
+        kind: 'step.ended',
+        at: at + 7,
+        sessionId: session,
+        messageId: 's',
+        finish: 'stop',
+        usage: {input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0},
+        cost: 0,
+      })
+      pipeline.observe({kind: 'execution.ended', at: at + 8, sessionId: session, outcome: 'succeeded'})
+    }
+  }
+
+  it('does the whole backlog when it fits the deadline', () => {
+    // #given a small backlog and a generous deadline
+    const ledger = createSnapshotLedger()
+    const {sink, spans, dropped} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber, ledger, limits: {sliceMs: 1_000}})
+    backlog(pipeline, 5, ledger)
+
+    // #when
+    pipeline.stop(5_000)
+
+    // #then everything was exported, nothing dropped, nothing held
+    expect(spans.filter(span => span.name.startsWith('invoke_agent'))).toHaveLength(5)
+    expect(dropped()).toBe(0)
+    expect(ledger.stats().pending).toBe(0)
+  })
+
+  it('stops at the deadline, drops and counts the rest, and releases their snapshots', () => {
+    // #given 60 turns at about 3 ms per string and a deadline of 60 ms: far less time than the whole needs
+    const ledger = createSnapshotLedger()
+    const {sink, spans, dropped} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber: slowScrubber(3), ledger, limits: {sliceMs: 1_000}})
+    backlog(pipeline, 60, ledger)
+
+    // #when
+    const started = performance.now()
+    pipeline.stop(60)
+    const elapsed = performance.now() - started
+
+    // #then it came back near the deadline (one string's cost over, at most), exported some, dropped the rest, and holds nothing
+    expect(elapsed).toBeLessThan(60 + 400)
+    const exported = spans.filter(span => span.name.startsWith('invoke_agent') || span.name.startsWith('chat')).length
+    expect(exported).toBeGreaterThan(0)
+    expect(exported).toBeLessThan(120)
+    expect(dropped()).toBeGreaterThan(0)
+    expect(ledger.stats()).toMatchObject({pending: 0, pendingChars: 0})
+  })
+
+  it('counts every span as exported or dropped, none twice and none lost', () => {
+    // #given the same backlog with a record per span: 60 turns make 120 spans (a root and a model call each)
+    const ledger = createSnapshotLedger()
+    const {sink, spans, dropped} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber: slowScrubber(3), ledger, limits: {sliceMs: 1_000}})
+    backlog(pipeline, 60, ledger)
+
+    // #when
+    pipeline.stop(60)
+
+    // #then exported plus dropped is the whole
+    expect(spans.length + dropped()).toBe(120)
+  })
+
+  it('with no time left reports every unprocessed observation as lost and releases its snapshots', () => {
+    // #given a backlog and a deadline that has already passed
+    const ledger = createSnapshotLedger()
+    const {sink, spans, dropped} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber, ledger, limits: {sliceMs: 1_000}})
+    backlog(pipeline, 10, ledger)
+
+    // #when
+    pipeline.stop(0)
+
+    // #then nothing was exported, the eighty observations were never turned into spans and are reported as lost, and the
+    // ledger is empty
+    expect(spans).toHaveLength(0)
+    expect(dropped()).toBe(0)
+    expect(pipeline.stats().observationsDropped).toBe(80)
+    expect(ledger.stats().pending).toBe(0)
+  })
+
+  it('keeps no work after stop: a later observation does nothing', () => {
+    // #given a stopped pipeline
+    const {sink, spans} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber})
+    pipeline.stop(100)
+
+    // #when
+    for (const observation of fixture('text-turn')) pipeline.observe(observation)
+
+    // #then
+    expect(spans).toHaveLength(0)
+  })
+})

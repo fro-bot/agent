@@ -65,8 +65,12 @@ export interface PipelineStats {
 export interface TracePipeline {
   /** Cheap: appends and schedules. Never throws. */
   readonly observe: (observation: Observation) => void
-  /** Runs everything still pending, closes every open span as interrupted and incomplete, and stops. */
-  readonly stop: () => void
+  /**
+   * Runs what is pending, closes every open span as interrupted and incomplete, and stops, working for at most `budgetMs`
+   * (one scrub can run over it, never more). What it has not done by then is dropped and counted, and its snapshots
+   * released, so the caller can give the exporter the rest of its own bound.
+   */
+  readonly stop: (budgetMs?: number) => void
   readonly stats: () => PipelineStats
 }
 
@@ -215,11 +219,19 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
       inbox.push(observation)
       schedule()
     },
-    stop: () => {
+    stop: (budgetMs = Number.POSITIVE_INFINITY) => {
       if (stopped) return
       if (tick !== undefined) clearInterval(tick)
       tick = undefined
-      while (inbox.length > 0) step()
+      const deadline = performance.now() + budgetMs
+      const timeLeft = (): boolean => performance.now() < deadline
+      // Observations first, so the model sees everything that happened; each step may be a slow one.
+      while (inbox.length > 0 && timeLeft()) step()
+      // Out of time: what was never processed is lost, and says so. Its snapshots go back to the ledger.
+      for (const unprocessed of inbox.splice(0)) {
+        observationsDropped += 1
+        releaseObservation(unprocessed)
+      }
       try {
         enqueue(model.flush(now()))
         retainShared()
@@ -229,7 +241,12 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
         observationsDropped += 1
       }
       stopped = true
-      while (records.length > 0) step()
+      while (records.length > 0 && timeLeft()) step()
+      // Whatever is left is counted as dropped spans and released.
+      for (const left of records.splice(0)) {
+        options.sink.drop(1)
+        release(left)
+      }
     },
     stats: () => ({observationsDropped, recordsFailed}),
   }

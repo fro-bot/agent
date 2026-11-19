@@ -25,6 +25,12 @@ import {createSnapshotLedger, type PendingLimits} from './snapshot.js'
  */
 export const CLEANUP_BOUND_MS = 3_000
 
+/**
+ * The most of the cleanup bound the pipeline may spend mapping and scrubbing what is left, so the exporter keeps the
+ * rest (about two thirds) to deliver the final batch. What the pipeline has not done by then is dropped and counted.
+ */
+export const DRAIN_BOUND_MS = 1_000
+
 export type OnSettings = Extract<TracingSettings, {mode: 'on'}>
 
 export interface TracingHandle {
@@ -39,6 +45,8 @@ export interface StartTracingOptions {
   readonly now?: () => number
   /** Bounds on snapshots pending export. Tests lower them; production uses the defaults. */
   readonly pending?: Partial<PendingLimits>
+  /** The most of the cleanup bound the pipeline may spend on what is left. Tests lower it; production uses `DRAIN_BOUND_MS`. */
+  readonly drainBoundMs?: number
 }
 
 export async function startTracing(
@@ -96,7 +104,7 @@ export async function startTracing(
         const started = Date.now()
         try {
           stopObserving()
-          pipeline.stop()
+          pipeline.stop(options.drainBoundMs ?? DRAIN_BOUND_MS)
         } catch {
           // Counted below as whatever the exporter holds.
         }
