@@ -224,13 +224,14 @@ describe('headless host without a launcher variable', () => {
   })
 })
 
-describe('a server started with the serve command', () => {
+describe('a server embedded by a parent process (`serve --stdio`)', () => {
   // `opencode serve --stdio` deletes OPENCODE_PASSWORD and OPENCODE_SERVER_PASSWORD from the process environment before a
-  // plugin loads (measured on 2.3.2), so for a headless stdio server the markers above may all be absent. The command
-  // line still says `serve`.
+  // plugin loads (measured on 2.3.2), so a server a parent embeds (an SDK client, a gateway, the Action) may show none of
+  // the markers above. The command line still says `serve --stdio`. A `serve` you start by hand, or the background
+  // service, is not embedded: the user's file covers it (see the README).
   it.each([
     ['serve --stdio', ['bun', '/$bunfs/root/opencode', 'serve', '--stdio', '--port', '0']],
-    ['serve', ['bun', '/$bunfs/root/opencode', 'serve']],
+    ['serve with the flag first', ['bun', '/$bunfs/root/opencode', 'serve', '--port', '0', '--stdio']],
     ['a global option before serve', ['bun', '/$bunfs/root/opencode', '--print-logs', 'serve', '--stdio']],
   ])('resolves to off for %s with no launcher variable and no marker, even with a valid user file', (_label, argv) => {
     // #given a valid user file naming this machine, and nothing else that says headless
@@ -245,19 +246,23 @@ describe('a server started with the serve command', () => {
   })
 
   it.each([
+    ['serve by hand', ['bun', '/$bunfs/root/opencode', 'serve']],
+    ['serve on a port', ['bun', '/$bunfs/root/opencode', 'serve', '--port', '4096']],
+    ['the background service', ['bun', '/$bunfs/root/opencode', 'serve', '--service']],
     ['no subcommand', ['bun', '/$bunfs/root/opencode']],
     ['run', ['bun', '/$bunfs/root/opencode', 'run', 'fix the build']],
-    ['a path that merely contains serve', ['bun', '/home/me/serve/opencode']],
+    ['a path that merely contains serve', ['bun', '/home/me/serve/opencode', '--stdio']],
+    ['an argument that merely contains stdio', ['bun', '/$bunfs/root/opencode', 'run', 'serve --stdio please']],
     ['an empty command line', []],
-  ])('does not call %s headless', (_label, argv) => {
+  ])('does not call %s embedded: the user file applies', (_label, argv) => {
     // #given a valid file
     writeSettings()
 
-    // #when / #then an interactive session is local
+    // #when / #then
     expect(resolve({}, {argv})).toMatchObject({mode: 'on', host: 'local'})
   })
 
-  it('does not change the Action launcher: serve is how the Action starts the server', () => {
+  it('does not change the Action launcher: `serve --stdio` is how the Action starts the server', () => {
     // #given the Action's command line and launcher
     const argv = ['bun', '/$bunfs/root/opencode', 'serve', '--stdio', '--port', '0']
 

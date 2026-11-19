@@ -35,13 +35,17 @@ export const TRACING_SETTINGS_VERSION = 1
 export const HEADLESS_MARKERS = ['OPENCODE_PASSWORD', 'OPENCODE_CONFIG_CONTENT'] as const
 
 /**
- * True when the command line is `opencode … serve …`. `opencode serve --stdio` deletes `OPENCODE_PASSWORD` and
- * `OPENCODE_SERVER_PASSWORD` from the process environment before a plugin loads (measured on 2.3.2), so a headless stdio
- * server started with only a password shows none of the markers above. The command line is what still says so. A word
- * `serve` anywhere after the program path only ever turns tracing off, so a false positive fails closed.
+ * True when the command line is `opencode … serve … --stdio`: a server a parent process embeds (an SDK client, a gateway,
+ * the Action). `opencode serve --stdio` deletes `OPENCODE_PASSWORD` and `OPENCODE_SERVER_PASSWORD` from the process
+ * environment before a plugin loads (measured on 2.3.2), so such a server started with only a password shows none of the
+ * markers above. The command line is what still says so. A `serve` started by hand, or the background service
+ * (`serve --service`; `--stdio` cannot be combined with it), is not embedded: the user's file is consent for those too.
+ * The subcommand is the first non-option word after the program path; `--stdio` must come after it.
  */
-function isServeCommand(argv: readonly string[]): boolean {
-  return argv.slice(2).includes('serve')
+function isEmbeddedServe(argv: readonly string[]): boolean {
+  const rest = argv.slice(2)
+  const serve = rest.indexOf('serve')
+  return serve !== -1 && rest.slice(serve + 1).includes('--stdio')
 }
 
 /** The user file, relative to the user's config directory. Not under `opencode/`: OpenCode reads nothing from here. */
@@ -120,7 +124,7 @@ export interface ResolveTracingSettingsInput {
   readonly platform?: NodeJS.Platform
   /** The current user's id. Defaults to `process.getuid()`. */
   readonly uid?: number | undefined
-  /** The command line. Defaults to `process.argv`. A `serve` command is a headless server. */
+  /** The command line. Defaults to `process.argv`. A `serve --stdio` command is a server a parent embeds: headless. */
   readonly argv?: readonly string[] | undefined
   /** The machine's name. Defaults to `os.hostname()`. Read only for a local session with a valid user file. */
   readonly hostname?: (() => string) | undefined
@@ -411,7 +415,7 @@ export function resolveTracingSettings(input: ResolveTracingSettingsInput): Trac
     if (launcher !== undefined) return finish(resolveLauncher(launcher))
 
     // No launcher: something that is not this repo's Action started the server. A headless server stays off.
-    if (HEADLESS_MARKERS.some(marker => env[marker] !== undefined) || isServeCommand(input.argv ?? process.argv)) {
+    if (HEADLESS_MARKERS.some(marker => env[marker] !== undefined) || isEmbeddedServe(input.argv ?? process.argv)) {
       return finish(off('headless-host'))
     }
 

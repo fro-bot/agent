@@ -42,6 +42,8 @@ To turn it on, create `~/.config/fro-bot/opencode-plugin/tracing.json` (under `$
 
 The plugin refuses the file, logging one line with a fixed reason and no values, unless it is a regular file you own, not writable by group or others, under 16 KiB, and not inside the project directory. It is not read on Windows. When tracing turns on, the plugin logs the collector's host name once.
 
+**This file is consent for the whole machine, under your account.** The plugin cannot tell your OpenCode processes apart. Any OpenCode you run here with no launcher variable and no headless marker exports its traces to the collector in this file. That includes an `opencode serve` you start by hand, the background service the interactive app connects to, and an editor integration or script that starts OpenCode for you. The one exception is a server another program embeds with `opencode serve --stdio` (the SDK, the Fro Bot Action, the gateway): it stays off, because the plugin cannot see its password. Name only machines you want traced, and delete the file to turn tracing off everywhere.
+
 The credential in this file is readable by anything that runs as you, including a local agent. Spans carry prompts, tool arguments and tool results, scrubbed on a best-effort basis for known secret shapes; scrubbing does not find a secret that has no recognizable shape. OpenCode's own exporter is separate and is not affected.
 
 ## Develop
