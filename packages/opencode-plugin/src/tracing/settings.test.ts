@@ -15,6 +15,8 @@ import {
 } from './settings.js'
 
 const isPosix = process.platform !== 'win32'
+/** The machine name every test resolves against, injected: no test depends on the real host name. */
+const HOSTNAME = 'build-box.example.test'
 const uid = process.getuid?.() ?? 0
 
 /** A throwaway user home, config directory and project directory. Nothing here touches the real home. */
@@ -54,6 +56,7 @@ function writeSettings(
     version: 1,
     endpoint: 'https://collector.example/v1/traces',
     headers: {authorization: 'Basic abc'},
+    hosts: [HOSTNAME],
   },
   mode = 0o600,
   target = settingsFile(),
@@ -64,11 +67,17 @@ function writeSettings(
   return target
 }
 
-function resolve(env: Record<string, string | undefined> = {}, extra: {platform?: NodeJS.Platform; uid?: number} = {}) {
+function resolve(
+  env: Record<string, string | undefined> = {},
+  extra: {platform?: NodeJS.Platform; uid?: number; hostname?: () => string; argv?: readonly string[]} = {},
+) {
   return resolveTracingSettings({
     env: {HOME: home, XDG_CONFIG_HOME: configHome, ...env},
     directory: project,
     log: line => lines.push(line),
+    hostname: () => HOSTNAME,
+    // Not the test runner's own: an interactive `opencode` with no subcommand.
+    argv: ['bun', '/$bunfs/root/opencode'],
     ...extra,
   })
 }
@@ -215,6 +224,48 @@ describe('headless host without a launcher variable', () => {
   })
 })
 
+describe('a server started with the serve command', () => {
+  // `opencode serve --stdio` deletes OPENCODE_PASSWORD and OPENCODE_SERVER_PASSWORD from the process environment before a
+  // plugin loads (measured on 2.3.2), so for a headless stdio server the markers above may all be absent. The command
+  // line still says `serve`.
+  it.each([
+    ['serve --stdio', ['bun', '/$bunfs/root/opencode', 'serve', '--stdio', '--port', '0']],
+    ['serve', ['bun', '/$bunfs/root/opencode', 'serve']],
+    ['a global option before serve', ['bun', '/$bunfs/root/opencode', '--print-logs', 'serve', '--stdio']],
+  ])('resolves to off for %s with no launcher variable and no marker, even with a valid user file', (_label, argv) => {
+    // #given a valid user file naming this machine, and nothing else that says headless
+    writeSettings()
+
+    // #when
+    const settings = resolve({}, {argv})
+
+    // #then
+    expect(settings).toEqual({mode: 'off', reason: 'headless-host'})
+    expect(lines).toEqual(['tracing off (headless-host)'])
+  })
+
+  it.each([
+    ['no subcommand', ['bun', '/$bunfs/root/opencode']],
+    ['run', ['bun', '/$bunfs/root/opencode', 'run', 'fix the build']],
+    ['a path that merely contains serve', ['bun', '/home/me/serve/opencode']],
+    ['an empty command line', []],
+  ])('does not call %s headless', (_label, argv) => {
+    // #given a valid file
+    writeSettings()
+
+    // #when / #then an interactive session is local
+    expect(resolve({}, {argv})).toMatchObject({mode: 'on', host: 'local'})
+  })
+
+  it('does not change the Action launcher: serve is how the Action starts the server', () => {
+    // #given the Action's command line and launcher
+    const argv = ['bun', '/$bunfs/root/opencode', 'serve', '--stdio', '--port', '0']
+
+    // #when / #then
+    expect(resolve({[TRACING_LAUNCHER_ENV]: launcher()}, {argv})).toMatchObject({mode: 'on', host: 'action'})
+  })
+})
+
 describe.skipIf(!isPosix)('local session', () => {
   it('resolves to on from a valid user file and logs only the destination host, once', () => {
     // #given a valid user file and no launcher variable or headless marker
@@ -222,6 +273,7 @@ describe.skipIf(!isPosix)('local session', () => {
       version: 1,
       endpoint: 'https://collector.example:4318/v1/traces?x=1',
       headers: {Authorization: 'Basic abc'},
+      hosts: [HOSTNAME],
     })
 
     // #when settings resolve
@@ -239,7 +291,7 @@ describe.skipIf(!isPosix)('local session', () => {
 
   it('accepts an endpoint with no headers and plain http to a loopback literal', () => {
     // #given a loopback collector file without headers
-    writeSettings({version: 1, endpoint: 'http://127.0.0.1:4318/v1/traces'})
+    writeSettings({version: 1, endpoint: 'http://127.0.0.1:4318/v1/traces', hosts: [HOSTNAME]})
 
     // #when / #then
     expect(resolve()).toEqual({mode: 'on', host: 'local', endpoint: 'http://127.0.0.1:4318/v1/traces', headers: {}})
@@ -413,13 +465,156 @@ describe.skipIf(!isPosix)('local session', () => {
       },
     ],
   ])('resolves a user file with %s to off, logging a fixed reason and no value', (_label, content) => {
-    // #given a file that is safe on disk and wrong in content
-    writeSettings(content)
+    // #given a file that is safe on disk and wrong in content, and (where it is a document) names this machine, so that
+    // the one thing wrong with it is what the case says
+    writeSettings(typeof content === 'object' ? {hosts: [HOSTNAME], ...content} : content)
 
     // #when / #then
     expect(resolve()).toEqual({mode: 'off', reason: 'settings-file-invalid'})
     expect(lines).toEqual(['tracing off (settings-file-invalid)'])
     expect(lines.join('\n')).not.toMatch(/SENTINEL|hunter2|203\.0\.113/)
+  })
+
+  describe('the machine allow-list', () => {
+    const FILE = {version: 1, endpoint: 'https://collector.example/v1/traces'}
+    const on = {mode: 'on', host: 'local', endpoint: 'https://collector.example/v1/traces', headers: {}}
+
+    it.each([
+      ['the exact name', ['build-box.example.test'], 'build-box.example.test'],
+      ['the name in another case', ['Build-Box.Example.TEST'], 'build-box.example.test'],
+      ['the machine reporting another case', ['build-box.example.test'], 'BUILD-BOX.Example.Test'],
+      ['an entry with a trailing dot', ['build-box.example.test.'], 'build-box.example.test'],
+      ['a name with a trailing dot', ['build-box.example.test'], 'build-box.example.test.'],
+      ['surrounding spaces in the entry', ['  build-box.example.test  '], 'build-box.example.test'],
+      [
+        'one of several entries',
+        ['other-1', 'other-2.example.test', 'build-box.example.test'],
+        'build-box.example.test',
+      ],
+      ['the short name, when the entry has no dot', ['build-box'], 'build-box.example.test'],
+      ['a short entry with a trailing dot', ['build-box.'], 'build-box.example.test'],
+      ['a short name that is the whole host name', ['build-box'], 'build-box'],
+    ])('resolves to on for %s', (_label, hosts, hostname) => {
+      // #given a file naming machines, and a machine
+      writeSettings({...FILE, hosts})
+
+      // #when
+      const settings = resolve({}, {hostname: () => hostname})
+
+      // #then tracing is on, and the one line names the destination, not the machine
+      expect(settings).toEqual(on)
+      expect(lines).toEqual(['tracing on, destination host collector.example'])
+    })
+
+    it.each([
+      ['another machine', ['other-box.example.test'], 'build-box.example.test'],
+      ['a name that only starts the same', ['build-box'], 'build-box-2.example.test'],
+      ['a name that only ends the same', ['box.example.test'], 'build-box.example.test'],
+      ['a short entry against a different short name', ['build'], 'build-box.example.test'],
+      ['a dotted entry against the short name only', ['build-box.example.test'], 'build-box'],
+      ['a dotted entry against another domain', ['build-box.example.test'], 'build-box.other.test'],
+      ['an empty machine name', ['build-box'], ''],
+      ['a machine name of only a dot', ['build-box'], '.'],
+    ])('resolves to off, silently, for %s', (_label, hosts, hostname) => {
+      // #given a valid file that does not name this machine
+      writeSettings({...FILE, hosts})
+
+      // #when
+      const settings = resolve({}, {hostname: () => hostname})
+
+      // #then off, with no log line: a shared file is simply not for this machine
+      expect(settings).toEqual({mode: 'off', reason: 'machine-not-listed'})
+      expect(lines).toEqual([])
+    })
+
+    it('does not read the machine name when the file is missing or the launcher decided', () => {
+      // #given a hostname that would throw, and no file at all
+      const hostname = (): string => {
+        throw new Error('no hostname')
+      }
+
+      // #when / #then neither a missing file nor an Action or workspace launcher consults it
+      expect(resolve({}, {hostname})).toEqual({mode: 'off', reason: 'no-settings-file'})
+      writeSettings({...FILE, hosts: [HOSTNAME]})
+      expect(resolve({[TRACING_LAUNCHER_ENV]: launcher()}, {hostname})).toMatchObject({mode: 'on', host: 'action'})
+      expect(resolve({[TRACING_LAUNCHER_ENV]: launcher({tracing: 'off'})}, {hostname})).toEqual({
+        mode: 'off',
+        reason: 'action-off',
+      })
+      expect(
+        resolve({[TRACING_LAUNCHER_ENV]: JSON.stringify({version: 1, host: 'workspace', tracing: 'off'})}, {hostname}),
+      ).toEqual({
+        mode: 'off',
+        reason: 'workspace-host',
+      })
+    })
+
+    it('resolves to off with a fixed reason when the machine name cannot be read', () => {
+      // #given a valid file and a hostname lookup that throws
+      writeSettings({...FILE, hosts: [HOSTNAME]})
+
+      // #when
+      const settings = resolve(
+        {},
+        {
+          hostname: () => {
+            throw new Error('SENTINEL')
+          },
+        },
+      )
+
+      // #then it fails closed, logging a fixed reason
+      expect(settings).toEqual({mode: 'off', reason: 'settings-error'})
+      expect(lines).toEqual(['tracing off (settings-error)'])
+    })
+
+    // Each of these is wrong in the file, not just about this machine: logged with a fixed reason, never a value.
+    it.each([
+      ['no hosts field', {...FILE}],
+      ['hosts that are not an array', {...FILE, hosts: 'SENTINEL-HOST'}],
+      ['hosts that are an object', {...FILE, hosts: {a: 'SENTINEL-HOST'}}],
+      ['an empty hosts list', {...FILE, hosts: []}],
+      ['more than 16 hosts', {...FILE, hosts: Array.from({length: 17}, (_, index) => `host-${index}.SENTINEL`)}],
+      ['a non-string host', {...FILE, hosts: [HOSTNAME, 5]}],
+      ['an empty host', {...FILE, hosts: [HOSTNAME, '']}],
+      ['a blank host', {...FILE, hosts: [HOSTNAME, '   ']}],
+      ['a host that is only a dot', {...FILE, hosts: [HOSTNAME, '.']}],
+      ['a wildcard host', {...FILE, hosts: ['*.example.test']}],
+      ['a partial wildcard host', {...FILE, hosts: ['build-*.SENTINEL']}],
+      ['a question-mark host', {...FILE, hosts: ['build-bo?.SENTINEL']}],
+      ['a host with a space inside', {...FILE, hosts: ['build box.SENTINEL']}],
+      ['a host with a control character', {...FILE, hosts: ['build\nbox.SENTINEL']}],
+      ['a host with a slash', {...FILE, hosts: ['build/box.SENTINEL']}],
+      ['a host with a port', {...FILE, hosts: ['build-box.SENTINEL:22']}],
+      ['a host over 253 characters', {...FILE, hosts: [`${'a'.repeat(254)}SENTINEL`]}],
+    ])('resolves a file with %s to off, logging a fixed reason', (_label, content) => {
+      // #given
+      writeSettings(content)
+
+      // #when / #then
+      expect(resolve()).toEqual({mode: 'off', reason: 'settings-file-invalid'})
+      expect(lines).toEqual(['tracing off (settings-file-invalid)'])
+      expect(lines.join('\n')).not.toMatch(/SENTINEL|host-0/)
+    })
+
+    it('accepts exactly 16 hosts and a 253-character name', () => {
+      // #given the boundary values
+      const long = `${'a'.repeat(60)}.${'b'.repeat(60)}.${'c'.repeat(60)}.${'d'.repeat(60)}.com`
+      expect(long.length).toBeLessThanOrEqual(253)
+      const hosts = [...Array.from({length: 15}, (_, index) => `other-${index}`), long]
+      writeSettings({...FILE, hosts})
+
+      // #when / #then
+      expect(resolve({}, {hostname: () => long})).toEqual(on)
+    })
+
+    it('judges the file before the machine: an invalid file is logged even on a machine it does not name', () => {
+      // #given a file with a bad endpoint that also names another machine
+      writeSettings({version: 1, endpoint: 'ftp://x', hosts: ['other-box']})
+
+      // #when / #then
+      expect(resolve()).toEqual({mode: 'off', reason: 'settings-file-invalid'})
+    })
   })
 
   it('does not take settings from the project directory, whatever it holds', () => {

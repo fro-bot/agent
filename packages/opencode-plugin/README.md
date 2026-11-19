@@ -21,6 +21,29 @@ opencode plugin add @fro.bot/opencode-plugin@<version>
 
 `effect` and `@opencode/plugin` are peer dependencies. OpenCode supplies both at load time, so the bundle never carries its own copy.
 
+## Tracing (opt-in, local sessions)
+
+The plugin can export a trace of each turn (model requests, tool calls and subagents) to an OpenTelemetry collector you run. It is **off** unless you turn it on, and it only turns on in a local session: a headless server (`OPENCODE_PASSWORD` or `OPENCODE_CONFIG_CONTENT` set) stays off. Plugin options and project config are never read for tracing, so nothing in a checkout can switch it on.
+
+To turn it on, create `~/.config/fro-bot/opencode-plugin/tracing.json` (under `$XDG_CONFIG_HOME` when that is set to an absolute path):
+
+```json
+{
+  "version": 1,
+  "endpoint": "https://collector.example.com/v1/traces",
+  "headers": {"authorization": "Basic <credentials>"},
+  "hosts": ["my-laptop"]
+}
+```
+
+- `endpoint` is the full OTLP/HTTP traces URL. A remote collector **must be `https`**, and the exporter verifies its certificate with the platform's defaults: there is no switch to turn that off, and the exporter does not follow a redirect (a `3xx` counts as a failed batch), so the credential in `headers` goes only to the URL you wrote. Plain `http` is accepted only for a loopback address (`127.0.0.1`, `[::1]`).
+- `headers` is optional, at most 16 entries. They carry your collector credential.
+- `hosts` is **required**: one to 16 machine names, and tracing is on only on a machine named in it. A name matches the machine's host name exactly (ignoring case and a trailing dot), or, when it has no dot, the part of the host name before its first dot (`my-laptop` matches `my-laptop.local`). There are no wildcards. A copy of this file on any other machine does nothing there, silently.
+
+The plugin refuses the file, logging one line with a fixed reason and no values, unless it is a regular file you own, not writable by group or others, under 16 KiB, and not inside the project directory. It is not read on Windows. When tracing turns on, the plugin logs the collector's host name once.
+
+The credential in this file is readable by anything that runs as you, including a local agent. Spans carry prompts, tool arguments and tool results, scrubbed on a best-effort basis for known secret shapes; scrubbing does not find a secret that has no recognizable shape. OpenCode's own exporter is separate and is not affected.
+
 ## Develop
 
 ```sh

@@ -8,6 +8,11 @@
  * - The launcher variable `OPENCODE_FROBOT_TRACING`, set by whatever started the server (the Action, the workspace).
  * - Otherwise, only in a local session, a user-scope file under the user's config directory.
  * Plugin options, project config, the checkout, restored state and session content are never read.
+ *
+ * The user file names the machines it is for (`hosts`, required): a file synced to another machine, or left behind on a
+ * shared one, does nothing there. And a remote collector in it must be `https`, with the platform's certificate
+ * verification left on: the exporter sends the file's headers (a credential) to that URL, and the file has no switch to
+ * relax verification, to follow a redirect, or to use plain `http` anywhere but a loopback literal.
  */
 
 import {Buffer} from 'node:buffer'
@@ -29,6 +34,16 @@ export const TRACING_SETTINGS_VERSION = 1
 /** Variables a headless server (the Action, the workspace, any `opencode serve`) always has and a local session lacks. */
 export const HEADLESS_MARKERS = ['OPENCODE_PASSWORD', 'OPENCODE_CONFIG_CONTENT'] as const
 
+/**
+ * True when the command line is `opencode … serve …`. `opencode serve --stdio` deletes `OPENCODE_PASSWORD` and
+ * `OPENCODE_SERVER_PASSWORD` from the process environment before a plugin loads (measured on 2.3.2), so a headless stdio
+ * server started with only a password shows none of the markers above. The command line is what still says so. A word
+ * `serve` anywhere after the program path only ever turns tracing off, so a false positive fails closed.
+ */
+function isServeCommand(argv: readonly string[]): boolean {
+  return argv.slice(2).includes('serve')
+}
+
 /** The user file, relative to the user's config directory. Not under `opencode/`: OpenCode reads nothing from here. */
 export const USER_SETTINGS_RELATIVE_PATH = path.join('fro-bot', 'opencode-plugin', 'tracing.json')
 
@@ -38,6 +53,9 @@ export const MAX_SETTINGS_FILE_BYTES = 16 * 1024
 export const MAX_ENDPOINT_CHARS = 2048
 export const MAX_HEADERS = 16
 export const MAX_HEADER_VALUE_CHARS = 4096
+export const MAX_HOSTS = 16
+/** The longest name DNS allows. */
+export const MAX_HOSTNAME_CHARS = 253
 export const MAX_IDENTITY_FIELD_CHARS = 200
 
 /** Run identity the Action supplies. Every span of an Action run carries it. */
@@ -58,6 +76,7 @@ export type OffReason =
   | 'workspace-host'
   | 'unsupported-platform'
   | 'no-settings-file'
+  | 'machine-not-listed'
   | 'launcher-malformed'
   | 'launcher-unsupported'
   | 'launcher-relay-invalid'
@@ -73,6 +92,7 @@ const SILENT_REASONS: ReadonlySet<OffReason> = new Set([
   'workspace-host',
   'unsupported-platform',
   'no-settings-file',
+  'machine-not-listed',
 ])
 
 export type TracingSettings =
@@ -100,6 +120,10 @@ export interface ResolveTracingSettingsInput {
   readonly platform?: NodeJS.Platform
   /** The current user's id. Defaults to `process.getuid()`. */
   readonly uid?: number | undefined
+  /** The command line. Defaults to `process.argv`. A `serve` command is a headless server. */
+  readonly argv?: readonly string[] | undefined
+  /** The machine's name. Defaults to `os.hostname()`. Read only for a local session with a valid user file. */
+  readonly hostname?: (() => string) | undefined
 }
 
 const off = (reason: OffReason): TracingSettings => ({mode: 'off', reason})
@@ -309,7 +333,44 @@ function readSettingsFile(filePath: string, directory: string, uid: number): Fil
   }
 }
 
-function resolveSettingsFile(text: string): {readonly settings: TracingSettings; readonly host?: string} {
+/** A name as compared: trimmed, lower case, without one trailing dot. */
+const normalizeHostname = (value: string): string => {
+  const lower = value.trim().toLowerCase()
+  return lower.endsWith('.') ? lower.slice(0, -1) : lower
+}
+
+/** Letters, digits, dot, hyphen and underscore: what a machine name holds. No wildcard, port, path or space. */
+const HOSTNAME_ENTRY = /^[\da-z._-]+$/
+
+/** The `hosts` list: one to 16 names, each normalized. Undefined when the list or any entry is not acceptable. */
+function parseHosts(value: unknown): string[] | undefined {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_HOSTS) return undefined
+  const hosts: string[] = []
+  for (const entry of value as unknown[]) {
+    if (typeof entry !== 'string' || entry.length > MAX_HOSTNAME_CHARS + 2) return undefined
+    const host = normalizeHostname(entry)
+    if (host.length === 0 || host.length > MAX_HOSTNAME_CHARS || !HOSTNAME_ENTRY.test(host)) return undefined
+    hosts.push(host)
+  }
+  return hosts
+}
+
+/**
+ * Whether `machine` is one of `hosts`. An entry matches the whole name, or the part of the name before its first dot. That
+ * part never holds a dot, so an entry with a dot can only ever match the whole name: `build-box.example.test` does not
+ * match a machine called `build-box`. No wildcards, no prefix or suffix matching.
+ */
+function namesMachine(hosts: readonly string[], machine: string): boolean {
+  const name = normalizeHostname(machine)
+  if (name.length === 0) return false
+  const short = name.split('.')[0]
+  return hosts.some(host => host === name || host === short)
+}
+
+function resolveSettingsFile(
+  text: string,
+  hostname: () => string,
+): {readonly settings: TracingSettings; readonly host?: string} {
   let document: unknown
   try {
     document = JSON.parse(text)
@@ -319,10 +380,17 @@ function resolveSettingsFile(text: string): {readonly settings: TracingSettings;
   if (!isRecord(document) || document.version !== TRACING_SETTINGS_VERSION) {
     return {settings: off('settings-file-invalid')}
   }
-  const allowed = Object.keys(document).every(key => key === 'version' || key === 'endpoint' || key === 'headers')
+  const allowed = Object.keys(document).every(
+    key => key === 'version' || key === 'endpoint' || key === 'headers' || key === 'hosts',
+  )
   const url = parseCollectorUrl(document.endpoint)
   const headers = parseHeaders(document.headers)
-  if (!allowed || url === undefined || headers === undefined) return {settings: off('settings-file-invalid')}
+  const hosts = parseHosts(document.hosts)
+  if (!allowed || url === undefined || headers === undefined || hosts === undefined) {
+    return {settings: off('settings-file-invalid')}
+  }
+  // A valid file for another machine is not an error: it is silently not for this one.
+  if (!namesMachine(hosts, hostname())) return {settings: off('machine-not-listed')}
   return {settings: {mode: 'on', host: 'local', endpoint: url.href, headers}, host: url.host}
 }
 
@@ -343,7 +411,9 @@ export function resolveTracingSettings(input: ResolveTracingSettingsInput): Trac
     if (launcher !== undefined) return finish(resolveLauncher(launcher))
 
     // No launcher: something that is not this repo's Action started the server. A headless server stays off.
-    if (HEADLESS_MARKERS.some(marker => env[marker] !== undefined)) return finish(off('headless-host'))
+    if (HEADLESS_MARKERS.some(marker => env[marker] !== undefined) || isServeCommand(input.argv ?? process.argv)) {
+      return finish(off('headless-host'))
+    }
 
     const platform = input.platform ?? process.platform
     const uid = input.uid ?? process.getuid?.()
@@ -351,7 +421,7 @@ export function resolveTracingSettings(input: ResolveTracingSettingsInput): Trac
 
     const file = readSettingsFile(userSettingsFilePath(env), directory, uid)
     if (!file.ok) return finish(off(file.reason))
-    const resolved = resolveSettingsFile(file.text)
+    const resolved = resolveSettingsFile(file.text, input.hostname ?? os.hostname)
     if (resolved.settings.mode === 'on' && resolved.host !== undefined) {
       log(`tracing on, destination host ${resolved.host}`)
     }
