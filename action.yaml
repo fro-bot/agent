@@ -65,7 +65,7 @@ inputs:
     description: 'Agent to use. When unset, uses OpenCode build agent. Must be a primary agent, not subagent.'
     required: false
   model:
-    description: "Model override (format: provider/model). If not set, uses agent's configured model."
+    description: 'Model to run (format: provider/model). If not set, the run uses opencode/big-pickle, a free model that needs no credentials; set it to run on your own provider.'
     required: false
   timeout:
     description: 'Execution timeout in milliseconds for OpenCode execution only (not the whole GitHub Actions job). 0 = no Action-internal execution deadline. Default: 1800000 (30 minutes). Set the job-level timeout-minutes as the whole-job backstop, with headroom beyond this value for setup, fallback response delivery, and cleanup.'
