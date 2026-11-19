@@ -329,7 +329,7 @@ Span shape for one turn:
 - Edge case: plugin options carrying an endpoint are ignored in every mode.
 - Edge case: a project config that names this plugin with tracing options does not turn tracing on.
 
-**Verification:** No input a checkout or project config can supply turns tracing on, and a headless host without the launcher variable stays off.
+**Verification:** No input a checkout or project config can supply turns tracing on. A host with a headless marker and no launcher variable stays off. An unmarked process under the operator's account on a machine the file names is a local session and traces.
 
 - [ ] **Unit 3: Turn model**
 
@@ -472,7 +472,7 @@ Span shape for one turn:
 
 ### Stage 2: the Action, against a locally built plugin
 
-- [ ] **Unit 6: Relay**
+- [x] **Unit 6: Relay**
 
 **Goal:** A loopback process that forwards a trace batch to one fixed URL with a credential it alone holds, and reports what happened.
 
@@ -515,7 +515,7 @@ Span shape for one turn:
 
 **Verification:** The child's whole output is one ready line and one report line, and the credential appears in no argument or environment.
 
-- [ ] **Unit 7: Relay supervisor and run lifecycle**
+- [x] **Unit 7: Relay supervisor and run lifecycle**
 
 **Goal:** The Action starts the relay before the server and stops it on every path, without letting it affect the run.
 
@@ -669,7 +669,7 @@ Span shape for one turn:
 - Read the trace in Langfuse and confirm it in Tempo.
 - Run the same subagent scenario in a local session on a registry install of the plugin, and confirm both surfaces show the prompt and tool results in Langfuse without reading session records. Include a continuation trace and confirm it is found through the session.
 - Read the run log for the relay's start and stop lines and the warning on the non-isolated run.
-- Repeat with a wrong credential and confirm the run succeeds and reports dropped spans.
+- Repeat with a wrong credential and confirm the run succeeds and reports the batch as dropped.
 - The learning records span structure, counts and log lines. It holds no trace content, endpoint or credential.
 
 **Test scenarios:** Test expectation: none -- operational verification on a published install.
