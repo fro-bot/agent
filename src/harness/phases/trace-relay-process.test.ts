@@ -5,7 +5,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import process from 'node:process'
 import {fileURLToPath} from 'node:url'
-import {afterEach, beforeEach, describe, expect, it} from 'vitest'
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {postBatch, rawExchange, startHttpUpstream} from '../../../packages/runtime/src/agent/trace-relay-test-kit.js'
 import {TRACE_RELAY_COUNTS_HEADER} from '../../../packages/runtime/src/agent/trace-relay-wire.js'
 import {createMockLogger, serializeLoggerCalls, unwrapErr, unwrapOk} from '../../shared/test-helpers.js'
@@ -412,6 +412,24 @@ describe('trace-relay-process', () => {
       // nothing but the integers it picked reaches a log line
       expect(serializeLoggerCalls(first.logger)).not.toContain('CANARY')
       expect(serializeLoggerCalls(second.logger)).not.toContain('CANARY')
+    })
+
+    it('treats the count as incomplete when the child printed a report and then exited unexpectedly', async () => {
+      // #given a child that reports, then dies on its own before stop is called
+      const leaving = await fakeChild(
+        String.raw`process.stdout.write('{"ready":true,"port":4321}\n'); setTimeout(() => { process.stdout.write('{"report":{"delivered":4,"retry":2,"dropped":1,"plugin":{"exportedSpans":90,"droppedSpans":6}}}\n'); process.exit(0) }, 100)`,
+      )
+      const {started, logger} = await startWith(leaving)
+      const relay = unwrapOk(started)
+      await vi.waitFor(() => expect(relay.crashed()).toBe(true), {timeout: 3000})
+
+      // #when the run stops it
+      const stopped = await relay.stop()
+
+      // #then the report is not taken for a complete count, and the log says so
+      expect(stopped).toEqual({outcome: 'already-exited', counts: 'incomplete'})
+      expect(stopped).not.toHaveProperty('pluginReported')
+      expect(loggedAt(logger, 'info').at(-1)).toEqual(['Trace relay stopped', {countIncomplete: true}])
     })
 
     it('logs neither the batch counts nor the plugin totals when the count is incomplete', async () => {

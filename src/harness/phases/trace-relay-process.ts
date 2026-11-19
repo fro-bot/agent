@@ -295,7 +295,10 @@ export async function startTraceRelayProcess(
   const stopOnce = async (stopOptions: TraceRelayStopOptions): Promise<TraceRelayStopResult> => {
     try {
       const outcome = await terminate()
-      const complete = (outcome === 'stopped' || outcome === 'already-exited') && stopOptions.serverKilled !== true
+      // A child that left on its own is never complete, whatever it printed first: it was not stopped by the plan, so what it
+      // reported cannot be taken as the run's whole count.
+      const complete =
+        (outcome === 'stopped' || outcome === 'already-exited') && !state.crashed && stopOptions.serverKilled !== true
       const counts = complete && state.report !== null ? state.report : 'incomplete'
       if (counts === 'incomplete') {
         logger.info('Trace relay stopped', {countIncomplete: true})
