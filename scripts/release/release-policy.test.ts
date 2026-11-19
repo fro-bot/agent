@@ -172,7 +172,20 @@ async function notesFor(messages: readonly string[]): Promise<string> {
 }
 
 describe('release policy: opencode-plugin commits stay out of the Action release notes', () => {
-  const PLUGIN_TYPES = ['feat', 'fix', 'build', 'docs', 'test', 'ci', 'style', 'refactor', 'perf', 'chore'] as const
+  const PLUGIN_TYPES = [
+    'feat',
+    'features',
+    'fix',
+    'build',
+    'docs',
+    'test',
+    'ci',
+    'style',
+    'refactor',
+    'perf',
+    'revert',
+    'chore',
+  ] as const
 
   it.each(PLUGIN_TYPES)('hides a %s(opencode-plugin) commit', async type => {
     // #given
@@ -184,6 +197,33 @@ describe('release policy: opencode-plugin commits stay out of the Action release
     // #then: the plugin commit is absent and the same type under another scope is still listed
     expect(notes).not.toContain('plugin only change')
     expect(notes).toContain('action change')
+  })
+
+  it('lets an Action commit set the release when a breaking plugin commit is in the same batch', async () => {
+    // #given: a plugin pin update for the Action beside a breaking plugin commit
+    const messages = [
+      'feat(opencode-plugin)!: breaking plugin change\n\nBREAKING CHANGE: plugin setting renamed',
+      'build(deps): update the plugin pin',
+    ]
+    const {preset, presetConfig, releaseRules} = loadReleasercPolicy()
+
+    // #when
+    const releaseType = await analyzeCommits(
+      {preset, presetConfig, releaseRules},
+      {
+        commits: messages.map((message, index) => ({hash: `abc12${index.toString().padStart(2, '0')}`, message})),
+        cwd: process.cwd(),
+        logger: noopLogger,
+      },
+    )
+    const notes = await notesFor(messages)
+
+    // #then: the pin update alone decides the bump, and preview.ts agrees
+    expect(releaseType).toBe('patch')
+    expect(analyzeReleaseType(messages)).toBe('patch')
+    // #then: the notes generator always shows a breaking note, so the plugin's one stays visible
+    expect(notes).toContain('update the plugin pin')
+    expect(notes).toContain('plugin setting renamed')
   })
 
   it('still lists the same types without a scope', async () => {

@@ -52,6 +52,8 @@ presetConfig:
   types:
     # `@fro.bot/opencode-plugin` has its own release and changelog. These entries come first because
     # the first matching entry wins, so its commits are left out of the Action's notes.
+    # The notes generator still shows a commit that carries a BREAKING CHANGE note or a
+    # Release-As footer, whatever its entry says.
     - type: feat
       scope: opencode-plugin
       effect: hidden
@@ -80,6 +82,9 @@ presetConfig:
       scope: opencode-plugin
       effect: hidden
     - type: perf
+      scope: opencode-plugin
+      effect: hidden
+    - type: revert
       scope: opencode-plugin
       effect: hidden
     - type: chore
