@@ -491,7 +491,7 @@ Span shape for one turn:
 - It binds `127.0.0.1` on an ephemeral port and serves `POST` on one path, checked with `isForwardableTarget`. Everything else is answered locally.
 - It accepts `content-type` of protobuf or JSON and `content-encoding` of identity or gzip, and refuses others. It sets its own length and forwards no other sender header.
 - It forwards the body unchanged with the configured headers, waits for the upstream within a timeout, and answers with a fixed status: delivered for 2xx, retry for 429, 5xx and timeouts, dropped for anything else. No upstream body is returned.
-- URL rules live in the wire module: `https`, or `http` to `127.0.0.0/8` or `::1`, no userinfo. The shared object-store validator is not changed.
+- URL rules live in the wire module: `https`, or `http` to `127.0.0.0/8` or `::1`, no userinfo, no port 0. An `http` URL is accepted only with no credential headers, because a plain-HTTP collector does not prove who it is. The shared object-store validator is not changed.
 - Redirects and upgrades are never followed. Request size, total bytes per run, connections, and header and request time are capped, as in the key proxy.
 - Node standard library only.
 
@@ -510,6 +510,8 @@ Span shape for one turn:
 - Edge case: a sender that stalls mid-request is cut off by the request timeout.
 - Edge case: the listening socket is bound to `127.0.0.1` only.
 - Error path: an `http` URL to a non-loopback host, `http://localhost`, a URL with userinfo, and a malformed frame are each refused at start with a fixed error code.
+- Error path: an `http` loopback URL with any credential header is refused at start with its own fixed error code, by the frame parse and by the supervisor before anything is spawned. An `http` loopback URL with no headers works end to end, and `https` with headers is unchanged.
+- Error path: an explicit port `0` is refused; an absent port means 443 for `https` and 80 for `http`.
 - Happy path: closing stdin prints the report line with the batch counts and ends the process.
 - Edge case: nothing the child prints contains the URL, a header value or body bytes.
 
@@ -572,7 +574,7 @@ Span shape for one turn:
 **Approach:**
 - `trace-endpoint` and `trace-headers` are parsed in `parseActionInputs`. Registered as secrets: the whole headers input, each line, each header value of eight characters or more, and for a Basic value the encoded part and the decoded pair. The endpoint is registered too. The input variables are removed from the process environment.
 - Header names are validated, and hop-by-hop and framing headers are refused. A parse failure names the input and line number only.
-- An endpoint with empty headers is on, and logs one notice that no credential is configured.
+- An endpoint with empty headers is on, and logs one notice that no credential is configured. An `http` endpoint with `trace-headers` set resolves to off with a warning, since the relay sends a credential only over HTTPS.
 - `startOpenCodeV2Server` takes a required host setting with no default: Action off, Action on with relay address and identity, or workspace. It writes the launcher variable from it and removes any inherited value. Every call site passes one.
 - `run.ts` threads a typed run identity through `runCacheRestore` to the server start: repository, run id, attempt, job and trigger, from the routed context.
 - `buildCIConfigV2` places this plugin after operator plugins only when tracing is on.
@@ -582,6 +584,7 @@ Span shape for one turn:
 **Test scenarios:**
 - Happy path: both inputs set yields a relay frame with the URL and headers, and a launcher variable with the relay address and identity.
 - Edge case: endpoint set, headers empty: on, with the no-credential notice.
+- Error path: an `http` endpoint with headers set: off, with a warning that names no value.
 - Edge case: headers set, endpoint empty: off, no relay.
 - Error path: an `http` endpoint to a public host, an endpoint with userinfo, a header line without a colon, and a `host` header each resolve to off with a warning that names the input and contains no part of the value.
 - Edge case: every derived form of a Basic header value is registered as a secret, and a one-character header value is not.
