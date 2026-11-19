@@ -4,7 +4,7 @@ import type {SpanExporter, SpanExporterOptions} from './exporter.js'
 import {createServer as createHttpServer} from 'node:http'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
-import {startOtlpSink, startTlsSink, type OtlpSink, type SinkRequest} from '../integration.fixture.js'
+import {opensslAvailable, startOtlpSink, startTlsSink, type OtlpSink, type SinkRequest} from '../integration.fixture.js'
 import {scrubbedBrand} from './content.js'
 import {
   createSpanExporter,
@@ -419,12 +419,12 @@ describe('what happens to the request at the cleanup deadline', () => {
 })
 
 describe('certificate validation', () => {
-  it.each([[undefined], ['0']])(
+  // Skipped, by name, only when `openssl` is not installed; any other failure making the certificate fails the test.
+  it.skipIf(!opensslAvailable()).each([[undefined], ['0']])(
     'refuses an untrusted certificate and sends nothing, with NODE_TLS_REJECT_UNAUTHORIZED=%s, and counts the batch dropped',
     async setting => {
       // #given an https destination with a self-signed certificate, and the process-wide switch that turns validation off
       const target = await startTlsSink()
-      if (target === undefined) return
       try {
         if (setting !== undefined) vi.stubEnv('NODE_TLS_REJECT_UNAUTHORIZED', setting)
         const exporter = exporterFor({url: target.url, headers: {authorization: 'Basic credential-never-sent'}})
@@ -433,9 +433,13 @@ describe('certificate validation', () => {
         // #when the batch is exported
         const counts = await exporter.close(3_000)
 
-        // #then no HTTP request reached the sink (so no body and no header), the handshake was refused, and the span is dropped
-        expect(target.requests).toEqual([])
+        // #then the exporter really reached the sink over TCP and began TLS, and the client refused it: a connection and a failed
+        // handshake, no completed one, no HTTP request (so no body and no header), and the span is counted dropped
+        expect(target.connections()).toBeGreaterThanOrEqual(1)
+        // The server learns of the client's refusal a moment after the exporter has given up on the batch.
+        await vi.waitFor(() => expect(target.tlsErrors()).toBeGreaterThanOrEqual(1), {timeout: 3_000})
         expect(target.handshakes()).toBe(0)
+        expect(target.requests).toEqual([])
         expect(counts).toEqual({exported: 0, dropped: 1})
       } finally {
         await target.stop()

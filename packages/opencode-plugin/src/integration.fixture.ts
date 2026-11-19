@@ -196,6 +196,8 @@ export interface SinkResponse {
   readonly body?: string
   /** Wait this long before answering. */
   readonly delayMs?: number
+  /** Never answer: the connection stays open until the sink stops, which destroys it. No timer is left running. */
+  readonly hold?: boolean
 }
 
 export interface OtlpSink {
@@ -205,6 +207,8 @@ export interface OtlpSink {
   readonly requests: SinkRequest[]
   /** Requests answered with a status below 300. */
   readonly accepted: () => SinkRequest[]
+  /** Requests received in full, whatever they were or will be answered with (a held one is counted when it arrives). */
+  readonly received: () => number
   /** Most requests that were in flight at once. */
   readonly peakConcurrent: () => number
   readonly stop: () => Promise<void>
@@ -221,6 +225,7 @@ export async function startOtlpSink(options: OtlpSinkOptions = {}): Promise<Otlp
   let inFlight = 0
   let peak = 0
   let count = 0
+  let received = 0
   const server = createServer((req, res) => {
     const chunks: Buffer[] = []
     inFlight += 1
@@ -235,6 +240,7 @@ export async function startOtlpSink(options: OtlpSinkOptions = {}): Promise<Otlp
         // Keep the text.
       }
       count += 1
+      received += 1
       const seen = {
         method: req.method ?? '',
         path: req.url ?? '',
@@ -244,6 +250,8 @@ export async function startOtlpSink(options: OtlpSinkOptions = {}): Promise<Otlp
         text,
       }
       const answer = options.respond?.(count, seen) ?? {status: 200, body: '{}'}
+      // Held: no answer and no timer; `stop` destroys the connection.
+      if (answer.hold === true) return
       const finish = (): void => {
         requests.push({...seen, status: answer.status})
         res.writeHead(answer.status, {'content-type': 'application/json', ...answer.headers})
@@ -261,6 +269,7 @@ export async function startOtlpSink(options: OtlpSinkOptions = {}): Promise<Otlp
     url: `http://127.0.0.1:${address.port}/v1/traces`,
     requests,
     accepted: () => requests.filter(request => request.status < 300),
+    received: () => received,
     peakConcurrent: () => peak,
     stop: async () =>
       new Promise<void>(resolve => {
@@ -282,11 +291,23 @@ export interface TlsSink {
   readonly stop: () => Promise<void>
 }
 
+/** Whether `openssl` can be run: the one thing that makes the TLS tests skip, by name. Anything else going wrong fails them. */
+export function opensslAvailable(): boolean {
+  try {
+    execFileSync('openssl', ['version'], {stdio: 'ignore'})
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+    throw error
+  }
+}
+
 /**
  * A loopback HTTPS collector with a self-signed certificate nothing trusts, made with `openssl` at run time (no key is
- * committed). Undefined when `openssl` is not available. A client that validates certificates refuses it.
+ * committed). A client that validates certificates refuses it. Throws when the certificate cannot be made: callers skip
+ * only when `opensslAvailable()` is false.
  */
-export async function startTlsSink(options: OtlpSinkOptions = {}): Promise<TlsSink | undefined> {
+export async function startTlsSink(options: OtlpSinkOptions = {}): Promise<TlsSink> {
   const dir = mkdtempSync(path.join(tmpdir(), 'tls-sink-'))
   const keyFile = path.join(dir, 'key.pem')
   const certFile = path.join(dir, 'cert.pem')
@@ -312,9 +333,9 @@ export async function startTlsSink(options: OtlpSinkOptions = {}): Promise<TlsSi
       ],
       {stdio: 'ignore'},
     )
-  } catch {
+  } catch (error) {
     rmSync(dir, {recursive: true, force: true})
-    return undefined
+    throw error
   }
   const requests: SinkRequest[] = []
   let connections = 0

@@ -17,6 +17,7 @@ import {describe, expect, it} from 'vitest'
 
 import {
   makeSandbox,
+  opensslAvailable,
   removeSandbox,
   startFakeProvider,
   startOpenCodeServer,
@@ -511,23 +512,33 @@ describe.skipIf(!runnable)('tracing in a real opencode V2', () => {
   }, 90_000)
 
   it.each([
-    ['a collector that accepts the connection and never answers', {respond: () => ({status: 200, delayMs: 120_000})}],
-    ['a collector that keeps answering 503', {respond: () => ({status: 503})}],
+    ['a collector that accepts the request and never answers', {respond: () => ({status: 200, hold: true})}, 'arrived'],
+    ['a collector that keeps answering 503', {respond: () => ({status: 503})}, 'retryable'],
+    [
+      'a collector that answers 503 with a long Retry-After',
+      {respond: () => ({status: 503, headers: {'retry-after': '9'}})},
+      'retryable',
+    ],
   ] as const)(
-    'stops inside the Action’s 5 s window when stdin closes against %s, and cleanup stays inside its own bound',
-    async (label, sinkOptions) => {
+    'stops inside the Action’s 5 s window when stdin closes against %s, with an export truly in flight',
+    async (label, sinkOptions, waitFor) => {
       // #given a finished turn whose spans are being exported to a collector that will not take them
       await run({steps: [{all: ['W-ONE'], text: 'answer'}], sink: sinkOptions}, async h => {
         const session = await h.session()
         await prompt(h.api, session, 'W-ONE hello')
-        await sleep(4_000)
 
-        // #when the server is stopped the way the Action stops it
+        // #when the export has really started (the stalled collector holds the request, or the failing one has answered its
+        // first retryable status, so a retry is pending) and the server is stopped the way the Action stops it
+        await waitUntil(
+          waitFor === 'arrived' ? 'the request to reach the stalled collector' : 'the first retryable answer',
+          () => (waitFor === 'arrived' ? h.sink.received() >= 1 : h.sink.requests.length >= 1),
+          60_000,
+        )
         const stopped = await h.server.stop()
         if (process.env.FRO_BOT_TIMING === '1') process.stdout.write(`STOP-TIMING ${label}: ${String(stopped.ms)} ms\n`)
 
         // #then it left on its own inside the Action's window (the assertion is at 5 s, not the fixture's 8 s), the plugin
-        // reported what it could not deliver, and a stalled or failing collector never kept the process alive
+        // reported what it could not deliver, and the collector never kept the process alive
         expect(stopped.exitedOnItsOwn).toBe(true)
         expect(stopped.ms).toBeLessThan(5_000)
         expect(h.server.stderr()).toMatch(/tracing stopped, exported 0 spans, dropped [1-9]/)
@@ -536,50 +547,58 @@ describe.skipIf(!runnable)('tracing in a real opencode V2', () => {
     90_000,
   )
 
-  it('refuses an untrusted https certificate in the compiled host, with certificate validation switched off in the environment', async () => {
-    // #given a collector over https with a self-signed certificate, a local-mode file pointing at it, and the process-wide switch off
-    const tls = await startTlsSink()
-    if (tls === undefined) return
-    try {
-      await run(
-        {
-          steps: [{all: ['V-ONE'], text: 'tls answer'}],
-          // Plain serve: `serve --stdio` is treated as embedded, so a local file would not apply there.
-          plain: true,
-          env: () => ({NODE_TLS_REJECT_UNAUTHORIZED: '0'}),
-          beforeStart: sandbox => {
-            const file = userSettingsFilePath({XDG_CONFIG_HOME: path.join(sandbox.home, 'config')})
-            mkdirSync(path.dirname(file), {recursive: true})
-            writeFileSync(
-              file,
-              JSON.stringify({
-                version: 1,
-                endpoint: tls.url,
-                hosts: [os.hostname()],
-                headers: {authorization: 'Basic never-sent'},
-              }),
-              {mode: 0o600},
-            )
+  // Skipped, by name, only when `openssl` is not installed; any other failure making the certificate fails the test.
+  it.skipIf(!opensslAvailable())(
+    'refuses an untrusted https certificate in the compiled host, with certificate validation switched off in the environment',
+    async () => {
+      // #given a collector over https with a self-signed certificate, a local-mode file pointing at it, and the process-wide switch off
+      const tls = await startTlsSink()
+      try {
+        await run(
+          {
+            steps: [{all: ['V-ONE'], text: 'tls answer'}],
+            // Plain serve: `serve --stdio` is treated as embedded, so a local file would not apply there.
+            plain: true,
+            env: () => ({NODE_TLS_REJECT_UNAUTHORIZED: '0'}),
+            beforeStart: sandbox => {
+              const file = userSettingsFilePath({XDG_CONFIG_HOME: path.join(sandbox.home, 'config')})
+              mkdirSync(path.dirname(file), {recursive: true})
+              writeFileSync(
+                file,
+                JSON.stringify({
+                  version: 1,
+                  endpoint: tls.url,
+                  hosts: [os.hostname()],
+                  headers: {authorization: 'Basic never-sent'},
+                }),
+                {mode: 0o600},
+              )
+            },
           },
-        },
-        async h => {
-          const session = await h.session()
+          async h => {
+            const session = await h.session()
 
-          // #when a turn runs and the server stops
-          await prompt(h.api, session, 'V-ONE hello')
-          await sleep(4_000)
-          await h.server.stop()
+            // #when a turn runs and the server stops
+            await prompt(h.api, session, 'V-ONE hello')
+            await sleep(4_000)
+            await h.server.stop()
 
-          // #then no request, no header and no body reached the collector, no handshake completed, and the spans were counted dropped
-          expect(tls.requests).toEqual([])
-          expect(tls.handshakes()).toBe(0)
-          expect(h.server.stderr()).toMatch(/tracing stopped, exported 0 spans, dropped [1-9]/)
-        },
-      )
-    } finally {
-      await tls.stop()
-    }
-  }, 120_000)
+            // #then the exporter reached the collector over TCP and began TLS, and was refused (a connection and a failed handshake,
+            // so the test cannot pass because the exporter never got that far); no request, no header and no body arrived, and the
+            // spans were counted dropped
+            expect(tls.connections()).toBeGreaterThanOrEqual(1)
+            expect(tls.tlsErrors()).toBeGreaterThanOrEqual(1)
+            expect(tls.handshakes()).toBe(0)
+            expect(tls.requests).toEqual([])
+            expect(h.server.stderr()).toMatch(/tracing stopped, exported 0 spans, dropped [1-9]/)
+          },
+        )
+      } finally {
+        await tls.stop()
+      }
+    },
+    120_000,
+  )
 
   describe('the user file in a plain `opencode serve`', () => {
     const writeFor = (hosts: string[]) => (sandbox: SandboxPaths, sink: OtlpSink) => {
