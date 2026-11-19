@@ -1796,3 +1796,70 @@ describe('a repeated tool terminal event', () => {
     expect(model.stats().sessions).toBe(0)
   })
 })
+
+describe('a report delivered inside a later turn after the dispatching trace closed', () => {
+  const limits = {rootInactivityMs: 1_000, tombstoneTtlMs: 5_000}
+
+  /** Turn one dispatches a child and goes quiet until its trace closes; turn two is running when the report arrives. */
+  const scenario = (reportAt: number) => {
+    const s = script()
+    s.prompt('p', 'm1')
+    s.enqueued('p', 'm1', 'user')
+    s.started('p')
+    s.delivered('p', 'm1')
+    s.request('p')
+    s.stepStarted('p', 's1')
+    s.toolBefore('p', 'c1', 'subagent')
+    s.toolAfter('p', 'c1', 'subagent', 'kid')
+    s.toolEnded('p', 'c1', {childSessionId: 'kid'})
+    s.stepEnded('p', 's1')
+    s.ended('p')
+    // The first trace's inactivity bound passes: it closes, incomplete, leaving a tombstone for the child.
+    s.tick(lastAt(s.out) + 1_001)
+    // A second turn is running when the report arrives, and its next request carries it.
+    s.at(reportAt - 10)
+    s.prompt('p', 'm2')
+    s.enqueued('p', 'm2', 'user')
+    s.started('p')
+    s.delivered('p', 'm2')
+    s.at(reportAt)
+    s.enqueued('p', 'report', 'synthetic', 'kid', 'completed')
+    // The recorded order: the request that carries the report goes out, then the inbox item is delivered.
+    s.request('p')
+    s.stepStarted('p', 's2')
+    s.delivered('p', 'report')
+    s.stepEnded('p', 's2')
+    s.ended('p')
+    return s
+  }
+
+  it('still names the first trace in follow_on_of, from its tombstone', () => {
+    // #given a report that arrives well inside the tombstone's life
+    const {records} = replay(scenario(2_000).out, {limits})
+
+    // #then the second turn's model request names the first turn's trace
+    const [first, second] = roots(records)
+    const followOn = chats(records).find(chat => chat.traceId === second?.traceId && chat.requestKind === 'primary')
+    expect(followOn?.followOnOf).toEqual([first?.traceId])
+  })
+
+  it('does not name it after the tombstone expired', () => {
+    // #given a report after the tombstone's ttl
+    const {records} = replay(scenario(10_000).out, {limits})
+
+    // #then nothing is named, and the report did not open a trace of its own
+    const [, second] = roots(records)
+    const followOn = chats(records).find(chat => chat.traceId === second?.traceId && chat.requestKind === 'primary')
+    expect(followOn?.followOnOf).toEqual([])
+  })
+
+  it('names a still-open origin as it did, and a trace is never named in its own follow-on', () => {
+    // #given the recorded case where the report arrives while the first trace is open
+    const {records} = run('prompt-while-subagent-runs-report-during')
+    const names = chats(records).flatMap(chat => chat.followOnOf.map(id => [chat.traceId, id]))
+
+    // #then it still names the other trace, never itself
+    expect(names.length).toBeGreaterThan(0)
+    expect(names.every(([own, named]) => own !== named)).toBe(true)
+  })
+})

@@ -1047,8 +1047,9 @@ export function createTurnModel(options: {
     for (const item of node.pending) {
       if (item.kind !== 'synthetic' || item.claimed) continue
       item.claimed = true
-      const origin = item.reportTrace
-      if (origin !== undefined && origin !== trace && !origin.closed) traceIds.push(origin.id)
+      // The origin's id: from the trace itself when it is known (open or since closed), else from the tombstone it left.
+      const origin = item.reportTrace?.id ?? item.reportTombstone
+      if (origin !== undefined && origin !== trace.id) traceIds.push(origin)
     }
     return traceIds
   }
