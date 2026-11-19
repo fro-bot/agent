@@ -6,6 +6,7 @@ import {Buffer} from 'node:buffer'
 import {
   parseTraceRelayConfig,
   readTraceRelayFrameLength,
+  TRACE_RELAY_EXIT_CREDENTIAL_OVER_HTTP,
   TRACE_RELAY_EXIT_INTERNAL,
   TRACE_RELAY_EXIT_INVALID_CONFIG,
   TRACE_RELAY_EXIT_START_FAILED,
@@ -44,6 +45,7 @@ export interface TraceRelayChild {
 const DEFAULT_FRAME_TIMEOUT_MS = 10_000
 
 const EXIT_CODES: Readonly<Record<TraceRelayChildErrorCode, number>> = {
+  'credential-over-http': TRACE_RELAY_EXIT_CREDENTIAL_OVER_HTTP,
   'invalid-config': TRACE_RELAY_EXIT_INVALID_CONFIG,
   'start-failed': TRACE_RELAY_EXIT_START_FAILED,
   internal: TRACE_RELAY_EXIT_INTERNAL,
@@ -102,7 +104,8 @@ export function runTraceRelayChild(io: TraceRelayChildIo, deps: TraceRelayChildD
     }
     const config = parseTraceRelayConfig(decoded)
     if (!config.success) {
-      fail('invalid-config')
+      // The parser's own fixed code: a credential over plain http is told apart from a malformed config.
+      fail(config.error)
       return
     }
     const started = await startRelay({

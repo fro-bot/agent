@@ -4,9 +4,11 @@ import {PassThrough} from 'node:stream'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
 import {err} from '../shared/types.js'
+import {startTlsUpstream} from './key-proxy-test-kit.js'
 import {runTraceRelayChild} from './trace-relay-child.js'
 import {postBatch, startHttpUpstream} from './trace-relay-test-kit.js'
 import {encodeTraceRelayConfig, TRACE_RELAY_COUNTS_HEADER, TRACE_RELAY_MAX_CONFIG_BYTES} from './trace-relay-wire.js'
+import {startTraceRelay} from './trace-relay.js'
 
 const CREDENTIAL = 'Basic Y2hpbGQtY2FuYXJ5LTAwMDc6c2VjcmV0'
 const BODY_CANARY = 'BATCH-BODY-CANARY-0007'
@@ -74,12 +76,14 @@ function run(options: {frameTimeoutMs?: number; deps?: Parameters<typeof runTrac
   }
 }
 
+/** A loopback http collector: it gets no credential, because a plain-http collector does not prove who it is. */
 function configFor(origin: string): TraceRelayWireConfig {
-  return {
-    version: 1,
-    url: `${origin}/api/public/otel/v1/traces`,
-    headers: [{name: 'Authorization', value: CREDENTIAL}],
-  }
+  return {version: 1, url: `${origin}/api/public/otel/v1/traces`, headers: []}
+}
+
+/** The relay trusting one test CA, for the tests whose collector is https and so may be given a credential. */
+function trusting(ca: string): NonNullable<Parameters<typeof runTraceRelayChild>[1]> {
+  return {startRelay: async options => startTraceRelay({...options, ca})}
 }
 
 function frameOf(value: unknown): Buffer {
@@ -108,12 +112,12 @@ describe('runTraceRelayChild', () => {
     r.stdin.write(frame.subarray(40))
     const readyOutput = await r.waitForLines(1)
 
-    // #then it prints exactly one ready line with a port, and the relay forwards with the credential
+    // #then it prints exactly one ready line with a port, and the relay forwards, with no credential to a plain-http collector
     const ready = JSON.parse(readyOutput) as {ready: boolean; port: number}
     expect(readyOutput).toBe(`{"ready":true,"port":${ready.port}}\n`)
     expect((await postBatch(ready.port, {body: Buffer.from(BODY_CANARY)})).status).toBe(200)
     expect((await postBatch(ready.port, {body: Buffer.from(BODY_CANARY)})).status).toBe(503)
-    expect(upstream.requests[0]?.headers.authorization).toBe(CREDENTIAL)
+    expect(upstream.requests[0]?.headers.authorization).toBeUndefined()
     expect(r.exits()).toEqual([])
 
     // #when stdin closes
@@ -125,11 +129,32 @@ describe('runTraceRelayChild', () => {
     await expect(postBatch(ready.port)).rejects.toThrow()
   })
 
+  it('forwards the credential to an https collector, and prints nothing that names it', async () => {
+    const upstream = await startTlsUpstream((_request, res) => res.end())
+    cleanups.push(upstream.close)
+    const r = run({deps: trusting(upstream.ca)})
+    r.stdin.write(
+      encodeTraceRelayConfig({
+        version: 1,
+        url: `${upstream.origin}/v1/traces`,
+        headers: [{name: 'Authorization', value: CREDENTIAL}],
+      }),
+    )
+    const ready = JSON.parse(await r.waitForLines(1)) as {port: number}
+
+    expect((await postBatch(ready.port)).status).toBe(200)
+    r.stdin.end()
+    await r.waitForExit()
+
+    expect(upstream.requests[0]?.headers.authorization).toBe(CREDENTIAL)
+    expect(r.output()).not.toContain(CREDENTIAL)
+  })
+
   it('prints nothing that names the collector, a header value or a body, from start to stop', async () => {
     // #given a collector whose host canary is in its URL, and a sender whose body carries a canary
-    const upstream = await startHttpUpstream((_request, res) => res.end())
+    const upstream = await startTlsUpstream((_request, res) => res.end())
     cleanups.push(upstream.close)
-    const r = run()
+    const r = run({deps: trusting(upstream.ca)})
     r.stdin.write(
       encodeTraceRelayConfig({
         version: 1,
@@ -227,6 +252,42 @@ describe('runTraceRelayChild', () => {
     const r = run()
 
     r.stdin.write(frameOf({version: 1, ...body}))
+
+    expect(await r.waitForExit()).toBe(64)
+    expect(r.output()).toBe('{"error":"invalid-config"}\n')
+  })
+
+  it('exits 66 with its own fixed line for a credential over plain http, before it starts anything', async () => {
+    const started: unknown[] = []
+    const r = run({
+      deps: {
+        startRelay: async options => {
+          started.push(options)
+          return err('must not be called')
+        },
+      },
+    })
+
+    r.stdin.write(
+      frameOf({
+        version: 1,
+        url: 'http://127.0.0.1:4318/v1/traces',
+        headers: [{name: 'Authorization', value: CREDENTIAL}],
+      }),
+    )
+
+    expect(await r.waitForExit()).toBe(66)
+    expect(r.output()).toBe('{"error":"credential-over-http"}\n')
+    expect(started).toEqual([])
+  })
+
+  it.each([
+    ['https', 'https://collector.example.com:0/v1/traces'],
+    ['loopback http', 'http://127.0.0.1:0/v1/traces'],
+  ])('exits 64 for an explicit port 0 on %s', async (_name, url) => {
+    const r = run()
+
+    r.stdin.write(frameOf({version: 1, url, headers: []}))
 
     expect(await r.waitForExit()).toBe(64)
     expect(r.output()).toBe('{"error":"invalid-config"}\n')

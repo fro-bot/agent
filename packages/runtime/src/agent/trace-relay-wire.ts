@@ -74,9 +74,10 @@ export function parseTraceRelayCountsHeader(value: string | string[] | undefined
 /** Exit codes of the child. Zero is a clean stop after stdin closed. */
 export const TRACE_RELAY_EXIT_INVALID_CONFIG = 64
 export const TRACE_RELAY_EXIT_START_FAILED = 65
+export const TRACE_RELAY_EXIT_CREDENTIAL_OVER_HTTP = 66
 export const TRACE_RELAY_EXIT_INTERNAL = 70
 
-export type TraceRelayChildErrorCode = 'internal' | 'invalid-config' | 'start-failed'
+export type TraceRelayChildErrorCode = 'credential-over-http' | 'internal' | 'invalid-config' | 'start-failed'
 
 export interface TraceRelayLimits {
   readonly maxHeaderBytes: number
@@ -211,9 +212,10 @@ function isLiteralLoopback(hostname: string): boolean {
 }
 
 /**
- * The collector URL rules: `https`, or `http` only to a literal `127.0.0.0/8` or `::1` address (a loopback collector); no
+ * The collector URL rules: `https`, or `http` only to a literal `127.0.0.0/8` or `::1` address (a loopback collector, which
+ * the config then allows no credential headers for); no
  * userinfo; no fragment; not a cloud metadata host. A path and a query are allowed (the collector's route is part of the
- * URL). The error is a fixed code: the value is never quoted.
+ * URL), and no port 0. The error is a fixed code: the value is never quoted.
  */
 export function validateTraceRelayUrl(value: string): Result<URL, 'invalid-url'> {
   let parsed: URL
@@ -228,7 +230,22 @@ export function validateTraceRelayUrl(value: string): Result<URL, 'invalid-url'>
   if (parsed.hostname.length === 0) return err('invalid-url')
   if (isMetadataHost(parsed.hostname)) return err('invalid-url')
   if (parsed.protocol === 'http:' && !isLiteralLoopback(parsed.hostname)) return err('invalid-url')
+  // Port 0 is not a port a collector listens on, and Node replaces it with the scheme default when it connects, which
+  // would silently change the destination. WHATWG drops the default port, so '' is "none" and '0' is every written zero.
+  if (parsed.port === '0') return err('invalid-url')
   return ok(parsed)
+}
+
+/**
+ * The port to connect to: the one in the URL, or the scheme's default when there is none. Explicit, never a falsy
+ * fallback: Node treats a port of 0 as "use the default", which `validateTraceRelayUrl` already refuses, and this throws
+ * on it rather than let a bad URL reach a connect.
+ */
+export function resolveTraceRelayUpstreamPort(url: URL): number {
+  if (url.port === '') return url.protocol === 'https:' ? 443 : 80
+  const port = Number(url.port)
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error('the collector port is not usable')
+  return port
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -269,12 +286,19 @@ function parseLimits(value: unknown): Partial<TraceRelayLimits> | null {
 }
 
 /** Validates the decoded JSON. The error is a fixed code: nothing of the input is ever quoted. */
-export function parseTraceRelayConfig(value: unknown): Result<TraceRelayWireConfig, 'invalid-config'> {
+export function parseTraceRelayConfig(
+  value: unknown,
+): Result<TraceRelayWireConfig, 'credential-over-http' | 'invalid-config'> {
   if (!isRecord(value) || !hasOnly(value, ['version', 'url', 'headers', 'limits'])) return err('invalid-config')
   if (value.version !== TRACE_RELAY_CONFIG_VERSION) return err('invalid-config')
-  if (typeof value.url !== 'string' || !validateTraceRelayUrl(value.url).success) return err('invalid-config')
+  if (typeof value.url !== 'string') return err('invalid-config')
+  const url = validateTraceRelayUrl(value.url)
+  if (!url.success) return err('invalid-config')
   const headers = parseHeaders(value.headers)
   if (headers === null) return err('invalid-config')
+  // A plain-HTTP collector does not prove who it is: whatever process owns that loopback port would be handed the
+  // credential. A credential goes over https only; http is for a collector that needs none.
+  if (url.data.protocol === 'http:' && headers.length > 0) return err('credential-over-http')
   const limits = value.limits === undefined ? undefined : parseLimits(value.limits)
   if (limits === null) return err('invalid-config')
   return ok({
@@ -334,7 +358,12 @@ export function parseTraceRelayChildLine(line: string): TraceRelayChildLine {
     const plugin = readPluginCounts(report.plugin)
     return {kind: 'report', counts: {delivered, retry, dropped}, ...(plugin === null ? {} : {plugin})}
   }
-  if (error === 'internal' || error === 'invalid-config' || error === 'start-failed')
+  if (
+    error === 'internal' ||
+    error === 'invalid-config' ||
+    error === 'start-failed' ||
+    error === 'credential-over-http'
+  )
     return {kind: 'error', code: error}
   return {kind: 'invalid'}
 }

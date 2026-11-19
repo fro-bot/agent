@@ -81,7 +81,14 @@ export interface StartTraceRelayProcessOptions {
 }
 
 export type TraceRelayStartErrorKind =
-  'bad-ready' | 'bundle-invalid' | 'child-error' | 'exited-early' | 'invalid-config' | 'ready-timeout' | 'spawn-failed'
+  | 'bad-ready'
+  | 'bundle-invalid'
+  | 'child-error'
+  | 'credential-over-http'
+  | 'exited-early'
+  | 'invalid-config'
+  | 'ready-timeout'
+  | 'spawn-failed'
 
 export interface TraceRelayStartError {
   /** A fixed reason. Never a URL, a header, a path or anything the child printed. */
@@ -154,8 +161,9 @@ export async function startTraceRelayProcess(
 
   const parsed = parseTraceRelayConfig({version: 1, url: options.config.url, headers: options.config.headers})
   if (!parsed.success) {
-    warnNotStarted('invalid-config')
-    return err({kind: 'invalid-config'})
+    // The parser's fixed code is the reason: a credential over plain http is told apart from a malformed config.
+    warnNotStarted(parsed.error)
+    return err({kind: parsed.error})
   }
   let frame: Buffer
   try {

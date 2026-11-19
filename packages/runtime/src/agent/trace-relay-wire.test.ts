@@ -10,6 +10,7 @@ import {
   parseTraceRelayConfig,
   parseTraceRelayCountsHeader,
   readTraceRelayFrameLength,
+  resolveTraceRelayUpstreamPort,
   TRACE_RELAY_COUNTS_HEADER,
   TRACE_RELAY_MAX_CONFIG_BYTES,
   TRACE_RELAY_PATH,
@@ -55,10 +56,33 @@ describe('validateTraceRelayUrl', () => {
     ['a file URL', 'file:///etc/passwd'],
     ['a string that is not a URL', 'collector.example.com'],
     ['an empty string', ''],
+    ['an explicit port 0 on https', 'https://collector.example.com:0/v1/traces'],
+    ['an explicit port 0 on loopback http', 'http://127.0.0.1:0/v1/traces'],
+    ['an explicit port 0 on ::1', 'http://[::1]:0/v1/traces'],
+    ['a port written as 00', 'https://collector.example.com:00/v1/traces'],
+    ['a port written as 0000', 'http://127.0.0.1:0000/v1/traces'],
     ['https to the AWS metadata address', 'https://169.254.169.254/latest'],
     ['https to the GCP metadata name', 'https://metadata.google.internal/v1/traces'],
   ])('refuses %s with a fixed reason that never quotes the value', (_name, url) => {
     expect(validateTraceRelayUrl(url)).toMatchObject({success: false, error: 'invalid-url'})
+  })
+})
+
+describe('resolveTraceRelayUpstreamPort', () => {
+  it.each([
+    ['https://collector.example.com/v1/traces', 443],
+    ['https://collector.example.com:443/v1/traces', 443],
+    ['http://127.0.0.1/v1/traces', 80],
+    ['http://127.0.0.1:80/v1/traces', 80],
+    ['https://collector.example.com:4318/v1/traces', 4318],
+    ['http://127.0.0.1:4318/v1/traces', 4318],
+    ['http://[::1]:65535/v1/traces', 65_535],
+  ])('names the port of %s as %i, with a missing port meaning the scheme default', (url, port) => {
+    expect(resolveTraceRelayUpstreamPort(new URL(url))).toBe(port)
+  })
+
+  it('never returns 0 or a port Node would replace with its own default', () => {
+    expect(() => resolveTraceRelayUpstreamPort(new URL('https://collector.example.com:0/v1/traces'))).toThrow()
   })
 })
 
@@ -129,6 +153,43 @@ describe('parseTraceRelayConfig', () => {
 
   it('accepts an empty header list', () => {
     expect(parseTraceRelayConfig({...validConfig(), headers: []}).success).toBe(true)
+  })
+
+  it('refuses any header over plain http, with its own fixed code, and names nothing of the input', () => {
+    const parsed = parseTraceRelayConfig({
+      version: 1,
+      url: 'http://127.0.0.1:4318/v1/traces',
+      headers: [{name: 'Authorization', value: CANARY}],
+    })
+
+    expect(parsed).toEqual({success: false, error: 'credential-over-http'})
+    expect(JSON.stringify(parsed)).not.toContain('Authorization')
+    expect(JSON.stringify(parsed)).not.toContain(CANARY)
+  })
+
+  it.each([
+    ['::1', 'http://[::1]:4318/v1/traces'],
+    ['127.8.9.10', 'http://127.8.9.10/v1/traces'],
+  ])('refuses any header over plain http to %s too', (_name, url) => {
+    expect(parseTraceRelayConfig({version: 1, url, headers: [{name: 'x-a', value: 'b'}]})).toEqual({
+      success: false,
+      error: 'credential-over-http',
+    })
+  })
+
+  it('accepts plain http to loopback with no headers, and https with headers', () => {
+    expect(parseTraceRelayConfig({version: 1, url: 'http://127.0.0.1:4318/v1/traces', headers: []}).success).toBe(true)
+    expect(parseTraceRelayConfig(validConfig()).success).toBe(true)
+  })
+
+  it('reports an invalid header on http as an invalid config, not as the credential rule', () => {
+    expect(
+      parseTraceRelayConfig({
+        version: 1,
+        url: 'http://127.0.0.1:4318/v1/traces',
+        headers: [{name: 'host', value: 'x'}],
+      }),
+    ).toEqual({success: false, error: 'invalid-config'})
   })
 
   it.each([
@@ -220,6 +281,10 @@ describe('parseTraceRelayChildLine', () => {
     expect(parseTraceRelayChildLine('{"error":"invalid-config"}')).toEqual({kind: 'error', code: 'invalid-config'})
     expect(parseTraceRelayChildLine('{"error":"start-failed"}')).toEqual({kind: 'error', code: 'start-failed'})
     expect(parseTraceRelayChildLine('{"error":"internal"}')).toEqual({kind: 'error', code: 'internal'})
+    expect(parseTraceRelayChildLine('{"error":"credential-over-http"}')).toEqual({
+      kind: 'error',
+      code: 'credential-over-http',
+    })
     expect(parseTraceRelayChildLine('{"error":"anything else"}')).toEqual({kind: 'invalid'})
   })
 

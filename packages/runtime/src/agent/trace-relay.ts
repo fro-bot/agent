@@ -14,6 +14,7 @@ import {err, ok} from '../shared/types.js'
 import {isForwardableTarget} from './forwardable-target.js'
 import {
   parseTraceRelayCountsHeader,
+  resolveTraceRelayUpstreamPort,
   TRACE_RELAY_COUNTS_HEADER,
   TRACE_RELAY_PATH,
   TRACE_RELAY_STATUS,
@@ -130,9 +131,11 @@ export async function startTraceRelay(options: StartTraceRelayOptions): Promise<
   if (!validated.success) return err('the collector URL is not allowed')
   const upstreamUrl = validated.data
   const useTls = upstreamUrl.protocol === 'https:'
+  // A plain-http collector does not prove who it is, so no credential goes to it: refused before anything is bound.
+  if (!useTls && options.headers.length > 0) return err('the collector URL does not allow a credential over plain http')
   const transport = useTls ? https : http
   const upstreamHost = upstreamUrl.hostname.startsWith('[') ? upstreamUrl.hostname.slice(1, -1) : upstreamUrl.hostname
-  const upstreamPort = upstreamUrl.port === '' ? (useTls ? 443 : 80) : Number(upstreamUrl.port)
+  const upstreamPort = resolveTraceRelayUpstreamPort(upstreamUrl)
   const upstreamPath = `${upstreamUrl.pathname}${upstreamUrl.search}`
   const credentialHeaders: http.OutgoingHttpHeaders = {}
   for (const header of options.headers) credentialHeaders[header.name] = header.value

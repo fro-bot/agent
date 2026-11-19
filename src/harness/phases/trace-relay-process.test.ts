@@ -89,7 +89,7 @@ describe('trace-relay-process', () => {
   }
 
   describe.skipIf(BUN === null)('with the real child', () => {
-    it('returns a port, forwards with the credential, and stops with the batch counts when stdin closes', async () => {
+    it('returns a port, forwards to a plain-http collector with no credential, and stops with the batch counts when stdin closes', async () => {
       // #given a loopback collector that answers delivered, then retry, and the real child on the source entry
       const statuses = [200, 503]
       let next = 0
@@ -99,7 +99,7 @@ describe('trace-relay-process', () => {
       })
       cleanups.push(upstream.close)
       const {started, logger} = await startWith(realLauncher(), {
-        config: {url: `${upstream.origin}/${COLLECTOR_HOST_CANARY}/v1/traces`, headers: HEADERS},
+        config: {url: `${upstream.origin}/${COLLECTOR_HOST_CANARY}/v1/traces`, headers: []},
       })
       const relay: TraceRelayProcess = unwrapOk(started)
 
@@ -107,8 +107,8 @@ describe('trace-relay-process', () => {
       expect((await postBatch(relay.port)).status).toBe(200)
       expect((await postBatch(relay.port)).status).toBe(503)
 
-      // #then the collector saw the credential, and nothing else of the sender's
-      expect(upstream.requests[0]?.headers.authorization).toBe(CREDENTIAL)
+      // #then the collector saw the batch and no credential: a plain-http collector is never handed one
+      expect(upstream.requests[0]?.headers.authorization).toBeUndefined()
       expect(upstream.requests[0]?.url).toBe(`/${COLLECTOR_HOST_CANARY}/v1/traces`)
 
       // #when it is stopped
@@ -135,7 +135,7 @@ describe('trace-relay-process', () => {
       const upstream = await startHttpUpstream((_request, res) => res.end())
       cleanups.push(upstream.close)
       const {started, logger} = await startWith(realLauncher(), {
-        config: {url: `${upstream.origin}/v1/traces`, headers: HEADERS},
+        config: {url: `${upstream.origin}/v1/traces`, headers: []},
       })
       const relay = unwrapOk(started)
       await postBatch(relay.port, {headers: {[TRACE_RELAY_COUNTS_HEADER]: 'exported=30;dropped=4'}})
@@ -166,7 +166,7 @@ describe('trace-relay-process', () => {
       const upstream = await startHttpUpstream((_request, res) => res.end())
       cleanups.push(upstream.close)
       const {started, logger} = await startWith(realLauncher(), {
-        config: {url: `${upstream.origin}/v1/traces`, headers: HEADERS},
+        config: {url: `${upstream.origin}/v1/traces`, headers: []},
       })
       const relay = unwrapOk(started)
       await postBatch(relay.port, {headers: {[TRACE_RELAY_COUNTS_HEADER]: 'exported=3;dropped=0'}})
@@ -183,7 +183,7 @@ describe('trace-relay-process', () => {
       const upstream = await startHttpUpstream((_request, res) => res.end())
       cleanups.push(upstream.close)
       const {started} = await startWith(realLauncher(), {
-        config: {url: `${upstream.origin}/v1/traces`, headers: HEADERS},
+        config: {url: `${upstream.origin}/v1/traces`, headers: []},
       })
       const relay = unwrapOk(started)
 
@@ -388,6 +388,58 @@ describe('trace-relay-process', () => {
 
       expect(unwrapOk(good.started).port).toBe(4321)
       expect(calls).toEqual(['good'])
+    })
+
+    it.each([
+      ['127.0.0.1', 'http://127.0.0.1:4318/v1/traces'],
+      ['::1', 'http://[::1]:4318/v1/traces'],
+    ])(
+      'refuses a credential header over plain http to %s before it spawns anything, and names no header',
+      async (_name, url) => {
+        // #given a launcher that fails loudly if it is ever spawned
+        const {started, logger} = await startWith(
+          {command: path.join(dir, 'must-not-spawn'), args: []},
+          {config: {url, headers: [{name: 'Authorization', value: CREDENTIAL}]}},
+        )
+
+        // #then the start fails on the credential rule, with its own reason, and no header name or value is logged
+        expect(unwrapErr(started).kind).toBe('credential-over-http')
+        expect(loggedAt(logger, 'warning')).toEqual([
+          ['The trace relay did not start; this run is not traced', {reason: 'credential-over-http'}],
+        ])
+        const logged = serializeLoggerCalls(logger)
+        for (const canary of [CREDENTIAL, 'Authorization', '4318']) expect(logged).not.toContain(canary)
+      },
+    )
+
+    it('asks nothing of the bundle check for a credential over plain http, and does not spawn', async () => {
+      const calls: string[] = []
+
+      const {started} = await startWith(
+        {command: path.join(dir, 'must-not-spawn'), args: []},
+        {
+          config: {url: 'http://127.0.0.1:4318/v1/traces', headers: HEADERS},
+          bundleCheck: async () => {
+            calls.push('check')
+            return true
+          },
+        },
+      )
+
+      expect(unwrapErr(started).kind).toBe('credential-over-http')
+      expect(calls).toEqual([])
+    })
+
+    it.each([
+      ['https', 'https://collector.example.com:0/v1/traces'],
+      ['loopback http', 'http://127.0.0.1:0/v1/traces'],
+    ])('refuses an explicit port 0 on %s before it spawns anything', async (_name, url) => {
+      const {started} = await startWith(
+        {command: path.join(dir, 'must-not-spawn'), args: []},
+        {config: {url, headers: []}},
+      )
+
+      expect(unwrapErr(started).kind).toBe('invalid-config')
     })
 
     it('refuses a config too large for the frame before it spawns anything', async () => {

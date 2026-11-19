@@ -28,10 +28,8 @@ async function relayFor(
 ): Promise<TraceRelayServer> {
   const started = await startTraceRelay({
     url,
-    headers: options.headers ?? [
-      {name: 'Authorization', value: CREDENTIAL},
-      {name: 'x-langfuse-ingestion-version', value: '4'},
-    ],
+    // No headers by default: a credential goes over https only, so the tests that carry one use `tlsUpstreamAnswering`.
+    headers: options.headers ?? [],
     ...(options.limits === undefined ? {} : {limits: options.limits}),
     ...(options.ca === undefined ? {} : {ca: options.ca}),
   })
@@ -40,6 +38,20 @@ async function relayFor(
     await started.data.close()
   })
   return started.data
+}
+
+const CREDENTIAL_HEADERS = [
+  {name: 'Authorization', value: CREDENTIAL},
+  {name: 'x-langfuse-ingestion-version', value: '4'},
+]
+
+async function tlsUpstreamAnswering(status: number, body = '') {
+  const upstream = await startTlsUpstream((_request, res) => {
+    res.writeHead(status, {'content-length': Buffer.byteLength(body)})
+    res.end(body)
+  })
+  cleanups.push(upstream.close)
+  return upstream
 }
 
 async function upstreamAnswering(status: number, body = '') {
@@ -55,8 +67,11 @@ describe('startTraceRelay: forwarding', () => {
   it('forwards a batch byte for byte with the configured headers and answers delivered with an empty body', async () => {
     // #given a recording upstream and a relay pointed at its traces URL
     const fetchSpy = vi.spyOn(globalThis, 'fetch')
-    const upstream = await upstreamAnswering(200, '{"partialSuccess":{}}')
-    const relay = await relayFor(`${upstream.origin}/api/public/otel/v1/traces?project=a`)
+    const upstream = await tlsUpstreamAnswering(200, '{"partialSuccess":{}}')
+    const relay = await relayFor(`${upstream.origin}/api/public/otel/v1/traces?project=a`, {
+      ca: upstream.ca,
+      headers: CREDENTIAL_HEADERS,
+    })
 
     // #when a batch is posted
     const answer = await postBatch(relay.port, {body: BATCH})
@@ -73,7 +88,7 @@ describe('startTraceRelay: forwarding', () => {
     expect(seen?.headers['x-langfuse-ingestion-version']).toBe('4')
     expect(seen?.headers['content-type']).toBe('application/x-protobuf')
     expect(seen?.headers['content-length']).toBe(String(BATCH.length))
-    expect(seen?.headers.host).toBe(`127.0.0.1:${upstream.port}`)
+    expect(seen?.headers.host).toBe(new URL(upstream.origin).host)
     expect(Object.keys(seen?.headers ?? {}).sort()).toEqual([
       'authorization',
       'connection',
@@ -155,8 +170,8 @@ describe('startTraceRelay: forwarding', () => {
   })
 
   it('does not forward sender headers other than the content type and encoding', async () => {
-    const upstream = await upstreamAnswering(200)
-    const relay = await relayFor(`${upstream.origin}/v1/traces`)
+    const upstream = await tlsUpstreamAnswering(200)
+    const relay = await relayFor(`${upstream.origin}/v1/traces`, {ca: upstream.ca, headers: CREDENTIAL_HEADERS})
 
     await postBatch(relay.port, {
       headers: {
@@ -187,13 +202,13 @@ describe('startTraceRelay: forwarding', () => {
     cleanups.push(upstream.close)
 
     // #when the relay trusts its CA
-    const trusting = await relayFor(`${upstream.origin}/v1/traces`, {ca: upstream.ca})
+    const trusting = await relayFor(`${upstream.origin}/v1/traces`, {ca: upstream.ca, headers: CREDENTIAL_HEADERS})
     const delivered = await postBatch(trusting.port)
 
     // #then the batch is delivered with the credential; without the CA the connection fails and the sender is told to retry
     expect(delivered.status).toBe(200)
     expect(upstream.requests[0]?.headers.authorization).toBe(CREDENTIAL)
-    const distrusting = await relayFor(`${upstream.origin}/v1/traces`)
+    const distrusting = await relayFor(`${upstream.origin}/v1/traces`, {headers: CREDENTIAL_HEADERS})
     const refused = await postBatch(distrusting.port)
     expect(refused.status).toBe(503)
     expect(upstream.requests).toHaveLength(1)
@@ -684,6 +699,23 @@ describe('startTraceRelay: its socket and its start', () => {
   ])('refuses %s at start', async (_name, url) => {
     const started = await startTraceRelay({url, headers: []})
     expect(started.success).toBe(false)
+  })
+
+  it('refuses a credential header over plain http before it binds anything', async () => {
+    const started = await startTraceRelay({
+      url: 'http://127.0.0.1:4318/v1/traces',
+      headers: [{name: 'Authorization', value: CREDENTIAL}],
+    })
+
+    expect(started).toEqual({success: false, error: 'the collector URL does not allow a credential over plain http'})
+    expect(JSON.stringify(started)).not.toContain(CREDENTIAL)
+  })
+
+  it.each([
+    ['https with an explicit port 0', 'https://collector.example.com:0/v1/traces'],
+    ['loopback http with an explicit port 0', 'http://127.0.0.1:0/v1/traces'],
+  ])('refuses %s at start, because Node would connect to the scheme default instead', async (_name, url) => {
+    expect((await startTraceRelay({url, headers: []})).success).toBe(false)
   })
 
   it('stops answering after close and aborts a forward that is still waiting', async () => {
