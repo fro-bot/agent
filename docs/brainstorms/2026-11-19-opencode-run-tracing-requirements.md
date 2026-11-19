@@ -7,7 +7,7 @@ topic: opencode-run-tracing
 
 ## Summary
 
-`@fro.bot/opencode-plugin` gains opt-in OpenTelemetry tracing. It records each model call, tool call and subagent of a run as `gen_ai` spans and sends them to a collector the operator controls. The first release covers local OpenCode sessions and the GitHub Action. In the Action, a relay outside the agent's sandbox holds the collector credential and forwards the spans.
+`@fro.bot/opencode-plugin` gains opt-in OpenTelemetry tracing. It records each model call, tool call and subagent of a run as `gen_ai` spans, with their content, and sends them to a collector the operator controls. The first release covers local OpenCode sessions and the GitHub Action. In the Action, a relay started by the Action holds the collector credential and forwards the spans.
 
 ---
 
@@ -24,9 +24,9 @@ The repo's recorded telemetry policy (RFC-007, F83) says raw prompts are never s
 ## Actors
 
 - A1. Operator: the person who owns the repo workflow or the workstation, turns tracing on, chooses the collector and reads the traces.
-- A2. Agent: the model and its tools, running inside the OpenCode server. Under `isolate-agent` it is untrusted and can read the server's environment and config.
-- A3. Plugin: `@fro.bot/opencode-plugin`, loaded by the OpenCode server. It observes the run and produces spans.
-- A4. Relay: a process the Action starts outside the agent's sandbox. It receives spans from the plugin, holds the collector credential and forwards to the collector.
+- A2. Agent: the model and its tools, running inside the OpenCode server. Always untrusted. Under `isolate-agent` it also cannot read the Action's files, environment or processes.
+- A3. Plugin: `@fro.bot/opencode-plugin`, loaded by the OpenCode server. It observes the run and produces spans. It shares a process with the agent.
+- A4. Relay: a loopback process the Action starts beside the existing key proxy. It receives spans from the plugin and forwards them to the collector with the credential.
 - A5. Collector: an OpenTelemetry collector the operator runs or rents. It is outside this repo.
 
 ---
@@ -34,18 +34,18 @@ The repo's recorded telemetry policy (RFC-007, F83) says raw prompts are never s
 ## Key Flows
 
 - F1. Local session
-  - **Trigger:** The operator enables tracing for a project on their workstation and starts an OpenCode session.
+  - **Trigger:** The operator enables tracing in their own user settings and starts an OpenCode session.
   - **Actors:** A1, A3, A5
-  - **Steps:** The plugin reads the operator's tracing settings. It records each turn as a trace. It sends spans to the operator's local collector, which holds any remote credential.
+  - **Steps:** The plugin reads the operator's user-scope tracing settings. It records each turn as a trace. It sends spans to the operator's collector. No relay is used. Keeping a remote backend's credential in that collector, and out of plugin settings, is the operator's choice.
   - **Outcome:** The operator opens the turn in their trace backend and reads each model call, tool call and subagent.
-  - **Covered by:** R1, R2, R3, R4, R5, R6, R9, R13
+  - **Covered by:** R1 to R11, R15
 
 - F2. Action run
-  - **Trigger:** A workflow that enables tracing through Action inputs runs on any trigger.
+  - **Trigger:** A workflow that enables tracing through Action inputs runs. Tracing follows the run: any trigger and actor the workflow lets through is traced.
   - **Actors:** A1, A2, A3, A4, A5
-  - **Steps:** The Action starts the relay before the agent. The plugin sends spans to the relay over loopback. The relay adds run identity, applies limits and forwards to the collector with the credential. At the end of the run the Action flushes the relay, within a time bound, then stops it.
-  - **Outcome:** The run's trace is in the operator's backend, tagged with the repository and run. The agent never held the collector credential when the run was isolated.
-  - **Covered by:** R1 to R8, R10, R11, R12, R14, R15, R16
+  - **Steps:** The Action starts the relay before the agent and gives the plugin the relay's address and the run's identity. The plugin sends spans to the relay over loopback. The relay forwards them to the collector with the credential. At the end of the run the plugin drains to the relay, the relay flushes to the collector, each within a time bound, and the Action stops the relay.
+  - **Outcome:** The run's trace is in the operator's backend, tagged with the repository and run. In an isolated run the agent never held the collector credential.
+  - **Covered by:** R1 to R16
 
 ---
 
@@ -54,88 +54,95 @@ The repo's recorded telemetry policy (RFC-007, F83) says raw prompts are never s
 **What a trace contains**
 
 - R1. One trace covers one turn of a session, from the prompt to the end of the work it started.
-- R2. Each model request is a span that follows the OpenTelemetry GenAI conventions for inference, with provider, model, agent, token usage and finish reason. This includes title and compaction requests.
-- R3. Each tool call is a span that follows the GenAI conventions for tool execution, with the tool name, call id and outcome.
-- R4. A subagent's spans are reachable from the tool call that started it. When the subagent outlives that call, the two are linked and not nested.
-- R5. At the content level, a model span carries the system instructions and the messages OpenCode assembled for that request, and the model's output. A tool span carries the tool's input and result.
-- R6. A span states where its data came from and marks anything it left out or cut short. A reader can tell a missing value from an empty one.
+- R2. Each model request is a span that follows the OpenTelemetry GenAI conventions for inference. It carries the provider, model and agent, and the token usage and finish reason when OpenCode reports them. This includes title and compaction requests.
+- R3. Each tool call is a span that follows the GenAI conventions for tool execution, with the tool name, call id, input, result and outcome. A rejected or interrupted call is recorded as such.
+- R4. A subagent that finishes within the tool call that started it is nested under that call in the same trace. A subagent that outlives the call records its own trace, and the parent's tool span links to it.
+- R5. A model span carries the system instructions, the messages and the tool definitions as the plugin's hook saw them, and the model's output. The hook sees the request before later hooks and OpenCode's own filtering, so the span is labelled as the hook-time view and not the bytes sent to the provider.
+- R6. Every span carries the session id and agent name. In the Action it also carries the repository, run id and trigger, which the Action supplies.
+- R7. A span marks any value it redacted or truncated. An absent attribute means the value was not captured.
 
-**Levels and consent**
+**Consent and settings**
 
-- R7. Tracing has three levels: off, structure and content. Off is the default everywhere. Structure sends an allowlisted set of non-content fields. Content adds the fields in R5.
-- R8. The operator sets the level and the destination. Nothing the agent can write changes either: not repo files, not session content, not tool output.
-- R9. Content is scrubbed for known secret shapes and limited in size per value, per span and per run before it leaves the process that captured it. Attachments, binary data and request headers are never sent.
-- R10. Turning tracing on never sends anything recorded before it was turned on.
+- R8. Tracing is off by default everywhere and has one switch. On means every span in R1 to R7 with its content. There is no default destination and no fallback when the operator's endpoint is unset.
+- R9. Only the operator turns tracing on and sets the destination. In the Action both come from workflow inputs, handed to the plugin once at server start. The plugin reads no tracing settings from the checkout, from repo-supplied OpenCode config, from restored session or cache state, or from session content. In a local session they come from user-scope settings only, and a project's own config can neither enable tracing nor redirect it.
+- R10. Content is scrubbed for known secret shapes over the whole value, then bounded in size, before it leaves the plugin. Attachments, binary data and request headers are never sent.
+- R11. No spans are created for turns that ended before tracing was on. A model span on a traced turn carries the session history that OpenCode sent with that request, including turns restored from earlier runs.
 
-**The Action**
+**The Action relay**
 
-- R11. The collector credential lives only in the relay. The plugin and the OpenCode server never receive it.
-- R12. The relay accepts spans only in the expected shape, enforces size and rate limits, and sets the repository and run identity itself. It ignores any identity the sender supplies.
-- R13. Tracing never fails a run. A collector that is down, a full buffer or a slow flush costs spans, and the run's log says how many were dropped without printing their content.
-- R14. Tracing works with and without `isolate-agent`. Without it, the Action logs a warning that the agent can read the collector credential and can write spans, and the docs say the same.
-- R15. When tracing is on, OpenCode's own exporter stays off for that run.
+- R12. The Action gives the collector credential only to the relay. The plugin and the OpenCode server are never handed it.
+- R13. The relay forwards only to the operator-configured endpoint. It binds to loopback on an ephemeral port, serves one route, never follows redirects, sends the credential only over HTTPS or to a loopback collector, caps request size and total bytes per run, and never returns a collector response body to the sender.
+- R14. Tracing works with and without `isolate-agent`. Without it, the Action logs one warning that the agent can read the collector credential.
+- R15. Tracing never fails a run. A relay that cannot start, a collector that is down, a full buffer or a slow flush costs spans. The run's log reports the drops it knows of, without content, and says when the count is incomplete because a process was killed. Buffered spans are held in memory only.
+- R16. The Action keeps `OTEL_*` out of the server's environment, so OpenCode's own exporter stays off. A local operator who also sets `OTEL_EXPORTER_OTLP_ENDPOINT` gets OpenCode's spans as a second, separate export.
 
-**Policy and docs**
+**Release and policy**
 
-- R16. RFC-007 F83 is revised: tracing is off by default, content leaves only by explicit operator opt-in, and only to an endpoint the operator configured. The project never receives trace data.
-- R17. The docs state what each level sends, where the credential lives, that scrubbing cannot guarantee every secret is removed, and that retention and access are the operator's collector's concern.
+- R17. The plugin does nothing when tracing is off, and adds no install or start-up failure to a run that does not use it. Outside a local session and the Action it stays off whatever its settings say, until gateway tracing ships.
+- R18. RFC-007 F83 is revised to match R8 and R9, and states that the project never receives trace data. The docs state what a trace contains, that it includes session history and may include secrets and other people's text, that scrubbing is best-effort, that an agent can write misleading spans to the operator's collector, and that the collector needs the same access control and retention as CI logs. They recommend an ingest-only credential scoped to one project.
 
 ---
 
 ## Acceptance Examples
 
-- AE1. **Covers R2, R4, R5.** Given content level and a turn where the agent starts a review subagent, when the operator opens the trace, they can read the system instructions of the parent's model call, the prompt handed to the subagent, and each tool the subagent called with its input and result.
-- AE2. **Covers R7.** Given structure level, when a model call and a shell tool call run, the trace shows both spans with model, tokens, tool name and outcome, and no prompt text, command text or output.
-- AE3. **Covers R8.** Given tracing off in the workflow, when a file in the checkout or a tool result sets a tracing endpoint or level, no spans are sent anywhere.
-- AE4. **Covers R9, R6.** Given content level, when a tool result contains a provider key and 5 MB of text, the span carries a scrubbed, truncated result and marks both the redaction and the truncation.
-- AE5. **Covers R11, R14.** Given an isolated Action run with tracing on, when the agent searches its environment, its config and every file it can read, it does not find the collector credential.
-- AE6. **Covers R14.** Given a non-isolated Action run with tracing on, the run proceeds, sends spans, and logs one warning naming the exposure.
-- AE7. **Covers R13.** Given a collector that refuses connections, when a traced run finishes, it succeeds, and its log reports the number of dropped spans.
-- AE8. **Covers R12.** Given an agent that posts a span to the relay claiming another repository, the forwarded span carries the real repository and run, or is dropped.
+- AE1. **Covers R2, R3, R4, R5.** Given tracing on and a turn where the agent starts a review subagent, when the operator opens the trace, they can read the system instructions of the parent's model call, the prompt handed to the subagent, and each tool the subagent called with its input and result.
+- AE2. **Covers R4.** Given a background subagent still running after its tool call returned, the parent's tool span links to a second trace that holds the subagent's spans.
+- AE3. **Covers R9.** Given tracing off in the workflow, when a file in the checkout, a tool result, or state restored from an earlier run names a tracing endpoint, no spans are sent anywhere.
+- AE4. **Covers R9.** Given a cloned repository whose project config enables tracing, when the operator opens a local session with tracing off in their user settings, no spans are sent.
+- AE5. **Covers R7, R10.** Given a tool result that contains a provider key and 5 MB of text, the span carries a scrubbed, truncated result and marks both the redaction and the truncation.
+- AE6. **Covers R12.** Given an isolated Action run with tracing on, the collector credential is absent from the server's environment, its config files and the arguments of every process the agent can list.
+- AE7. **Covers R14.** Given a non-isolated Action run with tracing on, the run proceeds, sends spans, and logs one warning naming the exposure.
+- AE8. **Covers R15.** Given a collector that refuses connections, when a traced run finishes, it succeeds, and its log reports the dropped spans.
+- AE9. **Covers R13.** Given a request to the relay that names another host, in its path, a header or its body, the relay still forwards only to the configured endpoint.
+- AE10. **Covers R1, R7, R15.** Given a long session with a compaction, a retried model call, a background subagent and several multi-megabyte tool results, the trace still shows every model and tool span with its identity, and each span that lost content says so.
 
 ---
 
 ## Success Criteria
 
-- The operator can answer "what was this subagent asked, and what did its tools return" for a local session and for an Action run by opening one trace, without reading session records.
-- A traced run on a published install shows the system instructions of a model call in the backend the operator chose.
-- A run with tracing off sends nothing, and behaves as it does today.
-- Planning can start without deciding what a trace contains, who may enable it, where the credential lives, or what the first release covers.
+- The operator can answer "what was this subagent asked, and what did its tools return" for a local session and for an Action run from one trace, or one link from it, without reading session records.
+- This is shown end to end on a published install with a dummy credential, with the content readable in Langfuse.
+- A run with tracing off sends nothing and behaves as it does today.
 
 ---
 
 ## Scope Boundaries
 
 - Gateway tracing per binding. It needs spans routed by run ownership on a shared workspace server and is the next release.
-- Standing up a collector and a trace backend. That is a task for the operator's infrastructure.
-- Capture of provider wire traffic, provider-side reasoning, and anything a provider adds after OpenCode sends the request.
-- Metrics and logs export. This is traces only.
+- A structure-only level that sends spans without content.
+- Decoding spans in the relay: enforcing fields, rewriting identity or span ids, re-scrubbing, rate limiting.
+- Standing up the collector and backends. That is a task for the operator's infrastructure.
+- Capture of provider wire traffic, provider-side reasoning, and anything changed after the plugin's hook runs.
+- Metrics and logs export, sampling, and OTLP over gRPC.
+- Spans for the Action's own phases, and a job-summary link to the trace.
 - Export of past sessions.
 - Merging these spans into the same trace as OpenCode's own spans.
-- A fro-bot hosted collector or any default destination.
+- A fro-bot hosted collector.
 
 ---
 
 ## Key Decisions
 
-- Capture lives in the plugin, not in the Action or gateway process: the plugin is the only place that sees the system instructions and the assembled messages. A host reading the event stream cannot recover them.
-- Managed runs export through a relay the host owns: it keeps the collector credential away from the agent and lets the host set run identity. The cost is a second trusted relay beside the key proxy.
-- Spans from the plugin are untrusted input: the agent shares a process with the plugin and can write to the relay. Traces are a debugging aid and not audit evidence.
-- Non-isolated runs are allowed with a warning: requiring `isolate-agent` would keep tracing from callers who cannot isolate yet, and the exposure is the same one those runs already accept for the GitHub token.
-- "Full exchange" means what OpenCode assembles before it sends: exact provider traffic is upstream's to expose.
-- Prior items with the same surface, and how this differs:
-  - Recorded as Completed in `RFCs/RFC-007-Observability-Run-Summary.md`, with its telemetry item F83 unimplemented: this work revises F83 and builds an operator-directed export, not project telemetry.
-  - Recorded as active in `docs/solutions/best-practices/authenticated-sse-run-observation-2026-06-20.md`: the operator stream stays payload-free. Traces are a separate surface with their own consent.
-  - Recorded as done in `docs/plans/2026-04-15-001-feat-durable-object-storage-plan.md`: stored sessions persist a run's records for continuity. They are not a searchable trace.
+- Capture lives in the plugin, not in the Action or gateway process: the plugin's hooks see the system instructions and the assembled messages, and a process reading the event stream cannot recover them.
+- Action runs export through a relay the Action owns: it keeps the collector credential out of the server the agent shares. The cost is a second loopback process beside the key proxy.
+- The relay is a fixed-destination forwarder and does not inspect spans: the agent can write misleading spans to the operator's own collector, the genuine spans still arrive, and traces are a debugging aid and not audit evidence.
+- One switch, content included: the purpose is to read prompts, tool data and model output, so a level without them has no user yet.
+- Session history is exported as part of each model span: the span shows what the model was sent.
+- Non-isolated runs are allowed with a warning: the exposure is the one those runs already accept for the GitHub token.
+- The first release is proven against Langfuse for reading transcripts. The operator's collector also sends to Tempo for general trace storage.
+- RFC-007's telemetry item F83 is recorded as unimplemented in `RFCs/RFC-007-Observability-Run-Summary.md`. This work revises it and builds an operator-directed export, not project telemetry.
 
 ---
 
 ## Dependencies / Assumptions
 
-- A V2 plugin can read the assembled system instructions, messages and tool definitions of each model request, and tool inputs and results, through its hooks. This was read from the OpenCode 2.3.2 source and has not been run.
-- The OpenTelemetry GenAI conventions are in Development status. The span shape pins one revision and may need to move with them.
-- The operator has a collector and a backend that renders GenAI content. Accepting OTLP does not mean a backend shows a readable transcript.
-- An upstream request asks OpenCode to restore opt-in content capture in its own exporter. If it lands, the model-call spans here can be retired. Subagent linkage, consent levels, credential placement and scrubbing stay.
+- Planning starts with a probe on the published pinned binary and a check of the existing community V2 OTel plugin. If the hooks cannot expose system instructions, this document is re-scoped. If the community plugin already produces the model and tool spans, the work shrinks to content, subagent linkage, consent and the Action relay.
+- What the hooks expose was read from the OpenCode 2.3.2 source and has not been run. Read there: request hooks carry system instructions, messages and tool definitions, not the completion, usage or finish reason. Title requests expose no tool definitions. Output and usage come from session events where OpenCode emits them.
+- The project moves the OpenCode pin every few days. The probe runs again on each pin change, and a hook that changes shape must show up as marked gaps in spans, not as silently thinner traces.
+- The OpenTelemetry GenAI conventions are in Development status. The span shape pins one revision.
+- Accepting OTLP does not mean a backend renders a transcript. Whether Langfuse reads the current GenAI message attributes, and whether it can issue an ingest-only key, are checked in the probe.
+- An upstream request asks OpenCode to restore opt-in content capture in its own exporter. If it ships, it is evaluated against these requirements before any of this capture is retired.
+- Adding OpenTelemetry code to the plugin changes its published package. Its install and start-up cost with tracing off is measured, not assumed.
 
 ---
 
@@ -143,27 +150,22 @@ The repo's recorded telemetry policy (RFC-007, F83) says raw prompts are never s
 
 ### Deferred to Planning
 
-- [Affects R2, R5][Needs research] Run a probe on the pinned binary: compare what the plugin hooks, the event stream, session records and OpenCode's own exporter each show for a text turn, a tool error, a retry, a compaction and a background subagent.
-- [Affects R2][Technical] Token usage: OpenCode's stored input count excludes cached tokens and its output count excludes reasoning. Decide how these map to the convention's totals, and how a missing count differs from zero.
-- [Affects R4][Technical] How a subagent's trace is joined to its parent when the child starts its own trace root.
-- [Affects R9][Technical] What the scrubber matches, the size limits, and which tool payloads are excluded by default.
-- [Affects R13][Technical] Flush on shutdown: the server gets five seconds after stdin closes before it is killed. Decide where spans are buffered so a forced stop loses a bounded amount.
-- [Affects R8][Technical] Where a local operator puts tracing settings so that a project's own files cannot turn tracing on or redirect it.
-- [Affects R7][Technical] The exact allowlist for structure level.
-- [Affects F1][Needs research] Check the existing community V2 OTel plugin against the pinned version and these requirements before building the same structural spans.
-- [Affects Success Criteria][User decision] Which backend the first release is proven against. Langfuse renders GenAI transcripts and is self-hostable. Tempo with Grafana is a general trace store with no model-specific view.
+- [Affects R1, R4][Technical] How a turn's boundaries and a subagent's parent call are established from prompt, tool-call and child-session events, including reused subagents, concurrent turns, interruption and manual compaction.
+- [Affects R2][Technical] How OpenCode's token counts map to the convention's totals. Its stored input count excludes cached tokens and its output count excludes reasoning.
+- [Affects R10][Technical] What the scrubber matches, the size bounds, and whether the repo's existing log redaction can be reused.
+- [Affects R11, AE10][Technical] How repeated session history across many model spans stays within the size bounds without losing the spans that matter.
+- [Affects R15][Technical] The drain and flush order and time budget inside the existing shutdown window, where the server gets five seconds after stdin closes before it is killed.
+- [Affects R9, R13][Technical] How the Action hands the plugin the relay address and run identity through the server's filtered environment, and how the relay's lifecycle sits beside the key proxy's, including two traced steps in one job.
+- [Affects R9][Technical] Where user-scope tracing settings live for a local session.
 
 ---
 
 ## Sources / Research
 
-- Facts established by reading the OpenCode source at the pinned tag:
-  - OpenCode 2.3.2 exporter: on when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, OTLP over HTTP only, traces and logs, no content attributes.
-  - OpenCode 1.19.x passed `experimental.openTelemetry` to the AI SDK's `experimental_telemetry` on each model call. 2.3.2 lists `openTelemetry` as an unsupported legacy key.
-  - Upstream `anomalyco/opencode`: PR #60974 (per-turn native traces, merged before 2.3.2), PR #64438 (assistant message id on the request hook, open), PR #35935 (structural V2 tracing, closed, with a follow-up request for content opt-in), issue #47351 (managed OTLP settings, open).
+- OpenCode at tag `v2.3.2`: the exporter is on when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, speaks OTLP over HTTP, sends traces and logs, and has no content attributes. OpenCode 1.19.x passed `experimental.openTelemetry` to the AI SDK's `experimental_telemetry`. 2.3.2 lists `openTelemetry` as an unsupported legacy key.
+- Upstream `anomalyco/opencode`: PR #60974 (per-turn native traces, merged before 2.3.2), PR #64438 (assistant message id on the request hook, open), PR #35935 (structural V2 tracing, closed, with a follow-up request for content opt-in), issue #47351 (managed OTLP settings, open).
 - `packages/runtime/src/agent/filter-env.ts` and `apps/workspace-agent/src/opencode-server-v2.ts`: the env allowlists that drop `OTEL_*` today.
-- `packages/opencode-plugin/`: the plugin that gains tracing. It ships four session tools and a subagent-reuse guard today.
-- `packages/runtime/src/agent/key-proxy*.ts` and `src/harness/phases/key-proxy-process.ts`: the existing pattern for a trusted loopback process started outside the sandbox.
-- `docs/solutions/best-practices/key-proxy-keeps-provider-keys-out-of-the-agent-sandbox-2026-11-17.md`: lessons for a relay that an untrusted process talks to.
+- `packages/opencode-plugin/`: the plugin that gains tracing.
+- `src/harness/phases/key-proxy-process.ts` and `docs/solutions/best-practices/key-proxy-keeps-provider-keys-out-of-the-agent-sandbox-2026-11-17.md`: the existing pattern, and its lessons, for a loopback process that holds a credential for an untrusted client.
 - `docs/solutions/workflow-issues/published-install-live-check-before-rollout-2026-11-17.md`: an opt-in feature is proven on a published install with dummy credentials before rollout.
 - OpenTelemetry GenAI semantic conventions: `https://github.com/open-telemetry/semantic-conventions-genai/tree/main/docs/gen-ai`.
