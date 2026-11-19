@@ -9,8 +9,15 @@
  * Scrubbing is best-effort: it removes the secret shapes listed in `SCRUB_PATTERNS` and the values of the plugin's own
  * secret-named environment variables. It does not find a secret that has no recognizable shape.
  *
- * Plain functions only: no SDK, no I/O, no clock. Every pattern is linear-time (no nested quantifier, no backreference,
- * no adjacent unbounded quantifiers); `content.test.ts` times each on its own adversarial input.
+ * The design that makes it safe to extend: every text rule is a pure matcher over the ORIGINAL string that only reports
+ * ranges (`ScrubMatcher`); `scrubWithMatchers` unites all ranges and builds the output once. No rule ever reads text another
+ * rule rewrote, so rule order cannot matter (`content.order.test.ts` proves it). Structured content is walked once
+ * (`scrubStructured`): sensitive-named keys go whole, every other string is scrubbed from its original text, and the result is
+ * serialized, never scanned again.
+ *
+ * Plain functions only: no SDK, no I/O, no clock. Every matcher is linear-time (no nested quantifier, no backreference,
+ * no adjacent unbounded quantifiers) and the union is a sort bounded by `MAX_RANGES`; `content.test.ts` times each on its own
+ * adversarial input.
  */
 
 import type {ActionIdentity} from './settings.js'
@@ -56,65 +63,87 @@ const TRUNCATION_SUFFIX = (removed: number): string => `…[truncated ${removed}
 // Scrubber
 // ---------------------------------------------------------------------------------------------------------------------
 
-export interface PatternResult {
-  readonly text: string
-  readonly count: number
-}
-
-export interface ScrubPattern {
-  /** Stable name: used in tests and nowhere in output (a marker never names the pattern that matched). */
+/**
+ * A text rule. A pure matcher over the ORIGINAL, unmodified string: it reports each range `[start, end)` it would redact
+ * through `emit`, and nothing else. It never reads another matcher's output, never rewrites text and never needs to
+ * recognise the redaction marker, so the order matchers run in cannot change what is removed (`scrubWithMatchers`).
+ */
+export interface ScrubMatcher {
+  /** The rule's name: used in tests and nowhere in output (a marker never names the rule that matched). */
   readonly id: string
-  readonly apply: (text: string, lower: string) => PatternResult
+  /** `lower` is `text` case-folded once, for cheap needle checks. Ranges may arrive in any order and may overlap. */
+  readonly find: (text: string, lower: string, emit: Emit) => void
 }
 
-/** Replaces each match with `replacement(...groups)`; skips the scan when none of `needles` occur (case-folded). */
-function replacing(
+export type Emit = (start: number, end: number) => void
+
+export interface Range {
+  readonly start: number
+  readonly end: number
+}
+
+/** Ranges one value may produce before it is omitted instead of scanned further. Bounds memory and the merge's sort. */
+export const MAX_RANGES = 50_000
+
+class TooManyRangesError extends Error {}
+
+/** Calls `matcher` and returns the ranges it reports, uncapped. For tests and tools: `scrubWithMatchers` caps them. */
+export function matchRanges(matcher: ScrubMatcher, text: string): Range[] {
+  const found: Range[] = []
+  matcher.find(text, text.toLowerCase(), (start, end) => {
+    found.push({start, end})
+  })
+  return found
+}
+
+/**
+ * Reports every match of `regex` (a global regex, reset before use) as the range `rangeOf` picks out of it. Skips the scan
+ * when none of `needles` occur (case-folded). `rangeOf` returns the part to redact: a token whole, or only the value
+ * after a name or a scheme word that stays visible.
+ */
+function regexMatcher(
   id: string,
   regex: RegExp,
-  replacement: (...groups: string[]) => string,
+  rangeOf: (match: RegExpExecArray, text: string) => Range,
   needles?: readonly string[],
-): ScrubPattern {
+): ScrubMatcher {
   return {
     id,
-    apply: (text, lower) => {
-      if (needles !== undefined && !needles.some(needle => lower.includes(needle))) return {text, count: 0}
-      let count = 0
-      const replaced = text.replace(regex, (...args: unknown[]) => {
-        count += 1
-        // The last arguments are offset and string (and groups when named): only the captures are passed on.
-        const groups = args.slice(1, -2).filter((value): value is string => typeof value === 'string')
-        return replacement(...groups)
-      })
-      return {text: replaced, count}
+    find: (text, lower, emit) => {
+      if (needles !== undefined && !needles.some(needle => lower.includes(needle))) return
+      regex.lastIndex = 0
+      for (let match = regex.exec(text); match !== null; match = regex.exec(text)) {
+        const range = rangeOf(match, text)
+        emit(range.start, range.end)
+      }
     },
   }
 }
 
-const whole = (): string => REDACTION
+const wholeMatch = (match: RegExpExecArray): Range => ({start: match.index, end: match.index + match[0].length})
 
 /**
  * A private-key block: from its header to its end line, or, when the tool cut the block short, to the end of the string
  * value (the next `"`) or of the text. Found by header regex and `indexOf`, never by a lazy match across the body.
  */
-function pemPattern(): ScrubPattern {
+function pemMatcher(): ScrubMatcher {
   const header = /-----BEGIN [A-Z0-9 ]{0,40}(?:PRIVATE KEY|KEY BLOCK)-----/g
   return {
     id: 'pem-private-key',
-    apply: (text, lower) => {
-      if (!lower.includes('-----begin ')) return {text, count: 0}
-      let count = 0
-      let out = ''
-      let cursor = 0
+    find: (text, lower, emit) => {
+      if (!lower.includes('-----begin ')) return
       header.lastIndex = 0
       // The next end line and the next quote are searched forward once and only moved when a header passes them, so a
       // text of many headers and no end line costs one scan, not one per header.
       let nextEnd = text.indexOf('-----END ')
       let nextQuote = text.indexOf('"')
+      let covered = 0
       for (;;) {
         const match = header.exec(text)
         if (match === null) break
         const from = match.index
-        if (from < cursor) continue
+        // A header inside a block already reported: the block covers it.
+        if (from < covered) continue
         const bodyStart = from + match[0].length
         if (nextEnd !== -1 && nextEnd < bodyStart) nextEnd = text.indexOf('-----END ', bodyStart)
         if (nextQuote !== -1 && nextQuote < bodyStart) nextQuote = text.indexOf('"', bodyStart)
@@ -125,12 +154,10 @@ function pemPattern(): ScrubPattern {
         } else if (nextQuote !== -1) {
           stop = nextQuote
         }
-        out += text.slice(cursor, from) + REDACTION
-        cursor = stop
+        emit(from, stop)
+        covered = stop
         header.lastIndex = Math.max(stop, header.lastIndex)
-        count += 1
       }
-      return count === 0 ? {text, count: 0} : {text: out + text.slice(cursor), count}
     },
   }
 }
@@ -155,11 +182,11 @@ const isWordChar = (code: number): boolean => code !== 0x2d && isSegmentChar(cod
  * Here a run's end is found once and remembered, and a candidate inside a run that already failed is skipped, so no
  * position is walked more than three times (once as each segment).
  */
-function jwtPattern(): ScrubPattern {
+function jwtMatcher(): ScrubMatcher {
   return {
     id: 'jwt',
-    apply: (text, lower) => {
-      if (!lower.includes('eyj')) return {text, count: 0}
+    find: (text, lower, emit) => {
+      if (!lower.includes('eyj')) return
       const length = text.length
       // The most recent maximal run of segment characters, so a start inside it does not walk it again.
       let runFrom = -1
@@ -172,9 +199,6 @@ function jwtPattern(): ScrubPattern {
         runTo = end
         return end
       }
-      let count = 0
-      let out = ''
-      let cursor = 0
       let from = 0
       for (;;) {
         const start = text.indexOf('eyJ', from)
@@ -199,12 +223,9 @@ function jwtPattern(): ScrubPattern {
           from = Math.max(from, headerEnd + 1)
           continue
         }
-        out += text.slice(cursor, start) + REDACTION
-        cursor = signatureEnd
+        emit(start, signatureEnd)
         from = signatureEnd
-        count += 1
       }
-      return count === 0 ? {text, count: 0} : {text: out + text.slice(cursor), count}
     },
   }
 }
@@ -257,26 +278,20 @@ const isIdentifierCode = (code: number): boolean =>
 /** The most a quoted value is searched for its closing quote. Past it the value is redacted to the end of the line. */
 const MAX_QUOTED_VALUE_CHARS = 8192
 
-/**
- * Where an unquoted value that starts at `from` ends. A marker inside it is part of the value, not the end of it (the marker
- * holds a closing bracket, which is also a delimiter): `pre-[REDACTED]-tail` is one value.
- */
+/** Where an unquoted value that starts at `from` ends: at the first delimiter. */
 function unquotedEnd(text: string, from: number): number {
   let end = from
-  while (end < text.length) {
-    if (text.startsWith(REDACTION, end)) {
-      end += REDACTION.length
-      continue
-    }
-    if (UNQUOTED_STOP.has(text.charCodeAt(end))) break
-    end += 1
-  }
+  while (end < text.length && !UNQUOTED_STOP.has(text.charCodeAt(end))) end += 1
   return end
 }
 
 const SCHEME_WORD = /^(?:bearer|basic|token|digest)$/i
 
-/** After an authorization scheme word ending at `end`: up to eight blanks and the credential token that follows it, if any. */
+/**
+ * `Authorization: Bearer <credential>`: when an assignment's first token is a scheme word, the value is the scheme AND the
+ * credential after it (up to eight blanks, then the next token). This is the rule's own boundary, read from the original
+ * text; the scheme rule (`auth-scheme-value`) finds the same credential on its own and the two ranges are united.
+ */
 function schemeCredentialEnd(text: string, end: number): number {
   let index = end
   while (index < text.length && index - end < 8 && (text.charCodeAt(index) === 0x20 || text.charCodeAt(index) === 0x09))
@@ -287,17 +302,16 @@ function schemeCredentialEnd(text: string, end: number): number {
 }
 
 /**
- * `name=value` and `name: value`, in plain text and in JSON text (`\"name\": \"value\"`). The match starts at the secret word
- * itself, so nothing before it is scanned or kept; every gap is a bounded class, so adjacent optional parts cannot trade
- * characters. The value is then read by hand, once, forward:
+ * `name=value` and `name: value`, in plain text and in JSON text (`\"name\": \"value\"`): the range is the value. The match
+ * starts at the secret word itself, every gap is a bounded class, and the value is then read by hand, once, forward:
  * - a quoted value runs to its closing quote, honouring escapes (in an escaped layer, `\"` closes and `\\\"` does not); if
  *   no closing quote is found within `MAX_QUOTED_VALUE_CHARS` it runs to the end of the line;
- * - an unquoted value is a run of non-delimiter characters (the first token only);
+ * - an unquoted value is a run of non-delimiter characters (the first token only), plus the credential after a scheme word;
  * - a number of up to eight digits survives only after a counter or limit name (`max_tokens: 8000`), never after a name that
  *   says password, secret, credential or authorization.
- * The cursor moves past everything consumed, so no character is scanned more than a bounded number of times.
+ * Scanning resumes after the value, so no character is scanned more than a bounded number of times.
  */
-function nameValuePattern(): ScrubPattern {
+function nameValueMatcher(): ScrubMatcher {
   const prefix = new RegExp(
     // The quote around a name or a value may sit in an escaped layer: any run of backslashes (JSON in JSON in JSON) before it.
     String.raw`((?:${SECRET_WORDS})[\w.-]{0,20})(?:\\{0,15}["'])?[ \t]{0,4}[:=][ \t]{0,4}(\\{0,15}["'])?`,
@@ -305,11 +319,8 @@ function nameValuePattern(): ScrubPattern {
   )
   return {
     id: 'name-value-pair',
-    apply: (text, lower) => {
-      if (!SECRET_NEEDLES.some(needle => lower.includes(needle))) return {text, count: 0}
-      let count = 0
-      let out = ''
-      let cursor = 0
+    find: (text, lower, emit) => {
+      if (!SECRET_NEEDLES.some(needle => lower.includes(needle))) return
       prefix.lastIndex = 0
       for (;;) {
         const match = prefix.exec(text)
@@ -323,10 +334,9 @@ function nameValuePattern(): ScrubPattern {
           from -= 1
         const counter = isCounterName(text.slice(from, match.index) + name)
 
-        let valueEnd = valueStart
+        let valueEnd: number
         if (opener === undefined) {
           valueEnd = unquotedEnd(text, valueStart)
-          // `Authorization: Bearer <credential>`: the first token is the scheme, the credential is the second.
           if (SCHEME_WORD.test(text.slice(valueStart, valueEnd))) valueEnd = schemeCredentialEnd(text, valueEnd)
           const value = text.slice(valueStart, valueEnd)
           if (counter && isShortNumber(value)) continue
@@ -336,15 +346,9 @@ function nameValuePattern(): ScrubPattern {
           valueEnd = closingQuote(text, valueStart, opener)
           if (valueEnd === valueStart) continue
         }
-        // Only a value that is exactly the marker counts as already redacted (an earlier pass, or the structured pass).
-        if (text.slice(valueStart, valueEnd) === REDACTION) continue
-        if (valueStart < cursor) continue
-        out += text.slice(cursor, valueStart) + REDACTION
-        cursor = valueEnd
+        emit(valueStart, valueEnd)
         prefix.lastIndex = Math.max(prefix.lastIndex, valueEnd)
-        count += 1
       }
-      return count === 0 ? {text, count: 0} : {text: out + text.slice(cursor), count}
     },
   }
 }
@@ -396,13 +400,20 @@ const QUERY_SECRET = new RegExp(
   'gi',
 )
 
+/** Where the value starts after a scheme word and its blanks: the scheme word stays visible. */
+const afterScheme = (match: RegExpExecArray, text: string): Range => {
+  let start = match.index + (match[1] ?? match[2] ?? '').length
+  while (text.charCodeAt(start) === 0x20 || text.charCodeAt(start) === 0x09) start += 1
+  return {start, end: match.index + match[0].length}
+}
+
 /**
- * The patterns, in the order they run. Specific shapes first, so a generic `name: value` match never has to guess at a
- * token that a specific pattern already recognized.
+ * The text rules. Each is a pure matcher over the original string; the list's order carries no meaning (`scrubWithMatchers`
+ * takes the union of every range), and `content.test.ts` runs it in other orders to show that.
  */
-export const SCRUB_PATTERNS: readonly ScrubPattern[] = [
-  pemPattern(),
-  replacing('github-token', /\b(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_\w{22,255})\b/g, whole, [
+export const SCRUB_PATTERNS: readonly ScrubMatcher[] = [
+  pemMatcher(),
+  regexMatcher('github-token', /\b(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_\w{22,255})\b/g, wholeMatch, [
     'ghp_',
     'gho_',
     'ghu_',
@@ -410,16 +421,16 @@ export const SCRUB_PATTERNS: readonly ScrubPattern[] = [
     'ghr_',
     'github_pat_',
   ]),
-  replacing(
+  regexMatcher(
     'aws-access-key-id',
     /(?<![A-Za-z0-9])(?:AKIA|ASIA|AGPA|AIDA|AROA|ANPA|ANVA|ABIA|ACCA)[A-Z0-9]{16}\b/g,
-    whole,
+    wholeMatch,
     ['akia', 'asia', 'agpa', 'aida', 'aroa', 'anpa', 'anva', 'abia', 'acca'],
   ),
-  replacing(
+  regexMatcher(
     'vendor-key-prefix',
     /\b(?:sk-[\w-]{20,}|sk_(?:live|test)_[A-Za-z0-9]{16,}|rk_(?:live|test)_[A-Za-z0-9]{16,}|xai-[A-Za-z0-9]{20,}|gsk_[A-Za-z0-9]{20,}|AIza[\w-]{35}|hf_[A-Za-z0-9]{30,}|pplx-[A-Za-z0-9]{30,}|fw_[A-Za-z0-9]{20,}|nvapi-[\w-]{30,}|npm_[A-Za-z0-9]{36}|glpat-[\w-]{20,}|xox[abposr]-[A-Za-z0-9-]{10,}|SG\.[\w-]{16,}\.[\w-]{16,}|ya29\.[\w-]{20,}|r8_[A-Za-z0-9]{30,}|dop_v1_[a-f0-9]{40,})/g,
-    whole,
+    wholeMatch,
     [
       'sk-',
       'sk_',
@@ -440,35 +451,36 @@ export const SCRUB_PATTERNS: readonly ScrubPattern[] = [
       'dop_v1_',
     ],
   ),
-  jwtPattern(),
+  jwtMatcher(),
   // `Bearer` is a credential marker on its own; the other schemes are also English words, so their value must contain a
-  // digit or a base64 or token punctuation character.
-  replacing(
+  // digit or a base64 or token punctuation character. The scheme word stays visible: the range is the credential.
+  regexMatcher(
     'auth-scheme-value',
     /\b(?:(Bearer)[ \t]{1,8}[\w.~+/=-]{8,}|(Basic|Token|Digest)[ \t]{1,8}(?=[\w.~+/=-]*[\d._~+/=-])[\w.~+/=-]{8,})/gi,
-    scheme => `${scheme} ${REDACTION}`,
+    afterScheme,
     ['bearer', 'basic', 'token', 'digest'],
   ),
-  replacing(
+  regexMatcher(
     'connection-string',
     /\b(?:postgres(?:ql)?|mysql|mariadb|mongodb(?:\+srv)?|redis|rediss|amqps?|mssql|sqlserver|clickhouse|cockroachdb):\/\/[^\s"'<>\\]{3,}/gi,
-    whole,
+    wholeMatch,
     ['postgres', 'mysql', 'mariadb', 'mongodb', 'redis', 'amqp', 'mssql', 'sqlserver', 'clickhouse', 'cockroachdb'],
   ),
-  replacing('url-userinfo', URL_USERINFO, prefix => `${prefix}${REDACTION}@`, ['://']),
-  replacing('url-query-secret', QUERY_SECRET, name => `${name}${REDACTION}`, [
-    'pass',
-    'pwd',
-    'secret',
-    'token',
-    'key',
-    'credential',
-    'authorization',
-    'signature',
-    'bearer',
-    'sig=',
-  ]),
-  nameValuePattern(),
+  // `scheme://user:password@host`: the range is the userinfo; the scheme and the `@` stay.
+  regexMatcher(
+    'url-userinfo',
+    URL_USERINFO,
+    match => ({start: match.index + (match[1] ?? '').length, end: match.index + match[0].length - 1}),
+    ['://'],
+  ),
+  // `?name=value`: the range is the value; the name stays.
+  regexMatcher(
+    'url-query-secret',
+    QUERY_SECRET,
+    match => ({start: match.index + (match[1] ?? '').length, end: match.index + match[0].length}),
+    ['pass', 'pwd', 'secret', 'token', 'key', 'credential', 'authorization', 'signature', 'bearer', 'sig='],
+  ),
+  nameValueMatcher(),
 ]
 
 /** Env names whose value the literal pass removes. `OPENCODE_PASSWORD` is the server's own credential. */
@@ -498,12 +510,31 @@ export function collectLiterals(
   return [...found].toSorted((a, b) => b.length - a.length).slice(0, MAX_LITERALS)
 }
 
+/**
+ * The environment's literal secrets as a matcher: every occurrence of each, overlapping ones included (the union covers a
+ * secret that overlaps itself or another). The literals were collected once at start; they are never named.
+ */
+export function literalMatcher(literals: readonly string[]): ScrubMatcher {
+  return {
+    id: 'environment-literal',
+    find: (text, _lower, emit) => {
+      for (const literal of literals) {
+        for (let at = text.indexOf(literal); at !== -1; at = text.indexOf(literal, at + 1))
+          emit(at, at + literal.length)
+      }
+    },
+  }
+}
+
 export type ScrubResult =
   | {readonly ok: true; readonly text: string; readonly redactions: number}
-  | {readonly ok: false; readonly reason: 'over-input-ceiling' | 'scrub-failed'}
+  | {readonly ok: false; readonly reason: 'over-input-ceiling' | 'scrub-failed' | 'too-many-ranges'}
 
 export interface Scrubber {
+  /** Scrubs one string: the ORIGINAL text in, text with each united range replaced by one marker out. */
   readonly scrub: (text: string) => ScrubResult
+  /** The longest string `scrub` accepts; a content attribute whose serialization is longer is omitted unscanned. */
+  readonly inputCeilingChars?: number
 }
 
 export interface ScrubberOptions {
@@ -512,57 +543,79 @@ export interface ScrubberOptions {
   /** Extra literal secrets, such as the trace credential this plugin was configured with. */
   readonly extraSecrets?: readonly string[]
   readonly limits?: Partial<ContentLimits>
-  /** Replaces the pattern list (tests). */
-  readonly patterns?: readonly ScrubPattern[]
+  /** Replaces the text rules (tests). The environment's literals are always matched as well. */
+  readonly patterns?: readonly ScrubMatcher[]
 }
 
-/** The patterns that run before the literals, in this order: they must see a value whole, over the original text. */
-const LEADING_PATTERN_IDS: readonly string[] = ['pem-private-key', 'name-value-pair']
+const isHighSurrogate = (code: number): boolean => code >= 0xd8_00 && code <= 0xdb_ff
+const isLowSurrogate = (code: number): boolean => code >= 0xdc_00 && code <= 0xdf_ff
+
+/**
+ * The scrub, in one step. Every matcher reads the same original `text`; their ranges are collected, sorted, united (ranges
+ * that overlap or touch become one) and the output is built in a single left-to-right pass with one marker per united
+ * range. Nothing is ever matched against text a marker was put into, so the result is the same whatever order `matchers`
+ * are in, and no rule can make another skip or split a match.
+ *
+ * The redaction count is the number of united ranges (markers in the output): a range several rules contributed to counts once.
+ * A range edge that falls inside a surrogate pair moves outward to the pair's edge, so a lone half is never left behind.
+ * Throws `TooManyRangesError` past `MAX_RANGES`: the caller omits the value rather than scan on.
+ */
+export function scrubWithMatchers(
+  text: string,
+  matchers: readonly ScrubMatcher[],
+): {readonly text: string; readonly redactions: number} {
+  const lower = text.toLowerCase()
+  const starts: number[] = []
+  const ends: number[] = []
+  const emit: Emit = (start, end) => {
+    if (end <= start) return
+    if (starts.length >= MAX_RANGES) throw new TooManyRangesError()
+    starts.push(Math.max(0, start))
+    ends.push(Math.min(text.length, end))
+  }
+  for (const matcher of matchers) matcher.find(text, lower, emit)
+  if (starts.length === 0) return {text, redactions: 0}
+
+  const order = starts.map((_start, index) => index).toSorted((a, b) => (starts[a] ?? 0) - (starts[b] ?? 0))
+  let out = ''
+  let cursor = 0
+  let redactions = 0
+  let index = 0
+  while (index < order.length) {
+    const first = order[index] ?? 0
+    let start = starts[first] ?? 0
+    let end = ends[first] ?? 0
+    index += 1
+    // Unite everything that overlaps or touches.
+    while (index < order.length && (starts[order[index] ?? 0] ?? 0) <= end) {
+      end = Math.max(end, ends[order[index] ?? 0] ?? 0)
+      index += 1
+    }
+    if (start > 0 && isLowSurrogate(text.charCodeAt(start)) && isHighSurrogate(text.charCodeAt(start - 1))) start -= 1
+    if (end < text.length && isHighSurrogate(text.charCodeAt(end - 1)) && isLowSurrogate(text.charCodeAt(end))) end += 1
+    // A pair-edge move can make this range reach back into the previous one: continue from where that ended.
+    if (start < cursor) start = cursor
+    out += text.slice(cursor, start) + REDACTION
+    cursor = end
+    redactions += 1
+  }
+  return {text: out + text.slice(cursor), redactions}
+}
 
 export function createScrubber(options: ScrubberOptions = {}): Scrubber {
   const ceiling = options.limits?.inputCeilingChars ?? DEFAULT_CONTENT_LIMITS.inputCeilingChars
-  const literals = collectLiterals(options.env ?? {}, options.extraSecrets)
-  const patterns = options.patterns ?? SCRUB_PATTERNS
-  const isLeading = (pattern: ScrubPattern): boolean => LEADING_PATTERN_IDS.includes(pattern.id)
-  const leading = LEADING_PATTERN_IDS.flatMap(id => patterns.filter(pattern => pattern.id === id))
-  const trailing = patterns.filter(pattern => !isLeading(pattern))
+  const matchers = [
+    ...(options.patterns ?? SCRUB_PATTERNS),
+    literalMatcher(collectLiterals(options.env ?? {}, options.extraSecrets)),
+  ]
   return {
+    inputCeilingChars: ceiling,
     scrub: text => {
       if (text.length > ceiling) return {ok: false, reason: 'over-input-ceiling'}
       try {
-        let current = text
-        let redactions = 0
-        // The order matters. A pass that inserts a marker can make a later pass skip or split what it would have matched, so
-        // the passes that must see a value whole run first, over the original text:
-        // 1. a private-key block (multi-line, consumed whole);
-        // 2. a secret-named assignment, which consumes its entire value from the original text;
-        // 3. the literal secrets from the environment;
-        // 4. every other token shape.
-        const lower0 = current.toLowerCase()
-        for (const pattern of leading) {
-          const result = pattern.apply(current, lower0)
-          if (result.count === 0) continue
-          current = result.text
-          redactions += result.count
-        }
-        for (const literal of literals) {
-          if (!current.includes(literal)) continue
-          const parts = current.split(literal)
-          redactions += parts.length - 1
-          current = parts.join(REDACTION)
-        }
-        const lower = current.toLowerCase()
-        for (const pattern of trailing) {
-          const result = pattern.apply(current, lower)
-          if (result.count === 0) continue
-          current = result.text
-          redactions += result.count
-          // The case-folded copy no longer matches the text once something was replaced; refresh it for later patterns.
-          // (Replacements only remove text that matched, so a stale copy could only over-trigger, never under-trigger.)
-        }
-        return {ok: true, text: current, redactions}
-      } catch {
-        return {ok: false, reason: 'scrub-failed'}
+        return {ok: true, ...scrubWithMatchers(text, matchers)}
+      } catch (error) {
+        return {ok: false, reason: error instanceof TooManyRangesError ? 'too-many-ranges' : 'scrub-failed'}
       }
     },
   }
@@ -773,7 +826,7 @@ function safeScrub(scrubber: Scrubber, text: string): ScrubResult {
 // Structured redaction
 // ---------------------------------------------------------------------------------------------------------------------
 
-/** A key whose name says it holds a credential. Same words as the text patterns. */
+/** A key whose name says it holds a credential. Same words as the text rules. */
 const SENSITIVE_KEY = new RegExp(SECRET_WORDS, 'i')
 const MAX_KEY_CHARS = 200
 /** Nodes visited and depth reached in one structured pass. Past either, the attribute is omitted, not exported. */
@@ -791,28 +844,45 @@ function isSensitiveKey(key: string, value: unknown): boolean {
   return true
 }
 
-interface RedactionWalk {
+interface TreeWalk {
   nodes: number
   redactions: number
 }
 
-class RedactionBudgetError extends Error {}
+type TreeFailureReason = 'over-input-ceiling' | 'scrub-failed' | 'too-many-ranges'
 
-function redactValue(value: unknown, depth: number, walk: RedactionWalk): unknown {
+class TreeFailure extends Error {
+  readonly reason: TreeFailureReason
+  constructor(reason: TreeFailureReason) {
+    super(reason)
+    this.reason = reason
+  }
+}
+
+/** One string of the structure, scrubbed once, from its original text. A failure fails the whole attribute. */
+function scrubLeaf(text: string, scrubber: Scrubber, walk: TreeWalk): string {
+  const result = safeScrub(scrubber, text)
+  if (!result.ok) throw new TreeFailure(result.reason)
+  walk.redactions += result.redactions
+  return result.text
+}
+
+function scrubNode(value: unknown, depth: number, scrubber: Scrubber, walk: TreeWalk): unknown {
   walk.nodes += 1
-  if (walk.nodes > MAX_REDACTION_NODES || depth > MAX_REDACTION_DEPTH) throw new RedactionBudgetError()
-  if (typeof value === 'string') return redactEmbeddedJson(value, depth, walk)
-  if (Array.isArray(value)) return value.map(item => redactValue(item, depth + 1, walk))
+  if (walk.nodes > MAX_REDACTION_NODES || depth > MAX_REDACTION_DEPTH) throw new TreeFailure('scrub-failed')
+  if (typeof value === 'string') return scrubString(value, depth, scrubber, walk)
+  if (Array.isArray(value)) return value.map(item => scrubNode(item, depth + 1, scrubber, walk))
   if (typeof value === 'object' && value !== null) {
     const copy: Record<string, unknown> = {}
     for (const key of Object.keys(value)) {
       if (key === '__proto__') continue
       const child = (value as Record<string, unknown>)[key]
       if (isSensitiveKey(key, child)) {
+        // The whole value goes, whatever its type; nothing inside it is read, and the marker is never scanned.
         walk.redactions += 1
-        copy[key] = REDACTION
+        copy[scrubLeaf(key, scrubber, walk)] = REDACTION
       } else {
-        copy[key] = redactValue(child, depth + 1, walk)
+        copy[scrubLeaf(key, scrubber, walk)] = scrubNode(child, depth + 1, scrubber, walk)
       }
     }
     return copy
@@ -820,35 +890,50 @@ function redactValue(value: unknown, depth: number, walk: RedactionWalk): unknow
   return value
 }
 
-/** A string that holds JSON (a tool argument carrying a JSON document): its sensitive keys are removed too, at any depth. */
-function redactEmbeddedJson(text: string, depth: number, walk: RedactionWalk): string {
-  if (text.length < 2 || text.length > MAX_EMBEDDED_JSON_CHARS) return text
-  const first = text.trimStart()[0]
-  if (first !== '{' && first !== '[') return text
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(text)
-  } catch {
-    return text
-  }
-  if (typeof parsed !== 'object' || parsed === null) return text
+/**
+ * A string leaf. When it holds a JSON document (a tool argument carrying one) it is parsed and walked like any other part
+ * of the structure, so its sensitive keys go whole and each of its own string leaves is scrubbed from its original text; if
+ * anything in it was redacted it is written back as the compact serialization of those already-scrubbed parts, and that
+ * text is NOT scanned again. Otherwise (not JSON, truncated JSON, a bare string) the text matchers read the original string.
+ */
+function scrubString(text: string, depth: number, scrubber: Scrubber, walk: TreeWalk): string {
+  const parsed = parseEmbeddedJson(text)
+  if (parsed === undefined) return scrubLeaf(text, scrubber, walk)
   const before = walk.redactions
-  const redacted = redactValue(parsed, depth + 1, walk)
-  return walk.redactions === before ? text : JSON.stringify(redacted)
+  const inner = scrubNode(parsed, depth + 1, scrubber, walk)
+  return walk.redactions === before ? text : JSON.stringify(inner)
+}
+
+function parseEmbeddedJson(text: string): object | undefined {
+  if (text.length < 2 || text.length > MAX_EMBEDDED_JSON_CHARS) return undefined
+  const first = text.trimStart()[0]
+  if (first !== '{' && first !== '[') return undefined
+  try {
+    const parsed: unknown = JSON.parse(text)
+    return typeof parsed === 'object' && parsed !== null ? parsed : undefined
+  } catch {
+    return undefined
+  }
 }
 
 /**
- * Removes the entire value of every key whose name says it is a credential, at any depth, whatever its type (string,
- * number, array, object, boolean, null), including inside a string that holds JSON. Runs before the text patterns, which
- * only ever see what is left. Undefined when the structure is too large or deep to walk: the caller omits the attribute.
+ * Scrubs a structured value in ONE walk. Sensitive-named keys have their entire value replaced, whatever its type, at any
+ * depth, including inside strings that hold JSON; every other string (and every key) goes through the text matchers once,
+ * from its original text. The two never feed each other: a marker the walk inserts is a node of the output tree, built from
+ * the original, and no matcher ever reads it, so a marker cannot hide a match or split one. The caller serializes the result
+ * and does not scan that text again.
  */
-export function redactSensitiveKeys(value: unknown): {readonly value: unknown; readonly count: number} | undefined {
-  const walk: RedactionWalk = {nodes: 0, redactions: 0}
+export function scrubStructured(
+  value: unknown,
+  scrubber: Scrubber,
+):
+  | {readonly ok: true; readonly value: unknown; readonly redactions: number}
+  | {readonly ok: false; readonly reason: TreeFailureReason} {
+  const walk: TreeWalk = {nodes: 0, redactions: 0}
   try {
-    const redacted = redactValue(value, 0, walk)
-    return {value: redacted, count: walk.redactions}
-  } catch {
-    return undefined
+    return {ok: true, value: scrubNode(value, 0, scrubber, walk), redactions: walk.redactions}
+  } catch (error) {
+    return {ok: false, reason: error instanceof TreeFailure ? error.reason : 'scrub-failed'}
   }
 }
 
@@ -876,32 +961,29 @@ export function scrubSpan(
 
   for (const [name, value] of Object.entries(span.attributes)) {
     if (isContentAttribute(value)) {
-      const walked = redactSensitiveKeys(value.value)
-      if (walked === undefined) {
-        // Too large or too deep to walk, or not serializable at all (a cycle shows up as depth): say which.
-        tally.omitted.push(`${name}:${serialize(value.value) === undefined ? 'unserializable' : 'scrub-failed'}`)
+      // The serialization of the ORIGINAL value, for the ceiling and to catch what cannot be serialized at all.
+      const original = serialize(value.value)
+      if (original === undefined) {
+        tally.omitted.push(`${name}:unserializable`)
         continue
       }
-      tally.redactions += walked.count
+      if (original.length > (scrubber.inputCeilingChars ?? limits.inputCeilingChars)) {
+        tally.omitted.push(`${name}:over-input-ceiling`)
+        continue
+      }
+      const walked = scrubStructured(value.value, scrubber)
+      if (!walked.ok) {
+        tally.omitted.push(`${name}:${walked.reason}`)
+        continue
+      }
+      tally.redactions += walked.redactions
+      // Already scrubbed, leaf by leaf: only serialized here, to bound it, never scanned.
       const json = serialize(walked.value)
       if (json === undefined) {
         tally.omitted.push(`${name}:unserializable`)
         continue
       }
-      const scrubbed = safeScrub(scrubber, json)
-      if (!scrubbed.ok) {
-        tally.omitted.push(`${name}:${scrubbed.reason}`)
-        continue
-      }
-      tally.redactions += scrubbed.redactions
-      let parsed: unknown
-      try {
-        parsed = JSON.parse(scrubbed.text)
-      } catch {
-        // A replacement broke the JSON: omit rather than export text that does not parse.
-        tally.omitted.push(`${name}:scrub-failed`)
-        continue
-      }
+      const parsed: unknown = JSON.parse(json)
       const bounded = boundJson(parsed, Math.min(value.maxChars, Math.max(0, budget)), value.dropOldest === true)
       if (bounded === undefined) {
         tally.omitted.push(`${name}:over-budget`)

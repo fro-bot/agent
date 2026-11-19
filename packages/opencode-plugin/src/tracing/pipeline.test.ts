@@ -519,12 +519,11 @@ describe('stop against a deadline', () => {
       patterns: [
         {
           id: 'slow',
-          apply: text => {
+          find: () => {
             const until = performance.now() + ms
             while (performance.now() < until) {
               // Busy wait: the cost is synchronous, as a big scrub is.
             }
-            return {text, count: 0}
           },
         },
       ],

@@ -15,10 +15,12 @@ import {
   extractToolDefinitions,
   extractToolResult,
   MARKER,
+  matchRanges,
   REDACTION,
   SCRUB_PATTERNS,
   scrubbedBrand,
   scrubSpan,
+  scrubWithMatchers,
 } from './content.js'
 
 // Fixture secrets are assembled at run time so no scanner mistakes this file for a leak.
@@ -259,9 +261,8 @@ describe('scrub patterns', () => {
         {
           id: 'counting',
           // Counts scans of the value under test; the span's name is scrubbed too and is not what is being counted.
-          apply: text => {
+          find: text => {
             if (text.includes('xxxx')) scans += 1
-            return {text, count: 0}
           },
         },
       ],
@@ -308,21 +309,6 @@ describe('scrub patterns', () => {
     expect(span.name).toBe('[omitted]')
     expect(span.attributes['gen_ai.tool.call.result']).toBeUndefined()
     expect(span.attributes[MARKER.omitted]).toEqual(expect.arrayContaining(['gen_ai.tool.call.result:scrub-failed']))
-  })
-
-  it('omits a value whose scrub broke its JSON, rather than export text that does not parse', () => {
-    // #given a scrubber that mangles the serialization
-    const mangling = {scrub: (text: string) => ({ok: true as const, text: `${text}}`, redactions: 1})}
-
-    // #when
-    const span = scrubSpan(
-      spanWith({attributes: {'gen_ai.tool.call.result': contentAttribute({a: 1}, 65_536)}}),
-      mangling,
-    )
-
-    // #then
-    expect(span.attributes['gen_ai.tool.call.result']).toBeUndefined()
-    expect(span.attributes[MARKER.omitted]).toEqual(['gen_ai.tool.call.result:scrub-failed'])
   })
 
   it('brands a span only through scrubSpan', () => {
@@ -483,28 +469,26 @@ describe('passes do not interact: an earlier marker never makes a later pass ski
     },
   )
 
-  it('reads an unquoted value past a marker that is already in it', () => {
-    // #given a value an earlier stage already partly redacted
+  it('treats marker text in the ORIGINAL input as ordinary text: no skip, no crash, no leak of a secret next to it', () => {
+    // #given input that already contains the marker text (a model quoting an earlier trace), quoted and unquoted, with a real
+    // secret beside it
+    const quoted = text(`password: "${REDACTION}" and token: "${REDACTION}" and ${SECRETS.githubClassic}`)
+    const bare = withEnv.scrub(`password: ${REDACTION} next ${ENV_LITERAL}`)
+
+    // #then nothing is skipped as "already redacted" (there is no such concept: the matchers see only original text), the
+    // secret beside it is gone, and the bare marker is read as a value that ends at its `]` like any other
+    expect(quoted).toBe(`password: "${REDACTION}" and token: "${REDACTION}" and ${REDACTION}`)
+    expect(bare).toEqual({ok: true, text: `password: ${REDACTION}] next ${REDACTION}`, redactions: 2})
+  })
+
+  it('reads an unquoted value that contains marker text as the first token, up to its `]` like any other delimiter', () => {
+    // #given a value whose first token is `pre-[REDACTED` and whose rest is after a `]`
     const out = text(`password=pre-${REDACTION}-tailword and more`)
 
-    // #then the suffix goes too
-    expect(out).not.toContain('tailword')
-  })
-
-  it('leaves a value that is exactly the marker alone, and does not count it again', () => {
-    // #given text that was already redacted upstream
-    const result = withEnv.scrub(`password: ${REDACTION} and token: "${REDACTION}"`)
-
-    // #then
-    expect(result).toEqual({ok: true, text: `password: ${REDACTION} and token: "${REDACTION}"`, redactions: 0})
-  })
-
-  it('redacts a value that merely starts with the marker, in full', () => {
-    // #given
-    const out = text(`password: ${REDACTION}leftover-suffix next`)
-
-    // #then
-    expect(out).not.toContain('leftover')
+    // #then the token before the delimiter is removed and what follows is left, exactly as for `pa]ss-tailword`; the marker
+    // text is not special (a secret that contains `]` is cut there by design, as before)
+    expect(out).toBe(`password=${REDACTION}]-tailword and more`)
+    expect(text('password=pa]ss-tailword and more')).toBe(`password=${REDACTION}]ss-tailword and more`)
   })
 
   it('does not count one value twice when a literal and an assignment both match it', () => {
@@ -671,6 +655,7 @@ describe('adversarial timing: growth, not a ceiling', () => {
       ['header glued to its own prefix', rep('-----BEGIN -----BEGIN PRIVATE KEY-----')],
     ],
     'github-token': [
+      ['dense matches, one every 41 characters', rep(join('ghp_', 'aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5 '))],
       ['prefix, 35 chars (one short)', run('ghp_', 'a', 35)],
       ['prefix, 300 chars (over the bound)', run('ghp_', 'a', 300)],
       ['prefix, 40 chars, glued', run('ghp_', 'a', 40)],
@@ -678,6 +663,7 @@ describe('adversarial timing: growth, not a ceiling', () => {
       ['prefix repeated', rep('ghp_')],
     ],
     'aws-access-key-id': [
+      ['dense matches, one every 21 characters', rep(join('AKIA', 'IOSFODNN7EXAMPLE '))],
       ['prefix, 15 chars', run('AKIA', 'A', 15)],
       ['prefix, 17 chars', run('AKIA', 'A', 17)],
       ['prefix repeated', rep('AKIA')],
@@ -692,6 +678,7 @@ describe('adversarial timing: growth, not a ceiling', () => {
       ['one long run after the prefix', n => `sk-${'a'.repeat(n)}`],
     ],
     jwt: [
+      ['dense matches, one every 36 characters', rep(join('eyJhbGciOiJ', '.eyJzdWIiOiIx.abcdefgh '))],
       ['eyJ- repeated (the class takes the dash)', rep('eyJ-')],
       ['eyJ, a dash, repeated, then a dot', n => `${rep('eyJ-')(n)}.`],
       ['eyJ-  with a dash run', run('eyJ', '-', 7)],
@@ -715,6 +702,7 @@ describe('adversarial timing: growth, not a ceiling', () => {
       ['scheme, one long run', n => `mongodb+srv://${'a'.repeat(n)}`],
     ],
     'url-userinfo': [
+      ['dense matches, one every 12 characters', rep('a://u:p@h/ ')],
       ['255 chars and no @', run('a://', 'b', 255)],
       ['257 chars and no @', run('a://', 'b', 257)],
       ['scheme repeated', rep('a://')],
@@ -728,6 +716,8 @@ describe('adversarial timing: growth, not a ceiling', () => {
       ['semicolons', rep(';password')],
     ],
     'name-value-pair': [
+      ['dense matches, one every 19 characters', rep('password=abcdefgh ')],
+      ['dense quoted matches', rep('secret: "ab cd" ')],
       ['the word alone', rep('password')],
       ['the word and 20 name chars', run('password', 'a', 20)],
       ['the word, 19 chars and a quote', rep(`password${'a'.repeat(19)}"`)],
@@ -862,10 +852,10 @@ describe('the JWT scanner agrees with the pattern it replaced', () => {
       })
 
       // #when
-      const got = jwt?.apply(text, text.toLowerCase())
+      const got = jwt === undefined ? undefined : scrubWithMatchers(text, [jwt])
 
       // #then
-      expect({text: got?.text, count: got?.count}).toEqual({text: count === 0 ? text : expected, count})
+      expect({text: got?.text, count: got?.redactions}).toEqual({text: count === 0 ? text : expected, count})
     }
   })
 
@@ -874,7 +864,7 @@ describe('the JWT scanner agrees with the pattern it replaced', () => {
     const glued = `xeyJ${'a'.repeat(8)}.${'b'.repeat(8)}.${'c'.repeat(4)}`
 
     // #when / #then
-    expect(jwt?.apply(glued, glued.toLowerCase()).count).toBe(0)
+    expect(jwt === undefined ? -1 : matchRanges(jwt, glued)).toEqual([])
   })
 })
 
