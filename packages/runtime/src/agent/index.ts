@@ -377,6 +377,32 @@ export type {
 } from './subagent-notice.js'
 export {parseSyntheticNoticePart, parseTaskNotice} from './task-notice.js'
 export type {TaskNotice} from './task-notice.js'
+export {
+  encodeTraceRelayConfig,
+  formatTraceRelayCountsHeader,
+  isValidTraceRelayHeaderName,
+  isValidTraceRelayHeaderValue,
+  parseTraceRelayChildLine,
+  parseTraceRelayConfig,
+  parseTraceRelayCountsHeader,
+  readTraceRelayFrameLength,
+  TRACE_RELAY_CONFIG_VERSION,
+  TRACE_RELAY_COUNTS_HEADER,
+  TRACE_RELAY_MAX_CONFIG_BYTES,
+  TRACE_RELAY_PATH,
+  TRACE_RELAY_STATUS,
+  validateTraceRelayUrl,
+} from './trace-relay-wire.js'
+export type {
+  TraceRelayBatchCounts,
+  TraceRelayChildErrorCode,
+  TraceRelayChildLine,
+  TraceRelayHeader,
+  TraceRelayLimits,
+  TraceRelayPluginCounts,
+  TraceRelayWireConfig,
+} from './trace-relay-wire.js'
+export type {StartTraceRelayOptions, TraceRelayServer} from './trace-relay.js'
 export type {
   AcknowledgmentState,
   AgentContext,
