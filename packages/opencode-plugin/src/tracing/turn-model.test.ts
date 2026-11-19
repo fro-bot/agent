@@ -93,8 +93,8 @@ function script() {
       add({kind: 'step.started', sessionId, messageId, agent: 'build', model: 'm', provider: 'p'}),
     stepEnded: (sessionId: string, messageId: string) =>
       add({kind: 'step.ended', sessionId, messageId, finish: 'stop', rawFinish: 'stop', usage: USAGE, cost: 0}),
-    text: (sessionId: string, messageId: string) =>
-      add({kind: 'output', sessionId, messageId, part: 'text', text: 'ok'}),
+    text: (sessionId: string, messageId: string, text = 'ok', part: 'text' | 'reasoning' = 'text') =>
+      add({kind: 'output', sessionId, messageId, part, text}),
     toolNamed: (sessionId: string, callId: string, tool = 'read') => add({kind: 'tool.named', sessionId, callId, tool}),
     toolCalled: (sessionId: string, callId: string, extra: Partial<Extract<Observation, {kind: 'tool.called'}>> = {}) =>
       add({kind: 'tool.called', sessionId, callId, executed: false, input: {from: 'event'}, ...extra}),
@@ -1368,5 +1368,132 @@ describe('the tombstone of a closed root', () => {
 
     // #then the model remembers no more than its bound, and the expired entry is gone
     expect(model.stats().tombstones).toBeLessThanOrEqual(DEFAULT_LIMITS.maxTombstones)
+  })
+})
+
+describe('the model holds a bounded amount of output while a request is open', () => {
+  const limits = {maxOutputChars: 100, maxHeldOutputChars: 250}
+  const open = (s: ReturnType<typeof script>, session: string, tag: string) => {
+    s.prompt(session, `m-${tag}`)
+    s.enqueued(session, `m-${tag}`, 'user')
+    s.started(session)
+    s.delivered(session, `m-${tag}`)
+    s.request(session)
+    s.stepStarted(session, `s-${tag}`)
+  }
+  const close = (s: ReturnType<typeof script>, session: string, tag: string) => {
+    s.stepEnded(session, `s-${tag}`)
+    s.ended(session)
+  }
+  const outputOf = (records: readonly SpanRecord[]) => chats(records)[0]
+
+  it('keeps output up to the per-request budget whole, and cuts the part that crosses it, saying so', () => {
+    // #given two parts, the second crossing the 100-character budget
+    const s = script()
+    open(s, 'a', '1')
+    s.text('a', 's-1', 'x'.repeat(60))
+    s.text('a', 's-1', 'y'.repeat(60))
+    close(s, 'a', '1')
+
+    // #when
+    const {records} = replay(s.out, {limits})
+
+    // #then the first is whole, the second is cut to what remains, and the span says output was truncated
+    const chat = outputOf(records)
+    expect(chat?.texts.map(text => text.length)).toEqual([60, 40])
+    expect(chat?.gaps).toContain('output-truncated')
+  })
+
+  it('does not cut output that is exactly at the budget, and cuts one character over', () => {
+    // #given
+    const at = script()
+    open(at, 'a', '1')
+    at.text('a', 's-1', 'x'.repeat(100))
+    close(at, 'a', '1')
+    const over = script()
+    open(over, 'a', '1')
+    over.text('a', 's-1', 'x'.repeat(101))
+    close(over, 'a', '1')
+
+    // #when
+    const exact = outputOf(replay(at.out, {limits}).records)
+    const cut = outputOf(replay(over.out, {limits}).records)
+
+    // #then
+    expect([exact?.texts[0]?.length, exact?.gaps.includes('output-truncated')]).toEqual([100, false])
+    expect([cut?.texts[0]?.length, cut?.gaps.includes('output-truncated')]).toEqual([100, true])
+  })
+
+  it('omits a part that arrives when the budget is spent, and counts reasoning in the same budget', () => {
+    // #given reasoning that spends the budget, then a text part
+    const s = script()
+    open(s, 'a', '1')
+    s.text('a', 's-1', 'r'.repeat(100), 'reasoning')
+    s.text('a', 's-1', 'late')
+    close(s, 'a', '1')
+
+    // #when
+    const chat = outputOf(replay(s.out, {limits}).records)
+
+    // #then the reasoning is whole, the text is not there, and the span says a part was omitted
+    expect(chat?.reasoning.map(text => text.length)).toEqual([100])
+    expect(chat?.texts).toEqual([])
+    expect(chat?.gaps).toContain('output-omitted')
+  })
+
+  it('bounds the total across open requests, and gives the budget back when they close', () => {
+    // #given three sessions with open requests, each under its own budget and together over the aggregate of 250
+    const s = script()
+    for (const session of ['a', 'b', 'c']) open(s, session, session)
+    for (const session of ['a', 'b', 'c']) s.text(session, `s-${session}`, 'x'.repeat(90))
+    const {model, records} = replay(s.out, {limits, flush: false})
+
+    // #then the third request found the aggregate spent: it holds a cut part, and the total never passed the bound
+    expect(model.stats().heldOutputChars).toBeLessThanOrEqual(250)
+    expect(model.stats().heldOutputChars).toBe(250)
+
+    // #when everything closes
+    for (const session of ['a', 'b', 'c']) close(s, session, session)
+    const closed = replay(s.out, {limits})
+
+    // #then all three spans exist, the aggregate-limited one says so, and nothing is held afterwards
+    expect(chats(closed.records)).toHaveLength(3)
+    expect(chats(closed.records).filter(chat => chat.gaps.includes('output-truncated'))).toHaveLength(1)
+    expect(closed.model.stats().heldOutputChars).toBe(0)
+    expect(records).toHaveLength(0)
+  })
+
+  it('bounds a compaction summary and a title the same way', () => {
+    // #given a compaction whose text is over the budget
+    const s = script()
+    s.prompt('a', 'm1')
+    s.enqueued('a', 'm1', 'user')
+    s.started('a')
+    s.delivered('a', 'm1')
+    s.request('a', 'compaction')
+    s.at(50)
+    s.out.push({kind: 'compaction.ended', at: 50, sessionId: 'a', ok: true, text: 'z'.repeat(500)})
+    s.ended('a')
+
+    // #when
+    const {records} = replay(s.out, {limits})
+
+    // #then
+    const compaction = chats(records).find(chat => chat.requestKind === 'compaction')
+    expect(compaction?.texts.join('').length).toBe(100)
+    expect(compaction?.gaps).toContain('output-truncated')
+  })
+
+  it('holds nothing at flush', () => {
+    // #given open requests with output
+    const s = script()
+    open(s, 'a', '1')
+    s.text('a', 's-1', 'x'.repeat(80))
+
+    // #when
+    const {model} = replay(s.out, {limits})
+
+    // #then
+    expect(model.stats().heldOutputChars).toBe(0)
   })
 })

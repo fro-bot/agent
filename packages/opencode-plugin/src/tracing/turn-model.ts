@@ -21,6 +21,8 @@
 
 import type {ErrorInfo, InboxItemKind, Observation, RequestKind, Usage} from './observation.js'
 
+import {Buffer} from 'node:buffer'
+
 export type {ErrorInfo, ExecutionOutcome, InboxItemKind, Observation, RequestKind, Usage} from './observation.js'
 
 export type ToolOutcome = 'success' | 'error' | 'rejected' | 'interrupted'
@@ -152,6 +154,14 @@ export interface TurnModelLimits {
    * arrived. Past this the oldest is dropped, silently.
    */
   readonly maxPendingToolNotes: number
+  /**
+   * Characters of model output (text and reasoning, a compaction summary, a title) one open request keeps. A part that
+   * crosses it is cut to what is left (a copy, so the larger string is not kept alive) and the span says so; later parts are
+   * omitted and the span says so. Equal to the span's own output bound.
+   */
+  readonly maxOutputChars: number
+  /** The same, summed over every open request in the model: past it, parts are cut or omitted the same way. */
+  readonly maxHeldOutputChars: number
   /** How long such a note waits for its event before it is dropped, silently. Checked on a tick and on the next note. */
   readonly toolNoteWaitMs: number
   /**
@@ -174,6 +184,8 @@ export const DEFAULT_LIMITS: TurnModelLimits = {
   maxOpenSpansPerTrace: 1_024,
   maxOutputParts: 64,
   maxPromptsPerSpan: 32,
+  maxOutputChars: 128 * 1024,
+  maxHeldOutputChars: 8 * 1024 * 1024,
   maxPendingToolNotes: 64,
   toolNoteWaitMs: 10_000,
   tombstoneTtlMs: 24 * 60 * 60_000,
@@ -188,6 +200,8 @@ export interface TurnModelStats {
   readonly unresolvedDispatches: number
   /** Tool names and hook observations waiting for their session event. */
   readonly pendingToolNotes: number
+  /** Characters of model output held by open requests. */
+  readonly heldOutputChars: number
   readonly droppedSpans: number
 }
 
@@ -263,6 +277,8 @@ interface RequestState {
   messageId: string | undefined
   texts: string[]
   reasoning: string[]
+  /** Characters of `texts` and `reasoning`, counted against the output budgets. */
+  outputChars: number
   toolCalls: RequestedToolCall[]
   finishReason: string | undefined
   rawFinishReason: string | undefined
@@ -369,6 +385,9 @@ export function createTurnModel(options: {
   const unresolved = new Set<string>()
   /** Child sessions that have been placed under a dispatch. */
   const linked = new Set<string>()
+  /** Characters of model output held by open requests, against `maxHeldOutputChars`. */
+  let heldOutputChars = 0
+
   /** Child session id to the closed trace it belonged to, and when it closed. Oldest first. */
   const tombstones = new Map<string, {readonly traceId: string; readonly at: number}>()
   /** Marks to put on a root trace the moment it is opened for a session. */
@@ -516,6 +535,8 @@ export function createTurnModel(options: {
   ): void {
     if (request.closed) return
     request.closed = true
+    // The request's output moves into its record: it no longer counts against what open requests hold.
+    heldOutputChars = Math.max(0, heldOutputChars - request.outputChars)
     request.trace.openSpans = Math.max(0, request.trace.openSpans - 1)
     const model = request.model
     emit({
@@ -995,6 +1016,7 @@ export function createTurnModel(options: {
       attempt,
       messageId: undefined,
       texts: [],
+      outputChars: 0,
       reasoning: [],
       toolCalls: [],
       finishReason: undefined,
@@ -1081,9 +1103,33 @@ export function createTurnModel(options: {
   function onOutput(o: Extract<Observation, {kind: 'output'}>): void {
     const request = sessions.get(o.sessionId)?.stepOwner.get(o.messageId)
     if (request === undefined) return
-    const parts = o.part === 'text' ? request.texts : request.reasoning
-    if (parts.length >= limits.maxOutputParts) request.gaps.add('output-over-limit')
-    else parts.push(o.text)
+    addOutput(request, o.part === 'text' ? request.texts : request.reasoning, o.text)
+  }
+
+  /**
+   * Keeps one output part, within the per-request and the aggregate character budgets and the part-count limit. A part that
+   * crosses a budget is cut to what is left, as a fresh copy (a slice would keep the whole string alive); a part that
+   * arrives when nothing is left is omitted. Either way the request says so.
+   */
+  function addOutput(request: RequestState, parts: string[], text: string): void {
+    if (request.closed) return
+    if (parts.length >= limits.maxOutputParts) {
+      request.gaps.add('output-over-limit')
+      return
+    }
+    const room = Math.min(limits.maxOutputChars - request.outputChars, limits.maxHeldOutputChars - heldOutputChars)
+    if (room <= 0) {
+      request.gaps.add('output-omitted')
+      return
+    }
+    let kept = text
+    if (text.length > room) {
+      kept = Buffer.from(text.slice(0, room), 'utf8').toString('utf8')
+      request.gaps.add('output-truncated')
+    }
+    parts.push(kept)
+    request.outputChars += kept.length
+    heldOutputChars += kept.length
   }
 
   // ------------------------------------------------------------------ tool calls
@@ -1300,7 +1346,7 @@ export function createTurnModel(options: {
     const request = node === undefined ? undefined : oldestPending(node, 'compaction')
     if (node === undefined || request === undefined) return
     if (o.ok) {
-      if (o.text !== undefined) request.texts.push(o.text)
+      if (o.text !== undefined) addOutput(request, request.texts, o.text)
       request.usage = o.usage
       request.cost = o.cost
       request.gaps.delete('usage')
@@ -1315,7 +1361,7 @@ export function createTurnModel(options: {
     const node = sessions.get(o.sessionId)
     const request = node === undefined ? undefined : oldestPending(node, 'title')
     if (node === undefined || request === undefined) return
-    request.texts.push(o.title)
+    addOutput(request, request.texts, o.title)
     emitRequest(request, o.at, 'ok')
     removeRequest(node, request)
     touch(request.trace, o.at)
@@ -1462,6 +1508,7 @@ export function createTurnModel(options: {
       bufferedBytes,
       tombstones: tombstones.size,
       unresolvedDispatches: unresolved.size,
+      heldOutputChars,
       pendingToolNotes: [...sessions.values()].reduce((sum, node) => sum + node.notes.size, 0),
       droppedSpans,
     }),
