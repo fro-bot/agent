@@ -238,7 +238,7 @@ FROM version-gate AS runtime
 WORKDIR /app
 
 # Pinned tool versions (track the runtime constants noted in the header).
-ARG SYSTEMATIC_VERSION=3.35.3
+ARG SYSTEMATIC_VERSION=3.36.0
 
 # System packages come from the base image's Alpine 3.24 branch and are not
 # pinned: the branch index drops older versions, so exact pins would break the
