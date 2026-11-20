@@ -1244,6 +1244,8 @@ interface TreeWalk {
   redactions: number
   /** String leaves withheld because a sensitive value's end could not be established. */
   withheld: number
+  /** Entries dropped because every key they could take was occupied (see `freeKey`). */
+  droppedKeys: number
 }
 
 type TreeFailureReason = 'over-input-ceiling' | 'scrub-failed' | 'too-many-ranges'
@@ -1271,21 +1273,25 @@ function scrubLeaf(text: string, scrubber: Scrubber, walk: TreeWalk): string {
   return result.text
 }
 
-/** The most entries that may share one scrubbed key name; past it the later ones merge into the last suffix. */
+/** The most entries that may share one scrubbed key name (the plain name and the suffixes ` (2)` to ` (64)`). */
 const MAX_KEY_COLLISIONS = 64
 
 /**
- * The key to write a scrubbed entry under. Two distinct keys that differ only inside text the scrubber redacts become the same
- * text, and the later entry would overwrite the earlier; the later ones get ` (2)`, ` (3)`... instead, so no entry is lost and
- * no original text is kept. Bounded: the probe stops at `MAX_KEY_COLLISIONS`.
+ * The key to write a scrubbed entry under, or undefined when there is none. Two distinct keys that differ only inside text the
+ * scrubber redacts become the same text, and the later entry would overwrite the earlier. THE RULE: this only ever returns an
+ * unoccupied key, so an entry is never overwritten, whether the occupant is a scrubbed key or a genuine input key that happens to
+ * look like a suffixed name (`name (2)`, before or after the colliding keys: a later genuine key is itself a collision with an
+ * occupied key and probes from its own name). A colliding key takes ` (2)`, ` (3)`... in order, skipping any that are taken. With
+ * every one up to ` (64)` taken, there is no free key: the caller drops the entry and counts it (`key-collision-overflow`). No
+ * original text is kept, and the probe is bounded.
  */
-function freeKey(target: Record<string, unknown>, name: string): string {
+function freeKey(target: Record<string, unknown>, name: string): string | undefined {
   if (!Object.hasOwn(target, name)) return name
-  for (let n = 2; n < MAX_KEY_COLLISIONS; n += 1) {
+  for (let n = 2; n <= MAX_KEY_COLLISIONS; n += 1) {
     const candidate = `${name} (${String(n)})`
     if (!Object.hasOwn(target, candidate)) return candidate
   }
-  return `${name} (${String(MAX_KEY_COLLISIONS)})`
+  return undefined
 }
 
 function scrubNode(value: unknown, depth: number, scrubber: Scrubber, walk: TreeWalk): unknown {
@@ -1304,9 +1310,13 @@ function scrubNode(value: unknown, depth: number, scrubber: Scrubber, walk: Tree
       if (isSensitiveKey(key, child)) {
         // The whole value goes, whatever its type; nothing inside it is read, and the marker is never scanned.
         walk.redactions += 1
-        copy[freeKey(copy, scrubLeaf(key, scrubber, walk))] = REDACTION
+        const slot = freeKey(copy, scrubLeaf(key, scrubber, walk))
+        if (slot === undefined) walk.droppedKeys += 1
+        else copy[slot] = REDACTION
       } else {
-        copy[freeKey(copy, scrubLeaf(key, scrubber, walk))] = scrubNode(child, depth + 1, scrubber, walk)
+        const slot = freeKey(copy, scrubLeaf(key, scrubber, walk))
+        if (slot === undefined) walk.droppedKeys += 1
+        else copy[slot] = scrubNode(child, depth + 1, scrubber, walk)
       }
     }
     return copy
@@ -1325,11 +1335,23 @@ export function scrubStructured(
   value: unknown,
   scrubber: Scrubber,
 ):
-  | {readonly ok: true; readonly value: unknown; readonly redactions: number; readonly withheld: number}
+  | {
+      readonly ok: true
+      readonly value: unknown
+      readonly redactions: number
+      readonly withheld: number
+      readonly droppedKeys: number
+    }
   | {readonly ok: false; readonly reason: TreeFailureReason} {
-  const walk: TreeWalk = {nodes: 0, redactions: 0, withheld: 0}
+  const walk: TreeWalk = {nodes: 0, redactions: 0, withheld: 0, droppedKeys: 0}
   try {
-    return {ok: true, value: scrubNode(value, 0, scrubber, walk), redactions: walk.redactions, withheld: walk.withheld}
+    return {
+      ok: true,
+      value: scrubNode(value, 0, scrubber, walk),
+      redactions: walk.redactions,
+      withheld: walk.withheld,
+      droppedKeys: walk.droppedKeys,
+    }
   } catch (error) {
     return {ok: false, reason: error instanceof TreeFailure ? error.reason : 'scrub-failed'}
   }
@@ -1377,6 +1399,8 @@ export function scrubSpan(
       tally.redactions += walked.redactions
       // Leaves withheld for an unbounded sensitive value are the marker in the output; the span says so once per attribute.
       if (walked.withheld > 0) tally.omitted.push(`${name}:sensitive-value-unbounded`)
+      // Entries dropped for want of a free key: counted once per attribute, with a fixed reason.
+      if (walked.droppedKeys > 0) tally.omitted.push(`${name}:key-collision-overflow`)
       // Already scrubbed, leaf by leaf: only serialized here, to bound it, never scanned.
       const json = serialize(walked.value)
       if (json === undefined) {

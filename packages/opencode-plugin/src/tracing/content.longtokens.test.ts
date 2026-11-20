@@ -6,7 +6,7 @@
 
 import {describe, expect, it} from 'vitest'
 
-import {createScrubber, REDACTION, scrubStructured} from './content.js'
+import {contentAttribute, createScrubber, MARKER, REDACTION, scrubSpan, scrubStructured} from './content.js'
 
 const scrubber = createScrubber({env: {}})
 const scrub = (text: string): string => {
@@ -147,15 +147,88 @@ describe('object keys that collide once scrubbed keep every entry', () => {
     })
   })
 
-  it('is bounded: past 64 collisions the later entries merge into the last suffix instead of probing without end', () => {
-    // #given 200 keys that all scrub to the same text
-    const input: Record<string, number> = {}
-    for (let index = 0; index < 200; index += 1)
-      input[`id-ghp_${String(index).padStart(3, '0')}${'x'.repeat(33)}`] = index
-    const out = walk(input)
+  const colliding = (from: number, to: number): Record<string, number> => {
+    const keys: Record<string, number> = {}
+    for (let index = from; index < to; index += 1)
+      keys[`id-ghp_${String(index).padStart(3, '0')}${'x'.repeat(33)}`] = index
+    return keys
+  }
+  const walked = (value: unknown) => {
+    const result = scrubStructured(value, scrubber)
+    if (!result.ok) throw new Error(result.reason)
+    return result
+  }
 
-    // #then the keys are the plain name and (2) to (64), and the last holds the last value
+  it('never overwrites an existing entry: a genuine key named like a suffix keeps its place, before or after the pair', () => {
+    // #given a genuine `id-[REDACTED] (2)` before two colliding keys, and the same after them
+    const before = walked({[`id-${REDACTION} (2)`]: 'genuine', [`id-${tokenA}`]: 1, [`id-${tokenB}`]: 2})
+    const after = walked({[`id-${tokenA}`]: 1, [`id-${tokenB}`]: 2, [`id-${REDACTION} (2)`]: 'genuine'})
+
+    // #then the genuine key is itself a collision with an occupied key and takes the next free suffix; nothing is lost
+    expect(before.value).toEqual({
+      [`id-${REDACTION}`]: 1,
+      [`id-${REDACTION} (2)`]: 'genuine',
+      [`id-${REDACTION} (3)`]: 2,
+    })
+    expect(after.value).toEqual({
+      [`id-${REDACTION}`]: 1,
+      [`id-${REDACTION} (2)`]: 2,
+      [`id-${REDACTION} (2) (2)`]: 'genuine',
+    })
+    expect(before.droppedKeys + after.droppedKeys).toBe(0)
+  })
+
+  it('probes past taken suffixes up to the cap, then drops the entry and counts it, never overwriting a distinct key at the cap', () => {
+    // #given a genuine key occupying the last suffix (64), then 100 colliding keys (the group saturates at 63 of them)
+    const input = {[`id-${REDACTION} (64)`]: 'genuine', ...colliding(0, 100)}
+    const result = walked(input)
+    const out = result.value as Record<string, unknown>
+
+    // #then the genuine entry is intact, the group fills the plain name and (2) to (63), and the rest are dropped and counted
+    expect(out[`id-${REDACTION} (64)`]).toBe('genuine')
     expect(Object.keys(out)).toHaveLength(64)
-    expect(out[`id-${REDACTION} (64)`]).toBe(199)
+    expect(out[`id-${REDACTION}`]).toBe(0)
+    expect(out[`id-${REDACTION} (63)`]).toBe(62)
+    expect(result.droppedKeys).toBe(100 - 63)
+  })
+
+  it('drops the colliding entries past the cap when the group comes first, and a later genuine key takes its own next suffix', () => {
+    // #given 70 colliding keys, then a genuine key named like the last suffix
+    const result = walked({...colliding(0, 70), [`id-${REDACTION} (64)`]: 'genuine'})
+    const out = result.value as Record<string, unknown>
+
+    // #then the group holds the plain name and (2) to (64) and the six past it are dropped; the genuine key collides with the
+    // occupied (64), so it probes from its own name and is written as `... (64) (2)`: nothing is overwritten
+    expect(out[`id-${REDACTION} (64)`]).toBe(63)
+    expect(out[`id-${REDACTION} (64) (2)`]).toBe('genuine')
+    expect(Object.keys(out)).toHaveLength(65)
+    expect(result.droppedKeys).toBe(6)
+  })
+
+  it('reports an overflow once per attribute, with a fixed reason, and exports no original text', () => {
+    // #given a tool result object with 100 colliding keys, and one with none
+    const noisy = {content: [{type: 'text', text: 'ok'}], meta: colliding(0, 100)}
+    const quiet = {content: [{type: 'text', text: 'ok'}], meta: colliding(0, 3)}
+    const make = (value: unknown) =>
+      scrubSpan(
+        {
+          traceId: 't',
+          spanId: 's',
+          parentSpanId: undefined,
+          name: 'execute_tool read',
+          kind: 'internal',
+          startMs: 1,
+          endMs: 2,
+          attributes: {'gen_ai.tool.call.result': contentAttribute(value, 1_048_576)},
+          status: {code: 'unset'},
+          events: [],
+        },
+        scrubber,
+      )
+
+    // #then
+    expect(make(noisy).attributes[MARKER.omitted]).toEqual(['gen_ai.tool.call.result:key-collision-overflow'])
+    expect(make(quiet).attributes[MARKER.omitted]).toBeUndefined()
+    expect(JSON.stringify(make(noisy).attributes)).not.toContain('ghp_')
   })
 })
