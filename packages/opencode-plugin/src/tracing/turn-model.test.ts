@@ -2103,3 +2103,270 @@ describe('a session id in an ordinary tool’s result', () => {
     expect(model.stats().openTraces).toBe(1)
   })
 })
+
+describe('a refused primary request keeps its own step events', () => {
+  const CAP = {maxOpenSpansPerTrace: 1}
+  /** The chat span of the session's primary request that holds `text`, or undefined. */
+  const chatWith = (records: readonly SpanRecord[], text: string) =>
+    chats(records).find(chat => chat.requestKind === 'primary' && chat.texts.includes(text))
+
+  /** The review's sequence: request 1 bound, request 2 refused (cap), request 1 ends, request 3 admitted, then request 2's events. */
+  const reviewSequence = () => {
+    const s = script()
+    s.started('p')
+    s.request('p')
+    s.stepStarted('p', 'm1')
+    s.request('p')
+    s.text('p', 'm1', 'one')
+    s.stepEnded('p', 'm1')
+    s.request('p')
+    // Request 2's own step events arrive after request 3 started.
+    s.stepStarted('p', 'm2')
+    s.text('p', 'm2', 'second request text')
+    s.stepEnded('p', 'm2')
+    // Request 3's own events.
+    s.stepStarted('p', 'm3')
+    s.text('p', 'm3', 'partial third')
+    return s
+  }
+
+  it('does not give the refused request’s text, finish or usage to the next admitted request', () => {
+    // #given the sequence, with a span cap of one open span, and the execution then ends
+    const s = reviewSequence()
+    s.ended('p')
+
+    // #when
+    const {records, model} = replay(s.out, {limits: CAP, flush: false})
+
+    // #then the refused request's text is on no span, and request 3 carries its own text
+    expect(model.stats().droppedSpans).toBe(1)
+    expect(chatWith(records, 'second request text')).toBeUndefined()
+    const third = chatWith(records, 'partial third')
+    expect(third).toBeDefined()
+    expect(third?.texts).toEqual(['partial third'])
+    expect(third?.gaps).not.toContain('step-binding-uncertain')
+    expect(model.stats().bindingTombstones).toBe(0)
+  })
+
+  it('handles two refused requests in a row', () => {
+    // #given request 1 bound and open, requests 2 and 3 refused, request 1 ends, request 4 admitted, then each step in order
+    const s = script()
+    s.started('p')
+    s.request('p')
+    s.stepStarted('p', 'm1')
+    s.request('p')
+    s.request('p')
+    s.text('p', 'm1', 'one')
+    s.stepEnded('p', 'm1')
+    s.request('p')
+    for (const [id, text] of [
+      ['m2', 'text two'],
+      ['m3', 'text three'],
+      ['m4', 'text four'],
+    ] as const) {
+      s.stepStarted('p', id)
+      s.text('p', id, text)
+      s.stepEnded('p', id)
+    }
+    s.ended('p')
+
+    // #when
+    const {records, model} = replay(s.out, {limits: CAP, flush: false})
+
+    // #then only requests 1 and 4 have spans, each with its own text
+    expect(model.stats().droppedSpans).toBe(2)
+    expect(chats(records).map(chat => chat.texts)).toEqual([['one'], ['text four']])
+    expect(model.stats().bindingTombstones).toBe(0)
+  })
+
+  it('consumes a refused request’s place when a retry hook reports its failure', () => {
+    // #given a refused request that fails before its step starts (a retry hook), then the next request admitted
+    const s = script()
+    s.started('p')
+    s.request('p')
+    s.stepStarted('p', 'm1')
+    s.request('p')
+    const beforeRetry = replay(s.out, {limits: CAP, flush: false}).model.stats().bindingTombstones
+    s.out.push({
+      kind: 'retry',
+      sessionId: 'p',
+      attempt: 2,
+      willRetry: true,
+      error: {type: 'provider.internal', message: 'x'},
+      at: lastAt(s.out) + 1,
+    })
+    const afterRetry = replay(s.out, {limits: CAP, flush: false}).model.stats().bindingTombstones
+    s.text('p', 'm1', 'one')
+    s.stepEnded('p', 'm1')
+    s.request('p')
+    s.stepStarted('p', 'm2')
+    s.stepStarted('p', 'm3')
+    s.text('p', 'm3', 'the third')
+    s.stepEnded('p', 'm3')
+    s.ended('p')
+
+    // #when
+    const {records, model} = replay(s.out, {limits: CAP, flush: false})
+
+    // #then the retry consumed the refused request's place at once (not request 3's), and the failed attempt's step start was skipped
+    expect([beforeRetry, afterRetry]).toEqual([1, 0])
+    expect(chatWith(records, 'the third')).toBeDefined()
+    expect(chats(records).map(chat => chat.texts)).toEqual([['one'], ['the third']])
+    expect(model.stats().bindingTombstones).toBe(0)
+  })
+
+  it('forgets a refused request whose step events never come once its window has passed, and binds the next one correctly', () => {
+    // #given a refused request with no events at all, and the next request starting after the window
+    const s = script()
+    s.started('p')
+    s.request('p')
+    s.stepStarted('p', 'm1')
+    s.request('p')
+    s.text('p', 'm1', 'one')
+    s.stepEnded('p', 'm1')
+    const refusedAt = lastAt(s.out)
+    const late = script()
+    late.out.push(...s.out)
+    late.at(refusedAt + DEFAULT_LIMITS.refusedWindowMs + 1)
+    late.request('p')
+    late.stepStarted('p', 'm3')
+    late.text('p', 'm3', 'the next')
+    late.stepEnded('p', 'm3')
+    late.ended('p')
+
+    // #when
+    const {records, model} = replay(late.out, {limits: CAP, flush: false})
+
+    // #then the tombstone expired, so the next request binds its own step, and nothing is marked uncertain
+    expect(chatWith(records, 'the next')?.gaps).not.toContain('step-binding-uncertain')
+    expect(model.stats().bindingTombstones).toBe(0)
+  })
+
+  it('keeps the tombstone to its exact window: still there one millisecond inside it, gone at the end', () => {
+    // #given a refused request at time t
+    const build = (after: number) => {
+      const s = script()
+      s.started('p')
+      s.request('p')
+      s.stepStarted('p', 'm1')
+      s.request('p')
+      const refusedAt = lastAt(s.out)
+      s.out.push({kind: 'tick', at: refusedAt + after})
+      return replay(s.out, {limits: CAP, flush: false}).model.stats().bindingTombstones
+    }
+
+    // #then
+    expect(build(DEFAULT_LIMITS.refusedWindowMs - 1)).toBe(1)
+    expect(build(DEFAULT_LIMITS.refusedWindowMs)).toBe(0)
+  })
+
+  it('marks the requests behind a tombstone that was evicted by the count bound, and gives them no output', () => {
+    // #given one slot for tombstones and three refused requests, so the oldest is evicted while its events may still arrive
+    const s = script()
+    s.started('p')
+    s.request('p')
+    s.stepStarted('p', 'm1')
+    s.request('p')
+    s.request('p')
+    s.request('p')
+    s.text('p', 'm1', 'one')
+    s.stepEnded('p', 'm1')
+    s.request('p')
+    // The events of refused requests 2, 3 and 4 and of admitted request 5, in order: the evicted one's step shifts everything.
+    for (const [id, text] of [
+      ['m2', 'text two'],
+      ['m3', 'text three'],
+      ['m4', 'text four'],
+      ['m5', 'text five'],
+    ] as const) {
+      s.stepStarted('p', id)
+      s.text('p', id, text)
+      s.stepEnded('p', id)
+    }
+    s.ended('p')
+
+    // #when
+    const {records, model} = replay(s.out, {limits: {...CAP, maxRefusedPrimaries: 1}, flush: false})
+
+    // #then request 5 may have been bound to another request's step: it carries no output and says why
+    const five = chats(records).find(chat => chat.gaps.includes('step-binding-uncertain'))
+    expect(five).toBeDefined()
+    expect(five?.texts).toEqual([])
+    expect(five?.reasoning).toEqual([])
+    expect(five?.toolCalls).toEqual([])
+    expect(five?.finishReason).toBeUndefined()
+    expect(five?.usage).toBeUndefined()
+    for (const text of ['text two', 'text three', 'text four', 'text five']) {
+      expect(chatWith(records, text)).toBeUndefined()
+    }
+    expect(model.stats().bindingTombstones).toBe(0)
+  })
+
+  it('keeps a subagent’s refused request off the parent’s spans: each session binds in its own queue', () => {
+    // #given a parent that dispatches a child, and a trace cap that leaves no room for the child's request
+    const s = script()
+    s.prompt('p', 'mp')
+    s.enqueued('p', 'mp', 'user')
+    s.started('p')
+    s.delivered('p', 'mp')
+    s.request('p')
+    s.stepStarted('p', 'sp1')
+    s.toolBefore('p', 'c1', 'subagent', 'sp1')
+    s.toolAfter('p', 'c1', 'subagent', 'kid')
+    s.toolEnded('p', 'c1', {childSessionId: 'kid'})
+    s.stepEnded('p', 'sp1')
+    s.created('kid', 'p')
+    s.prompt('kid', 'mk')
+    s.enqueued('kid', 'mk', 'user')
+    s.started('kid')
+    s.delivered('kid', 'mk')
+    s.request('kid')
+    s.request('p')
+    s.stepStarted('kid', 'sk')
+    s.text('kid', 'sk', 'child text')
+    s.stepEnded('kid', 'sk')
+    s.stepStarted('p', 'sp2')
+    s.text('p', 'sp2', 'parent text')
+    s.stepEnded('p', 'sp2')
+    s.ended('kid')
+    s.ended('p')
+
+    // #when only two spans may be open: the parent's request and the dispatch call
+    const {records} = replay(s.out, {limits: {maxOpenSpansPerTrace: 2}, flush: false})
+
+    // #then the parent's second request carries the parent's text, and no span carries the child's text under the parent's id
+    const parentChats = chats(records).filter(chat => chat.sessionId === 'p')
+    expect(parentChats.flatMap(chat => chat.texts)).toContain('parent text')
+    expect(parentChats.flatMap(chat => chat.texts)).not.toContain('child text')
+  })
+
+  it('drops a refused request’s place when its execution ends, so a request that never produced steps cannot swallow the next execution’s', () => {
+    // #given a trace kept open by a dispatched subagent (so the session survives its execution), a refused request with no step
+    // events at all, the execution ending, and a later execution with a request of its own
+    const s = script()
+    s.started('p')
+    s.request('p')
+    s.stepStarted('p', 'm1')
+    s.toolBefore('p', 'c1', 'subagent', 'm1')
+    s.toolAfter('p', 'c1', 'subagent', 'kid')
+    s.request('p')
+    s.text('p', 'm1', 'one')
+    s.stepEnded('p', 'm1')
+    s.ended('p')
+    const afterEnd = replay(s.out, {limits: {maxOpenSpansPerTrace: 2}, flush: false}).model.stats()
+    s.started('p')
+    s.request('p')
+    s.stepStarted('p', 'm9')
+    s.text('p', 'm9', 'the next execution')
+    s.stepEnded('p', 'm9')
+    s.ended('p')
+
+    // #when
+    const {records} = replay(s.out, {limits: {maxOpenSpansPerTrace: 2}, flush: false})
+
+    // #then the place was dropped at the end (the trace and the session are still open), and the next request binds its own step, nothing marked
+    expect(afterEnd).toMatchObject({openTraces: 1, bindingTombstones: 0})
+    expect(chatWith(records, 'the next execution')?.gaps).not.toContain('step-binding-uncertain')
+    expect(chatWith(records, 'the next execution')?.finishReason).toBe('stop')
+  })
+})

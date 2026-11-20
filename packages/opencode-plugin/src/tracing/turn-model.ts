@@ -182,6 +182,17 @@ export interface TurnModelLimits {
    * unattributed trace. The count bound (`maxTombstones`) applies too.
    */
   readonly tombstoneTtlMs: number
+  /**
+   * Refused primary requests remembered per session, each holding the place its step events will arrive in (see
+   * "Binding steps to requests"). Past it the oldest is forgotten while its events may still arrive, and the requests behind it
+   * are marked `step-binding-uncertain`.
+   */
+  readonly maxRefusedPrimaries: number
+  /**
+   * How long a refused primary request is remembered. A step follows its request's hook within seconds; after this it is assumed
+   * never to come (its request failed first), and the place is dropped without marking anything.
+   */
+  readonly refusedWindowMs: number
 }
 
 export const DEFAULT_LIMITS: TurnModelLimits = {
@@ -206,6 +217,8 @@ export const DEFAULT_LIMITS: TurnModelLimits = {
   maxPendingToolNotes: 64,
   toolNoteWaitMs: 10_000,
   tombstoneTtlMs: 24 * 60 * 60_000,
+  maxRefusedPrimaries: 16,
+  refusedWindowMs: 60_000,
 }
 
 export interface TurnModelStats {
@@ -213,6 +226,8 @@ export interface TurnModelStats {
   readonly sessions: number
   readonly bufferedSessions: number
   readonly bufferedBytes: number
+  /** Refused primary requests still holding a place for their step events. */
+  readonly bindingTombstones: number
   readonly tombstones: number
   readonly unresolvedDispatches: number
   /** Tool names and hook observations waiting for their session event. */
@@ -316,6 +331,10 @@ interface RequestState {
   marks: Set<string>
   /** Closed by a `retry` hook: waiting only for its `step.started` to be skipped. */
   closed: boolean
+  /** Place in the session's step-binding queue (`SessionNode.nextBindSeq`). */
+  readonly bindSeq: number
+  /** A tombstone ahead of it was evicted too early: the step it binds may not be its own, so it carries no output. */
+  bindUncertain: boolean
 }
 
 interface ToolState {
@@ -350,6 +369,12 @@ interface ToolNote {
   after?: Extract<Observation, {kind: 'tool.after'}> | undefined
 }
 
+/** A refused primary request: no span, but its step events will still arrive, and must be consumed by something that is not a later request. */
+interface Refused {
+  readonly seq: number
+  readonly at: number
+}
+
 interface SessionNode {
   readonly id: string
   /** Set for a child session: its trace and its own invoke span. */
@@ -368,6 +393,12 @@ interface SessionNode {
   readonly stepOwner: Map<string, RequestState>
   /** Steps still to start for requests a `retry` hook already closed. */
   skipStepStarts: number
+  /** Primary requests refused at the span cap, in start order, each holding its place in the step-binding queue. */
+  refused: Refused[]
+  /** Start-order counter shared by admitted and refused primary requests, so the oldest of either binds first. */
+  nextBindSeq: number
+  /** Until this time a request that starts may be bound to a step that is not its own (a tombstone was evicted too early). */
+  uncertainUntil: number
   nextAttempt: number
   lastActivity: number
 }
@@ -525,6 +556,9 @@ export function createTurnModel(options: {
       completed: new Set(),
       stepOwner: new Map(),
       skipStepStarts: 0,
+      refused: [],
+      nextBindSeq: 0,
+      uncertainUntil: -1,
       nextAttempt: 1,
       lastActivity: at,
     }
@@ -625,6 +659,8 @@ export function createTurnModel(options: {
     heldOutputChars = Math.max(0, heldOutputChars - request.outputChars)
     request.trace.openSpans = Math.max(0, request.trace.openSpans - 1)
     const model = request.model
+    // A request that may have been bound to another request's step carries none of what that step produced.
+    const unbound = request.bindUncertain
     emit({
       kind: 'chat',
       spanId: request.spanId,
@@ -638,21 +674,21 @@ export function createTurnModel(options: {
       sessionId: request.sessionId,
       rootSessionId: request.trace.rootSessionId,
       agent: request.agent,
-      gaps: [...request.gaps],
+      gaps: request.bindUncertain ? [...request.gaps, 'step-binding-uncertain'] : [...request.gaps],
       marks: [...request.marks, ...extraMarks],
       requestKind: request.requestKind,
       provider: request.provider,
       model,
       attempt: request.attempt,
-      messageId: request.messageId,
+      messageId: unbound ? undefined : request.messageId,
       request: request.request,
-      texts: request.texts,
-      reasoning: request.reasoning,
-      toolCalls: request.toolCalls,
-      finishReason: request.finishReason,
-      rawFinishReason: request.rawFinishReason,
-      usage: request.usage,
-      cost: request.cost,
+      texts: unbound ? [] : request.texts,
+      reasoning: unbound ? [] : request.reasoning,
+      toolCalls: unbound ? [] : request.toolCalls,
+      finishReason: unbound ? undefined : request.finishReason,
+      rawFinishReason: unbound ? undefined : request.rawFinishReason,
+      usage: unbound ? undefined : request.usage,
+      cost: unbound ? undefined : request.cost,
       followOnOf: request.followOnOf,
       attemptCountUnknown: request.requestKind !== 'primary',
     })
@@ -1047,6 +1083,8 @@ export function createTurnModel(options: {
 
   function onExecutionEnded(o: Extract<Observation, {kind: 'execution.ended'}>): void {
     const node = sessions.get(o.sessionId)
+    // The execution is over: no step can still arrive for a request that was refused in it, so no place is held for one.
+    if (node !== undefined) node.refused.length = 0
     const trace = node?.active?.trace
     if (node === undefined || trace === undefined) return
     node.active = undefined
@@ -1100,9 +1138,12 @@ export function createTurnModel(options: {
     const invoke = invokeOf(node, trace)
     invoke.agent ??= o.agent
     node.agent ??= o.agent
+    const bindSeq = o.requestKind === 'primary' ? node.nextBindSeq++ : 0
     if (trace.openSpans >= limits.maxOpenSpansPerTrace) {
       droppedSpans += 1
       invoke.gaps.add('spans-over-limit')
+      // No span, but the request's step events will still arrive: it keeps its place in the binding queue.
+      if (o.requestKind === 'primary') refuseBinding(node, bindSeq, o.at)
       return
     }
     trace.openSpans += 1
@@ -1132,6 +1173,8 @@ export function createTurnModel(options: {
       gaps: new Set(o.requestKind === 'primary' ? [] : ['finishReason', 'usage']),
       marks: new Set(),
       closed: false,
+      bindSeq,
+      bindUncertain: o.requestKind === 'primary' && o.at <= node.uncertainUntil,
     }
     if (o.content === undefined) request.gaps.add('request')
     node.requests.push(request)
@@ -1139,6 +1182,54 @@ export function createTurnModel(options: {
 
   const oldestPending = (node: SessionNode, kind: RequestKind): RequestState | undefined =>
     node.requests.find(request => request.requestKind === kind && !request.closed && request.messageId === undefined)
+
+  // ------------------------------------------------------------------ binding steps to requests
+  //
+  // A primary request's hook carries no message id (the `session.context` payload has the session, model, system, messages,
+  // options, agent and tools), and the step events that follow name only a message id. So a step is bound to a request by ORDER:
+  // each session keeps its primary requests in start order, and a `step.started` binds the oldest one still waiting. Exact keying
+  // is not available at request start.
+  //
+  // Order only works if every request holds its place. A request refused at the span cap has no span, but its step events still
+  // arrive: it keeps a bounded placeholder (`Refused`) in the same queue, and its `step.started` (or its `retry`) consumes that,
+  // so its text, finish and usage are discarded with it instead of landing on the next admitted request. The placeholders are
+  // bounded by count (`maxRefusedPrimaries`) and by lifetime (`refusedWindowMs`). When the count bound evicts one that may still
+  // be owed a step, the order is unknowable for the requests behind it: they are marked `bindUncertain` and carry no output
+  // content, only the gap `step-binding-uncertain`, never another request's content.
+
+  /** Drops placeholders that have waited past the window: their step is assumed never to come, so nothing is marked. */
+  function expireRefused(now: number): void {
+    for (const node of sessions.values()) {
+      while (node.refused[0] !== undefined && now - node.refused[0].at >= limits.refusedWindowMs) node.refused.shift()
+    }
+  }
+
+  function refuseBinding(node: SessionNode, seq: number, at: number): void {
+    node.refused.push({seq, at})
+    if (node.refused.length <= limits.maxRefusedPrimaries) return
+    const evicted = node.refused.shift()
+    if (evicted === undefined) return
+    // Its step may still arrive and would bind to a request that is not its own: every request that waits behind it, and every
+    // one that starts within the window, may be bound to someone else's step.
+    node.uncertainUntil = Math.max(node.uncertainUntil, at + limits.refusedWindowMs)
+    for (const request of node.requests) {
+      if (
+        request.requestKind === 'primary' &&
+        !request.closed &&
+        request.messageId === undefined &&
+        request.bindSeq > evicted.seq
+      )
+        request.bindUncertain = true
+    }
+  }
+
+  /** What the next `step.started` (or `retry`) belongs to: the older of the oldest waiting request and the oldest placeholder. */
+  function nextToBind(node: SessionNode): {request: RequestState} | {refused: Refused} | undefined {
+    const request = oldestPending(node, 'primary')
+    const refused = node.refused[0]
+    if (refused !== undefined && (request === undefined || refused.seq < request.bindSeq)) return {refused}
+    return request === undefined ? undefined : {request}
+  }
 
   function removeRequest(node: SessionNode, request: RequestState): void {
     const index = node.requests.indexOf(request)
@@ -1148,8 +1239,16 @@ export function createTurnModel(options: {
   function onRetry(o: Extract<Observation, {kind: 'retry'}>): void {
     const node = sessions.get(o.sessionId)
     if (node === undefined) return
-    const request = oldestPending(node, 'primary')
-    if (request === undefined) return
+    const next = nextToBind(node)
+    if (next === undefined) return
+    if ('refused' in next) {
+      // The failed attempt is a refused request: it has no span to close, but its `step.started` still arrives and must skip.
+      node.refused.shift()
+      node.skipStepStarts += 1
+      node.nextAttempt = o.willRetry ? o.attempt : 1
+      return
+    }
+    const request = next.request
     // The failed attempt: closed now, since no output will ever join it. Its `step.started` still arrives.
     request.gaps.add('output')
     emitRequest(request, o.at, 'error', o.error)
@@ -1166,8 +1265,14 @@ export function createTurnModel(options: {
       node.skipStepStarts -= 1
       return
     }
-    const request = oldestPending(node, 'primary')
-    if (request === undefined) return
+    const next = nextToBind(node)
+    if (next === undefined) return
+    if ('refused' in next) {
+      // A refused request's step: consumed here, so its text, finish and usage find no owner and are discarded.
+      node.refused.shift()
+      return
+    }
+    const request = next.request
     request.messageId = o.messageId
     request.agent ??= o.agent
     request.model ??= o.model
@@ -1532,6 +1637,7 @@ export function createTurnModel(options: {
 
   function sweep(now: number): void {
     expireBuffers(now)
+    expireRefused(now)
     expireIdleSessions(now)
     for (const trace of [...traces]) {
       if (trace.closed) continue
@@ -1676,6 +1782,7 @@ export function createTurnModel(options: {
       sessions: sessions.size,
       bufferedSessions: buffered.size,
       bufferedBytes,
+      bindingTombstones: [...sessions.values()].reduce((sum, node) => sum + node.refused.length, 0),
       tombstones: tombstones.size,
       unresolvedDispatches: unresolved.size,
       heldOutputChars,
