@@ -89,6 +89,11 @@ export type Observation = ObservationBase &
         readonly kind: 'step.started'
         readonly sessionId: string
         readonly messageId: string
+        /**
+         * When the attempt started, in the server's clock (epoch milliseconds, taken after the request hook returned and before the
+         * provider was called): the key the step is joined to its request hook by. Absent when the event carried none.
+         */
+        readonly started?: number | undefined
         readonly agent?: string | undefined
         readonly model?: string | undefined
         readonly provider?: string | undefined

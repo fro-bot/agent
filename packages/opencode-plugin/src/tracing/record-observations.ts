@@ -249,7 +249,16 @@ export function observeEvent(raw: unknown, snapshot: SnapshotContext = {}): Obse
     case 'session.step.started': {
       if (messageId === undefined) return undefined
       const {model, provider} = modelOf(data.model)
-      return {kind: 'step.started', at, sessionId, messageId, agent: asString(data.agent), model, provider}
+      return {
+        kind: 'step.started',
+        at,
+        sessionId,
+        messageId,
+        started: asNumber(data.started),
+        agent: asString(data.agent),
+        model,
+        provider,
+      }
     }
     case 'session.step.ended':
       return messageId === undefined

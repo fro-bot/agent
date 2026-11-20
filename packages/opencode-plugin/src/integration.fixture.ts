@@ -28,11 +28,15 @@ export interface FakeStep {
   readonly delayMs?: number
   /** After the text, stall this long before finishing the stream (cut short when the client goes away). */
   readonly hangMs?: number
+  /** Write the text, then drop the connection mid-stream (a failure AFTER output started). */
+  readonly abortAfterText?: boolean
   /** Provider-reported prompt, cached and completion token counts. */
   readonly usage?: {readonly prompt: number; readonly cached?: number; readonly completion: number}
 }
 
 export interface RecordedRequest {
+  /** When the provider received it (`Date.now()`): the same clock as a hook's receive time, to line requests up with hooks. */
+  readonly receivedAt?: number
   readonly body: string
   readonly toolNames: readonly string[]
   readonly messages: readonly {
@@ -63,7 +67,12 @@ function sse(delta: Record<string, unknown>, finish: string | null, extra: Recor
 
 const sleep = async (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 
-export async function startFakeProvider(): Promise<FakeProvider> {
+export async function startFakeProvider(
+  options: {
+    /** Every text names the request that answered it (`#r<n>`, n counting every request) so a test can tell whose text it is. */
+    readonly tagResponses?: boolean
+  } = {},
+): Promise<FakeProvider> {
   const queue: FakeStep[] = []
   const requests: RecordedRequest[] = []
 
@@ -92,7 +101,7 @@ export async function startFakeProvider(): Promise<FakeProvider> {
         messages?: RecordedRequest['messages']
       }
       const toolNames = (parsed.tools ?? []).flatMap(tool => (tool.function?.name == null ? [] : [tool.function.name]))
-      requests.push({body, toolNames, messages: parsed.messages ?? []})
+      requests.push({body, toolNames, messages: parsed.messages ?? [], receivedAt: Date.now()})
 
       // Requests with no tools are title or summary generation; they get the default reply.
       const index =
@@ -114,7 +123,14 @@ export async function startFakeProvider(): Promise<FakeProvider> {
       res.writeHead(200, {'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive'})
       res.write(sse({role: 'assistant', content: ''}, null))
       if (step.reasoning != null) res.write(sse({reasoning_content: step.reasoning}, null))
-      if (step.text != null) res.write(sse({content: step.text}, null))
+      const tagged =
+        options.tagResponses === true && step.text != null ? `${step.text} #r${String(requests.length)}` : step.text
+      if (tagged != null) res.write(sse({content: tagged}, null))
+      if (step.abortAfterText === true) {
+        await sleep(50)
+        res.destroy()
+        return
+      }
       if (step.hangMs != null) {
         for (let waited = 0; waited < step.hangMs && !gone.value; waited += 100) await sleep(100)
         if (gone.value) return
