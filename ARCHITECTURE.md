@@ -268,7 +268,7 @@ Per-repo S3 conditional-write locks (`If-None-Match` / `If-Match`) built by `get
 - With S3 configured, a lock error fails the Action closed; a contended Action exits 0 as `skipped`; a run without the lock never persists session state.
 - Ordinary renewal and release are guarded by the lock's ETag (`If-Match`). Adopting a renewal whose result was lost, and ownership-based cleanup (the gateway's release retry, the post hook's delete), check the acquisition instead: holder id, job or run id and the per-acquisition `acquisition_token`. A record without a token is never adopted.
 - The Action holder id stays `action:<runId>:<attempt>`; older agent versions match exactly that shape. The job identity rides in `holder_job`.
-- The gateway corroborates every expired lease before replacing it (`ConfirmExpiredHolder` `clear`, via `packages/gateway/src/execute/repo-quiescence.ts`). Only the Action reclaims an expired lease directly, and only from an Action holder (`reclaimableWithoutConfirmation`). This is snapshot corroboration, not fencing.
+- The gateway corroborates every expired lease before replacing it (`ConfirmExpiredHolder` `clear`, via `packages/gateway/src/execute/repo-quiescence-v2.ts`). Only the Action reclaims an expired lease directly, and only from an Action holder (`reclaimableWithoutConfirmation`). This is snapshot corroboration, not fencing.
 
 > See also: [Execution Lifecycle](docs/wiki/Execution%20Lifecycle.md#s3-conditional-write-locks-gateway-repojson-action-actionjson)
 
