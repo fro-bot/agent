@@ -29,7 +29,20 @@ import type {
 import type {TraceRelayLauncher, TraceRelayProcess, TraceRelayStopResult} from './trace-relay-process.js'
 import {Buffer} from 'node:buffer'
 import {execFileSync} from 'node:child_process'
-import {existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync} from 'node:fs'
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
@@ -80,6 +93,18 @@ const CREDENTIAL_USER = 'pk-trace-canary-user-0001'
 const CREDENTIAL_PASSWORD = 'sk-trace-canary-secret-9f3a'
 const CREDENTIAL = `Basic ${Buffer.from(`${CREDENTIAL_USER}:${CREDENTIAL_PASSWORD}`).toString('base64')}`
 const PROJECT_HEADER = 'x-trace-canary-project'
+const PROJECT_VALUE = 'canary-project-1'
+// Every form the credential and the headers could take: nothing the run logs, writes, exports or hands the agent may hold one.
+const CREDENTIAL_FORMS = [
+  `Authorization: ${CREDENTIAL}`,
+  `${PROJECT_HEADER}: ${PROJECT_VALUE}`,
+  CREDENTIAL,
+  CREDENTIAL.slice('Basic '.length),
+  `${CREDENTIAL_USER}:${CREDENTIAL_PASSWORD}`,
+  CREDENTIAL_USER,
+  CREDENTIAL_PASSWORD,
+  PROJECT_VALUE,
+] as const
 
 const MODEL = 'fake/fixture-model'
 const NOT_TOOL = '"role":"tool"'
@@ -147,6 +172,25 @@ function writeStubPlugin(dir: string, id: string): string {
   return dir
 }
 
+const MAX_SCANNED_FILE_BYTES = 8 * 1024 * 1024
+
+/** The file's bytes through one handle (opened without following a link), or null for anything that is not a small regular file. */
+function readSmallFile(file: string): Buffer | null {
+  let fd: number
+  try {
+    fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW)
+  } catch {
+    return null
+  }
+  try {
+    // The size and the read are both of the open handle, so nothing can be swapped in between them.
+    const stat = fstatSync(fd)
+    return stat.isFile() && stat.size <= MAX_SCANNED_FILE_BYTES ? readFileSync(fd) : null
+  } finally {
+    closeSync(fd)
+  }
+}
+
 /** Every file under `root` (up to 8 MB each) that holds `needle`, as paths relative to it. */
 function filesHolding(root: string, needle: string): string[] {
   const hits: string[] = []
@@ -154,24 +198,23 @@ function filesHolding(root: string, needle: string): string[] {
     for (const entry of readdirSync(dir, {withFileTypes: true})) {
       const full = path.join(dir, entry.name)
       if (entry.isDirectory()) walk(full)
-      else if (entry.isFile() && statSync(full).size <= 8 * 1024 * 1024 && readFileSync(full).includes(needle)) {
-        hits.push(path.relative(root, full))
-      }
+      else if (entry.isFile() && readSmallFile(full)?.includes(needle) === true) hits.push(path.relative(root, full))
     }
   }
   walk(root)
   return hits
 }
 
-/** The environment and command line of a live process where the platform shows them (Linux), else null. */
-function processTextIfReadable(pid: number): string | null {
-  try {
-    return [`/proc/${pid}/environ`, `/proc/${pid}/cmdline`]
-      .map(file => readFileSync(file, 'utf8').replaceAll('\u{0}', '\n'))
-      .join('\n')
-  } catch {
-    return null
-  }
+/**
+ * The environment and command line of a LIVE process, read now. Linux only: it throws when they cannot be read, so a
+ * platform that shows them can never pass by failing to look. Elsewhere (macOS has no /proc) it returns null, and the test
+ * says so in its assertions: nothing about the relay's process is checked there.
+ */
+function liveProcessText(pid: number): string | null {
+  if (process.platform !== 'linux') return null
+  return [`/proc/${pid}/environ`, `/proc/${pid}/cmdline`]
+    .map(file => readFileSync(file, 'utf8').replaceAll('\u{0}', '\n'))
+    .join('\n')
 }
 
 /** A recording plain-HTTP OTLP-ish sink: anything it receives is a leak in the scenarios that use it. */
@@ -217,6 +260,8 @@ interface TurnResult {
   /** The plugin list `buildCIConfigV2` wrote, before the local build was swapped in. */
   readonly configuredPlugins: readonly string[]
   readonly spawnConfigJson: string
+  /** The relay's environment and command line, read while it was alive (Linux), else null. */
+  readonly relayProcessText: string | null
   /** The whole session as the server returned it, which includes the output of the `shell` call. */
   readonly session: string
   readonly relay: TraceRelayProcess | null
@@ -286,7 +331,7 @@ async function runTurn(options: TurnOptions): Promise<TurnResult> {
   const parsed = parseTraceInputs(
     {
       endpoint: upstream === null ? '' : `${upstreamOrigin}/api/public/otel/v1/traces`,
-      headers: `Authorization: ${CREDENTIAL}\n${PROJECT_HEADER}: canary-project-1`,
+      headers: `Authorization: ${CREDENTIAL}\n${PROJECT_HEADER}: ${PROJECT_VALUE}`,
     },
     {warning: () => undefined, notice: () => undefined, info: () => undefined, mask: () => undefined},
   )
@@ -322,6 +367,7 @@ async function runTurn(options: TurnOptions): Promise<TurnResult> {
 
   let configuredPlugins: readonly string[] = []
   let spawnConfigJson = ''
+  let relayProcessText: string | null = null
   const startOptions: StartActionOpenCodeV2Options = {
     binaryPath: BINARY as string,
     workspacePath: box.repo,
@@ -352,16 +398,27 @@ async function runTurn(options: TurnOptions): Promise<TurnResult> {
     deps: {
       installPlugins: async () => ok(undefined),
       startServer: async (spawnOptions, spawnLogger) => {
-        const config = spawnOptions.config as {plugins: string[]} & Record<string, unknown>
-        configuredPlugins = [...config.plugins]
-        spawnConfigJson = JSON.stringify(config)
-        const local = config.plugins.map(spec => {
-          if (spec.startsWith('@fro.bot/systematic@')) return stubSystematic
-          if (spec.startsWith('@fro.bot/opencode-plugin@')) return PLUGIN_DIR
-          return spec
-        })
+        // The Action's tracing decision is taken by the runtime start right before the spawn. This wraps it: it takes the
+        // decision as made, records the config and plugin order that decision gave, and swaps each npm spec for its local
+        // directory in the same position, so what the child receives is the production decision on a local build.
+        const decide = spawnOptions.tracingHost
         return startOpenCodeV2Server(
-          {...spawnOptions, config: {...config, plugins: local}, timeouts: {agentReadyTimeoutMs: 90_000}},
+          {
+            ...spawnOptions,
+            tracingHost: () => {
+              const decision = typeof decide === 'function' ? decide() : {host: decide}
+              const config = (decision.config ?? spawnOptions.config) as {plugins: string[]} & Record<string, unknown>
+              configuredPlugins = [...config.plugins]
+              spawnConfigJson = JSON.stringify(config)
+              const local = config.plugins.map(spec => {
+                if (spec.startsWith('@fro.bot/systematic@')) return stubSystematic
+                if (spec.startsWith('@fro.bot/opencode-plugin@')) return PLUGIN_DIR
+                return spec
+              })
+              return {host: decision.host, config: {...config, plugins: local}}
+            },
+            timeouts: {agentReadyTimeoutMs: 90_000},
+          },
           spawnLogger,
         )
       },
@@ -416,6 +473,8 @@ async function runTurn(options: TurnOptions): Promise<TurnResult> {
             .join(', ')}`,
       )
     }
+    // The relay is alive here (it stops after the server): read its process now, not after it has gone.
+    relayProcessText = relay === null ? null : liveProcessText(relay.pid)
     const stopped = await handle.shutdown()
     shutdown = stopped.exit.outcome
     // The relay goes after the server has exited, as `run.ts` does.
@@ -430,6 +489,7 @@ async function runTurn(options: TurnOptions): Promise<TurnResult> {
     started,
     configuredPlugins,
     spawnConfigJson,
+    relayProcessText,
     session,
     relay,
     relayStop,
@@ -440,6 +500,22 @@ async function runTurn(options: TurnOptions): Promise<TurnResult> {
     spans: decodeSpans(requests),
   }
 }
+
+describe('the credential scan used by the real-binary test', () => {
+  it('finds a form in a file, follows no link, and skips what is not a small regular file', () => {
+    // #given a tree with the form in one file, a link to it, a clean file, and a directory
+    const root = mkdtempSync(path.join(os.tmpdir(), 'fro-bot-trace-scan-'))
+    cleanups.push(() => rmSync(root, {recursive: true, force: true}))
+    mkdirSync(path.join(root, 'nested'))
+    writeFileSync(path.join(root, 'nested', 'holds.txt'), `before ${CREDENTIAL_PASSWORD} after`)
+    writeFileSync(path.join(root, 'clean.txt'), 'nothing here')
+    symlinkSync(path.join(root, 'nested', 'holds.txt'), path.join(root, 'link.txt'))
+
+    // #then only the real file is reported (a clean scan is not a scan that looked at nothing)
+    expect(filesHolding(root, CREDENTIAL_PASSWORD)).toEqual([path.join('nested', 'holds.txt')])
+    expect(filesHolding(root, 'absent-needle')).toEqual([])
+  })
+})
 
 describe.skipIf(!enabled)('Action tracing against the real OpenCode V2 binary and the built plugin', () => {
   it('delivers a turn through the relay with the configured header and the Action identity, and keeps the credential out of the server', async () => {
@@ -474,7 +550,7 @@ describe.skipIf(!enabled)('Action tracing against the real OpenCode V2 binary an
     expect(turn.upstream?.requests.length).toBeGreaterThan(0)
     for (const received of turn.upstream?.requests ?? []) {
       expect(received.headers.authorization).toBe(CREDENTIAL)
-      expect(received.headers[PROJECT_HEADER]).toBe('canary-project-1')
+      expect(received.headers[PROJECT_HEADER]).toBe(PROJECT_VALUE)
       expect(received.url).toBe('/api/public/otel/v1/traces')
     }
     const root = turn.spans.find(isRoot)
@@ -496,28 +572,32 @@ describe.skipIf(!enabled)('Action tracing against the real OpenCode V2 binary an
     // #and the credential is not in the server's environment, as the agent sees it, nor in its config, nor on disk
     expect(turn.session).toContain('OPENCODE_FROBOT_TRACING=')
     expect(turn.session).toContain(`127.0.0.1:${turn.relay?.port}/v1/traces`)
-    for (const form of [CREDENTIAL, CREDENTIAL.slice('Basic '.length), CREDENTIAL_USER, CREDENTIAL_PASSWORD]) {
+    // every form is checked, not only the decoded password: the whole header line, the encoded part, the decoded pair
+    for (const form of CREDENTIAL_FORMS) {
       expect(turn.session).not.toContain(form)
       expect(turn.spawnConfigJson).not.toContain(form)
       expect(filesHolding(turn.box.root, form)).toEqual([])
     }
     expect(turn.spawnConfigJson).not.toContain(turn.upstream?.origin ?? 'no-origin')
-    // where the platform shows a process (Linux), the relay's own environment and arguments hold none of it either
-    const relayText = turn.relay === null ? null : processTextIfReadable(turn.relay.pid)
-    expect(relayText?.includes(CREDENTIAL_PASSWORD) ?? false).toBe(false)
+    // the relay's own environment and arguments, read while it was alive. On Linux they must be readable (a read that fails
+    // fails the test) and must show the command that was run; on macOS they are not inspected at all, because it has no /proc.
+    expect(turn.relayProcessText !== null || process.platform !== 'linux').toBe(true)
+    expect(turn.relayProcessText === null || turn.relayProcessText.includes('trace-relay.js')).toBe(true)
+    for (const form of CREDENTIAL_FORMS) expect(turn.relayProcessText?.includes(form) ?? false).toBe(false)
 
     // #and no OTEL_ variable reached the server, and OpenCode's own exporter sent nothing to the job's endpoint
     expect(turn.session).not.toMatch(/OTEL_/)
     expect(otel.requests).toEqual([])
 
-    // #and nothing the run logged holds the credential or the collector address
+    // #and nothing the run logged holds any form of the credential, or the collector address
     const logged = `${serializeLoggerCalls(turn.runLog)}\n${serializeLoggerCalls(turn.relayLog)}`
-    expect(logged).not.toContain(CREDENTIAL_PASSWORD)
+    const exported = JSON.stringify((turn.upstream?.requests ?? []).map(received => received.body.toString('utf8')))
+    for (const form of CREDENTIAL_FORMS) {
+      expect(logged).not.toContain(form)
+      // and the spans the collector received do not hold one either
+      expect(exported).not.toContain(form)
+    }
     expect(logged).not.toContain(turn.upstream?.origin ?? 'no-origin')
-    // and the spans the collector received do not hold it either
-    expect(
-      JSON.stringify((turn.upstream?.requests ?? []).map(received => received.body.toString('utf8'))),
-    ).not.toContain(CREDENTIAL_PASSWORD)
   }, 180_000)
 
   it('completes the run, and logs the batches as not acknowledged, when the collector refuses connections', async () => {
@@ -543,7 +623,7 @@ describe.skipIf(!enabled)('Action tracing against the real OpenCode V2 binary an
     expect(counts.retry + counts.dropped).toBeGreaterThan(0)
     const stopLine = vi.mocked(turn.relayLog.info).mock.calls.find(call => call[0] === 'Trace relay stopped')
     expect(stopLine?.[1]).toMatchObject({acknowledged: 0})
-    expect(serializeLoggerCalls(turn.relayLog)).not.toContain(CREDENTIAL_PASSWORD)
+    for (const form of CREDENTIAL_FORMS) expect(serializeLoggerCalls(turn.relayLog)).not.toContain(form)
   }, 180_000)
 
   it('sends nothing, and starts no relay, for a checkout and a restored session directory that name a tracing endpoint, with tracing off', async () => {

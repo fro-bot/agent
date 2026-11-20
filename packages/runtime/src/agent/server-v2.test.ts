@@ -16,7 +16,9 @@ import {
   ACTION_TRACING_OFF,
   buildTracingLauncherValue,
   WORKSPACE_TRACING_HOST,
+  type OpenCodeV2TracingDecision,
   type OpenCodeV2TracingHost,
+  type OpenCodeV2TracingSetting,
 } from './tracing-launcher.js'
 
 const FAST: Partial<OpenCodeV2Timeouts> = {
@@ -357,7 +359,73 @@ describe('startOpenCodeV2Server', () => {
 
         // #then a call that leaves the host out does not compile (checked by the type checker, not at run time)
         expectTypeOf<WithoutHost>().not.toExtend<Required>()
-        expectTypeOf<Required['tracingHost']>().toEqualTypeOf<OpenCodeV2TracingHost>()
+        expectTypeOf<Required['tracingHost']>().toEqualTypeOf<OpenCodeV2TracingSetting>()
+        // the plain host the workspace passes is one of the two forms, and so is a late resolver
+        expectTypeOf<OpenCodeV2TracingHost>().toExtend<OpenCodeV2TracingSetting>()
+        expectTypeOf<() => OpenCodeV2TracingDecision>().toExtend<OpenCodeV2TracingSetting>()
+      })
+
+      describe('a late decision', () => {
+        const BASE_CONFIG = {plugins: ['systematic', 'fro-bot', 'op-one']}
+        const ON_CONFIG = {plugins: ['systematic', 'op-one', 'fro-bot']}
+
+        it('is taken after the port is allocated and once, so a relay that went down while the port was picked is not advertised', async () => {
+          // #given a relay that goes down while the start is allocating its port: a microtask queued by the first call the
+          // start makes (registering the password) runs when the start yields to the port allocation
+          const created = fixture()
+          const relay = {down: false}
+          const decide = vi.fn((): OpenCodeV2TracingDecision =>
+            relay.down ? {host: ACTION_TRACING_OFF} : {host: ACTION_ON, config: ON_CONFIG},
+          )
+
+          // #when
+          const result = await start(created, {
+            config: BASE_CONFIG,
+            tracingHost: decide,
+            maskSecret: () => {
+              queueMicrotask(() => {
+                relay.down = true
+              })
+            },
+          })
+
+          // #then the child was given the off document and the base config, byte for byte what an off start gives
+          expect(result.success).toBe(true)
+          expect(decide).toHaveBeenCalledTimes(1)
+          expect(created.readRecord().env[LAUNCHER]).toBe(buildTracingLauncherValue(ACTION_TRACING_OFF))
+          expect(created.readRecord().env.OPENCODE_CONFIG_CONTENT).toBe(JSON.stringify(BASE_CONFIG))
+        })
+
+        it('gives the child the decision’s document and config when the relay is still up at the spawn', async () => {
+          // #given a relay that stays up
+          const created = fixture()
+
+          // #when
+          const result = await start(created, {
+            config: BASE_CONFIG,
+            tracingHost: () => ({host: ACTION_ON, config: ON_CONFIG}),
+          })
+
+          // #then
+          expect(result.success).toBe(true)
+          expect(created.readRecord().env[LAUNCHER]).toBe(buildTracingLauncherValue(ACTION_ON))
+          expect(created.readRecord().env.OPENCODE_CONFIG_CONTENT).toBe(JSON.stringify(ON_CONFIG))
+        })
+
+        it('keeps the base config when the decision carries none, and replaces an inherited launcher value', async () => {
+          const created = fixture()
+          const env = {PATH: process.env.PATH, [LAUNCHER]: '{"version":1,"host":"action","tracing":"on"}'}
+
+          const result = await start(created, {
+            config: BASE_CONFIG,
+            env,
+            tracingHost: () => ({host: ACTION_TRACING_OFF}),
+          })
+
+          expect(result.success).toBe(true)
+          expect(created.readRecord().env[LAUNCHER]).toBe(buildTracingLauncherValue(ACTION_TRACING_OFF))
+          expect(created.readRecord().env.OPENCODE_CONFIG_CONTENT).toBe(JSON.stringify(BASE_CONFIG))
+        })
       })
     })
 

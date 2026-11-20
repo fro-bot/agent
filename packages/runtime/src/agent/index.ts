@@ -412,7 +412,13 @@ export {
   tracingRelayUrl,
   WORKSPACE_TRACING_HOST,
 } from './tracing-launcher.js'
-export type {OpenCodeV2ActionTracingHost, OpenCodeV2TracingHost, TracingRunIdentity} from './tracing-launcher.js'
+export type {
+  OpenCodeV2ActionTracingHost,
+  OpenCodeV2TracingDecision,
+  OpenCodeV2TracingHost,
+  OpenCodeV2TracingSetting,
+  TracingRunIdentity,
+} from './tracing-launcher.js'
 export type {
   AcknowledgmentState,
   AgentContext,

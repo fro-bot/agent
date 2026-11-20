@@ -42,6 +42,24 @@ export type OpenCodeV2ActionTracingHost =
 /** Who launches the server, and what it says about tracing. Required by `startOpenCodeV2Server`, with no default. */
 export type OpenCodeV2TracingHost = OpenCodeV2ActionTracingHost | {readonly host: 'workspace'}
 
+/**
+ * What a late decision settles, once, right before the child is spawned: the launcher's host and, when the decision changes
+ * it, the config content the child receives. Everything that depends on whether tracing is on (the launcher document and the
+ * plugin list are the two today) must be in this one value, so a decision cannot be half applied.
+ */
+export interface OpenCodeV2TracingDecision {
+  readonly host: OpenCodeV2TracingHost
+  /** Replaces the start's `config` for this child. Absent: the start's own `config` (the tracing-off content) is used. */
+  readonly config?: Readonly<Record<string, unknown>>
+}
+
+/**
+ * What a start is given: a plain host, or a resolver the start calls once, after its port allocation and immediately before
+ * the spawn. A launcher that can learn something between preparing the start and spawning (the Action's relay can exit) passes
+ * the resolver; one that cannot (the workspace) passes its host. Either way the declaration is required.
+ */
+export type OpenCodeV2TracingSetting = OpenCodeV2TracingHost | (() => OpenCodeV2TracingDecision)
+
 export const ACTION_TRACING_OFF: OpenCodeV2ActionTracingHost = {host: 'action', tracing: 'off'}
 
 /** The workspace service: the plugin stays off there (gateway tracing is a later release). */

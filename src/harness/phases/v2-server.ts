@@ -4,6 +4,7 @@ import type {
   CredentialDisposition,
   OpenCodeV2SandboxLaunch,
   OpenCodeV2ServerHandle,
+  OpenCodeV2TracingDecision,
   StartOpenCodeV2ServerOptions,
 } from '@fro-bot/runtime'
 import type {ProviderKeyEntryV2} from '../../services/setup/credential-files-v2.js'
@@ -19,6 +20,7 @@ import * as path from 'node:path'
 import {setTimeout as delay} from 'node:timers/promises'
 import {err, ok} from '@bfra.me/es/result'
 import {
+  ACTION_TRACING_OFF,
   clearHeldClaims,
   FRO_BOT_PLUGIN_ID,
   modelProviderId,
@@ -139,10 +141,10 @@ export interface StartActionOpenCodeV2Options {
   /**
    * What the plugin is told about tracing: off, or on with the running relay's port and the run's identity, as a host or as a
    * source read at each use. Required, with no default, so a caller cannot start the server without deciding. The Action's own
-   * host only: this surface is never the workspace. A source is read once when the config is built (whether the Fro Bot plugin
-   * is listed after the operator's plugins) and again immediately before every spawn (what the launcher variable says), so a
-   * relay that died in between is never named to the plugin. Any further server start in a run must go through the same spawn
-   * options, and so reads the source again.
+   * host only: this surface is never the workspace. A source is read once while the start is prepared, only to know whether a
+   * traced config could be needed, and then once per spawn, after the runtime's port allocation and immediately before the
+   * child exists: that reading is the decision, and both the launcher document and the plugin list come from it. A relay that
+   * died in between is never named to the plugin, and the child then gets exactly what a run that never traced gets.
    */
   readonly tracing: ActionTracingSource
   readonly logger: Logger
@@ -386,7 +388,10 @@ export async function startActionOpenCodeV2(
     facts: {bytes: null, sessions: null},
   }
   const prepareRun = async (): Promise<
-    Result<{readonly built: BuiltConfigV2; readonly childEnv: NodeJS.ProcessEnv}, V2StartError>
+    Result<
+      {readonly built: BuiltConfigV2; readonly builtTraced: BuiltConfigV2 | null; readonly childEnv: NodeJS.ProcessEnv},
+      V2StartError
+    >
   > => {
     let proxied: Record<string, {baseURL: string; apiKey: string}> = {}
     if (options.sandbox != null && proxyPlans.length > 0) {
@@ -402,25 +407,38 @@ export async function startActionOpenCodeV2(
       )
     }
 
-    const builtConfig = buildCIConfigV2(
-      {
-        opencodeConfig: options.opencodeConfig,
-        credential: options.credential,
-        plugins: specs.data.specs,
-        runnerTemp: options.env.RUNNER_TEMP,
-        runId: options.runId,
-        runAttempt: options.runAttempt,
-        tracing: resolveActionTracing(options.tracing).tracing === 'on',
-        ...(options.env.FRO_BOT_INTEGRATION_WORK_DIR === undefined
-          ? {}
-          : {integrationWorkDir: options.env.FRO_BOT_INTEGRATION_WORK_DIR}),
-        ...(options.sandbox == null ? {providerKeyFiles: keyFiles} : {proxiedProviders: proxied}),
-        bundledSkillsDirectories,
-        ...(repoSkillsDirectory === undefined ? {} : {repoSkillsDirectory}),
-      },
-      logger,
-    )
+    const configInputs = {
+      opencodeConfig: options.opencodeConfig,
+      credential: options.credential,
+      plugins: specs.data.specs,
+      runnerTemp: options.env.RUNNER_TEMP,
+      runId: options.runId,
+      runAttempt: options.runAttempt,
+      ...(options.env.FRO_BOT_INTEGRATION_WORK_DIR === undefined
+        ? {}
+        : {integrationWorkDir: options.env.FRO_BOT_INTEGRATION_WORK_DIR}),
+      ...(options.sandbox == null ? {providerKeyFiles: keyFiles} : {proxiedProviders: proxied}),
+      bundledSkillsDirectories,
+      ...(repoSkillsDirectory === undefined ? {} : {repoSkillsDirectory}),
+    }
+    // The config a run that does not trace gets. This is the start's own config, and the one the child receives unless the
+    // spawn-time decision says tracing is on.
+    const builtConfig = buildCIConfigV2({...configInputs, tracing: false}, logger)
     if (!builtConfig.success) return stageError('config', `Invalid OpenCode configuration: ${builtConfig.error}`)
+    // The config a traced run would get (the plugin order and the dedupe of operator entries are the only differences), built
+    // only when the relay is up now. Whether it is used is decided later, once, at the spawn: a relay that is down now never
+    // comes back, so no traced variant is needed then. Built quietly, since the traced run's other warnings are the same ones.
+    const quiet: Logger = {
+      debug: () => undefined,
+      info: () => undefined,
+      warning: () => undefined,
+      error: () => undefined,
+    }
+    const tracedConfig =
+      resolveActionTracing(options.tracing).tracing === 'on'
+        ? buildCIConfigV2({...configInputs, tracing: true}, quiet)
+        : null
+    const builtTraced = tracedConfig?.success === true ? tracedConfig.data : null
     if (usesDefaultModel) {
       logDefaultModelNotice({
         logger,
@@ -438,6 +456,15 @@ export async function startActionOpenCodeV2(
         keys: keys.data,
         configs: [
           {label: 'the OpenCode config (OPENCODE_CONFIG_CONTENT)', text: JSON.stringify(builtConfig.data.content)},
+          // Either may be the one the child receives, so both are held to the same rule.
+          ...(builtTraced === null
+            ? []
+            : [
+                {
+                  label: 'the traced OpenCode config (OPENCODE_CONFIG_CONTENT)',
+                  text: JSON.stringify(builtTraced.content),
+                },
+              ]),
         ],
       })
       if (!clean.success) return stageError('config', clean.error)
@@ -472,10 +499,10 @@ export async function startActionOpenCodeV2(
       if (!prepared.success) return stageError('sandbox', `isolate-agent setup failed: ${prepared.error}`)
       if (ghConfigDir !== null) sandboxEnv = {...sandboxEnv, GH_CONFIG_DIR: ghConfigDir}
     }
-    return ok({built: builtConfig.data, childEnv: sandboxEnv})
+    return ok({built: builtConfig.data, builtTraced, childEnv: sandboxEnv})
   }
 
-  let prepared: Result<{readonly built: BuiltConfigV2; readonly childEnv: NodeJS.ProcessEnv}, V2StartError>
+  let prepared: Awaited<ReturnType<typeof prepareRun>>
   try {
     prepared = await prepareRun()
   } catch (error) {
@@ -486,8 +513,12 @@ export async function startActionOpenCodeV2(
     await releaseSandboxAfterFailure(options.sandbox, logger)
     return prepared
   }
-  const built = prepared.data.built
+  const builtUntraced = prepared.data.built
+  const builtTraced = prepared.data.builtTraced
   const childEnv = prepared.data.childEnv
+  // The config the child actually received, for the gates that read it after the spawn (permission rules, model, providers).
+  // The tracing-off one until the spawn-time decision says otherwise, and set by that decision alone.
+  let built = builtUntraced
   // The caller's signal, plus the proxy's: a proxy that dies on its own aborts the server and the gates.
   const runSignal =
     owned.proxy === null
@@ -501,6 +532,25 @@ export async function startActionOpenCodeV2(
   // With a sandbox the spawn goes through `sandbox.launch`, which records the attempt before port allocation begins and is
   // refused once the teardown has begun. `release` waits for the attempt to settle (and aborts it) before it verifies the
   // sandbox uid is empty, so a signal can no longer slip between this check and the privileged launch.
+  // The one tracing decision of a spawn. The runtime start calls it after its port allocation, right before the child exists:
+  // the relay is read here and nowhere else, and everything that depends on the answer comes from it: the launcher document
+  // (the host) and the plugin list and operator-entry dedupe (the traced config). An answer of off, or any failure to decide,
+  // gives the exact off document and the exact config of a run that never traced (the start's own config, which the decision
+  // leaves alone).
+  const decideTracing = (): OpenCodeV2TracingDecision => {
+    try {
+      const host = resolveActionTracing(options.tracing)
+      if (host.tracing === 'on' && builtTraced !== null) {
+        built = builtTraced
+        return {host, config: builtTraced.content}
+      }
+    } catch {
+      // Tracing never fails a start: fall through to off.
+    }
+    built = builtUntraced
+    return {host: ACTION_TRACING_OFF}
+  }
+
   const spawnOptions = (extra: {
     readonly sandbox?: OpenCodeV2SandboxLaunch
     readonly signal?: AbortSignal
@@ -509,15 +559,15 @@ export async function startActionOpenCodeV2(
     binaryPath: options.binaryPath,
     directory: options.workspacePath,
     expectedPluginIds: [SYSTEMATIC_V2_PLUGIN_ID, FRO_BOT_PLUGIN_ID],
-    config: built.content,
+    config: builtUntraced.content,
     env: childEnv,
     ...(extra.sandbox === undefined ? {} : {sandbox: extra.sandbox}),
     ...(extra.signal === undefined ? {} : {signal: extra.signal}),
     ...(extra.onSpawn === undefined ? {} : {onSpawn: extra.onSpawn}),
     ...(options.maskSecret === undefined ? {} : {maskSecret: options.maskSecret}),
     ...deps.startOptions,
-    // After the test seam's spread, so the host the caller declared is always the one the spawn writes.
-    tracingHost: resolveActionTracing(options.tracing),
+    // After the test seam's spread, so the decision is always the one the spawn applies.
+    tracingHost: decideTracing,
   })
 
   let started: Awaited<ReturnType<typeof deps.startServer>>
