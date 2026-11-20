@@ -193,4 +193,9 @@ export type Observation = ObservationBase &
     | {readonly kind: 'title'; readonly sessionId: string; readonly title: string}
     | {readonly kind: 'usage'; readonly sessionId: string}
     | {readonly kind: 'tick'}
+    /**
+     * Not an event of OpenCode: the pipeline lost an observation (its inbox was full, it was malformed, the model failed on it)
+     * and tells the model so, in its place in the sequence. `sessionIds` undefined means it cannot say whose it was: every session.
+     */
+    | {readonly kind: 'loss'; readonly sessionIds: readonly string[] | undefined; readonly reason: string}
   )

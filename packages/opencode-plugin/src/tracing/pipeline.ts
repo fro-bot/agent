@@ -219,6 +219,12 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
   const attributeOptions = options.identity === undefined ? {} : {identity: options.identity}
   /** Observations waiting for the model, each with the raw text it holds against `maxInboxChars`. */
   const inbox: {readonly observation: Observation; readonly chars: number}[] = []
+  /**
+   * Loss markers in `inbox`. They are not counted against `maxInbox` (the room for ordinary observations): a marker has a
+   * reserved slot and can never be dropped. Markers merge when adjacent, so there are never more than one more than the
+   * ordinary observations: the inbox stays bounded.
+   */
+  let markers = 0
   let inboxChars = 0
   let observationsOmitted = 0
   const records: SpanRecord[] = []
@@ -227,6 +233,60 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
   let observationsDropped = 0
   let recordsFailed = 0
   let tick: NodeJS.Timeout | undefined
+
+  const atOf = (observation: Observation): number => {
+    try {
+      return isPlainRecord(observation) && typeof observation.at === 'number' ? observation.at : now()
+    } catch {
+      return now()
+    }
+  }
+  const sessionOf = (observation: Observation): string | undefined => {
+    try {
+      return isPlainRecord(observation) && typeof observation.sessionId === 'string' ? observation.sessionId : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /** The most sessions one marker names; past it the marker names none, which means every session. */
+  const MAX_MARKER_SESSIONS = 32
+
+  /**
+   * Tells the model, in order, that `observation` never reached it: a marker at the tail (it happened after everything queued)
+   * or, for one the model just failed on, at the front. A marker next to another one joins it. A drop with no known session
+   * makes a marker that names none: every session.
+   */
+  function lose(observation: Observation, reason: string, position: 'tail' | 'front' = 'tail'): void {
+    // A session id that size is malformed (it is not stored): the loss counts for every session.
+    const named = sessionOf(observation)
+    const session = named !== undefined && named.length <= MAX_IDENTIFIER_CHARS ? named : undefined
+    const edge = position === 'tail' ? inbox.at(-1) : inbox[0]
+    const merged = edge?.observation
+    if (isPlainRecord(merged) && merged.kind === 'loss') {
+      const sessionIds =
+        merged.sessionIds === undefined || session === undefined
+          ? undefined
+          : merged.sessionIds.includes(session)
+            ? merged.sessionIds
+            : merged.sessionIds.length >= MAX_MARKER_SESSIONS
+              ? undefined
+              : [...merged.sessionIds, session]
+      const joined: Observation = {...merged, sessionIds}
+      if (position === 'tail') inbox[inbox.length - 1] = {observation: joined, chars: 0}
+      else inbox[0] = {observation: joined, chars: 0}
+      return
+    }
+    const marker: Observation = {
+      kind: 'loss',
+      at: atOf(observation),
+      sessionIds: session === undefined ? undefined : [session],
+      reason,
+    }
+    if (position === 'tail') inbox.push({observation: marker, chars: 0})
+    else inbox.unshift({observation: marker, chars: 0})
+    markers += 1
+  }
 
   /** Every snapshot a record holds: the request, the prompts, a tool's arguments and its result. */
   function release(record: SpanRecord): void {
@@ -303,15 +363,17 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
     if (queued !== undefined) {
       inboxChars -= queued.chars
       const next = queued.observation
+      if (isPlainRecord(next) && next.kind === 'loss') markers -= 1
       try {
         enqueue(model.observe(next))
         retainShared()
         releaseDiscarded()
         forwardDrops()
       } catch {
-        // A model failure loses this observation, never the session.
+        // A model failure loses this observation, never the session; the model hears of it before it sees anything else.
         observationsDropped += 1
         releaseObservation(next)
+        lose(next, 'model-failed', 'front')
       }
       return true
     }
@@ -345,9 +407,10 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
   return {
     observe: observation => {
       if (stopped) return
-      if (inbox.length >= limits.maxInbox) {
+      if (inbox.length - markers >= limits.maxInbox) {
         observationsDropped += 1
         releaseObservation(observation)
+        lose(observation, 'inbox-full')
         return
       }
       const measured = measure(observation)
@@ -355,6 +418,7 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
         // An identifier that size is not real: malformed, dropped, and anything it holds is freed.
         observationsDropped += 1
         releaseObservation(observation)
+        lose(observation, 'identifier-too-long')
         return
       }
       // Raw text over the remaining budget is replaced by its structure with the text omitted and marked. The replacement
@@ -378,11 +442,14 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
       const timeLeft = (): boolean => performance.now() < deadline
       // Observations first, so the model sees everything that happened; each step may be a slow one.
       while (inbox.length > 0 && timeLeft()) step()
-      // Out of time: what was never processed is lost, and says so. Its snapshots go back to the ledger.
+      // Out of time: what was never processed is lost, and its snapshots go back to the ledger. The model flushes next and closes
+      // every span as incomplete, so it needs no marker: nothing more will arrive for it to pair wrongly.
       for (const unprocessed of inbox.splice(0)) {
+        if (isPlainRecord(unprocessed.observation) && unprocessed.observation.kind === 'loss') continue
         observationsDropped += 1
         releaseObservation(unprocessed.observation)
       }
+      markers = 0
       inboxChars = 0
       try {
         enqueue(model.flush(now()))

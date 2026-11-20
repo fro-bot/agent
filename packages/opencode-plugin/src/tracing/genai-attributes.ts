@@ -109,6 +109,8 @@ function usageAttributes(usage: ChatRecord['usage']): Attributes {
 }
 
 function finishReasons(record: ChatRecord): readonly string[] | undefined {
+  // A span whose step data was withheld (binding uncertain) has an unknown response, not an interrupted one.
+  if (record.gaps.includes('step-binding-uncertain')) return undefined
   const reported = record.rawFinishReason ?? record.finishReason
   if (reported !== undefined) return [reported]
   if (record.status === 'error') return ['error']
