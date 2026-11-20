@@ -224,8 +224,10 @@ export interface TurnModelStats {
   readonly unresolvedDispatches: number
   /** Tool names and hook observations waiting for their session event. */
   readonly pendingToolNotes: number
-  /** Characters of model output held by open requests. */
+  /** Characters of model output held by open requests and by the final answers open agent spans retain. */
   readonly heldOutputChars: number
+  /** Open agent spans that retain a final answer's text. */
+  readonly answersHeld: number
   readonly droppedSpans: number
 }
 
@@ -269,6 +271,8 @@ interface InvokeState {
   standalone: 'compaction' | 'generate' | undefined
   /** The last primary response's text, while it is the last and stopped asking for tools; see `InvokeRecord.finalAnswer`. */
   finalAnswer: readonly string[] | undefined
+  /** The characters of `finalAnswer`, charged to the shared output budget while this span holds them. */
+  finalAnswerChars: number
 }
 
 interface TraceState {
@@ -315,6 +319,13 @@ interface RequestState {
   reasoning: string[]
   /** Characters of `texts` and `reasoning`, counted against the output budgets. */
   outputChars: number
+  /**
+   * Answer text was lost or shortened, from any cause (the part cap, a character budget, an omitted text part): independent of
+   * the bounded `texts` list, which only holds what was kept. Reasoning that was lost does not set it.
+   */
+  textLost: boolean
+  /** The response meant to call tools: a call was observed for it, whether or not one could be joined to the step. */
+  toolCallsSeen: boolean
   toolCalls: RequestedToolCall[]
   finishReason: string | undefined
   rawFinishReason: string | undefined
@@ -438,6 +449,8 @@ export function createTurnModel(options: {
   const releasedChildren = new Set<string>()
   /** Characters of model output held by open requests, against `maxHeldOutputChars`. */
   let heldOutputChars = 0
+  /** Open agent spans retaining a final answer's text (`releaseAnswer` gives each back). */
+  let answersHeld = 0
 
   /** Snapshots dropped with no span to carry them, until `takeDiscarded` hands them back. */
   let discarded: unknown[] = []
@@ -485,6 +498,7 @@ export function createTurnModel(options: {
       reportDeliveredInTrace: undefined,
       standalone: undefined,
       finalAnswer: undefined,
+      finalAnswerChars: 0,
     }
   }
 
@@ -625,25 +639,53 @@ export function createTurnModel(options: {
           ? invoke.finalAnswer
           : undefined,
     })
+    // The record carries the text now; the span holds none and its charge is returned.
+    releaseAnswer(invoke)
+  }
+
+  /** Gives back the shared-budget charge for the text an agent span retains, and clears the reference. */
+  function releaseAnswer(invoke: InvokeState): void {
+    if (invoke.finalAnswer !== undefined) answersHeld = Math.max(0, answersHeld - 1)
+    heldOutputChars = Math.max(0, heldOutputChars - invoke.finalAnswerChars)
+    invoke.finalAnswer = undefined
+    invoke.finalAnswerChars = 0
   }
 
   /**
-   * Each primary response that ends ok replaces its invoke's answer: its text parts if it stopped asking for tools, nothing if
-   * it asked for any (the turn is not over, or ended on a call). A title, compaction or generate request never counts, and a
-   * response that did not end ok leaves the answer alone (the turn's own status decides whether one is shown at all).
+   * Each primary response that ends ok replaces its invoke's answer: its text parts if it is a final answer, nothing if it is not.
+   * A final answer is a response whose text was kept whole (`textLost` is false: lost reasoning does not count) and that did not
+   * mean to call tools (no call was observed for it, and its finish reason is not `tool-calls`; one cut short by `length` or
+   * `content-filter` is not whole either). A title, compaction or generate request never counts, and a response that did not
+   * end ok leaves the answer alone (the turn's own status decides whether one is shown at all).
+   *
+   * The text is charged to the shared output budget while the span retains it: the charge the request held for its text moves to
+   * the span (returned, so the request does not release it), and `releaseAnswer` returns it when a later response replaces the
+   * answer or the span is emitted. Returns the characters whose charge moved.
    */
-  function recordFinalAnswer(request: RequestState, status: SpanStatus): void {
-    if (request.requestKind !== 'primary' || status !== 'ok') return
+  function recordFinalAnswer(request: RequestState, status: SpanStatus): number {
+    if (request.requestKind !== 'primary' || status !== 'ok') return 0
     const node = sessions.get(request.sessionId)
-    if (node === undefined) return
+    if (node === undefined) return 0
     const invoke = invokeOf(node, request.trace)
-    if (request.gaps.has('output-omitted')) {
-      invoke.finalAnswer = undefined
+    if (invoke.closed) return 0
+    releaseAnswer(invoke)
+    if (request.textLost) {
       invoke.gaps.add('final-output-omitted')
-      return
+      return 0
     }
-    invoke.finalAnswer = request.toolCalls.length === 0 && request.texts.length > 0 ? request.texts : undefined
     invoke.gaps.delete('final-output-omitted')
+    const meantTools =
+      request.toolCallsSeen ||
+      request.toolCalls.length > 0 ||
+      request.finishReason === 'tool-calls' ||
+      request.finishReason === 'length' ||
+      request.finishReason === 'content-filter'
+    if (meantTools || request.texts.length === 0) return 0
+    const chars = request.texts.reduce((sum, text) => sum + text.length, 0)
+    invoke.finalAnswer = request.texts
+    invoke.finalAnswerChars = chars
+    answersHeld += 1
+    return chars
   }
 
   function emitRequest(
@@ -655,9 +697,10 @@ export function createTurnModel(options: {
   ): void {
     if (request.closed) return
     request.closed = true
-    recordFinalAnswer(request, status)
-    // The request's output moves into its record: it no longer counts against what open requests hold.
-    heldOutputChars = Math.max(0, heldOutputChars - request.outputChars)
+    const transferred = recordFinalAnswer(request, status)
+    // The request's output moves into its record: it no longer counts against what open requests hold, except the text a span
+    // keeps as its final answer, whose charge moved to that span.
+    heldOutputChars = Math.max(0, heldOutputChars - (request.outputChars - transferred))
     request.trace.openSpans = Math.max(0, request.trace.openSpans - 1)
     const model = request.model
     emit({
@@ -1157,6 +1200,8 @@ export function createTurnModel(options: {
       messageId: undefined,
       texts: [],
       outputChars: 0,
+      textLost: false,
+      toolCallsSeen: false,
       reasoning: [],
       toolCalls: [],
       finishReason: undefined,
@@ -1246,30 +1291,36 @@ export function createTurnModel(options: {
     if (o.omitted === true) {
       // The pipeline's inbox was full of raw text: the text is not here, and the span says so.
       request.gaps.add('output-omitted')
+      if (o.part === 'text') request.textLost = true
       return
     }
-    addOutput(request, o.part === 'text' ? request.texts : request.reasoning, o.text)
+    addOutput(request, o.part === 'text' ? request.texts : request.reasoning, o.text, o.part === 'text')
   }
 
   /**
    * Keeps one output part, within the per-request and the aggregate character budgets and the part-count limit. A part that
-   * does not fit is omitted whole, never clipped: a cut before redaction could split a secret. The request says so.
+   * does not fit is omitted whole, never clipped: a cut before redaction could split a secret. The request says so, and a lost
+   * TEXT part (`isText`) also sets `textLost`, so a final answer is never built from what was left.
    */
-  function addOutput(request: RequestState, parts: string[], text: string): void {
+  function addOutput(request: RequestState, parts: string[], text: string, isText: boolean): void {
     if (request.closed) return
+    const lose = (gap: 'output-over-limit' | 'output-omitted'): void => {
+      request.gaps.add(gap)
+      if (isText) request.textLost = true
+    }
     if (parts.length >= limits.maxOutputParts) {
-      request.gaps.add('output-over-limit')
+      lose('output-over-limit')
       return
     }
     const room = Math.min(limits.maxOutputChars - request.outputChars, limits.maxHeldOutputChars - heldOutputChars)
     if (room <= 0) {
-      request.gaps.add('output-omitted')
+      lose('output-omitted')
       return
     }
     // Raw text is never clipped before redaction (a cut could split a secret and leave its prefix): a part that does not fit
     // is omitted whole, and the span says so.
     if (text.length > room) {
-      request.gaps.add('output-omitted')
+      lose('output-omitted')
       return
     }
     const kept = text
@@ -1401,6 +1452,7 @@ export function createTurnModel(options: {
     else if (o.input !== undefined) tool.discarded.push(o.input)
     const asked = o.messageId === undefined ? undefined : node.stepOwner.get(o.messageId)
     if (asked !== undefined) {
+      asked.toolCallsSeen = true
       if (asked.toolCalls.length >= limits.maxOutputParts) asked.gaps.add('tool-calls-over-limit')
       else {
         asked.toolCalls.push({callId: o.callId, tool: tool.tool, input: o.input})
@@ -1526,7 +1578,7 @@ export function createTurnModel(options: {
     if (node === undefined || request === undefined) return
     if (o.ok) {
       if (o.omitted === true) request.gaps.add('output-omitted')
-      else if (o.text !== undefined) addOutput(request, request.texts, o.text)
+      else if (o.text !== undefined) addOutput(request, request.texts, o.text, true)
       request.usage = o.usage
       request.cost = o.cost
       request.gaps.delete('usage')
@@ -1542,7 +1594,7 @@ export function createTurnModel(options: {
     const request = node === undefined ? undefined : oldestPending(node, 'title')
     if (node === undefined || request === undefined) return
     if (o.omitted === true) request.gaps.add('output-omitted')
-    else addOutput(request, request.texts, o.title)
+    else addOutput(request, request.texts, o.title, true)
     emitRequest(request, o.at, 'ok')
     removeRequest(node, request)
     touch(request.trace, o.at)
@@ -1714,6 +1766,7 @@ export function createTurnModel(options: {
       tombstones: tombstones.size,
       unresolvedDispatches: unresolved.size,
       heldOutputChars,
+      answersHeld,
       pendingToolNotes: [...sessions.values()].reduce((sum, node) => sum + node.notes.size, 0),
       droppedSpans,
     }),
