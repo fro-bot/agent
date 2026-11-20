@@ -1,24 +1,33 @@
 {
   "version": "1.0.0",
-  "updatedAt": "2026-11-06T00:00:00.000Z",
+  "updatedAt": "2026-11-20T00:00:00.000Z",
   "dependencies": [
     {
-      "name": "opencode (server)",
-      "resolvedVersion": "1.19.5",
+      "name": "opencode (session engine)",
+      "resolvedVersion": "2.3.2",
       "repoUrl": "https://github.com/anomalyco/opencode.git",
-      "ref": "v1.19.5",
+      "ref": "v2.3.2",
       "path": ".slim/clonedeps/repos/anomalyco__opencode",
-      "packagePath": "packages/opencode",
-      "reason": "OpenCode server source — owns session/prompt machinery and publishes message.part.updated bus events. Pinned to the harness base_version so source checks reflect what we ship."
+      "packagePath": "packages/core",
+      "reason": "OpenCode V2 session engine source: how a turn runs, the session events it publishes, plugin loading and hooks, model and provider resolution. Pinned to the V2 version the Action runs."
     },
     {
-      "name": "@opencode-ai/sdk",
-      "resolvedVersion": "1.19.5",
+      "name": "opencode (server)",
+      "resolvedVersion": "2.3.2",
       "repoUrl": "https://github.com/anomalyco/opencode.git",
-      "ref": "v1.19.5",
+      "ref": "v2.3.2",
       "path": ".slim/clonedeps/repos/anomalyco__opencode",
-      "packagePath": "packages/sdk/js",
-      "reason": "OpenCode SDK source for inspecting SSE subscription contract and error/status payload shapes."
+      "packagePath": "packages/server",
+      "reason": "OpenCode V2 HTTP server source: routes, handlers and the event stream the Action consumes."
+    },
+    {
+      "name": "@opencode/plugin",
+      "resolvedVersion": "2.3.2",
+      "repoUrl": "https://github.com/anomalyco/opencode.git",
+      "ref": "v2.3.2",
+      "path": ".slim/clonedeps/repos/anomalyco__opencode",
+      "packagePath": "packages/plugin",
+      "reason": "OpenCode V2 plugin API source, for checking the hooks and host services a plugin gets."
     }
   ]
 }
