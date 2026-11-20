@@ -2208,15 +2208,16 @@ describe('a refused primary request keeps its own step events', () => {
     // #when
     const {records, model} = replay(s.out, {limits: CAP, flush: false})
 
-    // #then the retry consumed the refused request's place at once (not request 3's), and the failed attempt's step start was skipped
-    expect([beforeRetry, afterRetry]).toEqual([1, 0])
+    // #then the retry reported the refused request's failed attempt without removing its place (its step still starts and consumes it),
+    // and request 3 bound its own step
+    expect([beforeRetry, afterRetry]).toEqual([1, 1])
     expect(chatWith(records, 'the third')).toBeDefined()
     expect(chats(records).map(chat => chat.texts)).toEqual([['one'], ['the third']])
     expect(model.stats().bindingTombstones).toBe(0)
   })
 
-  it('forgets a refused request whose step events never come once its window has passed, and binds the next one correctly', () => {
-    // #given a refused request with no events at all, and the next request starting after the window
+  it('keeps a placeholder until its step arrives, however late: no timer decides it', () => {
+    // #given a refused request whose step arrives ten minutes after the next request was admitted
     const s = script()
     s.started('p')
     s.request('p')
@@ -2224,120 +2225,352 @@ describe('a refused primary request keeps its own step events', () => {
     s.request('p')
     s.text('p', 'm1', 'one')
     s.stepEnded('p', 'm1')
-    const refusedAt = lastAt(s.out)
-    const late = script()
-    late.out.push(...s.out)
-    late.at(refusedAt + DEFAULT_LIMITS.refusedWindowMs + 1)
-    late.request('p')
-    late.stepStarted('p', 'm3')
-    late.text('p', 'm3', 'the next')
-    late.stepEnded('p', 'm3')
-    late.ended('p')
+    s.request('p')
+    const waiting = replay(s.out, {limits: CAP, flush: false}).model.stats().bindingTombstones
+    s.at(lastAt(s.out) + 10 * 60_000)
+    s.stepStarted('p', 'm2')
+    s.text('p', 'm2', 'text of the refused request')
+    s.stepEnded('p', 'm2')
+    s.stepStarted('p', 'm3')
+    s.text('p', 'm3', 'the admitted request’s own')
+    s.stepEnded('p', 'm3')
+    s.ended('p')
 
     // #when
-    const {records, model} = replay(late.out, {limits: CAP, flush: false})
+    const {records, model} = replay(s.out, {limits: CAP, flush: false})
 
-    // #then the tombstone expired, so the next request binds its own step, and nothing is marked uncertain
-    expect(chatWith(records, 'the next')?.gaps).not.toContain('step-binding-uncertain')
+    // #then the placeholder was still there, consumed the late step, and the admitted request kept its own
+    expect(waiting).toBe(1)
+    expect(chatWith(records, 'text of the refused request')).toBeUndefined()
+    const own = chatWith(records, 'the admitted request’s own')
+    expect(own?.finishReason).toBe('stop')
+    expect(own?.gaps).not.toContain('step-binding-uncertain')
     expect(model.stats().bindingTombstones).toBe(0)
   })
 
-  it('keeps the tombstone to its exact window: still there one millisecond inside it, gone at the end', () => {
-    // #given a refused request at time t
-    const build = (after: number) => {
-      const s = script()
-      s.started('p')
-      s.request('p')
-      s.stepStarted('p', 'm1')
-      s.request('p')
-      const refusedAt = lastAt(s.out)
-      s.out.push({kind: 'tick', at: refusedAt + after})
-      return replay(s.out, {limits: CAP, flush: false}).model.stats().bindingTombstones
-    }
-
-    // #then
-    expect(build(DEFAULT_LIMITS.refusedWindowMs - 1)).toBe(1)
-    expect(build(DEFAULT_LIMITS.refusedWindowMs)).toBe(0)
-  })
-
-  it('marks the requests behind a tombstone that was evicted by the count bound, and gives them no output', () => {
-    // #given one slot for tombstones and three refused requests, so the oldest is evicted while its events may still arrive
+  /**
+   * Three refusals with room for one placeholder: the oldest is evicted while its step may still arrive, so binding is uncertain.
+   * A cap of two spans lets request 2 be admitted and wait, a dispatched subagent keeps the session (and its trace) alive past its
+   * execution, and everything arrives in the order it really would.
+   */
+  const overflow = () => {
     const s = script()
     s.started('p')
     s.request('p')
     s.stepStarted('p', 'm1')
+    s.toolBefore('p', 'c1', 'subagent', 'm1')
+    s.toolAfter('p', 'c1', 'subagent', 'kid')
+    s.toolEnded('p', 'c1', {childSessionId: 'kid'})
     s.request('p')
     s.request('p')
     s.request('p')
     s.text('p', 'm1', 'one')
     s.stepEnded('p', 'm1')
-    s.request('p')
-    // The events of refused requests 2, 3 and 4 and of admitted request 5, in order: the evicted one's step shifts everything.
-    for (const [id, text] of [
-      ['m2', 'text two'],
-      ['m3', 'text three'],
-      ['m4', 'text four'],
-      ['m5', 'text five'],
-    ] as const) {
+    return s
+  }
+  const OVERFLOW = {maxOpenSpansPerTrace: 2, maxRefusedPrimaries: 1}
+  const steps = (s: ReturnType<typeof script>, list: readonly (readonly [string, string])[]) => {
+    for (const [id, text] of list) {
       s.stepStarted('p', id)
       s.text('p', id, text)
       s.stepEnded('p', id)
     }
+  }
+
+  it('keeps binding uncertain after an eviction until the execution ends, however long the steps take and however promptly they arrive', () => {
+    // #given the overflow, the steps delivered promptly in order, and then another request ten minutes later in the same execution
+    const s = overflow()
+    steps(s, [
+      ['m2', 'text two'],
+      ['m3', 'text three'],
+      ['m4', 'text four'],
+    ])
+    s.at(lastAt(s.out) + 10 * 60_000)
+    s.request('p')
+    steps(s, [['m5', 'text five']])
     s.ended('p')
 
     // #when
-    const {records, model} = replay(s.out, {limits: {...CAP, maxRefusedPrimaries: 1}, flush: false})
+    const {records} = replay(s.out, {limits: OVERFLOW, flush: false})
 
-    // #then request 5 may have been bound to another request's step: it carries no output and says why
-    const five = chats(records).find(chat => chat.gaps.includes('step-binding-uncertain'))
-    expect(five).toBeDefined()
-    expect(five?.texts).toEqual([])
-    expect(five?.reasoning).toEqual([])
-    expect(five?.toolCalls).toEqual([])
-    expect(five?.finishReason).toBeUndefined()
-    expect(five?.usage).toBeUndefined()
+    // #then no step of this execution after the eviction is trusted, so none of their text reaches any span
     for (const text of ['text two', 'text three', 'text four', 'text five']) {
       expect(chatWith(records, text)).toBeUndefined()
     }
+    const uncertain = chats(records).filter(chat => chat.gaps.includes('step-binding-uncertain'))
+    expect(uncertain.length).toBeGreaterThanOrEqual(2)
+    for (const chat of uncertain) {
+      expect(chat.texts).toEqual([])
+      expect(chat.finishReason).toBeUndefined()
+      expect(chat.usage).toBeUndefined()
+    }
+  })
+
+  it('discards a refused request’s step when its placeholder was evicted while an admitted request waits, and gives that request nothing', () => {
+    // #given the overflow: request 2 is admitted and waiting, the refused requests 3 and 4 hold one place between them
+    const s = overflow()
+
+    // #when the steps arrive: request 2's, then the refused requests' (the evicted one's step has no place of its own)
+    steps(s, [
+      ['m2', 'text two'],
+      ['m3', 'text three'],
+      ['m4', 'text four'],
+    ])
+    s.ended('p')
+    const {records, model} = replay(s.out, {limits: OVERFLOW, flush: false})
+
+    // #then the waiting request is marked, carries none of what any step produced, and no refused request's text is anywhere
+    const two = chats(records).find(chat => chat.gaps.includes('step-binding-uncertain'))
+    expect(two).toBeDefined()
+    expect(two?.texts).toEqual([])
+    expect(JSON.stringify(records)).not.toContain('text three')
+    expect(JSON.stringify(records)).not.toContain('text four')
+    expect(JSON.stringify(records)).not.toContain('text two')
     expect(model.stats().bindingTombstones).toBe(0)
   })
 
+  it('exports no outcome, error or metadata from a step that may be another request’s', () => {
+    // #given the overflow, request 5 started with no model of its own, and a step that FAILED, with its own agent and model
+    const s = overflow()
+    steps(s, [['m2', 'text two']])
+    s.out.push({
+      kind: 'step.started',
+      sessionId: 'p',
+      messageId: 'm3',
+      agent: 'FOREIGN-AGENT',
+      model: 'FOREIGN-MODEL',
+      provider: 'FOREIGN-PROVIDER',
+      at: lastAt(s.out) + 1,
+    })
+    s.out.push({
+      kind: 'step.failed',
+      sessionId: 'p',
+      messageId: 'm3',
+      error: {type: 'FOREIGN-ERROR', message: 'FOREIGN-MESSAGE'},
+      usage: USAGE,
+      at: lastAt(s.out) + 1,
+    })
+    s.ended('p')
+
+    // #when
+    const {records} = replay(s.out, {limits: OVERFLOW, flush: false})
+
+    // #then the span is incomplete, with no status or error of the failed step, and nothing of it anywhere in the output
+    const uncertain = chats(records).filter(chat => chat.gaps.includes('step-binding-uncertain'))
+    expect(uncertain.length).toBeGreaterThan(0)
+    for (const chat of uncertain) {
+      expect(chat.status).toBe('interrupted')
+      expect(chat.error).toBeUndefined()
+      expect(chat.marks).toContain('incomplete')
+      expect(chat.messageId).toBeUndefined()
+      expect(chat.usage).toBeUndefined()
+      expect(chat.agent).not.toBe('FOREIGN-AGENT')
+      expect(chat.model).not.toBe('FOREIGN-MODEL')
+    }
+    expect(JSON.stringify(records)).not.toContain('FOREIGN')
+  })
+
+  it('takes no agent, model or provider from the step for an uncertain request whose hook had none', () => {
+    // #given a request hook with no agent, model or provider, bound while binding is uncertain to a step that has all three
+    const s = overflow()
+    steps(s, [
+      ['m2', 'text two'],
+      ['m8', 'text eight'],
+    ])
+    s.out.push({
+      kind: 'request',
+      sessionId: 'p',
+      requestKind: 'primary',
+      content: {messages: []},
+      at: lastAt(s.out) + 1,
+    })
+    s.out.push({
+      kind: 'step.started',
+      sessionId: 'p',
+      messageId: 'm9',
+      agent: 'FOREIGN-AGENT',
+      model: 'FOREIGN-MODEL',
+      provider: 'FOREIGN-PROVIDER',
+      at: lastAt(s.out) + 1,
+    })
+    s.out.push({
+      kind: 'step.failed',
+      sessionId: 'p',
+      messageId: 'm9',
+      error: {type: 'aborted'},
+      at: lastAt(s.out) + 1,
+    })
+    s.ended('p')
+
+    // #when
+    const {records} = replay(s.out, {limits: OVERFLOW, flush: false})
+
+    // #then the request bound to the step carries none of the step's metadata, and nothing of it is anywhere
+    expect(JSON.stringify(records)).not.toContain('FOREIGN')
+    const bound = chats(records).filter(
+      chat => chat.gaps.includes('step-binding-uncertain') && chat.model === undefined,
+    )
+    expect(bound.some(chat => chat.agent === undefined && chat.provider === undefined)).toBe(true)
+  })
+
+  it('does not let a failed attempt’s step bind the request queued behind it', () => {
+    // #given request 1 and request 2 both started, a retry hook for request 1, then its failed attempt's step and request 2's own
+    const s = script()
+    s.started('p')
+    s.request('p')
+    s.request('p')
+    s.out.push({
+      kind: 'retry',
+      sessionId: 'p',
+      attempt: 2,
+      willRetry: true,
+      error: {type: 'provider.internal', message: 'x'},
+      at: lastAt(s.out) + 1,
+    })
+    s.stepStarted('p', 'failed-attempt')
+    s.stepStarted('p', 'm2')
+    s.text('p', 'm2', 'the second request')
+    s.stepEnded('p', 'm2')
+    s.ended('p')
+
+    // #when
+    const {records} = replay(s.out, {flush: false})
+
+    // #then request 2 has its own step, and request 1 is the failed span
+    expect(chatWith(records, 'the second request')?.messageId).toBe('m2')
+    expect(chats(records).filter(chat => chat.status === 'error')).toHaveLength(1)
+  })
+
+  it('starts the next execution on the same retained session with clean binding after an overflow, and it keeps its own first step', () => {
+    // #given the overflow, the execution ending (the subagent keeps the session and its trace), and a new execution
+    const s = overflow()
+    steps(s, [['m2', 'text two']])
+    s.ended('p')
+    s.started('p')
+    s.request('p')
+    steps(s, [['m9', 'its own first step']])
+    s.ended('p')
+
+    // #when
+    const {records, model} = replay(s.out, {limits: OVERFLOW, flush: false})
+
+    // #then the new execution is not suppressed: its request has its own text, finish reason and no uncertainty
+    const fresh = chatWith(records, 'its own first step')
+    expect(fresh).toBeDefined()
+    expect(fresh?.finishReason).toBe('stop')
+    expect(fresh?.gaps).not.toContain('step-binding-uncertain')
+    expect(model.stats().bindingTombstones).toBe(0)
+  })
+
+  it('starts the next execution clean after a refused retry whose step never started, and it keeps its own first step', () => {
+    // #given a refused request reported failed by a retry hook whose failed attempt's step never starts, a title request holding
+    // the trace (and so the session) open past the execution, and a new execution
+    const s = script()
+    s.started('p')
+    s.request('p')
+    s.request('p', 'title')
+    s.stepStarted('p', 'm1')
+    s.request('p')
+    s.out.push({
+      kind: 'retry',
+      sessionId: 'p',
+      attempt: 2,
+      willRetry: true,
+      error: {type: 'provider.internal', message: 'x'},
+      at: lastAt(s.out) + 1,
+    })
+    s.text('p', 'm1', 'one')
+    s.stepEnded('p', 'm1')
+    s.ended('p')
+    const retained = replay(s.out, {limits: {maxOpenSpansPerTrace: 2}, flush: false}).model.stats()
+    s.started('p')
+    s.request('p')
+    steps(s, [['m9', 'its own first step']])
+    s.ended('p')
+
+    // #when
+    const {records, model} = replay(s.out, {limits: {maxOpenSpansPerTrace: 2}, flush: false})
+
+    // #then the session was retained across the boundary, nothing of the retry's skip survived it, and the first step is the new request's
+    expect(retained).toMatchObject({sessions: 1, bindingTombstones: 0})
+    const fresh = chatWith(records, 'its own first step')
+    expect(fresh?.finishReason).toBe('stop')
+    expect(fresh?.gaps).not.toContain('step-binding-uncertain')
+    expect(model.stats().bindingTombstones).toBe(0)
+  })
+
+  it('does not hold a second owner of tool arguments on an uncertain chat', () => {
+    // #given the overflow, and an uncertain request whose step asks for a tool with object arguments
+    const s = overflow()
+    const input = {path: 'a'}
+    s.out.push({
+      kind: 'step.started',
+      sessionId: 'p',
+      messageId: 'm2',
+      agent: 'build',
+      model: 'm',
+      provider: 'p',
+      at: lastAt(s.out) + 1,
+    })
+    s.toolNamed('p', 'c2')
+    s.toolCalled('p', 'c2', {messageId: 'm2', input})
+    s.stepEnded('p', 'm2')
+    s.ended('p')
+
+    // #when
+    const {records, model} = replay(s.out, {limits: OVERFLOW, flush: false})
+
+    // #then the chat holds no tool calls, and the model was never asked to retain the arguments for it
+    const uncertain = chats(records).filter(chat => chat.gaps.includes('step-binding-uncertain'))
+    expect(uncertain.length).toBeGreaterThan(0)
+    expect(uncertain.every(chat => chat.toolCalls.length === 0)).toBe(true)
+    expect(model.takeRetained()).not.toContain(input)
+  })
+
   it('keeps a subagent’s refused request off the parent’s spans: each session binds in its own queue', () => {
-    // #given a parent that dispatches a child, and a trace cap that leaves no room for the child's request
+    // #given a parent whose trace holds three spans (its request, a title request and the dispatch call), a child whose request is
+    // refused for it (a live placeholder in the CHILD's queue), and then a parent request admitted and waiting
     const s = script()
     s.prompt('p', 'mp')
     s.enqueued('p', 'mp', 'user')
     s.started('p')
     s.delivered('p', 'mp')
     s.request('p')
+    s.request('p', 'title')
     s.stepStarted('p', 'sp1')
     s.toolBefore('p', 'c1', 'subagent', 'sp1')
     s.toolAfter('p', 'c1', 'subagent', 'kid')
-    s.toolEnded('p', 'c1', {childSessionId: 'kid'})
-    s.stepEnded('p', 'sp1')
     s.created('kid', 'p')
     s.prompt('kid', 'mk')
     s.enqueued('kid', 'mk', 'user')
     s.started('kid')
     s.delivered('kid', 'mk')
     s.request('kid')
+    s.toolEnded('p', 'c1', {childSessionId: 'kid'})
+    s.text('p', 'sp1', 'parent one')
+    s.stepEnded('p', 'sp1')
     s.request('p')
+    const live = replay(s.out, {limits: {maxOpenSpansPerTrace: 3}, flush: false}).model.stats()
+
+    // #when the parent's step is delivered FIRST, then the child's
+    s.stepStarted('p', 'sp2')
+    s.text('p', 'sp2', 'parent two')
+    s.stepEnded('p', 'sp2')
     s.stepStarted('kid', 'sk')
     s.text('kid', 'sk', 'child text')
     s.stepEnded('kid', 'sk')
-    s.stepStarted('p', 'sp2')
-    s.text('p', 'sp2', 'parent text')
-    s.stepEnded('p', 'sp2')
     s.ended('kid')
     s.ended('p')
+    const {records, model} = replay(s.out, {limits: {maxOpenSpansPerTrace: 3}, flush: false})
 
-    // #when only two spans may be open: the parent's request and the dispatch call
-    const {records} = replay(s.out, {limits: {maxOpenSpansPerTrace: 2}, flush: false})
-
-    // #then the parent's second request carries the parent's text, and no span carries the child's text under the parent's id
-    const parentChats = chats(records).filter(chat => chat.sessionId === 'p')
-    expect(parentChats.flatMap(chat => chat.texts)).toContain('parent text')
-    expect(parentChats.flatMap(chat => chat.texts)).not.toContain('child text')
+    // #then the child's request really was refused and its placeholder was live, the parent's request kept its own step, and the
+    // child's text is on no span
+    expect(live).toMatchObject({droppedSpans: 1, bindingTombstones: 1})
+    const parentTwo = chatWith(records, 'parent two')
+    expect(parentTwo?.sessionId).toBe('p')
+    expect(parentTwo?.finishReason).toBe('stop')
+    expect(JSON.stringify(records)).not.toContain('child text')
+    expect(model.stats().bindingTombstones).toBe(0)
   })
 
   it('drops a refused request’s place when its execution ends, so a request that never produced steps cannot swallow the next execution’s', () => {
