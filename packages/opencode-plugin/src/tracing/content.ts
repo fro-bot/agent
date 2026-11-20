@@ -1271,6 +1271,23 @@ function scrubLeaf(text: string, scrubber: Scrubber, walk: TreeWalk): string {
   return result.text
 }
 
+/** The most entries that may share one scrubbed key name; past it the later ones merge into the last suffix. */
+const MAX_KEY_COLLISIONS = 64
+
+/**
+ * The key to write a scrubbed entry under. Two distinct keys that differ only inside text the scrubber redacts become the same
+ * text, and the later entry would overwrite the earlier; the later ones get ` (2)`, ` (3)`... instead, so no entry is lost and
+ * no original text is kept. Bounded: the probe stops at `MAX_KEY_COLLISIONS`.
+ */
+function freeKey(target: Record<string, unknown>, name: string): string {
+  if (!Object.hasOwn(target, name)) return name
+  for (let n = 2; n < MAX_KEY_COLLISIONS; n += 1) {
+    const candidate = `${name} (${String(n)})`
+    if (!Object.hasOwn(target, candidate)) return candidate
+  }
+  return `${name} (${String(MAX_KEY_COLLISIONS)})`
+}
+
 function scrubNode(value: unknown, depth: number, scrubber: Scrubber, walk: TreeWalk): unknown {
   walk.nodes += 1
   if (walk.nodes > MAX_REDACTION_NODES || depth > MAX_REDACTION_DEPTH) throw new TreeFailure('scrub-failed')
@@ -1287,9 +1304,9 @@ function scrubNode(value: unknown, depth: number, scrubber: Scrubber, walk: Tree
       if (isSensitiveKey(key, child)) {
         // The whole value goes, whatever its type; nothing inside it is read, and the marker is never scanned.
         walk.redactions += 1
-        copy[scrubLeaf(key, scrubber, walk)] = REDACTION
+        copy[freeKey(copy, scrubLeaf(key, scrubber, walk))] = REDACTION
       } else {
-        copy[scrubLeaf(key, scrubber, walk)] = scrubNode(child, depth + 1, scrubber, walk)
+        copy[freeKey(copy, scrubLeaf(key, scrubber, walk))] = scrubNode(child, depth + 1, scrubber, walk)
       }
     }
     return copy

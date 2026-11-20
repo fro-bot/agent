@@ -6,7 +6,7 @@
 
 import {describe, expect, it} from 'vitest'
 
-import {createScrubber, REDACTION} from './content.js'
+import {createScrubber, REDACTION, scrubStructured} from './content.js'
 
 const scrubber = createScrubber({env: {}})
 const scrub = (text: string): string => {
@@ -99,5 +99,63 @@ describe('URL userinfo can only be in the authority', () => {
     // #then the query-secret rule redacts the value, the host stays; the connection-string rule redacts its own
     expect(query).toBe(`GET https://example.com/cb?token=${REDACTION}&x=1`)
     expect(conn).toBe(`db ${REDACTION} ok`)
+  })
+})
+
+describe('object keys that collide once scrubbed keep every entry', () => {
+  const tokenA = ['ghp_', 'aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5'].join('')
+  const tokenB = ['ghp_', 'Zy9xW7vU5tS3rQ1pN9mL7kJ5hG3fE1dC9bA7'].join('')
+  const tokenC = ['ghs_', 'Qq1Ww2Ee3Rr4Tt5Yy6Uu7Ii8Oo9Pp0Aa1Ss2'].join('')
+
+  const walk = (value: unknown): Record<string, unknown> => {
+    const result = scrubStructured(value, scrubber)
+    if (!result.ok) throw new Error(result.reason)
+    return result.value as Record<string, unknown>
+  }
+
+  it('gives each later colliding key a deterministic suffix, and keeps every value', () => {
+    // #given two and three keys that differ only inside text the scrubber redacts
+    const two = walk({[`id-${tokenA}`]: 1, [`id-${tokenB}`]: 2})
+    const three = walk({[`id-${tokenA}`]: 1, [`id-${tokenB}`]: 2, [`id-${tokenC}`]: 3})
+
+    // #then none is overwritten, the first keeps the plain name, and no original text is kept
+    expect(two).toEqual({[`id-${REDACTION}`]: 1, [`id-${REDACTION} (2)`]: 2})
+    expect(three).toEqual({[`id-${REDACTION}`]: 1, [`id-${REDACTION} (2)`]: 2, [`id-${REDACTION} (3)`]: 3})
+    expect(JSON.stringify(three)).not.toContain('aB3dE5')
+  })
+
+  it('does the same for keys whose values are withheld whole as sensitive', () => {
+    // #given two sensitive keys that collide after scrubbing
+    const out = walk({[`password-${tokenA}`]: 'one', [`password-${tokenB}`]: 'two'})
+
+    // #then both survive, each value replaced
+    expect(out).toEqual({[`password-${REDACTION}`]: REDACTION, [`password-${REDACTION} (2)`]: REDACTION})
+  })
+
+  it('leaves keys that do not collide untouched, including ones that look like a suffix', () => {
+    // #given distinct keys, one of which is already named like a suffix, and an inherited-property name
+    const out = walk({alpha: 1, beta: 2, [`k-${tokenA}`]: 3, [`k-${REDACTION} (2)`]: 4, constructor: 5, toString: 6})
+
+    // #then nothing is renamed: the redacted key and the one that is only named like a suffix do not collide
+    expect(out).toEqual({
+      alpha: 1,
+      beta: 2,
+      [`k-${REDACTION}`]: 3,
+      [`k-${REDACTION} (2)`]: 4,
+      constructor: 5,
+      toString: 6,
+    })
+  })
+
+  it('is bounded: past 64 collisions the later entries merge into the last suffix instead of probing without end', () => {
+    // #given 200 keys that all scrub to the same text
+    const input: Record<string, number> = {}
+    for (let index = 0; index < 200; index += 1)
+      input[`id-ghp_${String(index).padStart(3, '0')}${'x'.repeat(33)}`] = index
+    const out = walk(input)
+
+    // #then the keys are the plain name and (2) to (64), and the last holds the last value
+    expect(Object.keys(out)).toHaveLength(64)
+    expect(out[`id-${REDACTION} (64)`]).toBe(199)
   })
 })
