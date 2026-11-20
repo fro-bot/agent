@@ -1,16 +1,18 @@
 /** Harness for `integration.test.ts`: a scripted OpenAI-compatible provider and a real `opencode serve --stdio` process. */
 
 import {Buffer} from 'node:buffer'
-import {spawn} from 'node:child_process'
+import {execFileSync, spawn} from 'node:child_process'
 import {randomBytes} from 'node:crypto'
-import {mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync} from 'node:fs'
+import {mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync} from 'node:fs'
 import {createServer} from 'node:http'
+import {createServer as createHttpsServer} from 'node:https'
 import {tmpdir} from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 
 const LISTEN_TIMEOUT_MS = 60_000
 const EXIT_TIMEOUT_MS = 8_000
+const STDERR_KEEP = 64 * 1024
 
 export interface FakeStep {
   /** Every string must appear in the request body. */
@@ -18,7 +20,16 @@ export interface FakeStep {
   /** None of these may appear in the request body. */
   readonly none?: readonly string[]
   readonly text?: string
+  readonly reasoning?: string
   readonly tools?: readonly {readonly name: string; readonly args: unknown}[]
+  /** Answer with this HTTP status and an error body instead of a stream. */
+  readonly status?: number
+  /** Wait this long before answering, so a test can act while the request is in flight. */
+  readonly delayMs?: number
+  /** After the text, stall this long before finishing the stream (cut short when the client goes away). */
+  readonly hangMs?: number
+  /** Provider-reported prompt, cached and completion token counts. */
+  readonly usage?: {readonly prompt: number; readonly cached?: number; readonly completion: number}
 }
 
 export interface RecordedRequest {
@@ -50,14 +61,20 @@ function sse(delta: Record<string, unknown>, finish: string | null, extra: Recor
   })}\n\n`
 }
 
+const sleep = async (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
+
 export async function startFakeProvider(): Promise<FakeProvider> {
   const queue: FakeStep[] = []
   const requests: RecordedRequest[] = []
 
   const server = createServer((req, res) => {
     const chunks: Buffer[] = []
+    const gone = {value: false}
+    res.on('close', () => {
+      gone.value = true
+    })
     req.on('data', (chunk: Buffer) => chunks.push(chunk))
-    req.on('end', () => {
+    const respond = async (): Promise<void> => {
       if (req.url?.endsWith('/models') === true) {
         res.writeHead(200, {'content-type': 'application/json'})
         res.end(JSON.stringify({object: 'list', data: [{id: 'fixture-model', object: 'model'}]}))
@@ -88,10 +105,28 @@ export async function startFakeProvider(): Promise<FakeProvider> {
             )
       const step: FakeStep = index === -1 ? {text: 'ok'} : (queue.splice(index, 1)[0] ?? {text: 'ok'})
 
+      if (step.delayMs != null) await sleep(step.delayMs)
+      if (step.status != null && step.status !== 200) {
+        res.writeHead(step.status, {'content-type': 'application/json'})
+        res.end(JSON.stringify({error: {message: `scripted ${step.status}`, type: 'server_error'}}))
+        return
+      }
       res.writeHead(200, {'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive'})
       res.write(sse({role: 'assistant', content: ''}, null))
+      if (step.reasoning != null) res.write(sse({reasoning_content: step.reasoning}, null))
       if (step.text != null) res.write(sse({content: step.text}, null))
-      const usage = {usage: {prompt_tokens: 10, completion_tokens: 5, total_tokens: 15}}
+      if (step.hangMs != null) {
+        for (let waited = 0; waited < step.hangMs && !gone.value; waited += 100) await sleep(100)
+        if (gone.value) return
+      }
+      const usage = {
+        usage: {
+          prompt_tokens: step.usage?.prompt ?? 10,
+          completion_tokens: step.usage?.completion ?? 5,
+          total_tokens: (step.usage?.prompt ?? 10) + (step.usage?.completion ?? 5),
+          ...(step.usage?.cached == null ? {} : {prompt_tokens_details: {cached_tokens: step.usage.cached}}),
+        },
+      }
       if (step.tools != null && step.tools.length > 0) {
         step.tools.forEach((tool, i) => {
           const args = typeof tool.args === 'string' ? tool.args : JSON.stringify(tool.args)
@@ -117,6 +152,11 @@ export async function startFakeProvider(): Promise<FakeProvider> {
       }
       res.write('data: [DONE]\n\n')
       res.end()
+    }
+    req.on('end', () => {
+      respond().catch(() => {
+        res.destroy()
+      })
     })
   })
 
@@ -138,15 +178,237 @@ export async function startFakeProvider(): Promise<FakeProvider> {
   }
 }
 
+export interface SinkRequest {
+  readonly method: string
+  readonly path: string
+  readonly contentType: string
+  readonly headers: Readonly<Record<string, string | string[] | undefined>>
+  readonly body: unknown
+  /** The raw request body, for walking every string that was sent. */
+  readonly text: string
+  /** The status this request was answered with. */
+  readonly status: number
+}
+
+export interface SinkResponse {
+  readonly status: number
+  readonly headers?: Record<string, string>
+  readonly body?: string
+  /** Wait this long before answering. */
+  readonly delayMs?: number
+  /** Never answer: the connection stays open until the sink stops, which destroys it. No timer is left running. */
+  readonly hold?: boolean
+}
+
+export interface OtlpSink {
+  /** The full traces URL, for example `http://127.0.0.1:4318/v1/traces`. */
+  readonly url: string
+  /** Every request, in arrival order, whatever it was answered with. */
+  readonly requests: SinkRequest[]
+  /** Requests answered with a status below 300. */
+  readonly accepted: () => SinkRequest[]
+  /** Requests received in full, whatever they were or will be answered with (a held one is counted when it arrives). */
+  readonly received: () => number
+  /** Most requests that were in flight at once. */
+  readonly peakConcurrent: () => number
+  readonly stop: () => Promise<void>
+}
+
+export interface OtlpSinkOptions {
+  /** Decides the answer to request number `n` (from 1). Default: 200 with an empty JSON body. */
+  readonly respond?: (n: number, request: Omit<SinkRequest, 'status'>) => SinkResponse
+}
+
+/** A loopback OTLP/HTTP collector that records every request and answers as scripted. */
+export async function startOtlpSink(options: OtlpSinkOptions = {}): Promise<OtlpSink> {
+  const requests: SinkRequest[] = []
+  let inFlight = 0
+  let peak = 0
+  let count = 0
+  let received = 0
+  const server = createServer((req, res) => {
+    const chunks: Buffer[] = []
+    inFlight += 1
+    peak = Math.max(peak, inFlight)
+    req.on('data', (chunk: Buffer) => chunks.push(chunk))
+    req.on('end', () => {
+      const text = Buffer.concat(chunks).toString('utf8')
+      let body: unknown = text
+      try {
+        body = JSON.parse(text)
+      } catch {
+        // Keep the text.
+      }
+      count += 1
+      received += 1
+      const seen = {
+        method: req.method ?? '',
+        path: req.url ?? '',
+        contentType: req.headers['content-type'] ?? '',
+        headers: {...req.headers},
+        body,
+        text,
+      }
+      const answer = options.respond?.(count, seen) ?? {status: 200, body: '{}'}
+      // Held: no answer and no timer; `stop` destroys the connection.
+      if (answer.hold === true) return
+      const finish = (): void => {
+        requests.push({...seen, status: answer.status})
+        res.writeHead(answer.status, {'content-type': 'application/json', ...answer.headers})
+        res.end(answer.body ?? '{}')
+        inFlight -= 1
+      }
+      if (answer.delayMs === undefined) finish()
+      else setTimeout(finish, answer.delayMs)
+    })
+  })
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  if (address == null || typeof address === 'string') throw new Error('OTLP sink did not bind a TCP port')
+  return {
+    url: `http://127.0.0.1:${address.port}/v1/traces`,
+    requests,
+    accepted: () => requests.filter(request => request.status < 300),
+    received: () => received,
+    peakConcurrent: () => peak,
+    stop: async () =>
+      new Promise<void>(resolve => {
+        server.closeAllConnections()
+        server.close(() => resolve())
+      }),
+  }
+}
+
+export interface TlsSink {
+  /** The full traces URL over https, for example `https://127.0.0.1:4318/v1/traces`. */
+  readonly url: string
+  /** HTTP requests that got through TLS. A client that refuses the certificate never produces one. */
+  readonly requests: SinkRequest[]
+  /** TCP connections accepted, and TLS handshakes that completed or were refused by the client. */
+  readonly connections: () => number
+  readonly handshakes: () => number
+  readonly tlsErrors: () => number
+  readonly stop: () => Promise<void>
+}
+
+/** Whether `openssl` can be run: the one thing that makes the TLS tests skip, by name. Anything else going wrong fails them. */
+export function opensslAvailable(): boolean {
+  try {
+    execFileSync('openssl', ['version'], {stdio: 'ignore'})
+    return true
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false
+    throw error
+  }
+}
+
+/**
+ * A loopback HTTPS collector with a self-signed certificate nothing trusts, made with `openssl` at run time (no key is
+ * committed). A client that validates certificates refuses it. Throws when the certificate cannot be made: callers skip
+ * only when `opensslAvailable()` is false.
+ */
+export async function startTlsSink(options: OtlpSinkOptions = {}): Promise<TlsSink> {
+  const dir = mkdtempSync(path.join(tmpdir(), 'tls-sink-'))
+  const keyFile = path.join(dir, 'key.pem')
+  const certFile = path.join(dir, 'cert.pem')
+  try {
+    execFileSync(
+      'openssl',
+      [
+        'req',
+        '-x509',
+        '-newkey',
+        'rsa:2048',
+        '-nodes',
+        '-keyout',
+        keyFile,
+        '-out',
+        certFile,
+        '-days',
+        '2',
+        '-subj',
+        '/CN=127.0.0.1',
+        '-addext',
+        'subjectAltName=IP:127.0.0.1',
+      ],
+      {stdio: 'ignore'},
+    )
+  } catch (error) {
+    rmSync(dir, {recursive: true, force: true})
+    throw error
+  }
+  const requests: SinkRequest[] = []
+  let connections = 0
+  let handshakes = 0
+  let tlsErrors = 0
+  let count = 0
+  const server = createHttpsServer({key: readFileSync(keyFile), cert: readFileSync(certFile)}, (req, res) => {
+    const chunks: Buffer[] = []
+    req.on('data', (chunk: Buffer) => chunks.push(chunk))
+    req.on('end', () => {
+      const text = Buffer.concat(chunks).toString('utf8')
+      count += 1
+      const seen = {
+        method: req.method ?? '',
+        path: req.url ?? '',
+        contentType: req.headers['content-type'] ?? '',
+        headers: {...req.headers},
+        body: text,
+        text,
+      }
+      const answer = options.respond?.(count, seen) ?? {status: 200, body: '{}'}
+      requests.push({...seen, status: answer.status})
+      res.writeHead(answer.status, {'content-type': 'application/json'})
+      res.end(answer.body ?? '{}')
+    })
+  })
+  server.on('connection', () => {
+    connections += 1
+  })
+  server.on('secureConnection', () => {
+    handshakes += 1
+  })
+  server.on('tlsClientError', () => {
+    tlsErrors += 1
+  })
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  if (address == null || typeof address === 'string') throw new Error('TLS sink did not bind a TCP port')
+  return {
+    url: `https://127.0.0.1:${address.port}/v1/traces`,
+    requests,
+    connections: () => connections,
+    handshakes: () => handshakes,
+    tlsErrors: () => tlsErrors,
+    stop: async () =>
+      new Promise<void>(resolve => {
+        server.closeAllConnections()
+        server.close(() => {
+          rmSync(dir, {recursive: true, force: true})
+          resolve()
+        })
+      }),
+  }
+}
+
 export interface RunningServer {
   readonly url: string
+  /** What the server wrote to stderr so far (the last 64 KiB). */
+  readonly stderr: () => string
   /** Authenticated JSON request. `directory` selects the location. */
   readonly api: (
     method: string,
     pathname: string,
     options?: {readonly body?: unknown; readonly directory?: string},
   ) => Promise<{readonly status: number; readonly data: unknown}>
-  readonly stop: () => Promise<void>
+  /** Closes stdin, as the Action does, and waits for the server to leave on its own; kills it only after a timeout. */
+  readonly stop: () => Promise<StopResult>
+}
+
+/** How a server stopped: whether it left on its own after stdin closed, and how long that took. */
+export interface StopResult {
+  readonly exitedOnItsOwn: boolean
+  readonly ms: number
 }
 
 export interface SandboxPaths {
@@ -176,6 +438,22 @@ export async function startOpenCodeServer(options: {
   readonly sandbox: SandboxPaths
   readonly pluginDir: string
   readonly providerBaseURL: string
+  /** Extra server environment, applied last. */
+  readonly env?: Readonly<Record<string, string>>
+  /** Extra top-level server config (for example `permissions`), merged over the base config. */
+  readonly config?: Readonly<Record<string, unknown>>
+  /**
+   * Start so that the plugin sees none of the headless markers: the config goes in the user's global config file instead
+   * of `OPENCODE_CONFIG_CONTENT`, and the password goes in `OPENCODE_SERVER_PASSWORD`, which `serve --stdio` deletes from
+   * the process environment before any plugin loads (measured on 2.3.2). The command line still says `serve`.
+   */
+  readonly localMode?: boolean
+  /**
+   * Start plain `opencode serve` on a loopback port, not `serve --stdio`: what a user runs by hand. It implies `localMode`.
+   * Its password stays in `OPENCODE_SERVER_PASSWORD` (only `--stdio` deletes it), which is not a headless marker. It has no
+   * stdin protocol, so `stop` sends SIGTERM instead of closing stdin.
+   */
+  readonly plain?: boolean
 }): Promise<RunningServer> {
   const {binary, sandbox, pluginDir, providerBaseURL} = options
   const password = randomBytes(24).toString('base64url')
@@ -193,26 +471,46 @@ export async function startOpenCodeServer(options: {
     },
     model: 'fake/fixture-model',
     plugins: [pluginDir],
+    ...options.config,
   }
 
-  const child = spawn(binary, ['serve', '--stdio', '--port', '0'], {
-    cwd: sandbox.repo,
-    detached: true,
-    stdio: ['pipe', 'pipe', 'ignore'],
-    env: {
-      PATH: '/usr/bin:/bin:/usr/sbin:/sbin',
-      HOME: sandbox.home,
-      XDG_CONFIG_HOME: path.join(sandbox.home, 'config'),
-      XDG_DATA_HOME: path.join(sandbox.home, 'data'),
-      XDG_CACHE_HOME: path.join(sandbox.home, 'cache'),
-      XDG_STATE_HOME: path.join(sandbox.home, 'state'),
-      TMPDIR: sandbox.root,
-      OPENCODE_DISABLE_AUTOUPDATE: '1',
-      OPENCODE_DISABLE_MODELS_FETCH: '1',
-      OPENCODE_DISABLE_PROJECT_CONFIG: '1',
-      OPENCODE_PASSWORD: password,
-      OPENCODE_CONFIG_CONTENT: JSON.stringify(config),
+  const plain = options.plain === true
+  const localMode = options.localMode === true || plain
+  if (localMode) {
+    const configDir = path.join(sandbox.home, 'config', 'opencode')
+    mkdirSync(configDir, {recursive: true})
+    writeFileSync(path.join(configDir, 'opencode.json'), JSON.stringify(config))
+  }
+
+  const child = spawn(
+    binary,
+    plain ? ['serve', '--hostname', '127.0.0.1', '--port', '0'] : ['serve', '--stdio', '--port', '0'],
+    {
+      cwd: sandbox.repo,
+      detached: true,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: {
+        PATH: '/usr/bin:/bin:/usr/sbin:/sbin',
+        HOME: sandbox.home,
+        XDG_CONFIG_HOME: path.join(sandbox.home, 'config'),
+        XDG_DATA_HOME: path.join(sandbox.home, 'data'),
+        XDG_CACHE_HOME: path.join(sandbox.home, 'cache'),
+        XDG_STATE_HOME: path.join(sandbox.home, 'state'),
+        TMPDIR: sandbox.root,
+        OPENCODE_DISABLE_AUTOUPDATE: '1',
+        OPENCODE_DISABLE_MODELS_FETCH: '1',
+        OPENCODE_DISABLE_PROJECT_CONFIG: '1',
+        ...(localMode
+          ? {OPENCODE_SERVER_PASSWORD: password}
+          : {OPENCODE_PASSWORD: password, OPENCODE_CONFIG_CONTENT: JSON.stringify(config)}),
+        ...options.env,
+      },
     },
+  )
+
+  let stderrText = ''
+  child.stderr.on('data', (chunk: Buffer) => {
+    stderrText = (stderrText + chunk.toString('utf8')).slice(-STDERR_KEEP)
   })
 
   const exited = new Promise<void>(resolve => child.once('exit', () => resolve()))
@@ -233,6 +531,13 @@ export async function startOpenCodeServer(options: {
     child.stdout.on('data', (chunk: Buffer) => {
       buffered += chunk.toString('utf8')
       for (const line of buffered.split('\n')) {
+        // Plain `serve` prints `server listening on <url>`; `serve --stdio` prints a JSON line.
+        const listening = /^server listening on (http:\/\/\S+)/.exec(line)
+        if (listening?.[1] !== undefined) {
+          clearTimeout(timer)
+          resolve(listening[1])
+          return
+        }
         try {
           const parsed = JSON.parse(line) as {url?: unknown}
           if (typeof parsed.url === 'string') {
@@ -254,6 +559,7 @@ export async function startOpenCodeServer(options: {
   const auth = `Basic ${Buffer.from(`opencode:${password}`).toString('base64')}`
   return {
     url,
+    stderr: () => stderrText,
     api: async (method, pathname, requestOptions = {}) => {
       const response = await fetch(url + pathname, {
         method,
@@ -274,14 +580,18 @@ export async function startOpenCodeServer(options: {
       return {status: response.status, data}
     },
     stop: async () => {
-      child.stdin.end()
+      const started = Date.now()
+      if (plain) killGroup('SIGTERM')
+      else child.stdin.end()
       const winner = await Promise.race([
         exited.then(() => 'exited' as const),
         new Promise<'timeout'>(resolve => setTimeout(() => resolve('timeout'), EXIT_TIMEOUT_MS)),
       ])
+      const ms = Date.now() - started
       if (winner === 'timeout') killGroup('SIGKILL')
       killGroup('SIGKILL') // reap stragglers in the group
       await exited
+      return {exitedOnItsOwn: winner === 'exited', ms}
     },
   }
 }

@@ -3,17 +3,25 @@
  * `dist/index.mjs` exists.
  */
 
-import type {FakeProvider, RunningServer, SandboxPaths} from './integration.fixture.js'
+import type {FakeProvider, OtlpSink, RunningServer, SandboxPaths} from './integration.fixture.js'
 
-import {existsSync} from 'node:fs'
+import {cpSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync} from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import {fileURLToPath} from 'node:url'
-import {afterAll, beforeAll, describe, expect, it} from 'vitest'
+import {afterAll, afterEach, beforeAll, describe, expect, it} from 'vitest'
 
-import {makeSandbox, removeSandbox, startFakeProvider, startOpenCodeServer} from './integration.fixture.js'
+import {
+  makeSandbox,
+  removeSandbox,
+  startFakeProvider,
+  startOpenCodeServer,
+  startOtlpSink,
+} from './integration.fixture.js'
 import {FRO_BOT_PLUGIN_ID} from './plugin-id.js'
 import {TASK_REUSE_REJECTION} from './task-reuse-guard.js'
+import {TRACING_LAUNCHER_ENV, userSettingsFilePath} from './tracing/settings.js'
 
 const packageDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const binary = process.env.FRO_BOT_OPENCODE_V2_BIN
@@ -192,11 +200,156 @@ describe.skipIf(!runnable)('built plugin in a real opencode V2', () => {
     expect(rejectionText).not.toContain('CHILD_PROMPT')
 
     // #and the fresh subagent was allowed through: it ran and the parent saw its result
-    const finalRequest = provider.requests.find(
-      request => request.body.includes('GUARD_PROMPT') && request.body.includes('CHILD_DONE'),
+    // A subagent is a background job: its report reaches the parent after the fresh dispatch returns, so wait for it.
+    const finalRequest = await waitFor('the parent to see the child result', async () =>
+      provider.requests.find(request => request.body.includes('GUARD_PROMPT') && request.body.includes('CHILD_DONE')),
     )
     expect(finalRequest).toBeDefined()
     const children = await server.api('GET', `/api/session?parentID=${sessionID}`)
     expect(records(dataOf(children))).toHaveLength(1)
+  }, 90_000)
+})
+
+const IDENTITY = {repository: 'fro-bot/agent', runId: '1', attempt: '1', job: 'it', trigger: 'workflow_dispatch'}
+
+/** The launcher variable an Action run would set: tracing on, spans to `relay`. */
+const launcherOn = (relay: string): Record<string, string> => ({
+  [TRACING_LAUNCHER_ENV]: JSON.stringify({version: 1, host: 'action', tracing: 'on', relay, identity: IDENTITY}),
+})
+const launcherOff: Record<string, string> = {
+  [TRACING_LAUNCHER_ENV]: JSON.stringify({version: 1, host: 'action', tracing: 'off'}),
+}
+const SETTLE_MS = 1_500
+
+/**
+ * A throwaway copy of the built plugin, so a test can replace or remove the lazy tracing chunk without touching `dist/`.
+ * `chunk: 'marker'` swaps the SDK chunk for one that writes `marker` when it is evaluated.
+ */
+let stagedCopies = 0
+
+function stagePlugin(sandbox: SandboxPaths, chunk: 'keep' | 'marker' | 'missing', marker: string): string {
+  // A fresh directory per call: a still-running server may watch an earlier copy and reload it.
+  stagedCopies += 1
+  const dir = path.join(sandbox.root, `plugin-${chunk}-${stagedCopies}`)
+  cpSync(path.join(packageDir, 'package.json'), path.join(dir, 'package.json'))
+  cpSync(path.join(packageDir, 'dist'), path.join(dir, 'dist'), {recursive: true})
+  const name = readdirSync(path.join(dir, 'dist')).find(file => /^tracing-.*\.mjs$/.test(file))
+  if (name == null) throw new Error('the build emitted no tracing chunk')
+  if (chunk === 'missing') rmSync(path.join(dir, 'dist', name))
+  if (chunk === 'marker') {
+    writeFileSync(
+      path.join(dir, 'dist', name),
+      `import {writeFileSync} from 'node:fs'\nwriteFileSync(${JSON.stringify(marker)}, 'evaluated')\nexport async function startTracing() { return {stop: async () => {}} }\n`,
+    )
+  }
+  return dir
+}
+
+describe.skipIf(!runnable)('the lazy tracing chunk in a real opencode V2', () => {
+  let provider: FakeProvider
+  let sink: OtlpSink
+  let sandbox: SandboxPaths
+  const servers: RunningServer[] = []
+
+  const start = async (pluginDir: string, env: Record<string, string>): Promise<RunningServer> => {
+    const server = await startOpenCodeServer({
+      binary: binary ?? '',
+      sandbox,
+      pluginDir,
+      providerBaseURL: provider.baseURL,
+      env,
+    })
+    servers.push(server)
+    return server
+  }
+
+  const pluginState = async (server: RunningServer): Promise<unknown> => {
+    const entry = await waitFor('the fro-bot plugin to be listed', async () => {
+      const response = await server.api('GET', '/api/plugin')
+      return records(dataOf(response)).find(plugin => plugin.id === FRO_BOT_PLUGIN_ID)
+    })
+    return entry.state
+  }
+
+  const settle = async (): Promise<void> => new Promise(resolve => setTimeout(resolve, SETTLE_MS))
+
+  beforeAll(async () => {
+    sandbox = makeSandbox()
+    provider = await startFakeProvider()
+    sink = await startOtlpSink()
+  }, 30_000)
+
+  // Stop each test's servers before the next starts: they share a HOME, and a live server reacts to file changes in it.
+  afterEach(async () => {
+    for (const server of servers.splice(0)) await server.stop()
+  }, 60_000)
+
+  afterAll(async () => {
+    await provider?.stop()
+    await sink?.stop()
+    if (sandbox != null) removeSandbox(sandbox)
+  }, 60_000)
+
+  it('does not evaluate the chunk when tracing is off, and evaluates it from the install location when on', async () => {
+    // #given a copy of the built plugin whose chunk records when it is evaluated
+    const marker = path.join(sandbox.root, 'chunk-evaluated')
+    const dir = stagePlugin(sandbox, 'marker', marker)
+
+    // #when the server runs it with no launcher variable (a headless host: off)
+    const off = await start(dir, {})
+    expect(await pluginState(off)).toEqual({status: 'active'})
+    await settle()
+
+    // #then the chunk was never evaluated
+    expect(existsSync(marker)).toBe(false)
+
+    // #when it runs with an Action launcher that says on
+    const on = await start(dir, launcherOn(sink.url))
+    expect(await pluginState(on)).toEqual({status: 'active'})
+
+    // #then the chunk was resolved next to the entry and evaluated
+    await waitFor('the chunk to be evaluated', async () => (existsSync(marker) ? true : undefined))
+  }, 90_000)
+
+  it('keeps the plugin active and logs one line when the chunk file is missing', async () => {
+    // #given a copy of the built plugin with the chunk file removed
+    const dir = stagePlugin(sandbox, 'missing', '')
+    const before = sink.requests.length
+
+    // #when the server runs it with an Action launcher that says on
+    const server = await start(dir, launcherOn(sink.url))
+    const state = await pluginState(server)
+    await settle()
+
+    // #then the plugin is active, nothing was exported, and one line says tracing did not start
+    expect(state).toEqual({status: 'active'})
+    expect(sink.requests.length).toBe(before)
+    const lines = server
+      .stderr()
+      .split('\n')
+      .filter(line => line.includes('tracing could not start'))
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toMatch(/^\[fro-bot\/opencode-plugin\] tracing could not start \(\w+\)$/)
+  }, 90_000)
+
+  it('sends nothing and loads no chunk when only a user file names an endpoint, in any off mode', async () => {
+    // #given a valid, safe user file in the server's config directory, and a chunk that records its evaluation
+    const settingsFile = userSettingsFilePath({XDG_CONFIG_HOME: path.join(sandbox.home, 'config')})
+    mkdirSync(path.dirname(settingsFile), {recursive: true})
+    writeFileSync(settingsFile, JSON.stringify({version: 1, endpoint: sink.url, hosts: [os.hostname()]}), {mode: 0o600})
+    const marker = path.join(sandbox.root, 'chunk-evaluated-file')
+    const dir = stagePlugin(sandbox, 'marker', marker)
+    const before = sink.requests.length
+
+    // #when servers run with no launcher variable (headless) and with a launcher that says off
+    const headless = await start(dir, {})
+    const declaredOff = await start(dir, launcherOff)
+    const states = [await pluginState(headless), await pluginState(declaredOff)]
+    await settle()
+
+    // #then both plugins are active, nothing reached the sink, and the chunk was never evaluated
+    expect(states).toEqual([{status: 'active'}, {status: 'active'}])
+    expect(sink.requests.length).toBe(before)
+    expect(existsSync(marker)).toBe(false)
   }, 90_000)
 })
