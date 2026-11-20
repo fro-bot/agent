@@ -40,12 +40,15 @@ const lastAt = (observations: readonly Observation[]): number => observations.at
 function script() {
   let at = 0
   const out: Observation[] = []
+  /** The receive time of each session's latest primary request hook: what a step's own `started` is by default. */
+  const lastHook = new Map<string, number>()
   const add = (observation: ObservationInput): void => {
     if (observation.at === undefined) {
       at += 1
     } else {
       at = observation.at
     }
+    if (observation.kind === 'request' && observation.requestKind === 'primary') lastHook.set(observation.sessionId, at)
     out.push({...observation, at})
   }
   const api = {
@@ -92,8 +95,9 @@ function script() {
         content: {messages: []},
         ...extra,
       }),
-    stepStarted: (sessionId: string, messageId: string) =>
-      add({kind: 'step.started', sessionId, messageId, agent: 'build', model: 'm', provider: 'p'}),
+    /** `started` defaults to the session's latest hook time (the step answers the newest request); a delayed step names its own. */
+    stepStarted: (sessionId: string, messageId: string, started: number | undefined = lastHook.get(sessionId)) =>
+      add({kind: 'step.started', sessionId, messageId, started, agent: 'build', model: 'm', provider: 'p'}),
     stepEnded: (sessionId: string, messageId: string) =>
       add({kind: 'step.ended', sessionId, messageId, finish: 'stop', rawFinish: 'stop', usage: USAGE, cost: 0}),
     text: (sessionId: string, messageId: string, text = 'ok', part: 'text' | 'reasoning' = 'text') =>
@@ -2105,12 +2109,36 @@ describe('a session id in an ordinary tool’s result', () => {
   })
 })
 
-describe('step binding is trusted only while its order can be proved', () => {
+describe('a step belongs to the latest primary hook at or before its own start time', () => {
   const CAP = {maxOpenSpansPerTrace: 1}
   const chatWith = (records: readonly SpanRecord[], text: string) =>
     chats(records).find(chat => chat.requestKind === 'primary' && chat.texts.includes(text))
   const primaries = (records: readonly SpanRecord[], sessionId = 'p') =>
     chats(records).filter(chat => chat.requestKind === 'primary' && chat.sessionId === sessionId)
+  const hook = (s: ReturnType<typeof script>, session: string, at: number): void => {
+    s.request(session, 'primary', {at})
+  }
+  const step = (
+    s: ReturnType<typeof script>,
+    session: string,
+    message: string,
+    started: number,
+    text?: string,
+  ): void => {
+    s.stepStarted(session, message, started)
+    if (text !== undefined) s.text(session, message, text)
+    s.stepEnded(session, message)
+  }
+  const retry = (s: ReturnType<typeof script>, session: string, attempt = 2): void => {
+    s.out.push({
+      kind: 'retry',
+      sessionId: session,
+      attempt,
+      willRetry: true,
+      error: {type: 'provider.internal', message: 'x'},
+      at: lastAt(s.out) + 1,
+    })
+  }
 
   /** What an uncertain chat span exports: nothing a step produced, an incomplete outcome, and the gap. */
   const expectNoStepData = (chat: ChatRecord): void => {
@@ -2122,196 +2150,256 @@ describe('step binding is trusted only while its order can be proved', () => {
     expect(chat.reasoning).toEqual([])
     expect(chat.toolCalls).toEqual([])
     expect(chat.finishReason).toBeUndefined()
-    expect(chat.rawFinishReason).toBeUndefined()
     expect(chat.usage).toBeUndefined()
-    expect(chat.cost).toBeUndefined()
     expect(chat.messageId).toBeUndefined()
   }
 
-  it('keeps ordinary binding exact while every request is admitted and nothing is lost', () => {
+  it('binds each step to its own hook when steps and hooks arrive in order', () => {
     // #given two requests, each with its own step, in order
     const s = script()
     s.started('p')
-    s.request('p')
-    s.stepStarted('p', 'm1')
-    s.text('p', 'm1', 'one')
-    s.stepEnded('p', 'm1')
-    s.request('p')
-    s.stepStarted('p', 'm2')
-    s.text('p', 'm2', 'two')
-    s.stepEnded('p', 'm2')
+    hook(s, 'p', 100)
+    step(s, 'p', 'm1', 100, 'one')
+    hook(s, 'p', 200)
+    step(s, 'p', 'm2', 200, 'two')
     s.ended('p')
 
     // #when
-    const {records, model} = replay(s.out, {flush: false})
+    const {records} = replay(s.out, {flush: false})
 
-    // #then each has its own text, finish and usage, and nothing is uncertain
-    expect(chatWith(records, 'one')?.finishReason).toBe('stop')
-    expect(chatWith(records, 'two')?.finishReason).toBe('stop')
+    // #then
+    expect(chatWith(records, 'one')?.messageId).toBe('m1')
+    expect(chatWith(records, 'two')?.messageId).toBe('m2')
     expect(chats(records).some(chat => chat.gaps.includes('step-binding-uncertain'))).toBe(false)
-    expect(model.stats().uncertainSessions).toBe(0)
   })
 
-  it('makes the session uncertain at its FIRST refused primary request: waiting, bound and later requests export no step data', () => {
-    // #given request 1 bound and mid-text, request 2 refused at the span cap, then steps for both and a later request
+  it('binds correctly when hook(n+1) is observed before step.ended(n) and before step.started(n)', () => {
+    // #given the next hook observed first, then step n's start, text and end, then step n+1
     const s = script()
     s.started('p')
-    s.request('p')
-    s.stepStarted('p', 'm1')
-    s.text('p', 'm1', 'one')
-    s.request('p')
-    s.stepEnded('p', 'm1')
-    s.stepStarted('p', 'm2')
-    s.text('p', 'm2', 'two')
-    s.stepEnded('p', 'm2')
-    s.request('p')
-    s.stepStarted('p', 'm3')
-    s.text('p', 'm3', 'three')
-    s.stepEnded('p', 'm3')
+    hook(s, 'p', 100)
+    hook(s, 'p', 200)
+    step(s, 'p', 'm1', 100, 'one')
+    step(s, 'p', 'm2', 200, 'two')
     s.ended('p')
 
     // #when
-    const {records, model} = replay(s.out, {limits: CAP, flush: false})
+    const {records} = replay(s.out, {flush: false})
 
-    // #then nothing any step said is anywhere, and the one admitted request says why it has no data
-    expect(JSON.stringify(records)).not.toMatch(/"(one|two|three)"/)
-    const spans = primaries(records)
-    expect(spans.length).toBeGreaterThan(0)
-    for (const chat of spans) expectNoStepData(chat)
-    expect(model.stats().uncertainSessions).toBe(0)
+    // #then arrival order is irrelevant: each text is on its own request
+    expect(chatWith(records, 'one')?.messageId).toBe('m1')
+    expect(chatWith(records, 'two')?.messageId).toBe('m2')
+    expect(chatWith(records, 'one')?.start).toBe(100)
+    expect(chatWith(records, 'two')?.start).toBe(200)
   })
 
-  it('does not shift one step onto the next request when a refused request’s step.started never comes (the review’s case)', () => {
-    // #given a cap of two: both slots filled, a third request R refused, both slots freed by their steps, then A and B admitted;
-    // R's step.started never arrives, so A's start would take R's place and B's step would land on A
+  it('treats a start at exactly the hook’s time as that hook’s step', () => {
+    // #given a hook and a step that share a millisecond, and a later hook
     const s = script()
     s.started('p')
-    s.request('p')
-    s.request('p')
-    s.request('p')
-    s.stepStarted('p', 'm1')
-    s.text('p', 'm1', 'first')
+    hook(s, 'p', 100)
+    hook(s, 'p', 150)
+    step(s, 'p', 'm1', 100, 'one')
+    s.ended('p')
+
+    // #when
+    const {records} = replay(s.out, {flush: false})
+
+    // #then the tie goes to the hook at that time, not to a later one
+    expect(chatWith(records, 'one')?.start).toBe(100)
+  })
+
+  it('binds nothing when two hooks share the newest time at or before the start, since they cannot be told apart', () => {
+    // #given two hooks in the same millisecond and a step started at it
+    const s = script()
+    s.started('p')
+    hook(s, 'p', 100)
+    hook(s, 'p', 100)
+    step(s, 'p', 'm1', 100, 'one')
+    s.ended('p')
+
+    // #when
+    const {records} = replay(s.out, {flush: false})
+
+    // #then
+    expect(JSON.stringify(records)).not.toContain('"one"')
+  })
+
+  it('binds nothing for a step with no usable start time', () => {
+    // #given steps with no `started`, and with values that are not finite numbers
+    for (const started of [undefined, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      s.out.push({kind: 'step.started', sessionId: 'p', messageId: 'm1', started, at: lastAt(s.out) + 1})
+      s.text('p', 'm1', 'one')
+      s.stepEnded('p', 'm1')
+      s.ended('p')
+
+      // #when
+      const {records} = replay(s.out, {flush: false})
+
+      // #then
+      expect(JSON.stringify(records)).not.toContain('"one"')
+    }
+  })
+
+  it('binds nothing for a step that starts before every hook the session has recorded', () => {
+    // #given a step whose hook was never seen
+    const s = script()
+    s.started('p')
+    hook(s, 'p', 200)
+    step(s, 'p', 'm1', 100, 'orphan text')
+    s.ended('p')
+
+    // #when
+    const {records} = replay(s.out, {flush: false})
+
+    // #then the hook at 200 is not its hook
+    expect(JSON.stringify(records)).not.toContain('orphan text')
+  })
+
+  it('keeps helper requests out of the join: a title hook between a hook and its step is not a candidate', () => {
+    // #given a primary hook, a title hook after it, and the primary's step starting after both
+    const s = script()
+    s.started('p')
+    hook(s, 'p', 100)
+    s.request('p', 'title', {at: 105})
+    step(s, 'p', 'm1', 110, 'one')
+    s.ended('p')
+
+    // #when
+    const {records} = replay(s.out, {flush: false})
+
+    // #then the step is the primary's
+    expect(chatWith(records, 'one')?.requestKind).toBe('primary')
+  })
+
+  it('does not give a refused request’s text to the next admitted request (the first review’s case)', () => {
+    // #given a cap of one span: request 1 admitted and bound, request 2 refused, request 1 ends, request 3 admitted, then request
+    // 2's own step arrives after request 3's hook, and request 3's own
+    const s = script()
+    s.started('p')
+    hook(s, 'p', 100)
+    s.stepStarted('p', 'm1', 100)
+    hook(s, 'p', 200)
+    s.text('p', 'm1', 'one')
     s.stepEnded('p', 'm1')
-    s.stepStarted('p', 'm2')
-    s.text('p', 'm2', 'second')
-    s.stepEnded('p', 'm2')
-    s.request('p')
-    s.stepStarted('p', 'mA')
-    s.text('p', 'mA', 'A output')
-    s.stepEnded('p', 'mA')
-    s.request('p')
-    s.stepStarted('p', 'mB')
-    s.text('p', 'mB', 'B output')
-    s.stepEnded('p', 'mB')
+    hook(s, 'p', 300)
+    step(s, 'p', 'm2', 200, 'second request text')
+    step(s, 'p', 'm3', 300, 'third request text')
+    s.ended('p')
+
+    // #when
+    const {records} = replay(s.out, {limits: CAP, flush: false})
+
+    // #then the refused request's step bound nothing, and request 3 has its own
+    expect(JSON.stringify(records)).not.toContain('second request text')
+    expect(chatWith(records, 'third request text')?.messageId).toBe('m3')
+    expect(chatWith(records, 'one')?.messageId).toBe('m1')
+  })
+
+  it('does not shift later steps when a refused request’s step.started never comes, and both later requests are admitted (the second review’s case)', () => {
+    // #given a cap of two: both slots filled, R refused, both slots freed by their steps, then A and B admitted; R's start is lost
+    const s = script()
+    s.started('p')
+    hook(s, 'p', 100)
+    hook(s, 'p', 200)
+    hook(s, 'p', 300)
+    step(s, 'p', 'm1', 100, 'first')
+    step(s, 'p', 'm2', 200, 'second')
+    hook(s, 'p', 400)
+    step(s, 'p', 'mA', 400, 'A output')
+    hook(s, 'p', 500)
+    step(s, 'p', 'mB', 500, 'B output')
     s.ended('p')
 
     // #when
     const {records} = replay(s.out, {limits: {maxOpenSpansPerTrace: 2}, flush: false})
 
-    // #then no output of any step is on any span, least of all B's on A's
-    expect(JSON.stringify(records)).not.toMatch(/"(first|second|A output|B output)"/)
-    for (const chat of primaries(records)) expectNoStepData(chat)
+    // #then A and B were both admitted, each carries its own output, and nothing of R's exists
+    expect(chatWith(records, 'A output')?.messageId).toBe('mA')
+    expect(chatWith(records, 'B output')?.messageId).toBe('mB')
+    expect(chatWith(records, 'first')?.messageId).toBe('m1')
+    expect(chatWith(records, 'second')?.messageId).toBe('m2')
+    expect(primaries(records)).toHaveLength(4)
   })
 
-  it('makes the session uncertain at the first LOSS the pipeline reports for it: one lost step.started, then two complete steps', () => {
-    // #given request 1 complete, request 2 whose step.started was lost, and request 3 with its own complete step
+  it('binds nothing for a delayed step after a trace-cap eviction and a reopening with no execution.ended (the third review’s case)', () => {
+    // #given session p with a request, another root that evicts p's trace, then p asking again, and p's old step arriving late
     const s = script()
     s.started('p')
-    s.request('p')
-    s.stepStarted('p', 'm1')
-    s.text('p', 'm1', 'one')
-    s.stepEnded('p', 'm1')
-    s.request('p')
-    s.lost(['p'], 'inbox-full')
-    s.text('p', 'm2', 'two')
-    s.stepEnded('p', 'm2')
-    s.request('p')
-    s.stepStarted('p', 'm3')
-    s.text('p', 'm3', 'three')
-    s.stepEnded('p', 'm3')
-    s.ended('p')
-
-    // #when
-    const {records, model} = replay(s.out, {flush: false})
-
-    // #then the first request, whose step ended before the loss, keeps its own data; the others carry none, and no text of m2 or m3
-    // is on any span
-    expect(chatWith(records, 'one')?.finishReason).toBe('stop')
-    expect(JSON.stringify(records)).not.toMatch(/"(two|three)"/)
-    const uncertain = primaries(records).filter(chat => chat.gaps.includes('step-binding-uncertain'))
-    expect(uncertain).toHaveLength(2)
-    for (const chat of uncertain) expectNoStepData(chat)
-    expect(model.stats().uncertainSessions).toBe(0)
-  })
-
-  it('treats a loss that names no session as a loss for every session', () => {
-    // #given two sessions each with a request waiting, and a loss that names none
-    const s = script()
-    s.started('p')
-    s.request('p')
+    hook(s, 'p', 100)
     s.started('q')
-    s.request('q')
-    s.lost(undefined, 'identifier-too-long')
-    s.stepStarted('p', 'mp')
-    s.text('p', 'mp', 'p text')
-    s.stepEnded('p', 'mp')
-    s.stepStarted('q', 'mq')
-    s.text('q', 'mq', 'q text')
-    s.stepEnded('q', 'mq')
-    s.ended('p')
-    s.ended('q')
-
-    // #when
-    const {records} = replay(s.out, {flush: false})
-
-    // #then both are uncertain
-    expect(JSON.stringify(records)).not.toMatch(/"(p text|q text)"/)
-    expect(chats(records).filter(chat => chat.gaps.includes('step-binding-uncertain'))).toHaveLength(2)
-  })
-
-  it('survives a trace-cap eviction and a reopening with no execution.ended, so a delayed step still binds nothing', () => {
-    // #given session p made uncertain, another root starting so the trace cap evicts p's trace, then p asking again WITHOUT any
-    // execution.ended, and its old step arriving late
-    const s = script()
-    s.started('p')
-    s.request('p')
-    s.lost(['p'], 'inbox-full')
-    s.started('q')
-    s.request('q')
-    s.request('p')
-    s.stepStarted('p', 'late-step')
+    hook(s, 'q', 150)
+    hook(s, 'p', 200)
+    s.stepStarted('p', 'late-step', 100)
     s.text('p', 'late-step', 'delayed text')
     s.stepEnded('p', 'late-step')
+    s.stepStarted('p', 'own-step', 200)
+    s.text('p', 'own-step', 'own text')
+    s.stepEnded('p', 'own-step')
+    s.ended('p')
 
     // #when the cap holds one trace
-    const open = replay(s.out, {limits: {maxOpenTraces: 1}, flush: false})
+    const {records} = replay(s.out, {limits: {maxOpenTraces: 1}, flush: false})
 
-    // #then the uncertainty is still held, and the late step bound nothing
-    expect(open.model.stats().uncertainSessions).toBeGreaterThanOrEqual(1)
-    expect(JSON.stringify(open.records)).not.toContain('delayed text')
-    const after = script()
-    after.out.push(...s.out)
-    after.ended('p')
-    const done = replay(after.out, {limits: {maxOpenTraces: 1}, flush: false})
-    expect(JSON.stringify(done.records)).not.toContain('delayed text')
-    for (const chat of primaries(done.records)) expectNoStepData(chat)
-    // and only the observed execution.ended clears it
-    expect(done.model.stats().uncertainSessions).toBe(0)
+    // #then the delayed step bound to nothing; the reopened request has its own step
+    expect(JSON.stringify(records)).not.toContain('delayed text')
+    expect(chatWith(records, 'own text')?.messageId).toBe('own-step')
   })
 
-  it('exports no error, no finish reason and no usage for a non-abort failure bound to an uncertain chat', () => {
-    // #given an uncertain chat whose step then FAILS with a provider error
+  it('exports no error, finish reason or usage for a step that bound nothing, and no foreign metadata', () => {
+    // #given a refused request whose step then FAILS with its own error, agent, model and provider, and an admitted one after it
     const s = script()
     s.started('p')
-    s.request('p')
-    s.lost(['p'], 'inbox-full')
-    s.stepStarted('p', 'm1')
+    hook(s, 'p', 100)
+    s.stepStarted('p', 'm1', 100)
+    hook(s, 'p', 200)
+    s.out.push({
+      kind: 'step.started',
+      sessionId: 'p',
+      messageId: 'foreign',
+      started: 200,
+      agent: 'FOREIGN-AGENT',
+      model: 'FOREIGN-MODEL',
+      provider: 'FOREIGN-PROVIDER',
+      at: lastAt(s.out) + 1,
+    })
     s.out.push({
       kind: 'step.failed',
       sessionId: 'p',
-      messageId: 'm1',
+      messageId: 'foreign',
       error: {type: 'FOREIGN-ERROR', message: 'FOREIGN-MESSAGE', status: 503},
       usage: USAGE,
+      at: lastAt(s.out) + 1,
+    })
+    s.text('p', 'm1', 'one')
+    s.stepEnded('p', 'm1')
+    s.ended('p')
+
+    // #when the second hook is refused by the cap
+    const {records} = replay(s.out, {limits: CAP, flush: false})
+
+    // #then nothing of the failed step is anywhere
+    expect(JSON.stringify(records)).not.toContain('FOREIGN')
+    expect(chatWith(records, 'one')?.messageId).toBe('m1')
+  })
+
+  it('keeps hook-time agent, model and provider apart from the step’s: a request that never bound shows only its own', () => {
+    // #given a request hook with no agent, model or provider, a loss that makes it uncertain, and a step that would resolve to it
+    const s = script()
+    s.started('p')
+    s.out.push({kind: 'request', sessionId: 'p', requestKind: 'primary', content: {messages: []}, at: 100})
+    s.lost(['p'], 'inbox-full')
+    s.out.push({
+      kind: 'step.started',
+      sessionId: 'p',
+      messageId: 'm1',
+      started: 100,
+      agent: 'FOREIGN-AGENT',
+      model: 'FOREIGN-MODEL',
+      provider: 'FOREIGN-PROVIDER',
       at: lastAt(s.out) + 1,
     })
     s.ended('p')
@@ -2320,47 +2408,266 @@ describe('step binding is trusted only while its order can be proved', () => {
     const {records} = replay(s.out, {flush: false})
 
     // #then
-    const chat = primaries(records)[0]
-    expect(chat).toBeDefined()
-    if (chat !== undefined) expectNoStepData(chat)
+    expect(primaries(records)).toHaveLength(1)
+    for (const chat of primaries(records)) {
+      expectNoStepData(chat)
+      expect([chat.agent, chat.model, chat.provider]).toEqual([undefined, undefined, undefined])
+      expect(chat.name).toBe('chat primary')
+    }
     expect(JSON.stringify(records)).not.toContain('FOREIGN')
   })
 
-  it('starts clean after the observed execution.ended: the next execution on the same retained session keeps its own first step', () => {
-    // #given an uncertain execution that ends, and a new execution on the same session (a title request keeps its trace open)
+  it('lets a pending primary that never saw a step survive the execution boundary without taking the next execution’s step', () => {
+    // #given a primary with no step, the execution ending (a title keeps the session), and a new execution with its own request
     const s = script()
     s.started('p')
-    s.request('p')
-    s.request('p', 'title')
-    s.lost(['p'], 'inbox-full')
+    hook(s, 'p', 100)
+    s.request('p', 'title', {at: 101})
     s.ended('p')
     s.started('p')
-    s.request('p')
-    s.stepStarted('p', 'm9')
-    s.text('p', 'm9', 'its own first step')
-    s.stepEnded('p', 'm9')
+    hook(s, 'p', 300)
+    step(s, 'p', 'm9', 300, 'its own first step')
     s.ended('p')
 
     // #when
     const {records, model} = replay(s.out, {flush: false})
 
-    // #then
-    const fresh = chatWith(records, 'its own first step')
-    expect(fresh?.finishReason).toBe('stop')
-    expect(fresh?.gaps).not.toContain('step-binding-uncertain')
-    expect(fresh?.attempt).toBe(1)
-    expect(model.stats().uncertainSessions).toBe(0)
+    // #then the new execution's step went to the new request, and the session kept its record across the boundary
+    expect(chatWith(records, 'its own first step')?.start).toBe(300)
+    expect(model.stats().hookTimes).toBeGreaterThan(0)
   })
 
-  it('leaves a subagent session unaffected by its parent’s uncertainty, and the parent by the child’s', () => {
-    // #given a parent made uncertain by a loss, with a dispatched child that completes a turn of its own
+  it('treats a loss as having possibly taken the step.started of every request waiting at that point, and only those', () => {
+    // #given request 1 waiting, a loss, request 2 after the loss, and both steps
+    const s = script()
+    s.started('p')
+    hook(s, 'p', 100)
+    s.lost(['p'], 'inbox-full')
+    hook(s, 'p', 200)
+    step(s, 'p', 'm1', 100, 'one')
+    step(s, 'p', 'm2', 200, 'two')
+    s.ended('p')
+
+    // #when
+    const {records} = replay(s.out, {flush: false})
+
+    // #then request 1 is uncertain and holds no data; request 2, hooked after the marker, matches normally
+    expect(JSON.stringify(records)).not.toContain('"one"')
+    expect(chatWith(records, 'two')?.messageId).toBe('m2')
+    const waiting = primaries(records).filter(chat => chat.gaps.includes('step-binding-uncertain'))
+    expect(waiting).toHaveLength(1)
+    expect(waiting[0]?.start).toBe(100)
+    if (waiting[0] !== undefined) expectNoStepData(waiting[0])
+  })
+
+  it('treats a loss that names no session as a loss for every session', () => {
+    // #given two sessions each with a request waiting, and a loss that names none
+    const s = script()
+    s.started('p')
+    hook(s, 'p', 100)
+    s.started('q')
+    hook(s, 'q', 110)
+    s.lost(undefined, 'identifier-too-long')
+    step(s, 'p', 'mp', 100, 'p text')
+    step(s, 'q', 'mq', 110, 'q text')
+    s.ended('p')
+    s.ended('q')
+
+    // #when
+    const {records} = replay(s.out, {flush: false})
+
+    // #then
+    expect(JSON.stringify(records)).not.toMatch(/"(p text|q text)"/)
+    expect(chats(records).filter(chat => chat.gaps.includes('step-binding-uncertain'))).toHaveLength(2)
+  })
+
+  it('needs nothing for a lost hook: its step resolves to the older hook, which already has a step, and binds nothing', () => {
+    // #given request 1 complete, request 2's hook lost (with its marker), its step arriving, and request 3 with its own step
+    const s = script()
+    s.started('p')
+    hook(s, 'p', 100)
+    step(s, 'p', 'm1', 100, 'one')
+    s.lost(['p'], 'inbox-full')
+    step(s, 'p', 'm2', 200, 'lost hook text')
+    hook(s, 'p', 300)
+    step(s, 'p', 'm3', 300, 'three')
+    s.ended('p')
+
+    // #when
+    const {records} = replay(s.out, {flush: false})
+
+    // #then the orphan step is nobody's, and the others are their own
+    expect(JSON.stringify(records)).not.toContain('lost hook text')
+    expect(chatWith(records, 'one')?.messageId).toBe('m1')
+    expect(chatWith(records, 'three')?.messageId).toBe('m3')
+  })
+
+  it('survives the double loss: hook n+1 lost AND step.started n lost', () => {
+    // #given request 1 whose step.started is lost, request 2's hook lost, then request 2's step, and request 3 with its own
+    const s = script()
+    s.started('p')
+    hook(s, 'p', 100)
+    s.lost(['p'], 'inbox-full')
+    s.lost(['p'], 'inbox-full')
+    s.text('p', 'm1', 'one')
+    s.stepEnded('p', 'm1')
+    s.stepStarted('p', 'm2', 200)
+    s.text('p', 'm2', 'two')
+    s.stepEnded('p', 'm2')
+    hook(s, 'p', 300)
+    step(s, 'p', 'm3', 300, 'three')
+    s.ended('p')
+
+    // #when
+    const {records} = replay(s.out, {flush: false})
+
+    // #then request 2's step resolves to request 1's hook, which is uncertain, and binds nothing; request 3 is its own
+    expect(JSON.stringify(records)).not.toMatch(/"(one|two)"/)
+    expect(chatWith(records, 'three')?.messageId).toBe('m3')
+    const waiting = primaries(records).filter(chat => chat.gaps.includes('step-binding-uncertain'))
+    expect(waiting).toHaveLength(1)
+  })
+
+  it('records a pre-output retry exactly: the failed attempt is its own span, and the retried attempt reuses the message id', () => {
+    // #given attempt 1 (hook, retry hook, its step.started), attempt 2 (hook, step.started with the SAME message id, text, end)
+    const s = script()
+    s.started('p')
+    hook(s, 'p', 100)
+    retry(s, 'p')
+    s.stepStarted('p', 'm1', 100)
+    hook(s, 'p', 1800)
+    s.stepStarted('p', 'm1', 1800)
+    s.text('p', 'm1', 'recovered')
+    s.stepEnded('p', 'm1')
+    s.ended('p')
+
+    // #when
+    const {records} = replay(s.out, {flush: false})
+
+    // #then
+    const [failed, ok] = primaries(records)
+    expect(failed?.status).toBe('error')
+    expect(failed?.attempt).toBe(1)
+    expect(failed?.messageId).toBeUndefined()
+    expect(ok?.texts).toEqual(['recovered'])
+    expect(ok?.attempt).toBe(2)
+    expect(ok?.start).toBe(1800)
+  })
+
+  it('holds no step open for a failed attempt whose request a retry hook already closed', () => {
+    // #given a pre-output failure: the retry hook closes the request, then the failed attempt's step.started is delivered, and the
+    // second attempt never starts its step
+    const s = script()
+    s.started('p')
+    hook(s, 'p', 100)
+    retry(s, 'p')
+    s.stepStarted('p', 'm1', 100)
+
+    // #when the session is still running (no execution end yet)
+    const {model} = replay(s.out, {flush: false})
+
+    // #then the step bound to nothing, so nothing waits for an end that will not come
+    expect(model.stats().openSteps).toBe(0)
+  })
+
+  it('records the same retry when the failed attempt’s step.started is delivered after the next hook', () => {
+    // #given the retry's hook and step.started delivered late, after the next attempt's hook
+    const s = script()
+    s.started('p')
+    hook(s, 'p', 100)
+    retry(s, 'p')
+    hook(s, 'p', 1800)
+    s.stepStarted('p', 'm1', 100)
+    s.stepStarted('p', 'm1', 1800)
+    s.text('p', 'm1', 'recovered')
+    s.stepEnded('p', 'm1')
+    s.ended('p')
+
+    // #when
+    const {records} = replay(s.out, {flush: false})
+
+    // #then
+    const [failed, ok] = primaries(records)
+    expect(failed?.status).toBe('error')
+    expect(ok?.texts).toEqual(['recovered'])
+    expect(ok?.start).toBe(1800)
+  })
+
+  it('does not close a request that already has a step when a retry hook follows it (a failure after output)', () => {
+    // #given a step with output, the retry hook, then the step's failure, and a second attempt
+    const s = script()
+    s.started('p')
+    hook(s, 'p', 100)
+    s.stepStarted('p', 'm1', 100)
+    s.text('p', 'm1', 'partial')
+    retry(s, 'p')
+    s.out.push({kind: 'step.failed', sessionId: 'p', messageId: 'm1', error: {type: 'aborted'}, at: lastAt(s.out) + 1})
+    hook(s, 'p', 1800)
+    step(s, 'p', 'm2', 1800, 'recovered')
+    s.ended('p')
+
+    // #when
+    const {records} = replay(s.out, {flush: false})
+
+    // #then the failed attempt keeps its partial text, closed by its own failure
+    const [failed, ok] = primaries(records)
+    expect(failed?.texts).toEqual(['partial'])
+    expect(failed?.messageId).toBe('m1')
+    expect(ok?.texts).toEqual(['recovered'])
+  })
+
+  it('does not carry a retry’s attempt number past the hook that consumed it, nor past a refused one', () => {
+    // #given a retry (attempt 2), its hook refused by the cap, and the next hooks
+    const s = script()
+    s.started('p')
+    hook(s, 'p', 100)
+    s.stepStarted('p', 'm1', 100)
+    retry(s, 'p')
+    hook(s, 'p', 200)
+    s.text('p', 'm1', 'one')
+    s.stepEnded('p', 'm1')
+    hook(s, 'p', 300)
+    step(s, 'p', 'm3', 300, 'third')
+    s.ended('p')
+
+    // #when
+    const {records} = replay(s.out, {limits: CAP, flush: false})
+
+    // #then the refused hook consumed the 2; the third request is attempt 1
+    expect(chatWith(records, 'third')?.attempt).toBe(1)
+  })
+
+  it('bounds the hook record per session, oldest first: a step whose hook was dropped binds nothing, not an older hook', () => {
+    // #given a record of three hooks and five requests, the first two unmatched when they are evicted
+    const s = script()
+    s.started('p')
+    for (const at of [100, 200, 300, 400, 500]) hook(s, 'p', at)
+    step(s, 'p', 'm1', 100, 'evicted one')
+    step(s, 'p', 'm2', 250, 'between')
+    step(s, 'p', 'm3', 300, 'three')
+    step(s, 'p', 'm5', 500, 'five')
+    s.ended('p')
+
+    // #when
+    const {records, model} = replay(s.out, {limits: {maxHookTimes: 3}, flush: false})
+
+    // #then steps older than every retained hook bind nothing; retained hooks still bind; evicted waiting requests are uncertain
+    expect(JSON.stringify(records)).not.toMatch(/"(evicted one|between)"/)
+    expect(chatWith(records, 'three')?.messageId).toBe('m3')
+    expect(chatWith(records, 'five')?.messageId).toBe('m5')
+    expect(chats(records).filter(chat => chat.gaps.includes('step-binding-uncertain'))).toHaveLength(2)
+    expect(model.stats().hookTimes).toBeLessThanOrEqual(3)
+  })
+
+  it('keeps a subagent’s hooks in its own record: its times never resolve a parent’s step', () => {
+    // #given a parent and a dispatched child whose hook times interleave with the parent's
     const s = script()
     s.prompt('p', 'mp')
     s.enqueued('p', 'mp', 'user')
     s.started('p')
     s.delivered('p', 'mp')
-    s.request('p')
-    s.stepStarted('p', 'sp1')
+    hook(s, 'p', 100)
+    s.stepStarted('p', 'sp1', 100)
     s.toolBefore('p', 'c1', 'subagent', 'sp1')
     s.toolAfter('p', 'c1', 'subagent', 'kid')
     s.toolEnded('p', 'c1', {childSessionId: 'kid'})
@@ -2369,183 +2676,158 @@ describe('step binding is trusted only while its order can be proved', () => {
     s.enqueued('kid', 'mk', 'user')
     s.started('kid')
     s.delivered('kid', 'mk')
-    s.lost(['p'], 'inbox-full')
-    s.request('kid')
-    s.stepStarted('kid', 'sk')
-    s.text('kid', 'sk', 'child text')
-    s.stepEnded('kid', 'sk')
+    hook(s, 'kid', 150)
+    hook(s, 'p', 160)
+    s.text('p', 'sp1', 'parent one')
+    s.stepEnded('p', 'sp1')
+    step(s, 'p', 'sp2', 160, 'parent two')
+    step(s, 'kid', 'sk', 150, 'child text')
     s.ended('kid')
     s.ended('p')
 
     // #when
     const {records} = replay(s.out, {flush: false})
 
-    // #then the child's span has its text and finish; the parent's has none
+    // #then each text is on its own session's span
     expect(chatWith(records, 'child text')?.sessionId).toBe('kid')
-    expect(chatWith(records, 'child text')?.gaps).not.toContain('step-binding-uncertain')
-    for (const chat of primaries(records, 'p')) expectNoStepData(chat)
+    expect(chatWith(records, 'parent two')?.sessionId).toBe('p')
   })
 
-  it('reports attempt 1 for a request that starts after an uncertain execution, so a refused retry leaves no stale count', () => {
-    // #given a retry hook (attempt 2) while the session is clean, a request refused at the cap, the execution ending (a title
-    // request keeps the session and its trace), and a new execution
+  /** A parent that dispatches a child whose observations are buffered until the dispatch link arrives. */
+  const bufferedChild = (): ReturnType<typeof script> => {
     const s = script()
+    s.prompt('p', 'mp')
+    s.enqueued('p', 'mp', 'user')
     s.started('p')
-    s.request('p')
-    s.request('p', 'title')
-    s.out.push({
-      kind: 'retry',
-      sessionId: 'p',
-      attempt: 2,
-      willRetry: true,
-      error: {type: 'provider.internal', message: 'x'},
-      at: lastAt(s.out) + 1,
-    })
-    s.request('p')
-    s.request('p')
+    s.delivered('p', 'mp')
+    hook(s, 'p', 100)
+    s.stepStarted('p', 'sp1', 100)
+    s.toolNamed('p', 'c1', 'subagent')
+    s.toolCalled('p', 'c1', {messageId: 'sp1'})
+    s.toolBefore('p', 'c1', 'subagent', 'sp1')
+    s.created('kid', 'p')
+    return s
+  }
+  const link = (s: ReturnType<typeof script>): void => {
+    s.toolAfter('p', 'c1', 'subagent', 'kid')
+    s.toolEnded('p', 'c1', {childSessionId: 'kid'})
+    s.text('p', 'sp1', 'parent one')
+    s.stepEnded('p', 'sp1')
     s.ended('p')
-    s.started('p')
-    s.request('p')
-    s.stepStarted('p', 'm5')
-    s.text('p', 'm5', 'fresh')
-    s.stepEnded('p', 'm5')
-    s.ended('p')
+  }
 
-    // #when the cap is two open spans: the title and the retried attempt's retry fit, the next request is refused
-    const {records, model} = replay(s.out, {limits: {maxOpenSpansPerTrace: 2}, flush: false})
-
-    // #then the session was kept across the boundary and the new execution's request is attempt 1, not a stale 2
-    expect(model.stats().sessions).toBeGreaterThan(0)
-    expect(chatWith(records, 'fresh')?.attempt).toBe(1)
-  })
-
-  it('gives an uncertain request attempt 1, not the retry count a clean one before it left behind', () => {
-    // #given a retry hook (attempt 2) that its request consumed, a loss, and a request that starts after it
-    const s = script()
-    s.started('p')
-    s.request('p')
-    s.out.push({
-      kind: 'retry',
-      sessionId: 'p',
-      attempt: 2,
-      willRetry: true,
-      error: {type: 'provider.internal', message: 'x'},
-      at: lastAt(s.out) + 1,
-    })
-    s.request('p')
-    s.lost(['p'], 'inbox-full')
-    s.request('p')
-    s.ended('p')
+  it('joins a buffered child unchanged on replay: its observations carry their own times', () => {
+    // #given a child whose whole turn arrives before the dispatch link
+    const s = bufferedChild()
+    s.prompt('kid', 'mk')
+    s.enqueued('kid', 'mk', 'user')
+    s.started('kid')
+    s.delivered('kid', 'mk')
+    hook(s, 'kid', 150)
+    hook(s, 'kid', 250)
+    step(s, 'kid', 'k2', 250, 'second kid text')
+    step(s, 'kid', 'k1', 150, 'first kid text')
+    s.ended('kid')
+    link(s)
 
     // #when
     const {records} = replay(s.out, {flush: false})
 
-    // #then the retried request says attempt 2; the one after the loss does not claim it
-    const attempts = chats(records)
-      .filter(chat => chat.requestKind === 'primary' && chat.gaps.includes('step-binding-uncertain'))
-      .map(chat => chat.attempt)
-    expect(attempts).toContain(1)
-    expect(chats(records).findLast(chat => chat.gaps.includes('step-binding-uncertain'))?.attempt).toBe(1)
+    // #then
+    expect(chatWith(records, 'first kid text')?.start).toBe(150)
+    expect(chatWith(records, 'second kid text')?.start).toBe(250)
   })
 
-  it('clears the failed attempts’ owed steps at the execution boundary: the next execution’s first step binds its own request', () => {
-    // #given a retry whose failed attempt's step never starts, the execution ending (a title keeps the session), a new execution
-    const s = script()
-    s.started('p')
-    s.request('p')
-    s.request('p', 'title')
-    s.out.push({
-      kind: 'retry',
-      sessionId: 'p',
-      attempt: 2,
-      willRetry: true,
-      error: {type: 'provider.internal', message: 'x'},
-      at: lastAt(s.out) + 1,
-    })
-    s.ended('p')
-    s.started('p')
-    s.request('p')
-    s.stepStarted('p', 'm9')
-    s.text('p', 'm9', 'its own first step')
-    s.stepEnded('p', 'm9')
-    s.ended('p')
+  it('puts a loss for a buffered child in its buffer in order: an execution.ended before it cannot clear it', () => {
+    // #given a child that completes a turn and ends, whose NEXT request hook is lost (a named loss), then a later request
+    const s = bufferedChild()
+    s.prompt('kid', 'mk')
+    s.enqueued('kid', 'mk', 'user')
+    s.started('kid')
+    s.delivered('kid', 'mk')
+    hook(s, 'kid', 150)
+    step(s, 'kid', 'k1', 150, 'first kid text')
+    s.ended('kid')
+    s.lost(['kid'], 'inbox-full')
+    step(s, 'kid', 'k2', 200, 'lost hook text')
+    s.started('kid')
+    hook(s, 'kid', 300)
+    step(s, 'kid', 'k3', 300, 'third kid text')
+    s.ended('kid')
+    link(s)
 
     // #when
     const {records} = replay(s.out, {flush: false})
 
-    // #then it was not swallowed as the previous execution's failed attempt
-    expect(chatWith(records, 'its own first step')?.finishReason).toBe('stop')
+    // #then the lost hook's step is nobody's, and the later request has its own
+    expect(JSON.stringify(records)).not.toContain('lost hook text')
+    expect(chatWith(records, 'first kid text')?.messageId).toBe('k1')
+    expect(chatWith(records, 'third kid text')?.messageId).toBe('k3')
   })
 
-  it('returns the second owner of a tool call’s arguments when a request bound with calls turns uncertain', () => {
-    // #given request 1 bound, asking for a tool with object arguments, then a loss for the session
-    const s = script()
-    const input = {path: 'a'}
-    s.started('p')
-    s.request('p')
-    s.stepStarted('p', 'm1')
-    s.toolNamed('p', 'c1')
-    s.toolCalled('p', 'c1', {messageId: 'm1', input})
-    s.lost(['p'], 'inbox-full')
-    s.ended('p')
-
-    // #when
-    const {model} = replay(s.out, {flush: false})
-
-    // #then the arguments the chat span can no longer carry are handed back for release
-    expect(model.takeDiscarded()).toContain(input)
-  })
-
-  it('does not let a failed attempt’s step bind the request queued behind it', () => {
-    // #given request 1 and request 2 both started, a retry hook for request 1, then its failed attempt's step and request 2's own
-    const s = script()
-    s.started('p')
-    s.request('p')
-    s.request('p')
-    s.out.push({
-      kind: 'retry',
-      sessionId: 'p',
-      attempt: 2,
-      willRetry: true,
-      error: {type: 'provider.internal', message: 'x'},
-      at: lastAt(s.out) + 1,
-    })
-    s.stepStarted('p', 'failed-attempt')
-    s.stepStarted('p', 'm2')
-    s.text('p', 'm2', 'the second request')
-    s.stepEnded('p', 'm2')
-    s.ended('p')
+  it('tells every buffered child about a loss that names no session', () => {
+    // #given a buffered child with a request waiting for its step, and an unnamed loss before the link
+    const s = bufferedChild()
+    s.prompt('kid', 'mk')
+    s.enqueued('kid', 'mk', 'user')
+    s.started('kid')
+    s.delivered('kid', 'mk')
+    hook(s, 'kid', 150)
+    s.lost(undefined, 'identifier-too-long')
+    step(s, 'kid', 'k1', 150, 'kid text')
+    s.ended('kid')
+    link(s)
 
     // #when
     const {records} = replay(s.out, {flush: false})
 
-    // #then request 2 has its own step, and request 1 is the failed span
-    expect(chatWith(records, 'the second request')?.messageId).toBe('m2')
-    expect(chats(records).filter(chat => chat.status === 'error')).toHaveLength(1)
+    // #then the child's waiting request is uncertain
+    expect(JSON.stringify(records)).not.toContain('kid text')
+    expect(primaries(records, 'kid').some(chat => chat.gaps.includes('step-binding-uncertain'))).toBe(true)
+  })
+})
+
+describe('the join against every recorded scenario, with the scripted provider’s own account of whose each step was', () => {
+  const names = Object.keys(recordedFixtures).filter(name => recordedFixtures[name]?.truth !== undefined)
+
+  it('has the truth for every recorded scenario that has steps', () => {
+    // #then the recorder wrote it for all of them
+    expect(names.length).toBeGreaterThanOrEqual(22)
   })
 
-  it('makes the session uncertain when more steps are owed to failed attempts than the bound allows', () => {
-    // #given four waiting requests and a retry for each, none of whose failed attempts' steps ever start, with a bound of two
-    const s = script()
-    s.started('p')
-    for (let index = 0; index < 4; index += 1) s.request('p')
-    for (let index = 0; index < 4; index += 1) {
-      s.out.push({
-        kind: 'retry',
-        sessionId: 'p',
-        attempt: 2,
-        willRetry: true,
-        error: {type: 'provider.internal', message: 'x'},
-        at: lastAt(s.out) + 1,
-      })
+  it.each(names)('binds every step of %s to the request the provider answered with it', name => {
+    // #given the recording and what the scripted provider says each step answered
+    const fixture = recordedFixtures[name]
+    const truth = fixture?.truth ?? []
+    const {records} = replay(fixture?.observations ?? [])
+
+    // #when the primary chats of each session are ranked by when their request hook arrived
+    const bySession = new Map<string, ChatRecord[]>()
+    for (const chat of chats(records).filter(candidate => candidate.requestKind === 'primary')) {
+      bySession.set(
+        chat.sessionId,
+        [...(bySession.get(chat.sessionId) ?? []), chat].sort((a, b) => a.start - b.start),
+      )
     }
-    s.ended('p')
 
-    // #when
-    const {records} = replay(s.out, {limits: {maxStepSkips: 2}, flush: false})
-
-    // #then two failed attempts are reported, and the two requests left waiting are uncertain, not failed
-    expect(chats(records).filter(chat => chat.status === 'error')).toHaveLength(2)
-    expect(chats(records).filter(chat => chat.gaps.includes('step-binding-uncertain'))).toHaveLength(2)
+    // #then a chat that has a step has the step that the provider's own account gives its request; one that has none is a
+    // failed attempt a retry hook closed, and the step it was given is the later attempt's (same message id)
+    let bound = 0
+    for (const {session, message, request} of truth) {
+      const chat = bySession.get(session)?.[request]
+      expect({session, request, chat: chat !== undefined}).toEqual({session, request, chat: true})
+      const own = chat?.messageId === message
+      const closedByRetry = chat?.messageId === undefined && chat?.status === 'error'
+      expect({session, request, message, own, closedByRetry}).toEqual({
+        session,
+        request,
+        message,
+        own,
+        closedByRetry: !own,
+      })
+      bound += own ? 1 : 0
+    }
+    expect(bound).toBeGreaterThan(0)
+    expect(chats(records).filter(chat => chat.gaps.includes('step-binding-uncertain'))).toHaveLength(0)
   })
 })

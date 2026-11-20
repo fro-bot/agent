@@ -330,16 +330,26 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
   /** Tells the sink about spans the model refused, once each: the model keeps a running total, this sends the difference. */
   function forwardDrops(): void {
     const total = model.stats().droppedSpans
-    if (total > forwardedDrops) {
-      options.sink.drop(total - forwardedDrops)
-      forwardedDrops = total
+    if (total <= forwardedDrops) return
+    const owed = total - forwardedDrops
+    // Counted as told before the sink hears it: a sink that throws loses these counts, it never makes them repeat.
+    forwardedDrops = total
+    tellSink(owed)
+  }
+
+  /** The sink's `drop`, which may throw: its failure is its own, and never a reason to treat the model's work as lost. */
+  function tellSink(count: number): void {
+    try {
+      options.sink.drop(count)
+    } catch {
+      // Nothing more can be done with a count the sink will not take.
     }
   }
 
   function enqueue(spans: readonly SpanRecord[]): void {
     for (const record of spans) {
       if (records.length >= limits.maxRecords) {
-        options.sink.drop(1)
+        tellSink(1)
         release(record)
         continue
       }
@@ -352,7 +362,7 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
       options.sink.export(toExportSpan(record, attributeOptions, options.scrubber))
     } catch {
       recordsFailed += 1
-      options.sink.drop(1)
+      tellSink(1)
     } finally {
       release(record)
     }
@@ -364,16 +374,24 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
       inboxChars -= queued.chars
       const next = queued.observation
       if (isPlainRecord(next) && next.kind === 'loss') markers -= 1
+      let produced: SpanRecord[] | undefined
       try {
-        enqueue(model.observe(next))
-        retainShared()
-        releaseDiscarded()
-        forwardDrops()
+        produced = model.observe(next)
       } catch {
         // A model failure loses this observation, never the session; the model hears of it before it sees anything else.
         observationsDropped += 1
         releaseObservation(next)
         lose(next, 'model-failed', 'front')
+      }
+      if (produced !== undefined) {
+        try {
+          enqueue(produced)
+          retainShared()
+          releaseDiscarded()
+          forwardDrops()
+        } catch {
+          // What the model did is done; a failure handing it on is not a failure of the observation.
+        }
       }
       return true
     }
@@ -463,7 +481,7 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
       while (records.length > 0 && timeLeft()) step()
       // Whatever is left is counted as dropped spans and released.
       for (const left of records.splice(0)) {
-        options.sink.drop(1)
+        tellSink(1)
         release(left)
       }
     },

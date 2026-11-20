@@ -183,10 +183,10 @@ export interface TurnModelLimits {
    */
   readonly tombstoneTtlMs: number
   /**
-   * Steps still owed to attempts a `retry` hook closed, per session. Each is consumed by the failed attempt's `step.started`;
-   * past this many the order is not worth trusting and the session's binding is uncertain (see "Binding steps to requests").
+   * Primary request hook times kept per session for the step join (see "Binding steps to requests"). Oldest first out, so a step
+   * whose hook was dropped finds no hook at all and binds nothing; it never falls through to an older one.
    */
-  readonly maxStepSkips: number
+  readonly maxHookTimes: number
 }
 
 export const DEFAULT_LIMITS: TurnModelLimits = {
@@ -211,7 +211,7 @@ export const DEFAULT_LIMITS: TurnModelLimits = {
   maxPendingToolNotes: 64,
   toolNoteWaitMs: 10_000,
   tombstoneTtlMs: 24 * 60 * 60_000,
-  maxStepSkips: 16,
+  maxHookTimes: 64,
 }
 
 export interface TurnModelStats {
@@ -220,7 +220,10 @@ export interface TurnModelStats {
   readonly bufferedSessions: number
   readonly bufferedBytes: number
   /** Refused primary requests still holding a place for their step events. */
-  readonly uncertainSessions: number
+  /** Primary request hook times held across sessions (bounded per session by `maxHookTimes`). */
+  readonly hookTimes: number
+  /** Steps bound to a request and still open, across sessions: each is released when its step ends or fails. */
+  readonly openSteps: number
   readonly tombstones: number
   readonly unresolvedDispatches: number
   /** Tool names and hook observations waiting for their session event. */
@@ -324,8 +327,12 @@ interface RequestState {
   marks: Set<string>
   /** Closed by a `retry` hook: waiting only for its `step.started` to be skipped. */
   closed: boolean
+  /** The agent, model and provider its step named. Kept apart from the hook's own, which a span prefers and a withheld one is limited to. */
+  stepAgent: string | undefined
+  stepModel: string | undefined
+  stepProvider: string | undefined
   /**
-   * The step it binds may not be its own (the session's binding is uncertain): it carries nothing a step produced, only
+   * Its step may not be its own (a loss was reported while it waited for one): it carries nothing a step produced, only
    * an incomplete outcome and its hook-time metadata.
    */
   bindUncertain: boolean
@@ -363,6 +370,12 @@ interface ToolNote {
   after?: Extract<Observation, {kind: 'tool.after'}> | undefined
 }
 
+/** One primary request hook: when the plugin received it, and the request it opened (none when the span cap refused it). */
+interface HookRecord {
+  readonly at: number
+  readonly request: RequestState | undefined
+}
+
 interface SessionNode {
   readonly id: string
   /** Set for a child session: its trace and its own invoke span. */
@@ -379,10 +392,8 @@ interface SessionNode {
   /** Call ids that have ended, oldest first. */
   readonly completed: Set<string>
   readonly stepOwner: Map<string, RequestState>
-  /** Steps still to start for attempts a `retry` hook already closed (see "Binding steps to requests"). */
-  skipStepStarts: number
-  /** Order can no longer be trusted for this session: set by a refused request or a loss, cleared only by `execution.ended`. */
-  bindingUncertain: boolean
+  /** The session's primary request hooks, in the order they arrived: the step join's record (see "Binding steps to requests"). */
+  readonly hooks: HookRecord[]
   nextAttempt: number
   lastActivity: number
 }
@@ -432,8 +443,6 @@ export function createTurnModel(options: {
   const {ids} = options
 
   const traces = new Set<TraceState>()
-  /** Sessions whose step binding is uncertain (see "Binding steps to requests"). */
-  const uncertainSessions = new Set<string>()
   const sessions = new Map<string, SessionNode>()
   const buffered = new Map<string, BufferedSession>()
   /** Session ids a `session.created` event said have a parent, before any dispatch link arrived. */
@@ -541,8 +550,7 @@ export function createTurnModel(options: {
       notes: new Map(),
       completed: new Set(),
       stepOwner: new Map(),
-      skipStepStarts: 0,
-      bindingUncertain: uncertainSessions.has(sessionId),
+      hooks: [],
       nextAttempt: 1,
       lastActivity: at,
     }
@@ -642,11 +650,11 @@ export function createTurnModel(options: {
     // The request's output moves into its record: it no longer counts against what open requests hold.
     heldOutputChars = Math.max(0, heldOutputChars - request.outputChars)
     request.trace.openSpans = Math.max(0, request.trace.openSpans - 1)
-    const model = request.model
-    // A request that may have been bound to another request's step carries nothing that step produced: no output, finish reason,
-    // usage, message id, status or error (the outcome is only "incomplete"), and none of the step's own agent, model or provider
-    // (`onStepStarted` never copied them). Only what its own hook gave it, and the gap.
+    // A request that never got a step of its own (a loss was reported while it waited, or its hook record was evicted) was never
+    // bound, so it holds nothing a step produced; it says so, and its outcome is only "incomplete". The agent, model and provider
+    // are the hook's own, with the step's as a fallback only for a request that really has a step.
     const unbound = request.bindUncertain
+    const model = request.model ?? request.stepModel
     emit({
       kind: 'chat',
       spanId: request.spanId,
@@ -659,24 +667,24 @@ export function createTurnModel(options: {
       error: unbound ? undefined : error,
       sessionId: request.sessionId,
       rootSessionId: request.trace.rootSessionId,
-      agent: request.agent,
+      agent: request.agent ?? request.stepAgent,
       gaps: unbound
         ? ['step-binding-uncertain', ...(request.gaps.has('request') ? ['request'] : [])]
         : [...request.gaps],
       marks: unbound ? [...request.marks, 'incomplete', ...extraMarks] : [...request.marks, ...extraMarks],
       requestKind: request.requestKind,
-      provider: request.provider,
+      provider: request.provider ?? request.stepProvider,
       model,
       attempt: request.attempt,
-      messageId: unbound ? undefined : request.messageId,
+      messageId: request.messageId,
       request: request.request,
-      texts: unbound ? [] : request.texts,
-      reasoning: unbound ? [] : request.reasoning,
-      toolCalls: unbound ? [] : request.toolCalls,
-      finishReason: unbound ? undefined : request.finishReason,
-      rawFinishReason: unbound ? undefined : request.rawFinishReason,
-      usage: unbound ? undefined : request.usage,
-      cost: unbound ? undefined : request.cost,
+      texts: request.texts,
+      reasoning: request.reasoning,
+      toolCalls: request.toolCalls,
+      finishReason: request.finishReason,
+      rawFinishReason: request.rawFinishReason,
+      usage: request.usage,
+      cost: request.cost,
       followOnOf: request.followOnOf,
       attemptCountUnknown: request.requestKind !== 'primary',
     })
@@ -1071,8 +1079,8 @@ export function createTurnModel(options: {
 
   function onExecutionEnded(o: Extract<Observation, {kind: 'execution.ended'}>): void {
     const node = sessions.get(o.sessionId)
-    // The one verified boundary: the execution is over, so no step can still arrive for a request of it.
-    endBinding(o.sessionId, node, o.at)
+    // The execution is over: what waited for a step that cannot be trusted is closed here, as incomplete.
+    if (node !== undefined) closeUncertain(node, o.at)
     const trace = node?.active?.trace
     if (node === undefined || trace === undefined) return
     node.active = undefined
@@ -1126,16 +1134,17 @@ export function createTurnModel(options: {
     const invoke = invokeOf(node, trace)
     invoke.agent ??= o.agent
     node.agent ??= o.agent
+    // Every primary hook, admitted or refused, consumes the retry hook's attempt number that came before it.
+    const attempt = o.requestKind === 'primary' ? node.nextAttempt : 1
+    if (o.requestKind === 'primary') node.nextAttempt = 1
     if (trace.openSpans >= limits.maxOpenSpansPerTrace) {
       droppedSpans += 1
       invoke.gaps.add('spans-over-limit')
-      // No span, but its step events will still arrive and nothing says which step is whose any more.
-      if (o.requestKind === 'primary') markBindingUncertain(node)
+      // No span, but its step still arrives and must find its own hook, which holds no request.
+      if (o.requestKind === 'primary') recordHook(node, o.at, undefined)
       return
     }
     trace.openSpans += 1
-    // An uncertain request cannot know its attempt (the retry hooks that say are not trusted either).
-    const attempt = o.requestKind === 'primary' && !node.bindingUncertain ? node.nextAttempt : 1
     const request: RequestState = {
       spanId: ids.span(),
       trace,
@@ -1161,85 +1170,96 @@ export function createTurnModel(options: {
       gaps: new Set(o.requestKind === 'primary' ? [] : ['finishReason', 'usage']),
       marks: new Set(),
       closed: false,
-      bindUncertain: o.requestKind === 'primary' && node.bindingUncertain,
+      bindUncertain: false,
+      stepAgent: undefined,
+      stepModel: undefined,
+      stepProvider: undefined,
     }
     if (o.content === undefined) request.gaps.add('request')
     node.requests.push(request)
+    if (o.requestKind === 'primary') recordHook(node, o.at, request)
   }
 
   // ------------------------------------------------------------------ binding steps to requests
   //
   // THE RULE. A primary request's hook carries no message id, and the step events that follow name only a message id, so a step is
-  // bound to a request by ORDER: a `step.started` binds the oldest primary request of its session still waiting for a step. Order
-  // is trusted only while every primary request of the execution was admitted (it has a span) AND no observation of the session
-  // was lost. The FIRST refused primary request, or the first loss the pipeline reports for the session (a loss that names no
-  // session counts for every session), makes the session's binding UNCERTAIN, and there is no repairing it: a refused request's
-  // step, or a lost one, shifts every pairing behind it, and nothing observable says by how much.
+  // joined to its request by TIME, never by arrival order: a `step.started` carries `started`, the server's clock at the start of
+  // its attempt, taken after the request hook returned and before the provider was called. A step belongs to the session's
+  // LATEST primary hook whose receive time is at or before `started` (a hook at exactly `started` counts: the two share a
+  // millisecond whenever the hook returns at once, which is the usual case). Arrival order cannot be used: the hook is a direct call
+  // and the events come through a pull loop, so the plugin can see hook(n+1) before step.started(n) or step.ended(n).
   //
-  // An uncertain session's primary requests, those already waiting or bound and those that start later, export no step data (no
-  // output, reasoning, tool calls, finish reason, usage, cost, message id, and no status or error from a step), only what their own
-  // hook gave them (agent, model, provider, request content), an incomplete outcome and the gap `step-binding-uncertain`. Its
-  // steps bind nothing: they find no owner and are ignored.
+  // The step binds a request only if that hook opened one that is still open and has no step yet. It binds nothing, and every
+  // later event of its message is ignored, when:
+  //   - `started` is missing or not a finite number;
+  //   - no recorded hook is at or before it (the hook was never seen, or its record was evicted: eviction is oldest first, so a
+  //     step cannot fall through to an OLDER hook);
+  //   - the two newest candidates share a time (indistinguishable: nothing is bound on a guess);
+  //   - the hook was refused at the span cap, or its request already has a step, was closed by a `retry` hook, or lost its place.
+  // Helper requests (title, compaction, generate) are other hook names and never enter the record.
   //
-  // Uncertainty ends ONLY at an observed `execution.ended` for the session, never at a trace reopening, a new implicit execution
-  // or a trace-cap eviction: none of those proves that the server stopped the execution. It is kept by session id, so it survives
-  // the session's node being forgotten. A subagent's session has its own state.
+  // A loss the pipeline reports for the session (a loss that names none counts for every session) marks every request of it that
+  // waits for a step at that point as uncertain: its `step.started` may have been the lost event, and the next step could
+  // otherwise resolve to it. Hooks that arrive after the marker join normally. An uncertain request holds no step data, only its
+  // own hook's metadata, an incomplete outcome and the gap `step-binding-uncertain`, and is closed when the execution ends.
   //
-  // The retry skip counts steps owed to attempts a `retry` hook closed; it is bounded (`maxStepSkips`) and cleared with the rest.
+  // The record is bounded per session (`maxHookTimes`) and dies with the session's node, not at an execution boundary: time makes
+  // boundaries irrelevant, a later step is later than an earlier hook whatever execution it belongs to.
 
-  /** Session ids whose binding is uncertain, newest last, bounded by `maxTombstones`. */
-  function rememberUncertain(sessionId: string): void {
-    uncertainSessions.delete(sessionId)
-    uncertainSessions.add(sessionId)
-    while (uncertainSessions.size > limits.maxTombstones) {
-      const oldest = uncertainSessions.values().next()
-      if (oldest.done === true) break
-      uncertainSessions.delete(oldest.value)
+  function recordHook(node: SessionNode, at: number, request: RequestState | undefined): void {
+    node.hooks.push({at, request})
+    while (node.hooks.length > limits.maxHookTimes) {
+      const evicted = node.hooks.shift()?.request
+      // Its step would now resolve to nothing: it is not waited for.
+      if (evicted !== undefined && !evicted.closed && evicted.messageId === undefined) evicted.bindUncertain = true
     }
   }
 
-  function markBindingUncertain(node: SessionNode): void {
-    rememberUncertain(node.id)
-    if (node.bindingUncertain) return
-    node.bindingUncertain = true
-    // What is waiting or already bound can no longer be trusted: its steps find no owner from here on.
-    node.stepOwner.clear()
-    for (const request of node.requests) {
-      if (request.requestKind !== 'primary' || request.closed) continue
-      request.bindUncertain = true
-      // The chat span will carry no tool calls, so the second owner of their arguments is returned now.
-      for (const call of request.toolCalls) discard(call.input)
-      request.toolCalls = []
+  /** The hook a step started at `started` belongs to, or undefined when it cannot be told. */
+  function hookOf(node: SessionNode, started: number): HookRecord | undefined {
+    let found: HookRecord | undefined
+    let tied = false
+    for (const hook of node.hooks) {
+      if (hook.at > started) continue
+      if (found === undefined || hook.at > found.at) {
+        found = hook
+        tied = false
+      } else if (hook.at === found.at) tied = true
+    }
+    return tied ? undefined : found
+  }
+
+  /** Marks what waits for a step as uncertain: the loss may have been its `step.started`. */
+  function markWaiting(node: SessionNode): void {
+    for (const {request} of node.hooks) {
+      if (request !== undefined && !request.closed && request.messageId === undefined) request.bindUncertain = true
     }
   }
 
-  /** The pipeline lost something here in the sequence: those sessions' binding is uncertain (none named: every session). */
+  /** The pipeline lost something here in the sequence. A buffered child hears of it in its own buffer, in order. */
   function onLoss(o: Extract<Observation, {kind: 'loss'}>): void {
-    if (o.sessionIds === undefined) {
-      for (const node of sessions.values()) markBindingUncertain(node)
+    const named = (sessionId: string): void => {
+      const node = sessions.get(sessionId)
+      if (node !== undefined) markWaiting(node)
+      else if (buffered.has(sessionId)) bufferObservation(sessionId, {...o, sessionIds: [sessionId]})
+    }
+    if (o.sessionIds !== undefined) {
+      for (const sessionId of o.sessionIds) named(sessionId)
       return
     }
-    for (const sessionId of o.sessionIds) {
-      const node = sessions.get(sessionId)
-      if (node === undefined) rememberUncertain(sessionId)
-      else markBindingUncertain(node)
-    }
+    for (const node of sessions.values()) markWaiting(node)
+    for (const sessionId of [...buffered.keys()]) named(sessionId)
   }
 
-  /** The execution ended (observed): what was uncertain is emitted as incomplete, and the session starts clean. */
-  function endBinding(sessionId: string, node: SessionNode | undefined, at: number): void {
-    uncertainSessions.delete(sessionId)
-    if (node === undefined) return
+  /** The execution ended: what waited for a step that cannot be trusted is closed, as incomplete. */
+  function closeUncertain(node: SessionNode, at: number): void {
+    node.nextAttempt = 1
     for (const request of [...node.requests]) {
       if (!request.bindUncertain || request.closed) continue
       request.gaps.add('output')
       emitRequest(request, at, 'interrupted', undefined, ['incomplete'])
       removeRequest(node, request)
     }
-    node.bindingUncertain = false
-    node.skipStepStarts = 0
-    node.nextAttempt = 1
-    node.stepOwner.clear()
   }
 
   const oldestPending = (node: SessionNode, kind: RequestKind): RequestState | undefined =>
@@ -1252,35 +1272,28 @@ export function createTurnModel(options: {
 
   function onRetry(o: Extract<Observation, {kind: 'retry'}>): void {
     const node = sessions.get(o.sessionId)
-    if (node === undefined || node.bindingUncertain) return
-    const request = oldestPending(node, 'primary')
-    if (request === undefined) return
-    if (node.skipStepStarts >= limits.maxStepSkips) {
-      markBindingUncertain(node)
-      return
-    }
+    if (node === undefined) return
     node.nextAttempt = o.willRetry ? o.attempt : 1
-    // The failed attempt: closed now, since no output will ever join it. Its `step.started` still arrives, and is discarded.
+    // The retry hook follows the failed attempt's request hook on the hook channel, so the attempt that failed is the session's
+    // newest primary hook. One that already has a step is closed by that step's failure; one with none is closed here, since no
+    // output will ever join it, and its own `step.started`, when it comes, finds a closed request and binds nothing.
+    const request = node.hooks.at(-1)?.request
+    if (request === undefined || request.closed || request.messageId !== undefined || request.bindUncertain) return
     request.gaps.add('output')
     emitRequest(request, o.at, 'error', o.error)
-    node.skipStepStarts += 1
     removeRequest(node, request)
     touch(request.trace, o.at)
   }
 
   function onStepStarted(o: Extract<Observation, {kind: 'step.started'}>): void {
     const node = sessions.get(o.sessionId)
-    if (node === undefined || node.bindingUncertain) return
-    if (node.skipStepStarts > 0) {
-      node.skipStepStarts -= 1
-      return
-    }
-    const request = oldestPending(node, 'primary')
-    if (request === undefined) return
+    if (node === undefined || o.started === undefined || !Number.isFinite(o.started)) return
+    const request = hookOf(node, o.started)?.request
+    if (request === undefined || request.closed || request.messageId !== undefined || request.bindUncertain) return
     request.messageId = o.messageId
-    request.agent ??= o.agent
-    request.model ??= o.model
-    request.provider ??= o.provider
+    request.stepAgent = o.agent
+    request.stepModel = o.model
+    request.stepProvider = o.provider
     node.stepOwner.set(o.messageId, request)
     touch(request.trace, o.at)
   }
@@ -1298,7 +1311,6 @@ export function createTurnModel(options: {
     emitRequest(request, o.at, 'ok')
     node.stepOwner.delete(o.messageId)
     removeRequest(node, request)
-    node.nextAttempt = 1
     touch(request.trace, o.at)
   }
 
@@ -1789,7 +1801,8 @@ export function createTurnModel(options: {
       sessions: sessions.size,
       bufferedSessions: buffered.size,
       bufferedBytes,
-      uncertainSessions: uncertainSessions.size,
+      hookTimes: [...sessions.values()].reduce((sum, node) => sum + node.hooks.length, 0),
+      openSteps: [...sessions.values()].reduce((sum, node) => sum + node.stepOwner.size, 0),
       tombstones: tombstones.size,
       unresolvedDispatches: unresolved.size,
       heldOutputChars,
