@@ -341,12 +341,12 @@ The Action can send an OpenTelemetry trace of each run to a collector you operat
 ```
 
 - `trace-endpoint` is the full URL of the collector's OTLP/HTTP traces route. It must be `https`. Plain `http` is accepted only for a loopback IP address such as `127.0.0.1`, for a collector running in the same job.
-- `trace-headers` holds the collector credential, one `Name: value` header per line. Keep it in a secret. It is refused with an `http` endpoint, because a loopback collector cannot prove who it is. For the same reason, do not put a token in the path or query of an `http` endpoint.
+- `trace-headers` holds the collector credential, one `Name: value` header per line, for example `Authorization: Bearer <token>`. Keep it in a secret. It is refused with an `http` endpoint, because a loopback collector cannot prove who it is. For the same reason, do not put a token in the path or query of an `http` endpoint.
 - A value that is not accepted turns tracing off with one warning. It never fails the run.
 
 ### What a trace contains
 
-Each turn of the session is one trace. It has a span for the agent, one for each model request and one for each tool call. A subagent's spans sit under the tool call that started it. Span names and attributes follow the OpenTelemetry GenAI conventions.
+Each turn of the session is one trace. It has a span for the agent, one for each model request and one for each tool call. A subagent's spans sit under the tool call that started it. Span names and attributes follow the OpenTelemetry GenAI conventions. The agent's span carries the prompt and, when the turn finished normally, the final answer.
 
 The spans carry content:
 
@@ -358,7 +358,7 @@ The messages of a request include the session's earlier history. So the first tr
 
 A trace can hold private repository content, text written by other people (issue and comment bodies, fetched web pages) and secrets. Treat the collector like a store of CI logs with secrets in them: limit who can read it and how long it keeps data.
 
-Every span also carries the session id, the repository, the run id and attempt, the job and the trigger.
+Every span also carries the session id, the repository, the run id and attempt, the job and the trigger. For Langfuse, every span repeats the root session's id as `langfuse.session.id`, so a session and its subagents show as one session, and the run identity as `langfuse.trace.metadata.*`. Other backends ignore these.
 
 ### What a trace leaves out
 
@@ -372,6 +372,15 @@ Every span also carries the session id, the repository, the run id and attempt, 
 Before a span is sent, the plugin removes values that look like credentials: known token formats, private keys, connection strings, the values of secret-named fields, and the values of its own secret-named environment variables. Large values are shortened after that.
 
 This is best-effort. A secret with no recognisable shape, in a field with an ordinary name, is not found.
+
+### Sizes, and what your collector and backend must allow
+
+The messages of each model request include the whole history sent to the model. A trace therefore grows roughly with the square of the number of model requests in a turn, and a long turn can be tens of megabytes.
+
+- The plugin sends one request at a time. Each holds at most 32 spans and at most 4,000,000 bytes of body, as JSON, uncompressed. Set any request-size limit in front of your collector above that.
+- A single value is at most about 512,000 characters. A span too large for one request has its largest content left out and marked.
+- A request the collector answers with `429` or a `5xx` status is retried. Any other failure drops that batch. After three failed batches in a row the plugin stops sending for the rest of the run.
+- Check your backend's limits before you rely on it. Some backends shorten a large attribute or drop the end of a large trace and still answer `200`. Grafana Tempo's defaults do both: attributes are cut at 2,048 bytes and a trace is cut at 5 MB.
 
 ### How the credential is kept
 
