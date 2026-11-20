@@ -62,6 +62,13 @@ function identityAttributes(record: SpanRecord, options: AttributeOptions): Attr
     'session.id': record.sessionId,
     'gen_ai.conversation.id': record.sessionId,
     'fro_bot.root_session.id': record.rootSessionId,
+    // Langfuse's OTLP ingestion reads the session from `langfuse.session.id` first and from `session.id` only when that is absent
+    // (`extractSessionId` in langfuse/langfuse `OtelIngestionProcessor.ts`; the keys are listed in that order, and the docs'
+    // attribute-mapping table names both), and it groups its Sessions view by it. Every span of a tree carries the ROOT session's
+    // id here, so a subagent shows under its parent's session; `session.id` stays each span's own session. It is set on every span,
+    // not only the root: Langfuse filters and aggregates per observation. The turn model sets `rootSessionId` when a child's
+    // dispatch link resolves (a child that finished before its link is replayed with it), and an unlinked session is its own root.
+    'langfuse.session.id': record.rootSessionId,
   }
   set(attributes, 'gen_ai.agent.name', record.agent)
   if (options.identity !== undefined) Object.assign(attributes, actionIdentityAttributes(options.identity))

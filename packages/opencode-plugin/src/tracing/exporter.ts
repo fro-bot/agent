@@ -17,11 +17,14 @@
  * does not follow redirects and the delegate does not either (pinned by `exporter.test.ts`), so the credential in a
  * local-mode header goes only to the URL in the settings file, which must be `https` for a remote collector with
  * certificate verification left at the platform default (`settings.ts` accepts nothing else). The relay's `503` is
- * therefore a retry and its `422` a drop. One batch is in flight at a time, far under the relay's refusal threshold of eight.
+ * therefore a retry and its `422` a drop. One batch is in flight at a time, far under the relay's refusal threshold of eight;
+ * the next one starts only after the delegate has finished with the last (see `startBatch`).
  */
 
 import type {ReadableSpan, SpanProcessor} from '@opentelemetry/sdk-trace-base'
 import type {ScrubbedSpan} from './content.js'
+
+import {Buffer} from 'node:buffer'
 
 import {ROOT_CONTEXT, SpanKind, SpanStatusCode, trace, TraceFlags} from '@opentelemetry/api'
 import {OTLPExporterBase} from '@opentelemetry/otlp-exporter-base'
@@ -29,6 +32,8 @@ import {createOtlpHttpExportDelegate, httpAgentFactoryFromOptions} from '@opente
 import {JsonTraceSerializer} from '@opentelemetry/otlp-transformer'
 import {resourceFromAttributes} from '@opentelemetry/resources'
 import {AlwaysOnSampler, BasicTracerProvider} from '@opentelemetry/sdk-trace-base'
+
+import {CONTENT_ATTRIBUTE_NAMES, MARKER} from './content.js'
 
 /**
  * The request header that carries the plugin's running totals to the Action's relay, in Action mode only.
@@ -55,9 +60,14 @@ export interface ExporterLimits {
   /** Spans waiting for export. A span past this is dropped and counted. */
   readonly maxQueueSpans: number
   /** Estimated bytes waiting for export. */
+  /** Encoded bytes waiting for export (each span counted at the size it will have on the wire). */
   readonly maxQueueBytes: number
   readonly maxBatchSpans: number
-  /** Estimated bytes in one batch. A single span over it goes alone. */
+  /**
+   * The most bytes in one request BODY, as encoded on the wire (UTF-8 bytes of the OTLP JSON, envelope included). Exact, not
+   * estimated: every span is serialized once when it is queued, and a batch closes before its body would pass this. A span that
+   * alone would pass it has its content omitted (see `exportSpan`) or is dropped; nothing over the limit is ever sent.
+   */
   readonly maxBatchBytes: number
   /** From the first queued span to its batch. Short, so a trace is visible soon after the turn. */
   readonly batchIntervalMs: number
@@ -70,11 +80,18 @@ export interface ExporterLimits {
   readonly maxConsecutiveFailures: number
 }
 
+/**
+ * The most the collector's front proxy accepts in one request body: 4.5 MiB. Over it the answer is 413, which is final, so the
+ * batch is lost. (Measured there: 4,192,616 bytes accepted, 5 MiB refused.) `maxBatchBytes` stays at least half a mebibyte under
+ * it, and under the Action relay's own body cap (16 MiB, `trace-relay.ts`); `runtime-parity.test.ts` pins both relations.
+ */
+export const COLLECTOR_BODY_LIMIT_BYTES = 4_718_592
+
 export const DEFAULT_EXPORTER_LIMITS: ExporterLimits = {
   maxQueueSpans: 512,
   maxQueueBytes: 32 * 1024 * 1024,
   maxBatchSpans: 32,
-  maxBatchBytes: 4 * 1024 * 1024,
+  maxBatchBytes: 4_000_000,
   batchIntervalMs: 1_000,
   requestTimeoutMs: 10_000,
   maxConsecutiveFailures: 3,
@@ -103,6 +120,11 @@ export interface SpanExporterOptions {
   readonly limits?: Partial<ExporterLimits>
   /** Called once if the circuit opens. Fixed text only. */
   readonly onStopped?: () => void
+  /** Test seams only; nothing in production sets them. */
+  readonly testing?: {
+    /** Cancelling a request cannot reach its socket: the delegate never lets go, as if its transport could not be stopped. */
+    readonly ignoreAgentDestroy?: boolean
+  }
 }
 
 export interface SpanExporter {
@@ -123,20 +145,11 @@ interface Queued {
   readonly size: number
 }
 
-/** A span's size as the exporter budgets it: the characters it holds, not the encoded request. */
-export function estimateSpanBytes(span: ScrubbedSpan): number {
-  let size = 256 + span.name.length
-  for (const [name, value] of Object.entries(span.attributes)) {
-    size += 24 + name.length
-    if (typeof value === 'string') size += value.length
-    else if (typeof value !== 'number' && typeof value !== 'boolean') for (const item of value) size += item.length + 4
-  }
-  for (const event of span.events) {
-    size += 64 + event.name.length
-    for (const [name, text] of Object.entries(event.attributes)) size += name.length + text.length
-  }
-  return size + (span.status.message?.length ?? 0)
-}
+/** The most content attributes omitted from one span to bring it under the body limit, and the smallest one worth omitting. */
+/** How long the delegate may take to let go of a cancelled request before the transport is given up on. */
+const DRAIN_GRACE_MS = 1_000
+const MAX_OMISSIONS = 32
+const MIN_OMIT_BYTES = 256
 
 const hrTime = (ms: number): [number, number] => {
   const seconds = Math.floor(ms / 1000)
@@ -148,13 +161,46 @@ const sleep = async (ms: number): Promise<void> =>
     setTimeout(resolve, ms).unref()
   })
 
+/** What an attribute costs on the wire: its key and its value as JSON, in UTF-8 bytes (the OTLP JSON encodes a string as JSON does). */
+const wireBytes = (name: string, value: string): number =>
+  Buffer.byteLength(JSON.stringify(name), 'utf8') + Buffer.byteLength(JSON.stringify(value), 'utf8')
+
+/**
+ * The span without the content attribute that costs the most bytes on the wire, which it names in the omission marker; or
+ * undefined. Only the content attributes are candidates (never identity, outcome or any other metadata), ranked by encoded bytes
+ * saved, not by character count: escaped or multi-byte text costs far more than its length says.
+ */
+function omitLargestContent(span: ScrubbedSpan): ScrubbedSpan | undefined {
+  let largest: string | undefined
+  let weight = 0
+  for (const name of CONTENT_ATTRIBUTE_NAMES) {
+    const value = span.attributes[name]
+    if (typeof value !== 'string') continue
+    const bytes = wireBytes(name, value)
+    if (bytes > weight) {
+      largest = name
+      weight = bytes
+    }
+  }
+  // Nothing of content is left to omit: whatever makes the span too large is not something that can be taken out.
+  if (largest === undefined || weight < MIN_OMIT_BYTES) return undefined
+  const attributes: Record<string, string | number | boolean | readonly string[]> = {}
+  for (const [name, value] of Object.entries(span.attributes)) if (name !== largest) attributes[name] = value
+  const marked = span.attributes[MARKER.omitted]
+  attributes[MARKER.omitted] = [...(typeof marked === 'object' ? marked : []), `${largest}:span-too-large`]
+  return {...span, attributes}
+}
+
 export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
   const limits: ExporterLimits = {...DEFAULT_EXPORTER_LIMITS, ...options.limits}
   let exported = 0
   let dropped = 0
   let queue: Queued[] = []
   let queuedBytes = 0
-  let inFlight: {readonly done: Promise<void>; readonly size: number; abandoned: boolean} | undefined
+  // The batch the delegate holds. `counted` and "the delegate has let go" are separate facts: a batch is counted (exported or
+  // dropped) once, by whichever of its result, the watchdog or shutdown comes first, while `inFlight` stays set until the delegate
+  // has drained (its slot is free), because a batch handed to an occupied delegate is refused and its spans would be lost.
+  let inFlight: {readonly done: Promise<void>; readonly size: number; counted: boolean} | undefined
   let timer: NodeJS.Timeout | undefined
   let consecutiveFailures = 0
   let tripped = false
@@ -173,6 +219,8 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
   // once) and the headers function, which the transport awaits before EVERY request including each retry (once cancelled it
   // throws, so no further request is made). Both are used at the cleanup deadline.
   let cancelled = false
+  // Set while the request of a batch the watchdog gave up on is being cancelled: nothing may be sent until the delegate lets go.
+  let cancelling = false
   let agent: {readonly destroy: () => void} | undefined
   const makeAgent = httpAgentFactoryFromOptions({keepAlive: true, rejectUnauthorized: true})
 
@@ -182,7 +230,7 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
         url: options.url,
         // Read on every request, so each batch carries the totals as of its start.
         headers: async () => {
-          if (cancelled) throw new Error('export cancelled')
+          if (cancelled || cancelling) throw new Error('export cancelled')
           return options.reportCounts
             ? {...baseHeaders, [TRACE_COUNTS_HEADER]: formatCountsHeader(counts())}
             : baseHeaders
@@ -195,7 +243,7 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
         // turn it off: the credential in a local-mode header goes only to a destination whose certificate verified.
         agentFactory: async protocol => {
           const made = await makeAgent(protocol)
-          agent = made
+          agent = options.testing?.ignoreAgentDestroy === true ? undefined : made
           return made
         },
       },
@@ -203,12 +251,14 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
     ),
   )
 
-  let pendingSize = 0
+  // The span the SDK just finished, handed over by the processor to `build`, which sizes it before it is queued.
+  let ended: ReadableSpan | undefined
+  // The bytes of a request body that are not spans (the resource and the scope); derived from the first span, see `spanBytes`.
+  let envelopeBytes = 0
   const processor: SpanProcessor = {
     onStart: () => {},
     onEnd: span => {
-      queue.push({span, size: pendingSize})
-      queuedBytes += pendingSize
+      ended = span
     },
     forceFlush: async () => {},
     shutdown: async () => {},
@@ -228,7 +278,9 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
   const tracer = provider.getTracer('fro-bot-opencode-plugin')
 
   function trip(): void {
-    if (tripped) return
+    // Shutdown's permanent cancellation (`cancelled`) already counted the queue and returned the totals: a stop announced after
+    // close() has returned would report a state the caller no longer sees.
+    if (tripped || cancelled) return
     tripped = true
     dropped += queue.length
     queue = []
@@ -244,11 +296,12 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
 
   function takeBatch(): Queued[] {
     const batch: Queued[] = []
-    let bytes = 0
+    // The body is the envelope, the spans' own JSON, and a comma between each pair: exact, so the sum is the request's size.
+    let bytes = envelopeBytes
     while (queue.length > 0 && batch.length < limits.maxBatchSpans) {
       const next = queue[0]
       if (next === undefined) break
-      if (batch.length > 0 && bytes + next.size > limits.maxBatchBytes) break
+      if (batch.length > 0 && bytes + batch.length + next.size > limits.maxBatchBytes) break
       batch.push(next)
       bytes += next.size
       queue.shift()
@@ -257,12 +310,44 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
     return batch
   }
 
+  /**
+   * Cancels the request the delegate holds and waits, for a bound, until it has let go of its slot. Used when the watchdog gives
+   * up on a batch: the SDK's request timeout is an IDLE timeout on the socket, so a collector that keeps the connection active
+   * (a response that trickles) outlasts the watchdog, and the next batch handed to the delegate would be refused as over its
+   * concurrency limit. Destroying the agent closes every open socket, which ends the request, and the headers function refuses
+   * every request until the delegate has drained. If it has not drained within the grace period the transport cannot be stopped:
+   * the breaker trips (everything queued is counted dropped) and nothing more is sent.
+   */
+  async function cancelInFlight(): Promise<void> {
+    cancelling = true
+    try {
+      agent?.destroy()
+    } catch {
+      // The headers function still stops every further request.
+    }
+    const drained = await Promise.race([
+      exporter.forceFlush().then(
+        () => true,
+        () => true,
+      ),
+      sleep(DRAIN_GRACE_MS).then(() => false),
+    ])
+    if (drained) {
+      cancelling = false
+      return
+    }
+    trip()
+    cancelled = true
+  }
+
   function startBatch(): void {
     if (inFlight !== undefined || queue.length === 0 || tripped) return
     const batch = takeBatch()
-    const current = {abandoned: false, size: batch.length} as {done: Promise<void>; size: number; abandoned: boolean}
+    const current = {counted: false, size: batch.length} as {done: Promise<void>; size: number; counted: boolean}
+    /** Counts the batch, once, whatever order the result, the watchdog and shutdown come in. */
     const settle = (ok: boolean): void => {
-      if (current.abandoned) return
+      if (current.counted) return
+      current.counted = true
       if (ok) {
         exported += batch.length
         consecutiveFailures = 0
@@ -273,11 +358,11 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
       }
     }
     current.done = new Promise<void>(resolve => {
-      // A watchdog over the whole batch, in case a result never comes back: a lost result is a failed batch.
+      // A watchdog over the whole batch, in case a result never comes back: a lost result is a failed batch. The request is then
+      // cancelled and the next batch waits until the delegate has let go of it.
       const watchdog = setTimeout(() => {
         settle(false)
-        current.abandoned = true
-        resolve()
+        cancelInFlight().then(resolve, resolve)
       }, limits.requestTimeoutMs + 2_000)
       watchdog.unref()
       try {
@@ -286,7 +371,14 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
           result => {
             clearTimeout(watchdog)
             settle(result.code === 0)
-            resolve()
+            // The delegate calls this from inside the promise it keeps in its own in-flight set (`otlp-export-delegate.js`:
+            // `this._promiseQueue.pushPromise(this._transport.send(...).then(response => { ...resultCallback(...) }))`), and
+            // takes that promise out of the set only AFTER it settles (`bounded-queue-export-promise-handler.js`:
+            // `promise.then(popPromise, popPromise)`). Starting the next batch from here would find the set still full and be
+            // refused with `Concurrent export limit reached` (a whole batch counted dropped). So the batch is not over until the
+            // delegate says nothing is in flight: `forceFlush()` is `Promise.all` over that set, and the set's own removal was
+            // registered on the same promise first, so by the time it resolves the entry is gone.
+            exporter.forceFlush().then(resolve, resolve)
           },
         )
       } catch {
@@ -314,43 +406,96 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
     timer.unref()
   }
 
+  /** Hands the SDK a span with the ids the turn model chose, and returns what it ended up with, or undefined. */
+  function build(span: ScrubbedSpan): ReadableSpan | undefined {
+    const parent =
+      span.parentSpanId === undefined
+        ? ROOT_CONTEXT
+        : trace.setSpanContext(ROOT_CONTEXT, {
+            traceId: span.traceId,
+            spanId: span.parentSpanId,
+            traceFlags: TraceFlags.SAMPLED,
+          })
+    nextTraceId = span.traceId
+    nextSpanId = span.spanId
+    ended = undefined
+    const sdkSpan = tracer.startSpan(
+      span.name,
+      {
+        kind: span.kind === 'client' ? SpanKind.CLIENT : SpanKind.INTERNAL,
+        startTime: hrTime(span.startMs),
+        attributes: {...span.attributes} as Record<string, string | number | boolean | string[]>,
+      },
+      // Always explicit: an ambient context another library registered in this process must never become a parent.
+      parent,
+    )
+    if (span.status.code === 'error') {
+      sdkSpan.setStatus({
+        code: SpanStatusCode.ERROR,
+        ...(span.status.message === undefined ? {} : {message: span.status.message}),
+      })
+    }
+    for (const event of span.events) sdkSpan.addEvent(event.name, {...event.attributes}, hrTime(event.timeMs))
+    // `end` hands the finished span to the processor above, which leaves it in `ended`.
+    sdkSpan.end(hrTime(span.endMs))
+    const finished = ended
+    ended = undefined
+    return finished
+  }
+
+  function encodedLength(spans: ReadableSpan[]): number {
+    const body = JsonTraceSerializer.serializeRequest(spans)
+    if (body === undefined) throw new Error('nothing to encode')
+    return body.byteLength
+  }
+
+  /**
+   * The span's own bytes in a request body, exact: the body of a request holding it alone, less the envelope (the resource and the
+   * scope, the same for every span). The envelope is derived once, from the first span: a request of one span is `E + a`, of the
+   * same span twice `E + 2a + 1` (a comma), so `a` is the difference less one and `E` is what is left. The sum for a batch of n is
+   * then `E + (a1 + ... + an) + (n - 1)`, which is what the delegate's serializer produces (pinned by `exporter.test.ts`).
+   */
+  function spanBytes(readable: ReadableSpan): number {
+    const alone = encodedLength([readable])
+    if (envelopeBytes === 0) {
+      const twice = encodedLength([readable, readable])
+      envelopeBytes = alone - (twice - alone - 1)
+    }
+    return alone - envelopeBytes
+  }
+
   function exportSpan(span: ScrubbedSpan): void {
     try {
-      const size = estimateSpanBytes(span)
-      if (closed || tripped || queue.length >= limits.maxQueueSpans || queuedBytes + size > limits.maxQueueBytes) {
+      if (closed || tripped || queue.length >= limits.maxQueueSpans) {
         dropped += 1
         return
       }
-      const parent =
-        span.parentSpanId === undefined
-          ? ROOT_CONTEXT
-          : trace.setSpanContext(ROOT_CONTEXT, {
-              traceId: span.traceId,
-              spanId: span.parentSpanId,
-              traceFlags: TraceFlags.SAMPLED,
-            })
-      nextTraceId = span.traceId
-      nextSpanId = span.spanId
-      pendingSize = size
-      const sdkSpan = tracer.startSpan(
-        span.name,
-        {
-          kind: span.kind === 'client' ? SpanKind.CLIENT : SpanKind.INTERNAL,
-          startTime: hrTime(span.startMs),
-          attributes: {...span.attributes} as Record<string, string | number | boolean | string[]>,
-        },
-        // Always explicit: an ambient context another library registered in this process must never become a parent.
-        parent,
-      )
-      if (span.status.code === 'error') {
-        sdkSpan.setStatus({
-          code: SpanStatusCode.ERROR,
-          ...(span.status.message === undefined ? {} : {message: span.status.message}),
-        })
+      // Sized once, exactly, before it is queued. A span that alone would pass the body limit has its largest content omitted,
+      // again and again up to a bound, so the span itself still arrives; one that cannot be brought under is dropped and counted.
+      let candidate = span
+      for (let attempt = 0; ; attempt += 1) {
+        const readable = build(candidate)
+        if (readable === undefined) {
+          dropped += 1
+          return
+        }
+        const size = spanBytes(readable)
+        if (envelopeBytes + size <= limits.maxBatchBytes) {
+          if (queuedBytes + size > limits.maxQueueBytes) {
+            dropped += 1
+            return
+          }
+          queue.push({span: readable, size})
+          queuedBytes += size
+          break
+        }
+        const trimmed = attempt < MAX_OMISSIONS ? omitLargestContent(candidate) : undefined
+        if (trimmed === undefined) {
+          dropped += 1
+          return
+        }
+        candidate = trimmed
       }
-      for (const event of span.events) sdkSpan.addEvent(event.name, {...event.attributes}, hrTime(event.timeMs))
-      // `end` hands the finished span to the processor above, which queues it.
-      sdkSpan.end(hrTime(span.endMs))
       schedule()
     } catch {
       dropped += 1
@@ -393,9 +538,9 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
       } catch {
         // Nothing more can be done: the headers function stops every further request.
       }
-      if (inFlight !== undefined) {
-        if (!inFlight.abandoned) dropped += inFlight.size
-        inFlight.abandoned = true
+      if (inFlight !== undefined && !inFlight.counted) {
+        dropped += inFlight.size
+        inFlight.counted = true
       }
       dropped += queue.length
       queue = []

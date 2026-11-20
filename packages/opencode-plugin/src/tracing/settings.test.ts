@@ -351,13 +351,53 @@ describe.skipIf(!isPosix)('local session', () => {
     ['writable by the group', 0o620],
     ['writable by others', 0o602],
     ['writable by everyone', 0o666],
+    ['readable by the group', 0o640],
+    ['readable by others', 0o604],
+    ['readable by everyone (0644)', 0o644],
+    ['executable by the group', 0o610],
+    ['executable by others', 0o601],
+    ['readable and executable by everyone', 0o755],
+    ['any group or other bit with the owner read-only', 0o404],
   ])('resolves a user file %s to off', (_label, mode) => {
-    // #given a file with a write bit for group or others
+    // #given a file with any permission bit for group or others (the file can hold a collector credential)
     writeSettings(undefined, mode)
 
     // #when / #then
     expect(resolve()).toEqual({mode: 'off', reason: 'settings-file-unsafe'})
     expect(lines).toEqual(['tracing off (settings-file-unsafe)'])
+  })
+
+  it.each([
+    ['owner read and write (0600)', 0o600],
+    ['owner read only (0400)', 0o400],
+    ['owner read, write and execute (0700)', 0o700],
+  ])('accepts a user file that is %s: no group or other bit is set', (_label, mode) => {
+    // #given a file only its owner has any access to
+    writeSettings(undefined, mode)
+
+    // #when / #then
+    expect(resolve()).toMatchObject({mode: 'on', host: 'local'})
+    expect(lines.filter(line => line.includes('settings-file-unsafe'))).toEqual([])
+  })
+
+  it('names no path, mode or value in the refusal', () => {
+    // #given a world-readable file holding a credential
+    writeSettings(
+      {
+        version: 1,
+        endpoint: 'https://collector.example/v1/traces',
+        headers: {authorization: 'Basic abc'},
+        hosts: ['x'],
+      },
+      0o644,
+    )
+
+    // #when
+    resolve()
+
+    // #then the one line is the fixed reason, nothing else
+    expect(lines).toEqual(['tracing off (settings-file-unsafe)'])
+    expect(lines.join('\n')).not.toMatch(/644|abc|collector|\//)
   })
 
   it('resolves a user file owned by another user to off', () => {

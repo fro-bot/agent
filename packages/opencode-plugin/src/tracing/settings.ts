@@ -290,9 +290,9 @@ function isInside(child: string, parent: string): boolean {
 }
 
 /**
- * Reads the user file, checking the OPENED handle: a regular file, owned by the current user, not writable by group or
- * others, small, and whose real path is outside the project. A symlink is resolved first and its target is what gets
- * opened and checked.
+ * Reads the user file, checking the OPENED handle: a regular file, owned by the current user, private to its owner (no group
+ * or other permission bit at all: it can hold a collector credential, so readable is as bad as writable), small, and whose
+ * real path is outside the project. A symlink is resolved first and its target is what gets opened and checked.
  */
 function readSettingsFile(filePath: string, directory: string, uid: number): FileRead {
   let realPath: string
@@ -323,7 +323,7 @@ function readSettingsFile(filePath: string, directory: string, uid: number): Fil
   }
   try {
     const stat = fstatSync(fd)
-    if (!stat.isFile() || stat.uid !== uid || (stat.mode & 0o022) !== 0 || stat.size > MAX_SETTINGS_FILE_BYTES) {
+    if (!stat.isFile() || stat.uid !== uid || (stat.mode & 0o077) !== 0 || stat.size > MAX_SETTINGS_FILE_BYTES) {
       return {ok: false, reason: 'settings-file-unsafe'}
     }
     const buffer = Buffer.alloc(stat.size)

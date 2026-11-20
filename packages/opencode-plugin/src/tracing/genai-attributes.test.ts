@@ -3,7 +3,7 @@ import type {ChatRecord, InvokeRecord, SpanRecord, ToolRecord} from './turn-mode
 
 import {describe, expect, it} from 'vitest'
 
-import {createScrubber, MARKER} from './content.js'
+import {CONTENT_ATTRIBUTE_NAMES, createScrubber, MARKER} from './content.js'
 import {GENAI_SEMCONV_REVISION, toExportSpan, toPendingSpan} from './genai-attributes.js'
 import {omittedContent, snapshotPrompt, snapshotRequest, snapshotToolArguments, snapshotToolResult} from './snapshot.js'
 import {recordedFixtures} from './turn-model.fixtures.js'
@@ -409,6 +409,38 @@ describe('agent spans', () => {
   })
 })
 
+describe('the content attribute list', () => {
+  it('names exactly the content attributes the spans set', () => {
+    // #given a model span and a tool span with every kind of content
+    const secretFree = (text: string): string => text
+    const spans = [
+      exported(
+        chat({
+          texts: [secretFree('answer')],
+          request: {
+            system: [{text: 'system'}],
+            messages: [{role: 'user', parts: [{type: 'text', text: 'hi'}]}],
+            tools: {read: {description: 'reads', parameters: {type: 'object'}}},
+          },
+        }),
+      ),
+      exported(tool({input: {path: 'a'}, result: {content: 'body'}})),
+    ]
+
+    // #then every `gen_ai.*` content attribute they set is in the list, and every one in the list was set by one of them (the agent span sets only the prompt, the same input attribute)
+    const contentLike = new Set(
+      spans.flatMap(span =>
+        Object.keys(span.attributes).filter(name =>
+          /^gen_ai\.(?:input\.messages|output\.messages|system_instructions|tool\.definitions|tool\.call\.(?:arguments|result))$/.test(
+            name,
+          ),
+        ),
+      ),
+    )
+    expect([...contentLike].toSorted()).toEqual([...CONTENT_ATTRIBUTE_NAMES].toSorted())
+  })
+})
+
 describe('identity', () => {
   it('puts the session id, the root session id and the agent on every span of a subagent', () => {
     // #given the three record kinds of a child session
@@ -421,9 +453,54 @@ describe('identity', () => {
         'session.id': 'ses_child',
         'gen_ai.conversation.id': 'ses_child',
         'fro_bot.root_session.id': 'ses_root',
+        'langfuse.session.id': 'ses_root',
         'gen_ai.agent.name': 'build',
       })
     }
+  })
+
+  it('groups a whole subagent tree under the root session id for Langfuse, and keeps session.id as each span’s own', () => {
+    // #given the nested-subagent fixture: a root session, a child and a child of that child
+    const {records} = replay(recordedFixtures['subagent-nested']?.observations ?? [])
+
+    // #when every record is mapped
+    const spans = records.map(record => exported(record))
+
+    // #then every span of every session carries the ROOT id in `langfuse.session.id` (the attribute Langfuse's OTLP ingestion
+    // reads first for its session, ahead of `session.id`), while `session.id` stays the span's own session
+    expect(new Set(spans.map(span => span.attributes['langfuse.session.id']))).toEqual(new Set(['ses_1']))
+    expect(new Set(spans.map(span => span.attributes['session.id']))).toEqual(new Set(['ses_1', 'ses_2', 'ses_3']))
+    for (const span of spans)
+      expect(span.attributes['langfuse.session.id']).toBe(span.attributes['fro_bot.root_session.id'])
+  })
+
+  it('gives a session that is not linked to a root its own id, on every kind of span', () => {
+    // #given records of a session that is its own root (a standalone request, or a child whose link never came)
+    const records: SpanRecord[] = [
+      chat({sessionId: 'ses_alone', rootSessionId: 'ses_alone'}),
+      tool({sessionId: 'ses_alone', rootSessionId: 'ses_alone'}),
+      invoke({sessionId: 'ses_alone', rootSessionId: 'ses_alone', role: 'root'}),
+    ]
+
+    // #then
+    for (const record of records) {
+      expect(exported(record).attributes).toMatchObject({
+        'langfuse.session.id': 'ses_alone',
+        'session.id': 'ses_alone',
+        'fro_bot.root_session.id': 'ses_alone',
+      })
+    }
+  })
+
+  it('scrubs the id like every other string attribute', () => {
+    // #given a root id that contains a secret shape (the inbox already drops an identifier over 512 characters, so the id is
+    // bounded before it reaches a record; this is the guard on the way out)
+    const secret = ['ghp_', 'aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5'].join('')
+    const span = exported(chat({sessionId: 'ses_child', rootSessionId: `ses-${secret}`}))
+
+    // #then the Langfuse session attribute goes through the same scrubber as `fro_bot.root_session.id`
+    expect(JSON.stringify(span.attributes)).not.toContain(secret)
+    expect(span.attributes['langfuse.session.id']).toBe(span.attributes['fro_bot.root_session.id'])
   })
 
   it('puts repository and run identity on every span in Action mode, and on none in local mode', () => {
@@ -442,6 +519,45 @@ describe('identity', () => {
       const local = Object.keys(exported(record).attributes)
       expect(local.filter(name => /^fro_bot\.(?:repository|run\.|job|trigger)/.test(name))).toEqual([])
     }
+  })
+
+  it('mirrors the run identity into Langfuse trace metadata on every span in Action mode, with the same values', () => {
+    // #given the three record kinds
+    const records: SpanRecord[] = [chat(), tool(), invoke()]
+
+    // #then each carries the five short keys (strings, as Langfuse keeps a string metadata value as sent), equal to their twins
+    for (const record of records) {
+      const {attributes} = exported(record, IDENTITY)
+      expect(attributes).toMatchObject({
+        'langfuse.trace.metadata.repository': 'fro-bot/agent',
+        'langfuse.trace.metadata.run_id': '4242',
+        'langfuse.trace.metadata.run_attempt': '2',
+        'langfuse.trace.metadata.job': 'fro-bot',
+        'langfuse.trace.metadata.trigger': 'issue_comment',
+      })
+      expect(attributes['langfuse.trace.metadata.repository']).toBe(attributes['fro_bot.repository'])
+      expect(attributes['langfuse.trace.metadata.run_id']).toBe(attributes['fro_bot.run.id'])
+      expect(attributes['langfuse.trace.metadata.run_attempt']).toBe(attributes['fro_bot.run.attempt'])
+      expect(attributes['langfuse.trace.metadata.job']).toBe(attributes['fro_bot.job'])
+      expect(attributes['langfuse.trace.metadata.trigger']).toBe(attributes['fro_bot.trigger'])
+    }
+  })
+
+  it('sets no Langfuse trace metadata in local mode, where there is no run identity', () => {
+    for (const record of [chat(), tool(), invoke()]) {
+      const names = Object.keys(exported(record).attributes)
+      expect(names.filter(name => name.startsWith('langfuse.trace.metadata'))).toEqual([])
+    }
+  })
+
+  it('scrubs the mirrored values like every other string, and bounds nothing the twins do not', () => {
+    // #given an identity whose job carries a secret shape
+    const secret = ['ghp_', 'aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5'].join('')
+    const span = exported(chat(), {...IDENTITY, job: `job-${secret}`})
+
+    // #then neither the twin nor the mirror holds it, and the two agree
+    expect(JSON.stringify(span.attributes)).not.toContain(secret)
+    expect(span.attributes['langfuse.trace.metadata.job']).toBe(span.attributes['fro_bot.job'])
   })
 
   it('records every span of a replayed fixture without losing the grouping key', () => {
