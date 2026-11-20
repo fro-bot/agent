@@ -91,7 +91,7 @@ function piece(random: () => number, brackets: boolean): Piece {
   const atom = pick(random, ATOMS)
   const name = pick(random, NAMES)
   const sep = pick(random, [': ', '=', ':', ' = '])
-  switch (Math.floor(random() * (brackets ? 28 : 16))) {
+  switch (Math.floor(random() * (brackets ? 34 : 16))) {
     case 0:
       return {text: token, secrets: [token]}
     case 1:
@@ -161,6 +161,35 @@ function piece(random: () => number, brackets: boolean): Piece {
     case 27:
       // More whitespace than the gap bound after a quoted key: fails closed to the end of the line.
       return {text: `{"${name}":${pick(random, [' ', '\n']).repeat(300)}"${atom}"}`, secrets: [atom]}
+    case 28:
+      // JSON whitespace between a quoted key and its colon, and after it.
+      return {
+        text: `{"${name}"${pick(random, ['\n', '\r\n\t', ' \n '])}:\n"${atom} ${token}", "ok": 1}`,
+        secrets: [atom, token],
+      }
+    case 29:
+      // The first letter of the name written as a `\u` escape, with a line break before the colon some of the time.
+      return {
+        text: String.raw`{"\u${(name.codePointAt(0) ?? 0).toString(16).padStart(4, '0')}${name.slice(1)}"${pick(random, ['', '\n'])}: "${atom}"}`,
+        secrets: [atom],
+      }
+    case 30:
+      // The same one layer down a JSON string: every backslash doubles.
+      return {
+        text: JSON.stringify({
+          v: `{"\\u${(name.codePointAt(0) ?? 0).toString(16).padStart(4, '0')}${name.slice(1)}"\n: "${atom} ${token}"}`,
+        }),
+        secrets: [atom, token],
+      }
+    case 31:
+      // A suffix longer than twenty characters after the word.
+      return {text: `{"${name}HashSaltPepperPlusLongerSuffix": "${atom}"}`, secrets: [atom]}
+    case 32:
+      // A zero-width space inside the word, and spaces around it.
+      return {text: `{"my ${name.slice(0, 1)}\u200B${name.slice(1)} hint": "${atom}"}`, secrets: [atom]}
+    case 33:
+      // A key that ends in an escaped backslash.
+      return {text: String.raw`{"${name}\\": "${atom}"}`, secrets: [atom]}
     default:
       return {text: `${name}${sep}"${PEM} ${atom}"`, secrets: [PEM_BODY, atom]}
   }

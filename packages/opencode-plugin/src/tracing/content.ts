@@ -257,6 +257,8 @@ function jwtMatcher(): ScrubMatcher {
 /** Words that make a name secret-like. Matched inside a name, so `X_API_KEY` and `dbPassword` both qualify. */
 const SECRET_WORDS =
   'password|passwd|pwd|passphrase|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|credential|authorization|auth[_-]?key|session[_-]?key|client[_-]?secret|signature|bearer'
+/** A key whose name says it holds a credential. Same words as the text rules. */
+const SENSITIVE_KEY = new RegExp(SECRET_WORDS, 'i')
 const SECRET_NEEDLES: readonly string[] = [
   'pass',
   'pwd',
@@ -425,49 +427,140 @@ function schemeCredentialEnd(text: string, end: number): number {
   return tokenEnd === index ? end : tokenEnd
 }
 
+/** Characters that are invisible inside a key and never part of a real name: zero-width space, joiners, word joiner, BOM. */
+const ZERO_WIDTH = /[\u200B-\u200D\u2060\uFEFF]/
+const ZERO_WIDTH_ALL = /[\u200B-\u200D\u2060\uFEFF]/g
+
+/** The longest raw key (between its quotes) the quoted-key pass inspects. A longer one is not a name. */
+const MAX_KEY_RAW_CHARS = 1024
+
+/** The most backslashes counted before a quote. A longer run is not a delimiter at a supported depth. */
+const MAX_QUOTE_RUN = 64
+
 /**
- * `name=value` and `name: value`, in plain text and in JSON text (`\"name\": \"value\"`): the range is the value. The match
- * starts at the secret word itself, every gap is a bounded class, and the value is then read by hand, once, forward:
+ * The escape depth a quote delimits at, from the backslash run before it. A quote of a document under `d` JSON encodings is
+ * preceded by `2^d - 1` backslashes, plus any number of escaped backslashes that end the string before it (`2^(d+1)` each):
+ * the run plus one has exactly `d` trailing zero bits. Depth 0 to 4; -1 for anything deeper or a run too long to be one.
+ */
+function depthOfDelimiterRun(run: number): number {
+  if (run >= MAX_QUOTE_RUN) return -1
+  const depth = Math.clz32((run + 1) & -(run + 1)) ^ 31
+  return depth <= 4 ? depth : -1
+}
+
+const SIMPLE_ESCAPES: Readonly<Record<number, string>> = {
+  0x22: '"',
+  0x5c: '\\',
+  0x2f: '/',
+  0x62: '\b',
+  0x66: '\f',
+  0x6e: '\n',
+  0x72: '\r',
+  0x74: '\t',
+}
+
+/**
+ * One layer of JSON string-body decoding: `\"` `\\` `\/` `\b` `\f` `\n` `\r` `\t` and `\uXXXX` (upper- or lower-case hex; a
+ * surrogate pair is two escapes that join). Undefined for anything that is not a valid body: an unescaped quote, a lone
+ * backslash at the end, an escape this does not know, a `\u` without four hex digits. One forward pass, no exceptions.
+ */
+function decodeLayer(body: string): string | undefined {
+  let out = ''
+  let index = 0
+  while (index < body.length) {
+    const code = body.charCodeAt(index)
+    if (code === 0x22) return undefined
+    if (code !== 0x5c) {
+      out += body.charAt(index)
+      index += 1
+      continue
+    }
+    const next = body.charCodeAt(index + 1)
+    const simple = SIMPLE_ESCAPES[next]
+    if (simple !== undefined) {
+      out += simple
+      index += 2
+    } else if (next === 0x75) {
+      const hex = body.slice(index + 2, index + 6)
+      if (!/^[\da-f]{4}$/i.test(hex)) return undefined
+      out += String.fromCharCode(Number.parseInt(hex, 16))
+      index += 6
+    } else {
+      return undefined
+    }
+  }
+  return out
+}
+
+/**
+ * A quoted key's text, as the document means it: its escapes decoded at the depth the document is written in (a document
+ * under `d` encodings has `d + 1` layers of escaping to remove). Undefined when it cannot be decoded.
+ */
+function decodeKey(raw: string, layers: number): string | undefined {
+  if (!raw.includes('\\')) return raw
+  let current = raw
+  for (let pass = 0; pass <= layers; pass += 1) {
+    const next = decodeLayer(current)
+    if (next === undefined) return undefined
+    current = next
+  }
+  return current
+}
+
+/**
+ * `name=value` and `name: value`, in plain text and in JSON text (`\"name\": \"value\"`): the range is the value.
+ *
+ * Two ways in, both reading the ORIGINAL text:
+ * 1. A secret word, then (for an unquoted name) up to four blanks and `:` or `=`; or (for a name in quotes) the key's closing
+ *    quote, then any JSON whitespace up to `MAX_GAP_CHARS` and `:`.
+ * 2. Every double-quoted JSON key at the supported escape depths, found by pairing consecutive delimiting quotes of one depth
+ *    (so it does not depend on how the key is spelled): its text is DECODED (`\u0061`, `\n`, `\/`, surrogate pairs, at the
+ *    depth it is written in), zero-width characters are dropped, and if the result holds a secret word the value after the
+ *    colon is read exactly as in 1. This is what finds `"p\u0061ssword"` and a key whose word has a long suffix.
+ *
+ * A key that cannot be decoded (a malformed escape, longer than `MAX_KEY_RAW_CHARS`, an escape depth beyond four) is not
+ * inspected and does not withhold: it is not valid JSON, or not a name, and withholding on it would withhold most text with
+ * a backslash in it. The value is read by hand, once, forward:
  * - a quoted value runs to its closing quote, honouring escapes (in an escaped layer, `\"` closes and `\\\"` does not); if
  *   no closing quote is found within `MAX_QUOTED_VALUE_CHARS` the end is not established and the string is withheld;
  * - an unquoted value is a run of non-delimiter characters (the first token only), plus the credential after a scheme word;
+ * - a `{` or `[` value runs to its balanced close, or the string is withheld;
  * - a number of up to eight digits survives only after a counter or limit name (`max_tokens: 8000`), never after a name that
  *   says password, secret, credential or authorization.
  * Scanning resumes after the value, so no character is scanned more than a bounded number of times.
  */
 function nameValueMatcher(): ScrubMatcher {
   const prefix = new RegExp(
-    // The quote around a name or a value may sit in an escaped layer: any run of backslashes (JSON in JSON in JSON) before it.
-    String.raw`((?:${SECRET_WORDS})[\w.-]{0,20})(\\{0,64}["'])?[ \t]{0,4}([:=])`,
+    // A word and its suffix, then EITHER the closing quote of a quoted name (a run of backslashes before it is an escaped layer;
+    // what follows is read by hand, since a quoted key allows wide whitespace before its colon) OR, for an unquoted name, up to
+    // four blanks and the separator.
+    String.raw`((?:${SECRET_WORDS})[\w.-]{0,20})(?:(\\{0,64}["'])|[ \t]{0,4}([:=]))`,
     'gi',
   )
+  const SKIP = -1
+  const WITHHELD = -2
   return {
     id: 'name-value-pair',
     find: (text, lower, emit, withhold) => {
-      if (!SECRET_NEEDLES.some(needle => lower.includes(needle))) return
+      const named = SECRET_NEEDLES.some(needle => lower.includes(needle))
+      // A key whose word is spelled with escapes or zero-width characters has no needle in its raw text.
+      const keyed = named || text.includes(String.raw`\u`) || ZERO_WIDTH.test(text)
+      if (!keyed) return
       // The work every value of this text may spend scanning for its close, all together: a text of many unterminated openers
       // costs a constant multiple of its length, not a scan each. When it is spent the value's end cannot be established, and
-      // the string is withheld.
-      const budget = {left: 4 * text.length + 65_536}
-      prefix.lastIndex = 0
-      for (;;) {
-        const match = prefix.exec(text)
-        if (match === null) break
-        const name = match[1] ?? ''
-        const nameQuote = match[2]
+      // the string is withheld. (A value can be read by both ways in, so it is twice what one way needs.)
+      const budget = {left: 8 * text.length + 65_536}
+
+      /** Reads the value that starts after a separator ending at `sepEnd`. Returns where scanning resumes, SKIP or WITHHELD. */
+      const readValue = (sepEnd: number, jsonForm: boolean, layers: number, counter: boolean): number => {
         // The gap between the separator and the value. For a QUOTED key and a colon (the JSON form) it may hold newlines, real or
         // escaped at the document's depth, up to `MAX_GAP_CHARS`; for every other form it is up to four spaces or tabs, so prose
         // like `password:` at the end of a line does not reach the next one.
-        let at = match.index + match[0].length
-        const jsonForm = nameQuote !== undefined && match[3] === ':'
+        let at = sepEnd
         if (jsonForm) {
-          const layers = layersOfRun(nameQuote.length - 1)
-          // An escape depth this matcher cannot read (deeper than it supports, or a backslash run that is not `2^d - 1`): it
-          // cannot tell what the value looks like, so it cannot tell where it ends.
-          if (layers === -1) return withhold()
           const gap = skipGap(text, at, layers)
           // More whitespace than the bound: where the value starts cannot be told.
-          if (gap.over) return withhold()
+          if (gap.over) return WITHHELD
           at = gap.end
         } else {
           for (
@@ -486,12 +579,7 @@ function nameValueMatcher(): ScrubMatcher {
         const valueStart = opened ? runEnd + 1 : at
         // After a quoted key, a backslash that is not an opening quote is an escape this matcher did not recognise (a run too long,
         // a whitespace escape of another depth): the value's start is unknown, so its end is.
-        if (jsonForm && !opened && text.charCodeAt(at) === 0x5c) return withhold()
-        // The identifier the name belongs to: what precedes the secret word (`max_` of `max_tokens`) counts.
-        let from = match.index
-        while (from > 0 && match.index - from < MAX_IDENTIFIER_CHARS && isIdentifierCode(text.charCodeAt(from - 1)))
-          from -= 1
-        const counter = isCounterName(text.slice(from, match.index) + name)
+        if (jsonForm && !opened && text.charCodeAt(at) === 0x5c) return WITHHELD
 
         // Every branch below either establishes the value's end (a balanced close, a closing quote, a delimiter) or withholds the
         // string. There is no "to the end of the line".
@@ -501,7 +589,7 @@ function nameValueMatcher(): ScrubMatcher {
           // A whole object or array after a sensitive name: consumed to its balanced close. No close within the size bound, or
           // within the shared work budget, or an unreadable escape depth inside: the end is not established.
           const close = structureEnd(text, valueStart, budget)
-          if (close === -1) return withhold()
+          if (close === -1) return WITHHELD
           valueEnd = close
         } else if (opener === undefined) {
           // Unquoted: the value ends at the first delimiter (whitespace, a quote, a bracket, a comma...). That is the rule for this
@@ -509,20 +597,101 @@ function nameValueMatcher(): ScrubMatcher {
           valueEnd = unquotedEnd(text, valueStart)
           if (SCHEME_WORD.test(text.slice(valueStart, valueEnd))) valueEnd = schemeCredentialEnd(text, valueEnd)
           const value = text.slice(valueStart, valueEnd)
-          if (counter && isShortNumber(value)) continue
+          if (counter && isShortNumber(value)) return SKIP
           // A counter name keeps the old floor of three characters; a credential name has none.
-          if (value.length < (counter ? 3 : 1)) continue
+          if (value.length < (counter ? 3 : 1)) return SKIP
         } else {
           // Quoted: ends at its closing quote. None within the scan bound, or the shared work budget is spent: not established.
           const close = budget.left > MAX_QUOTED_VALUE_CHARS ? closingQuote(text, valueStart, opener) : -1
-          if (close === -1) return withhold()
+          if (close === -1) return WITHHELD
           valueEnd = close
           budget.left -= valueEnd - valueStart
-          if (valueEnd === valueStart) continue
+          if (valueEnd === valueStart) return SKIP
         }
         emit(valueStart, valueEnd)
-        prefix.lastIndex = Math.max(prefix.lastIndex, valueEnd)
+        return valueEnd
       }
+
+      /** Way in 2: every double-quoted key at a supported depth, by its DECODED text. */
+      const quotedKeys = (): void => {
+        // The most recent delimiting quote at each depth: the opening quote of whatever string the next one closes.
+        const lastQuote = [-1, -1, -1, -1, -1]
+        for (let quote = text.indexOf('"'); quote !== -1; quote = text.indexOf('"', quote + 1)) {
+          let run = 0
+          while (run < MAX_QUOTE_RUN && text.charCodeAt(quote - 1 - run) === 0x5c) run += 1
+          const depth = depthOfDelimiterRun(run)
+          if (depth === -1) continue
+          // The `2^d - 1` backslashes right before the quote belong to it; any before those are the key's own escaped backslashes.
+          const delimiterRun = 2 ** depth - 1
+          const open = lastQuote[depth] ?? -1
+          lastQuote[depth] = quote
+          if (open === -1 || quote - open > MAX_KEY_RAW_CHARS) continue
+          // Is it a key at all? A closing quote, then JSON whitespace, then a colon. Cheap, and it comes first.
+          const gap = skipGap(text, quote + 1, depth)
+          if (text.charCodeAt(gap.end) !== 0x3a) continue
+          const key = decodeKey(text.slice(open + 1, quote - delimiterRun), depth)
+          // A key that cannot be decoded is not inspected (see above).
+          if (key === undefined) continue
+          const name = ZERO_WIDTH.test(key) ? key.replaceAll(ZERO_WIDTH_ALL, '') : key
+          if (!SENSITIVE_KEY.test(name)) continue
+          // The sensitive name is recognised: from here the outcome is the same as for a key found by its spelling.
+          if (gap.over) return withhold()
+          const result = readValue(gap.end + 1, true, depth, isCounterName(name))
+          if (result === WITHHELD) return withhold()
+        }
+      }
+
+      if (named) {
+        prefix.lastIndex = 0
+        for (;;) {
+          const match = prefix.exec(text)
+          if (match === null) break
+          const name = match[1] ?? ''
+          const nameQuote = match[2]
+          const afterName = match.index + match[0].length
+          // The identifier the name belongs to: what precedes the secret word (`max_` of `max_tokens`) counts.
+          let from = match.index
+          while (from > 0 && match.index - from < MAX_IDENTIFIER_CHARS && isIdentifierCode(text.charCodeAt(from - 1)))
+            from -= 1
+          const counter = isCounterName(text.slice(from, match.index) + name)
+
+          let result: number
+          if (nameQuote === undefined) {
+            result = readValue(afterName, false, 0, counter)
+          } else {
+            const layers = depthOfDelimiterRun(nameQuote.length - 1)
+            // Up to four blanks and a separator, the form a name in quotes had before the JSON whitespace rule.
+            let blanksEnd = afterName
+            while (
+              blanksEnd - afterName < 4 &&
+              (text.charCodeAt(blanksEnd) === 0x20 || text.charCodeAt(blanksEnd) === 0x09)
+            )
+              blanksEnd += 1
+            if (layers === -1) {
+              // An escape depth this matcher cannot read (deeper than it supports, or a backslash run that is not `2^d - 1`): a
+              // key followed by a colon cannot be read, so it cannot tell where the value ends.
+              if (text.charCodeAt(blanksEnd) === 0x3a) return withhold()
+              if (text.charCodeAt(blanksEnd) !== 0x3d) continue
+              result = readValue(blanksEnd + 1, false, 0, counter)
+            } else {
+              // The JSON form: any JSON whitespace, real or escaped at this depth, up to the bound, then a colon.
+              const gap = skipGap(text, afterName, layers)
+              if (text.charCodeAt(gap.end) === 0x3a) {
+                // More whitespace than the bound before the colon: the key is recognised but where its value starts cannot be told.
+                if (gap.over) return withhold()
+                result = readValue(gap.end + 1, true, layers, counter)
+              } else if (text.charCodeAt(blanksEnd) === 0x3d) {
+                result = readValue(blanksEnd + 1, false, 0, counter)
+              } else {
+                continue
+              }
+            }
+          }
+          if (result === WITHHELD) return withhold()
+          if (result !== SKIP) prefix.lastIndex = Math.max(prefix.lastIndex, result)
+        }
+      }
+      if (keyed) quotedKeys()
     },
   }
 }
@@ -1037,8 +1206,6 @@ function safeScrub(scrubber: Scrubber, text: string): ScrubResult {
 // Structured redaction
 // ---------------------------------------------------------------------------------------------------------------------
 
-/** A key whose name says it holds a credential. Same words as the text rules. */
-const SENSITIVE_KEY = new RegExp(SECRET_WORDS, 'i')
 const MAX_KEY_CHARS = 200
 /** Nodes visited and depth reached in one structured pass. Past either, the attribute is omitted, not exported. */
 const MAX_REDACTION_NODES = 500_000

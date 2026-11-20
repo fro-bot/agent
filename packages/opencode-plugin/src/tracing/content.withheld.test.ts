@@ -100,7 +100,10 @@ describe('a recognised sensitive name whose value cannot be bounded withholds th
       'five layers of encoding (a quote run of 31)',
       (inner: string) => [1, 2, 3, 4, 5].reduce(text => JSON.stringify({v: text}), inner),
     ],
-    ['a name quote run of two backslashes', () => String.raw`before-text {\\"password\\": "leaky one"} after-text`],
+    [
+      'a name quote run of 31 backslashes (a depth of five)',
+      () => `before-text {${'\\'.repeat(31)}"password${'\\'.repeat(31)}": "leaky one"} after-text`,
+    ],
     [
       'an escaped whitespace of another depth after a quoted key',
       () => String.raw`before-text {\"password\":\\n  \"leaky one\"} after-text`,
