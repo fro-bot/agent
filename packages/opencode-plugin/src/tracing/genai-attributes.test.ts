@@ -421,9 +421,54 @@ describe('identity', () => {
         'session.id': 'ses_child',
         'gen_ai.conversation.id': 'ses_child',
         'fro_bot.root_session.id': 'ses_root',
+        'langfuse.session.id': 'ses_root',
         'gen_ai.agent.name': 'build',
       })
     }
+  })
+
+  it('groups a whole subagent tree under the root session id for Langfuse, and keeps session.id as each span’s own', () => {
+    // #given the nested-subagent fixture: a root session, a child and a child of that child
+    const {records} = replay(recordedFixtures['subagent-nested']?.observations ?? [])
+
+    // #when every record is mapped
+    const spans = records.map(record => exported(record))
+
+    // #then every span of every session carries the ROOT id in `langfuse.session.id` (the attribute Langfuse's OTLP ingestion
+    // reads first for its session, ahead of `session.id`), while `session.id` stays the span's own session
+    expect(new Set(spans.map(span => span.attributes['langfuse.session.id']))).toEqual(new Set(['ses_1']))
+    expect(new Set(spans.map(span => span.attributes['session.id']))).toEqual(new Set(['ses_1', 'ses_2', 'ses_3']))
+    for (const span of spans)
+      expect(span.attributes['langfuse.session.id']).toBe(span.attributes['fro_bot.root_session.id'])
+  })
+
+  it('gives a session that is not linked to a root its own id, on every kind of span', () => {
+    // #given records of a session that is its own root (a standalone request, or a child whose link never came)
+    const records: SpanRecord[] = [
+      chat({sessionId: 'ses_alone', rootSessionId: 'ses_alone'}),
+      tool({sessionId: 'ses_alone', rootSessionId: 'ses_alone'}),
+      invoke({sessionId: 'ses_alone', rootSessionId: 'ses_alone', role: 'root'}),
+    ]
+
+    // #then
+    for (const record of records) {
+      expect(exported(record).attributes).toMatchObject({
+        'langfuse.session.id': 'ses_alone',
+        'session.id': 'ses_alone',
+        'fro_bot.root_session.id': 'ses_alone',
+      })
+    }
+  })
+
+  it('scrubs the id like every other string attribute', () => {
+    // #given a root id that contains a secret shape (the inbox already drops an identifier over 512 characters, so the id is
+    // bounded before it reaches a record; this is the guard on the way out)
+    const secret = ['ghp_', 'aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5'].join('')
+    const span = exported(chat({sessionId: 'ses_child', rootSessionId: `ses-${secret}`}))
+
+    // #then the Langfuse session attribute goes through the same scrubber as `fro_bot.root_session.id`
+    expect(JSON.stringify(span.attributes)).not.toContain(secret)
+    expect(span.attributes['langfuse.session.id']).toBe(span.attributes['fro_bot.root_session.id'])
   })
 
   it('puts repository and run identity on every span in Action mode, and on none in local mode', () => {

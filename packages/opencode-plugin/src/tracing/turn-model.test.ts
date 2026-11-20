@@ -1915,6 +1915,8 @@ describe('a child that finishes before its dispatch link arrives', () => {
     expect(kidChat?.texts).toEqual(['child answer'])
     expect(kidChat?.usage).toBeDefined()
     expect(kidChat?.status).toBe('ok')
+    // the root session id is known by the time the link resolves, for every span the child produced
+    expect(new Set(records.map(record => record.rootSessionId))).toEqual(new Set(['p']))
     expect(tools(records).filter(tool => tool.sessionId === 'kid')).toHaveLength(1)
     const invokes = records.filter(record => record.kind === 'invoke_agent')
     expect(invokes).toHaveLength(2)
