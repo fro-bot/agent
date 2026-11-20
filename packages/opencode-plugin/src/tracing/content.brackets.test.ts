@@ -43,22 +43,34 @@ const wrap = (text: string, depth: number): string => {
 
 const DEPTHS = [0, 1, 3] as const
 
-/** Nothing of the string is exported: the leaf is the marker, and the span says why. */
+/**
+ * The exported attribute for a placement, compared whole: what the span would carry if exactly `expectedText` replaced the
+ * document in that placement. This proves the sensitive value was removed AND nothing else was touched.
+ */
+function expectExact(document: string, expectedDocument: string, depths: readonly number[] = DEPTHS): void {
+  for (const depth of depths) {
+    const actual = placements(wrap(document, depth))
+    const expected = placements(wrap(expectedDocument, depth))
+    for (const [index, {where, value}] of actual.entries()) {
+      const result = run(value)
+      const wanted = JSON.stringify(expected[index]?.value)
+      expect({where, depth, attribute: String(result.attributes[ATTRIBUTE])}).toEqual({where, depth, attribute: wanted})
+    }
+  }
+}
+
+/** Nothing of the string is exported: every leaf is exactly the marker, and the span says why. */
 function expectWithheld(document: string, depths: readonly number[] = DEPTHS): void {
   for (const depth of depths) {
-    for (const {where, value} of placements(wrap(document, depth))) {
+    const actual = placements(wrap(document, depth))
+    const expected = placements('[omitted]')
+    for (const [index, {where, value}] of actual.entries()) {
       const result = run(value)
-      const out = JSON.stringify(result.attributes[ATTRIBUTE])
-      expect({
+      expect({where, depth, attribute: String(result.attributes[ATTRIBUTE])}).toEqual({
         where,
         depth,
-        leaked: out.includes(VALUE) || out.includes('before-text') || out.includes('after-text'),
-      }).toEqual({
-        where,
-        depth,
-        leaked: false,
+        attribute: JSON.stringify(expected[index]?.value),
       })
-      expect({where, depth, marked: out.includes('[omitted]')}).toEqual({where, depth, marked: true})
       expect({where, depth, reasons: result.attributes[MARKER.omitted]}).toEqual({
         where,
         depth,
@@ -125,22 +137,19 @@ describe('a correctly nested value is still redacted in place', () => {
     ['brackets inside strings are ignored', '{"a": "]} [ {", "b": ["x}", "y]"]}'],
     ['an array of arrays', '[[1, 2], [3, [4, [5]]]]'],
   ])('%s', (_label, value) => {
-    // #given a well-formed value under a sensitive key, with neighbours
-    for (const depth of DEPTHS) {
-      const text = wrap(`{"keep": "keep-text", "password": ${value}, "tail": "after-text"}`, depth)
-      for (const {where, value: placed} of placements(text)) {
-        // #when
-        const result = run(placed)
-        const out = JSON.stringify(result.attributes[ATTRIBUTE])
+    // #given a well-formed value under a sensitive key, with neighbours, at every escape depth
+    const document = `{"keep": "keep-text", "password": ${value}, "tail": "after-text"}`
+    const redacted = `{"keep": "keep-text", "password": ${REDACTION}, "tail": "after-text"}`
 
-        // #then it is redacted in place: marker, neighbours intact, no omission
-        expect({where, depth, redacted: out.includes(REDACTION)}).toEqual({where, depth, redacted: true})
-        expect({where, depth, neighbours: out.includes('keep-text') && out.includes('after-text')}).toEqual({
+    // #then the exported leaf is exactly the document with the whole value replaced by the marker, and nothing else
+    expectExact(document, redacted)
+    for (const depth of DEPTHS) {
+      for (const {where, value: placed} of placements(wrap(document, depth))) {
+        expect({where, depth, omitted: run(placed).attributes[MARKER.omitted]}).toEqual({
           where,
           depth,
-          neighbours: true,
+          omitted: undefined,
         })
-        expect({where, depth, omitted: result.attributes[MARKER.omitted]}).toEqual({where, depth, omitted: undefined})
       }
     }
   })
