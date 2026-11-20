@@ -71,11 +71,16 @@ const TRUNCATION_SUFFIX = (removed: number): string => `…[truncated ${removed}
 export interface ScrubMatcher {
   /** The rule's name: used in tests and nowhere in output (a marker never names the rule that matched). */
   readonly id: string
-  /** `lower` is `text` case-folded once, for cheap needle checks. Ranges may arrive in any order and may overlap. */
-  readonly find: (text: string, lower: string, emit: Emit) => void
+  /**
+   * `lower` is `text` case-folded once, for cheap needle checks. Ranges may arrive in any order and may overlap. `withhold` is the
+   * one fail-closed signal: a matcher that has recognised a secret but cannot establish where it ends calls it, and the whole
+   * string is withheld (`sensitive-value-unbounded`), never redacted "up to" a guess.
+   */
+  readonly find: (text: string, lower: string, emit: Emit, withhold: Withhold) => void
 }
 
 export type Emit = (start: number, end: number) => void
+export type Withhold = () => void
 
 export interface Range {
   readonly start: number
@@ -90,10 +95,29 @@ class TooManyRangesError extends Error {}
 /** Calls `matcher` and returns the ranges it reports, uncapped. For tests and tools: `scrubWithMatchers` caps them. */
 export function matchRanges(matcher: ScrubMatcher, text: string): Range[] {
   const found: Range[] = []
-  matcher.find(text, text.toLowerCase(), (start, end) => {
-    found.push({start, end})
-  })
+  matcher.find(
+    text,
+    text.toLowerCase(),
+    (start, end) => {
+      found.push({start, end})
+    },
+    () => {},
+  )
   return found
+}
+
+/** Whether `matcher` withholds `text` (it recognised a secret and could not establish where its value ends). */
+export function matchWithholds(matcher: ScrubMatcher, text: string): boolean {
+  let withheld = false
+  matcher.find(
+    text,
+    text.toLowerCase(),
+    () => {},
+    () => {
+      withheld = true
+    },
+  )
+  return withheld
 }
 
 /**
@@ -311,14 +335,14 @@ function skipGap(text: string, from: number, layers: number): {readonly end: num
   return {end: index, over: index - from > MAX_GAP_CHARS}
 }
 
-/** The most a bracketed value (`{...}` or `[...]`) is scanned for its balanced close. Past it, the value runs to the end of the line. */
+/** The most a bracketed value (`{...}` or `[...]`) is scanned for its balanced close. Past it the end is not established and the string is withheld. */
 const MAX_STRUCTURE_VALUE_CHARS = 256 * 1024
 
 /**
  * A value that begins with `{` or `[`, read by one forward scan to its balanced close: brackets count outside strings only, a
  * string ends at its own closing quote, and quotes are read at the escape depth the document is written in. Returns the index
  * after the close, or -1 when there is none within `MAX_STRUCTURE_VALUE_CHARS` or the shared `budget` (then the caller redacts
- * to the end of the line). `budget.left` is the work all such scans of one text may do together, so a text of many
+ * withholds the string). `budget.left` is the work all such scans of one text may do together, so a text of many
  * unterminated openers costs a constant multiple of its length, not a scan each.
  *
  * Escape depth: the first quote inside the value is preceded by `r` backslashes, and `r = 2^d - 1` for a document encoded `d`
@@ -375,13 +399,7 @@ function structureEnd(text: string, from: number, budget: {left: number}): numbe
   return -1
 }
 
-/** The end of the line `from` is on, or the end of the text. */
-function lineEnd(text: string, from: number): number {
-  const newline = text.indexOf('\n', from)
-  return newline === -1 ? text.length : newline
-}
-
-/** The most a quoted value is searched for its closing quote. Past it the value is redacted to the end of the line. */
+/** The most a quoted value is searched for its closing quote. Past it the end is not established and the string is withheld. */
 const MAX_QUOTED_VALUE_CHARS = 8192
 
 /** Where an unquoted value that starts at `from` ends: at the first delimiter. */
@@ -411,7 +429,7 @@ function schemeCredentialEnd(text: string, end: number): number {
  * `name=value` and `name: value`, in plain text and in JSON text (`\"name\": \"value\"`): the range is the value. The match
  * starts at the secret word itself, every gap is a bounded class, and the value is then read by hand, once, forward:
  * - a quoted value runs to its closing quote, honouring escapes (in an escaped layer, `\"` closes and `\\\"` does not); if
- *   no closing quote is found within `MAX_QUOTED_VALUE_CHARS` it runs to the end of the line;
+ *   no closing quote is found within `MAX_QUOTED_VALUE_CHARS` the end is not established and the string is withheld;
  * - an unquoted value is a run of non-delimiter characters (the first token only), plus the credential after a scheme word;
  * - a number of up to eight digits survives only after a counter or limit name (`max_tokens: 8000`), never after a name that
  *   says password, secret, credential or authorization.
@@ -420,26 +438,17 @@ function schemeCredentialEnd(text: string, end: number): number {
 function nameValueMatcher(): ScrubMatcher {
   const prefix = new RegExp(
     // The quote around a name or a value may sit in an escaped layer: any run of backslashes (JSON in JSON in JSON) before it.
-    String.raw`((?:${SECRET_WORDS})[\w.-]{0,20})(\\{0,15}["'])?[ \t]{0,4}([:=])`,
+    String.raw`((?:${SECRET_WORDS})[\w.-]{0,20})(\\{0,64}["'])?[ \t]{0,4}([:=])`,
     'gi',
   )
   return {
     id: 'name-value-pair',
-    find: (text, lower, emit) => {
+    find: (text, lower, emit, withhold) => {
       if (!SECRET_NEEDLES.some(needle => lower.includes(needle))) return
       // The work every value of this text may spend scanning for its close, all together: a text of many unterminated openers
-      // costs a constant multiple of its length, not a scan each. Once it is spent a value runs to the end of its line.
+      // costs a constant multiple of its length, not a scan each. When it is spent the value's end cannot be established, and
+      // the string is withheld.
       const budget = {left: 4 * text.length + 65_536}
-      // The next line end at or after a position, found once per line: positions only move forward.
-      let lineFrom = 0
-      let lineAt = -1
-      const endOfLine = (position: number): number => {
-        if (lineAt === -1 || position < lineFrom || position > lineAt) {
-          lineAt = lineEnd(text, position)
-          lineFrom = position
-        }
-        return lineAt
-      }
       prefix.lastIndex = 0
       for (;;) {
         const match = prefix.exec(text)
@@ -450,11 +459,16 @@ function nameValueMatcher(): ScrubMatcher {
         // escaped at the document's depth, up to `MAX_GAP_CHARS`; for every other form it is up to four spaces or tabs, so prose
         // like `password:` at the end of a line does not reach the next one.
         let at = match.index + match[0].length
-        let gapOver = false
-        if (nameQuote !== undefined && match[3] === ':') {
-          const gap = skipGap(text, at, layersOfRun(nameQuote.length - 1))
+        const jsonForm = nameQuote !== undefined && match[3] === ':'
+        if (jsonForm) {
+          const layers = layersOfRun(nameQuote.length - 1)
+          // An escape depth this matcher cannot read (deeper than it supports, or a backslash run that is not `2^d - 1`): it
+          // cannot tell what the value looks like, so it cannot tell where it ends.
+          if (layers === -1) return withhold()
+          const gap = skipGap(text, at, layers)
+          // More whitespace than the bound: where the value starts cannot be told.
+          if (gap.over) return withhold()
           at = gap.end
-          gapOver = gap.over
         } else {
           for (
             let blanks = 0;
@@ -470,27 +484,28 @@ function nameValueMatcher(): ScrubMatcher {
         const opened = runEnd - at <= 15 && (quoteCode === 0x22 || quoteCode === 0x27)
         const opener = opened ? text.slice(at, runEnd + 1) : undefined
         const valueStart = opened ? runEnd + 1 : at
+        // After a quoted key, a backslash that is not an opening quote is an escape this matcher did not recognise (a run too long,
+        // a whitespace escape of another depth): the value's start is unknown, so its end is.
+        if (jsonForm && !opened && text.charCodeAt(at) === 0x5c) return withhold()
         // The identifier the name belongs to: what precedes the secret word (`max_` of `max_tokens`) counts.
         let from = match.index
         while (from > 0 && match.index - from < MAX_IDENTIFIER_CHARS && isIdentifierCode(text.charCodeAt(from - 1)))
           from -= 1
         const counter = isCounterName(text.slice(from, match.index) + name)
 
+        // Every branch below either establishes the value's end (a balanced close, a closing quote, a delimiter) or withholds the
+        // string. There is no "to the end of the line".
         let valueEnd: number
-        // Whether the end was found (a closing quote, a balanced close, a delimiter) or is the fallback, the end of the line.
-        let found = true
         const first = text.charCodeAt(valueStart)
-        if (gapOver) {
-          // More whitespace than the bound: where the value is cannot be told, so it and the rest of its line go (fail closed).
-          found = false
-          valueEnd = endOfLine(valueStart)
-          if (valueEnd === valueStart) continue
-        } else if (opener === undefined && (first === 0x7b || first === 0x5b)) {
-          // A whole object or array after a sensitive name: consumed to its balanced close, or to the end of the line.
+        if (opener === undefined && (first === 0x7b || first === 0x5b)) {
+          // A whole object or array after a sensitive name: consumed to its balanced close. No close within the size bound, or
+          // within the shared work budget, or an unreadable escape depth inside: the end is not established.
           const close = structureEnd(text, valueStart, budget)
-          found = close !== -1
-          valueEnd = found ? close : endOfLine(valueStart)
+          if (close === -1) return withhold()
+          valueEnd = close
         } else if (opener === undefined) {
+          // Unquoted: the value ends at the first delimiter (whitespace, a quote, a bracket, a comma...). That is the rule for this
+          // form, not a guess: a delimiter or the end of the text always ends it.
           valueEnd = unquotedEnd(text, valueStart)
           if (SCHEME_WORD.test(text.slice(valueStart, valueEnd))) valueEnd = schemeCredentialEnd(text, valueEnd)
           const value = text.slice(valueStart, valueEnd)
@@ -498,17 +513,15 @@ function nameValueMatcher(): ScrubMatcher {
           // A counter name keeps the old floor of three characters; a credential name has none.
           if (value.length < (counter ? 3 : 1)) continue
         } else {
+          // Quoted: ends at its closing quote. None within the scan bound, or the shared work budget is spent: not established.
           const close = budget.left > MAX_QUOTED_VALUE_CHARS ? closingQuote(text, valueStart, opener) : -1
-          found = close !== -1
-          valueEnd = found ? close : endOfLine(valueStart)
-          budget.left -= found ? valueEnd - valueStart : MAX_QUOTED_VALUE_CHARS
+          if (close === -1) return withhold()
+          valueEnd = close
+          budget.left -= valueEnd - valueStart
           if (valueEnd === valueStart) continue
         }
         emit(valueStart, valueEnd)
-        // Scanning resumes after a value whose end was found. A value that ran to the end of its line did not prove where it ends:
-        // a longer value that starts inside it (one that continues on the next line) must still be found, so scanning resumes
-        // inside it.
-        prefix.lastIndex = found ? Math.max(prefix.lastIndex, valueEnd) : Math.max(prefix.lastIndex, valueStart)
+        prefix.lastIndex = Math.max(prefix.lastIndex, valueEnd)
       }
     },
   }
@@ -516,7 +529,7 @@ function nameValueMatcher(): ScrubMatcher {
 
 /**
  * Where a quoted value that starts at `from` ends: the index of its closing delimiter, or -1 when none is found within the
- * bound (the caller then runs the value to the end of its line). `opener` is the quote and any backslashes before it (`"`, `'`, `\"`, `\\\"`): the run of backslashes
+ * bound (the caller then withholds the string). `opener` is the quote and any backslashes before it (`"`, `'`, `\"`, `\\\"`): the run of backslashes
  * says how many layers of JSON escaping the text is in. In a layer, the delimiter is exactly that run and a quote; a quote
  * of the value itself is written with a longer run and does not close it.
  */
@@ -687,7 +700,10 @@ export function literalMatcher(literals: readonly string[]): ScrubMatcher {
 
 export type ScrubResult =
   | {readonly ok: true; readonly text: string; readonly redactions: number}
-  | {readonly ok: false; readonly reason: 'over-input-ceiling' | 'scrub-failed' | 'too-many-ranges'}
+  | {
+      readonly ok: false
+      readonly reason: 'over-input-ceiling' | 'scrub-failed' | 'too-many-ranges' | 'sensitive-value-unbounded'
+    }
 
 export interface Scrubber {
   /** Scrubs one string: the ORIGINAL text in, text with each united range replaced by one marker out. */
@@ -730,18 +746,29 @@ const isLowSurrogate = (code: number): boolean => code >= 0xdc_00 && code <= 0xd
 export function scrubWithMatchers(
   text: string,
   matchers: readonly ScrubMatcher[],
-): {readonly text: string; readonly redactions: number} {
+): {readonly text: string; readonly redactions: number; readonly withheld: boolean} {
   const lower = text.toLowerCase()
   const starts: number[] = []
   const ends: number[] = []
+  let withheld = false
+  let overCap = false
   const emit: Emit = (start, end) => {
-    if (end <= start) return
-    if (starts.length >= MAX_RANGES) throw new TooManyRangesError()
+    if (end <= start || overCap) return
+    if (starts.length >= MAX_RANGES) {
+      overCap = true
+      return
+    }
     starts.push(Math.max(0, start))
     ends.push(Math.min(text.length, end))
   }
-  for (const matcher of matchers) matcher.find(text, lower, emit)
-  if (starts.length === 0) return {text, redactions: 0}
+  const withhold: Withhold = () => {
+    withheld = true
+  }
+  for (const matcher of matchers) matcher.find(text, lower, emit, withhold)
+  // Withholding outranks the range cap, so the outcome does not depend on the order the matchers ran in.
+  if (withheld) return {text: '', redactions: 0, withheld: true}
+  if (overCap) throw new TooManyRangesError()
+  if (starts.length === 0) return {text, redactions: 0, withheld: false}
 
   const order = starts.map((_start, index) => index).toSorted((a, b) => (starts[a] ?? 0) - (starts[b] ?? 0))
   let out = ''
@@ -766,7 +793,7 @@ export function scrubWithMatchers(
     cursor = end
     redactions += 1
   }
-  return {text: out + text.slice(cursor), redactions}
+  return {text: out + text.slice(cursor), redactions, withheld: false}
 }
 
 export function createScrubber(options: ScrubberOptions = {}): Scrubber {
@@ -789,7 +816,10 @@ export function createScrubber(options: ScrubberOptions = {}): Scrubber {
     scrub: text => {
       if (text.length > ceiling) return {ok: false, reason: 'over-input-ceiling'}
       try {
-        return {ok: true, ...scrubWithMatchers(text, matchers)}
+        const result = scrubWithMatchers(text, matchers)
+        return result.withheld
+          ? {ok: false, reason: 'sensitive-value-unbounded'}
+          : {ok: true, text: result.text, redactions: result.redactions}
       } catch (error) {
         return {ok: false, reason: error instanceof TooManyRangesError ? 'too-many-ranges' : 'scrub-failed'}
       }
@@ -1026,6 +1056,8 @@ function isSensitiveKey(key: string, value: unknown): boolean {
 interface TreeWalk {
   nodes: number
   redactions: number
+  /** String leaves withheld because a sensitive value's end could not be established. */
+  withheld: number
 }
 
 type TreeFailureReason = 'over-input-ceiling' | 'scrub-failed' | 'too-many-ranges'
@@ -1041,7 +1073,14 @@ class TreeFailure extends Error {
 /** One string of the structure, scrubbed once, from its original text. A failure fails the whole attribute. */
 function scrubLeaf(text: string, scrubber: Scrubber, walk: TreeWalk): string {
   const result = safeScrub(scrubber, text)
-  if (!result.ok) throw new TreeFailure(result.reason)
+  if (!result.ok) {
+    // A sensitive value whose end cannot be established withholds THIS leaf; every other failure fails the whole attribute.
+    if (result.reason === 'sensitive-value-unbounded') {
+      walk.withheld += 1
+      return OMITTED_TEXT
+    }
+    throw new TreeFailure(result.reason)
+  }
   walk.redactions += result.redactions
   return result.text
 }
@@ -1083,11 +1122,11 @@ export function scrubStructured(
   value: unknown,
   scrubber: Scrubber,
 ):
-  | {readonly ok: true; readonly value: unknown; readonly redactions: number}
+  | {readonly ok: true; readonly value: unknown; readonly redactions: number; readonly withheld: number}
   | {readonly ok: false; readonly reason: TreeFailureReason} {
-  const walk: TreeWalk = {nodes: 0, redactions: 0}
+  const walk: TreeWalk = {nodes: 0, redactions: 0, withheld: 0}
   try {
-    return {ok: true, value: scrubNode(value, 0, scrubber, walk), redactions: walk.redactions}
+    return {ok: true, value: scrubNode(value, 0, scrubber, walk), redactions: walk.redactions, withheld: walk.withheld}
   } catch (error) {
     return {ok: false, reason: error instanceof TreeFailure ? error.reason : 'scrub-failed'}
   }
@@ -1133,6 +1172,8 @@ export function scrubSpan(
         continue
       }
       tally.redactions += walked.redactions
+      // Leaves withheld for an unbounded sensitive value are the marker in the output; the span says so once per attribute.
+      if (walked.withheld > 0) tally.omitted.push(`${name}:sensitive-value-unbounded`)
       // Already scrubbed, leaf by leaf: only serialized here, to bound it, never scanned.
       const json = serialize(walked.value)
       if (json === undefined) {

@@ -274,7 +274,7 @@ describe('order independence', () => {
     for (const {text} of inputs) {
       const [first, ...rest] = orders.map(({order}) => scrubWithMatchers(text, order))
       for (const [index, other] of rest.entries()) {
-        if (other.text !== first?.text || other.redactions !== first.redactions) {
+        if (other.text !== first?.text || other.redactions !== first.redactions || other.withheld !== first.withheld) {
           mismatches.push(`${orders[index + 1]?.label ?? '?'}: ${JSON.stringify(text.slice(0, 120))}`)
         }
       }
@@ -313,7 +313,7 @@ describe('order independence', () => {
     const result = scrubWithMatchers(input, matchers)
 
     // #then two markers: one for the quoted value (rule, token and nothing else overlap into one range), one for the literal
-    expect(result).toEqual({text: `password: "${REDACTION}" ${REDACTION}`, redactions: 2})
+    expect(result).toMatchObject({text: `password: "${REDACTION}" ${REDACTION}`, redactions: 2})
     expect((result.text.match(/\[REDACTED\]/g) ?? []).length).toBe(result.redactions)
   })
 })
@@ -383,8 +383,8 @@ describe('edges of the union', () => {
     const text = 'abcdefghijkl'
 
     // #then [0,3) and [3,6) touch and become one marker; [0,3) and [4,6) stay two
-    expect(scrubWithMatchers(text, [at([0, 3], [3, 6])])).toEqual({text: `${REDACTION}ghijkl`, redactions: 1})
-    expect(scrubWithMatchers(text, [at([0, 3], [4, 6])])).toEqual({
+    expect(scrubWithMatchers(text, [at([0, 3], [3, 6])])).toMatchObject({text: `${REDACTION}ghijkl`, redactions: 1})
+    expect(scrubWithMatchers(text, [at([0, 3], [4, 6])])).toMatchObject({
       text: `${REDACTION}d${REDACTION}ghijkl`,
       redactions: 2,
     })
@@ -396,9 +396,9 @@ describe('edges of the union', () => {
     const expected = {text: `${REDACTION}jkl`, redactions: 1}
 
     // #then
-    expect(scrubWithMatchers(text, [at([0, 5], [2, 9])])).toEqual(expected)
-    expect(scrubWithMatchers(text, [at([2, 9]), at([0, 5])])).toEqual(expected)
-    expect(scrubWithMatchers(text, [at([0, 9]), at([2, 4], [5, 7])])).toEqual(expected)
+    expect(scrubWithMatchers(text, [at([0, 5], [2, 9])])).toMatchObject(expected)
+    expect(scrubWithMatchers(text, [at([2, 9]), at([0, 5])])).toMatchObject(expected)
+    expect(scrubWithMatchers(text, [at([0, 9]), at([2, 4], [5, 7])])).toMatchObject(expected)
   })
 
   it('redacts a match at offset 0 and one that ends the string, and the whole string', () => {
@@ -408,7 +408,7 @@ describe('edges of the union', () => {
     // #then
     expect(scrubWithMatchers(text, [at([0, 2])]).text).toBe(`${REDACTION}cdefghijkl`)
     expect(scrubWithMatchers(text, [at([10, 12])]).text).toBe(`abcdefghij${REDACTION}`)
-    expect(scrubWithMatchers(text, [at([0, 12])])).toEqual({text: REDACTION, redactions: 1})
+    expect(scrubWithMatchers(text, [at([0, 12])])).toMatchObject({text: REDACTION, redactions: 1})
     expect(scrubWithMatchers(`password=${TOKENS.openai}`, matchers).text).toBe(`password=${REDACTION}`)
     expect(scrubWithMatchers(TOKENS.openai, matchers).text).toBe(REDACTION)
   })
@@ -418,8 +418,11 @@ describe('edges of the union', () => {
     const text = 'abcdef'
 
     // #then
-    expect(scrubWithMatchers(text, [at([3, 3], [4, 2])])).toEqual({text, redactions: 0})
-    expect(scrubWithMatchers(text, [at([-5, 2], [4, 99])])).toEqual({text: `${REDACTION}cd${REDACTION}`, redactions: 2})
+    expect(scrubWithMatchers(text, [at([3, 3], [4, 2])])).toMatchObject({text, redactions: 0})
+    expect(scrubWithMatchers(text, [at([-5, 2], [4, 99])])).toMatchObject({
+      text: `${REDACTION}cd${REDACTION}`,
+      redactions: 2,
+    })
   })
 
   it('moves a range edge that would split a surrogate pair outward, so no lone half is left', () => {

@@ -175,7 +175,7 @@ describe('a sensitive-named key inside JSON in a string: its whole value goes', 
           // #then no part of the value survives (a boolean or null is checked by its literal form too)
           for (const secret of secrets)
             expect({where, secret, found: out.includes(secret)}).toEqual({where, secret, found: false})
-          expect(out).toContain(REDACTION)
+          expect(out).toContain(balanced ? REDACTION : '[omitted]')
           // #and when the value is balanced, what follows it is untouched
           expect({where, kept: !(balanced && depth === 0) || out.includes('after-text')}).toEqual({where, kept: true})
         }
@@ -183,7 +183,7 @@ describe('a sensitive-named key inside JSON in a string: its whole value goes', 
     }
   }
 
-  it('runs an unterminated object to the end of its line, and leaves the next line', () => {
+  it('withholds the string for an object that never closes: its end is not established, so none of it is exported', () => {
     // #given an object that never closes, on one line of a multi-line text
     const text = 'log: password: {"a": "unfinished secret\nnext line stays'
 
@@ -192,7 +192,8 @@ describe('a sensitive-named key inside JSON in a string: its whole value goes', 
 
     // #then
     expect(out).not.toContain('unfinished')
-    expect(out).toContain('next line stays')
+    expect(out).not.toContain('next line stays')
+    expect(out).toContain('[omitted]')
   })
 
   it('keeps a counter name’s number, as before', () => {
@@ -299,24 +300,16 @@ describe('the safety net: a known literal that is still present at export is wit
   })
 })
 
-describe('a value that runs to the end of its line does not hide a longer one inside it', () => {
+describe('a value whose end cannot be established withholds the whole string', () => {
   const scrubber = createScrubber({env: {}})
-  const out = (text: string): string => {
-    const result = scrubber.scrub(text)
-    if (!result.ok) throw new Error(result.reason)
-    return result.text
-  }
 
   it.each([
     ['an unbalanced bracket', 'client_secret:{[{[ first passphrase: "multi\nline words" tail'],
     ['an unterminated quote', "secret: \"abc passphrase: 'multi\nline words' tail"],
-  ])('keeps looking inside %s: the inner value that continues past the line goes too', (_label, text) => {
-    // #given an outer value whose end could not be found (so it runs to the end of its line), with a longer value inside it
-    const result = out(text)
-
-    // #then the inner value is removed to its own end, on the next line
-    expect(result).not.toContain('line words')
-    expect(result).toContain('tail')
+  ])('withholds %s whole, with a longer value inside it too', (_label, text) => {
+    // #given an outer value whose end could not be found, with a longer value inside it
+    // #then nothing is exported: no "up to the end of the line", so nothing for a longer inner value to hide in
+    expect(scrubber.scrub(text)).toEqual({ok: false, reason: 'sensitive-value-unbounded'})
   })
 
   it('stays linear on many such openers on one line', () => {
@@ -445,19 +438,12 @@ describe('a sensitive key whose value starts on a later line (pretty-printed JSO
     expect(scrubber.scrub(text)).toEqual({ok: true, text, redactions: 0})
   })
 
-  it('fails closed past the whitespace bound: the value and the rest of its line are removed', () => {
+  it('fails closed past the whitespace bound: the whole string is withheld', () => {
     // #given a quoted key, 300 newlines (past the 256-character bound), then a string value and more on that line
     const text = `{"password":${'\n'.repeat(300)}"leaky words", "tail": "after-text"}\nnext line stays`
 
-    // #when
-    const result = scrubber.scrub(text)
-
-    // #then the value is gone along with the rest of its line (its end cannot be located safely), and the next line is not
-    expect(result.ok).toBe(true)
-    const out = result.ok ? result.text : ''
-    expect(out).not.toContain('leaky')
-    expect(out).not.toContain('after-text')
-    expect(out).toContain('next line stays')
+    // #when / #then the value's start cannot be told, so nothing of the string is exported
+    expect(scrubber.scrub(text)).toEqual({ok: false, reason: 'sensitive-value-unbounded'})
   })
 
   it('counts a number after a counter name as a counter, even from the next line', () => {

@@ -46,7 +46,7 @@ The plugin refuses the file, logging one line with a fixed reason and no values,
 
 **Shutdown.** When the server stops, the plugin exports what it has within 3 seconds, then cancels the request that is in flight and counts what was not delivered as dropped. The SDK's retry wait is a timer the plugin cannot cancel, and it keeps a process alive that waits for its event loop to drain: after the plugin has finished, it can outlast it by up to the request timeout (10 seconds) if the collector sent a long `Retry-After`, and by about 1 to 5 seconds otherwise. Nothing is sent when it fires. OpenCode's own server does not wait for such a timer (it left about 3.3 seconds after stdin closed in every measured run, including against a collector that answers `503` with `Retry-After: 9`).
 
-The credential in this file is readable by anything that runs as you, including a local agent. Spans carry prompts, tool arguments and tool results, scrubbed on a best-effort basis for known secret shapes; scrubbing does not find a secret that has no recognizable shape. OpenCode's own exporter is separate and is not affected.
+The credential in this file is readable by anything that runs as you, including a local agent. Spans carry prompts, tool arguments and tool results, scrubbed on a best-effort basis for known secret shapes; scrubbing does not find a secret that has no recognizable shape. When the plugin cannot tell where a secret-named value ends, it withholds that whole value (the span carries `[omitted]` and the reason `sensitive-value-unbounded`). OpenCode's own exporter is separate and is not affected.
 
 ## Develop
 

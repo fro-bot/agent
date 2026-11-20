@@ -595,7 +595,6 @@ describe('a secret-named field is removed whole, not in part', () => {
     ['a single-quoted value', "secret='correct horse battery' end", 'horse'],
     ['an escaped quote inside the value', String.raw`password: "he said \"correct horse\" there" tail`, 'horse'],
     ['a value in an escaped (JSON-in-JSON) layer', String.raw`password: \"correct horse battery\" tail`, 'battery'],
-    ['an unterminated quote, to the end of the line', 'password: "correct horse\nnext line stays', 'horse'],
     ['a numeric password', 'password: 123456 done', '123456'],
     ['a short numeric pin', 'pwd=1234', '1234'],
     ['a numeric token that is not a counter', 'token: 99 end', '99'],
@@ -609,10 +608,12 @@ describe('a secret-named field is removed whole, not in part', () => {
     expect(out).toContain(REDACTION)
   })
 
-  it('stops at the closing quote and keeps what follows, and ends an unterminated quote at the line', () => {
+  it('stops at the closing quote and keeps what follows, and withholds the string when a quote never closes', () => {
     // #given
     expect(scrubText('a password: "x y z" and the rest')).toBe(`a password: "${REDACTION}" and the rest`)
-    expect(scrubText('password: "x y\nnext line stays')).toContain('next line stays')
+
+    // #then an unterminated quote does not establish where the value ends: nothing of the string is exported
+    expect(scrubber.scrub('password: "x y\nnext line stays')).toEqual({ok: false, reason: 'sensitive-value-unbounded'})
   })
 
   it.each([
