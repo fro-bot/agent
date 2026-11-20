@@ -91,7 +91,7 @@ function piece(random: () => number, brackets: boolean): Piece {
   const atom = pick(random, ATOMS)
   const name = pick(random, NAMES)
   const sep = pick(random, [': ', '=', ':', ' = '])
-  switch (Math.floor(random() * (brackets ? 34 : 16))) {
+  switch (Math.floor(random() * (brackets ? 38 : 16))) {
     case 0:
       return {text: token, secrets: [token]}
     case 1:
@@ -190,6 +190,17 @@ function piece(random: () => number, brackets: boolean): Piece {
     case 33:
       // A key that ends in an escaped backslash.
       return {text: String.raw`{"${name}\\": "${atom}"}`, secrets: [atom]}
+    case 34:
+      // A closer of the wrong type: the value cannot be bounded, so the whole text is withheld (the atoms are in it, after the closer).
+      return {text: `{"${name}": {"a": 1] "b": "${atom}"} ${token}`, secrets: [atom, token]}
+    case 35:
+      return {text: `${name}: [{"a": ${atom}] }, ${token}`, secrets: [atom, token]}
+    case 36:
+      // Correctly nested, mixed brackets, redacted in place.
+      return {text: `{"${name}": {"a": [{"b": [1, {}]}], "c": "${atom}"}, "ok": 1}`, secrets: [atom]}
+    case 37:
+      // Nesting past the depth bound.
+      return {text: `{"${name}": ${'['.repeat(70)}${']'.repeat(70)}, "b": "${atom}"}`, secrets: [atom]}
     default:
       return {text: `${name}${sep}"${PEM} ${atom}"`, secrets: [PEM_BODY, atom]}
   }

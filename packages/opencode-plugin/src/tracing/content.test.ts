@@ -747,6 +747,17 @@ describe('adversarial timing: growth, not a ceiling', () => {
         n => String.raw`{\\\\\\\\"password\\\\\\\\":${String.raw`\\\\n `.repeat(Math.ceil(n / 6))}1}`,
       ],
       ['a quoted key, whitespace, then an opener never closed', n => `"password":${' \n'.repeat(Math.ceil(n / 4))}{[`],
+      [
+        'deep alternating nesting, balanced',
+        n => `password: ${'{"a":['.repeat(Math.ceil(n / 12))}1${']}'.repeat(Math.ceil(n / 12))}`,
+      ],
+      [
+        'deep alternating nesting, mismatched at the end',
+        n => `password: ${'{"a":['.repeat(Math.ceil(n / 12))}1${'}]'.repeat(Math.ceil(n / 12))}`,
+      ],
+      ['mismatched pairs, repeated', rep('password: {"a": [1}] ')],
+      ['nesting at the depth bound, repeated', rep(`token: ${'['.repeat(64)}${']'.repeat(64)} `)],
+      ['nesting past the depth bound, repeated', rep(`token: ${'['.repeat(65)}${']'.repeat(65)} `)],
       ['a long run of openers, no close', n => `password: ${'{['.repeat(Math.ceil(n / 2))}`],
       ['unbalanced openers, one per line', rep('password: {[ x\n')],
       ['unbalanced openers, all on one line', rep('secret: {[ pad ')],

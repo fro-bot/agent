@@ -340,11 +340,15 @@ function skipGap(text: string, from: number, layers: number): {readonly end: num
 /** The most a bracketed value (`{...}` or `[...]`) is scanned for its balanced close. Past it the end is not established and the string is withheld. */
 const MAX_STRUCTURE_VALUE_CHARS = 256 * 1024
 
+/** The deepest bracket nesting the scan follows. Deeper, the end of the value is not established and the string is withheld. */
+const MAX_BRACKET_DEPTH = 64
+
 /**
- * A value that begins with `{` or `[`, read by one forward scan to its balanced close: brackets count outside strings only, a
- * string ends at its own closing quote, and quotes are read at the escape depth the document is written in. Returns the index
- * after the close, or -1 when there is none within `MAX_STRUCTURE_VALUE_CHARS` or the shared `budget` (then the caller redacts
- * withholds the string). `budget.left` is the work all such scans of one text may do together, so a text of many
+ * A value that begins with `{` or `[`, read by one forward scan to its balanced close: brackets count outside strings only, each
+ * closer must be the one the innermost open bracket expects (`}` for `{`, `]` for `[`), a string ends at its own closing quote,
+ * and quotes are read at the escape depth the document is written in. Returns the index after the close, or -1 when there is
+ * none within `MAX_STRUCTURE_VALUE_CHARS` or the shared `budget`, a closer does not match, or the nesting is deeper than
+ * `MAX_BRACKET_DEPTH` (then the caller withholds the string). `budget.left` is the work all such scans of one text may do together, so a text of many
  * unterminated openers costs a constant multiple of its length, not a scan each.
  *
  * Escape depth: the first quote inside the value is preceded by `r` backslashes, and `r = 2^d - 1` for a document encoded `d`
@@ -355,6 +359,8 @@ const MAX_STRUCTURE_VALUE_CHARS = 256 * 1024
 function structureEnd(text: string, from: number, budget: {left: number}): number {
   const limit = Math.min(text.length, from + MAX_STRUCTURE_VALUE_CHARS)
   let layers = -1
+  // The closer each open bracket expects, innermost last: `}` (0x7d) for `{`, `]` (0x5d) for `[`.
+  const expected = new Uint8Array(MAX_BRACKET_DEPTH)
   let depth = 0
   /** Whether a quote after `run` backslashes delimits a string (true) or is escaped inside one (false); undefined: not at this depth. */
   const delimits = (run: number): boolean | undefined => {
@@ -393,8 +399,16 @@ function structureEnd(text: string, from: number, budget: {left: number}): numbe
       if (layers === -1) layers = 0
       if (layers === 0 && delimits(0) === true) inString = !inString
     } else if (!inString) {
-      if (code === 0x7b || code === 0x5b) depth += 1
-      else if ((code === 0x7d || code === 0x5d) && --depth === 0) return index + 1
+      if (code === 0x7b || code === 0x5b) {
+        if (depth === MAX_BRACKET_DEPTH) return -1
+        expected[depth] = code === 0x7b ? 0x7d : 0x5d
+        depth += 1
+      } else if (code === 0x7d || code === 0x5d) {
+        // A closer that is not the innermost open bracket's: the value is malformed and its end cannot be established.
+        depth -= 1
+        if (expected[depth] !== code) return -1
+        if (depth === 0) return index + 1
+      }
     }
     index += 1
   }
