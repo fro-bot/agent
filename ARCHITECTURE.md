@@ -266,9 +266,9 @@ Session persistence spans two distinct layers that are easy to conflate. During 
 Per-repo S3 conditional-write locks (`If-None-Match` / `If-Match`) built by `getLockKey` (`packages/runtime/src/coordination/lock.ts`): gateway runs exclude each other on `locks/repo.json`, Action runs on `locks/action.json`; the surfaces do not exclude each other. The Action acquires in `src/harness/phases/acquire-lock.ts` (15-minute TTL) and releases in `cleanup.ts`; both surfaces renew through one `createLeaseLoop` (`packages/runtime/src/coordination/lease-loop.ts`).
 
 - With S3 configured, a lock error fails the Action closed; a contended Action exits 0 as `skipped`; a run without the lock never persists session state.
-- A lock is renewed, adopted, released or deleted only by its own acquisition: the holder id, the job or run id, and the per-acquisition `acquisition_token` must all match. A record without a token is never adopted.
+- Ordinary renewal and release are guarded by the lock's ETag (`If-Match`). Adopting a renewal whose result was lost, and ownership-based cleanup (the gateway's release retry, the post hook's delete), check the acquisition instead: holder id, job or run id and the per-acquisition `acquisition_token`. A record without a token is never adopted.
 - The Action holder id stays `action:<runId>:<attempt>`; older agent versions match exactly that shape. The job identity rides in `holder_job`.
-- An expired lease is replaced only with corroboration (`ConfirmExpiredHolder` `clear`, via `packages/gateway/src/execute/repo-quiescence.ts`), except an Action holder, which the Action reclaims directly (`reclaimableWithoutConfirmation`). This is snapshot corroboration, not fencing.
+- The gateway corroborates every expired lease before replacing it (`ConfirmExpiredHolder` `clear`, via `packages/gateway/src/execute/repo-quiescence.ts`). Only the Action reclaims an expired lease directly, and only from an Action holder (`reclaimableWithoutConfirmation`). This is snapshot corroboration, not fencing.
 
 > See also: [Execution Lifecycle](docs/wiki/Execution%20Lifecycle.md#s3-conditional-write-locks-gateway-repojson-action-actionjson)
 
@@ -372,7 +372,7 @@ With `isolate-agent`, the Action creates a per-run local user, hands it only the
 
 - Published installs only: the preflight refuses a local `uses: ./`, an alias or a symlinked install. `_actions` is a reserved subtree no handoff grant may touch.
 - Every process-producing step goes through `lifecycle.launch`, and the lifecycle is the sole owner of signal handling while a sandbox is live.
-- The exit order is fixed: shut down the server, kill every member of the launch's mount namespace and confirm it is empty, kill and verify every sandbox process, take files back, then read, publish and persist. A dead launcher is never the confirmation.
+- The handoff happens after the held-claim clear and before the spawn. The exit order is fixed: shut down the server; `release` waits for every in-flight `lifecycle.launch` before it verifies teardown and takes files back; kill every member of the launch's mount namespace and confirm it is empty, kill and verify every sandbox process, take files back, then read, publish and persist. A dead launcher is never the confirmation.
 - An unconfirmed stop or unsafe take-back fails the run and declines publication and persistence; the post hook never retries a save for an isolated run.
 - Provider keys never reach the agent's user: a key proxy child (`packages/runtime/src/agent/key-proxy.ts`) holds them. It starts first and stops last.
 - Grants outside the writable set are read and execute only, and narrow: the agent's `PATH` mirrors the runner's, and only tool roots that `PATH` needs are granted (`src/services/setup/sandbox-tool-roots.ts`). Never grant the runner home.
