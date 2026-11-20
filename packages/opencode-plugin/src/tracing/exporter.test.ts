@@ -555,6 +555,41 @@ describe('failure, overflow and shutdown', () => {
     expect(counts).toEqual({exported: 2, dropped: 1})
   }, 15_000)
 
+  it('counts the queue in encoded bytes: escaped text that is short in characters overflows it', async () => {
+    // #given a byte budget that holds one span of 2,000 control characters (12 KB encoded) but not two, though the two together are
+    // only 4,000 characters: an accounting by characters would fit both
+    const target = await sink({respond: () => ({status: 200, delayMs: 300})})
+    const escaped = (): ScrubbedSpan => span({attributes: {'gen_ai.input.messages': '\u0001'.repeat(2_000)}})
+    const exporter = exporterFor({url: target.url, limits: {...FAST, maxQueueBytes: 13_500, maxBatchSpans: 1}})
+
+    // #when the first span goes in flight and two more arrive
+    exporter.export(span())
+    await new Promise(resolve => setTimeout(resolve, 80))
+    exporter.export(escaped())
+    exporter.export(escaped())
+    const counts = await exporter.close(4_000)
+
+    // #then one was queued and one dropped
+    expect(counts).toEqual({exported: 2, dropped: 1})
+  }, 15_000)
+
+  it('counts multi-byte text in encoded bytes too', async () => {
+    // #given a budget for one 3,000-character CJK span (9 KB encoded), and a third span that does not fit beside it
+    const target = await sink({respond: () => ({status: 200, delayMs: 300})})
+    const cjk = (): ScrubbedSpan => span({attributes: {'gen_ai.input.messages': '漢'.repeat(3_000)}})
+    const exporter = exporterFor({url: target.url, limits: {...FAST, maxQueueBytes: 10_000, maxBatchSpans: 1}})
+
+    // #when
+    exporter.export(span())
+    await new Promise(resolve => setTimeout(resolve, 80))
+    exporter.export(cjk())
+    exporter.export(cjk())
+    const counts = await exporter.close(4_000)
+
+    // #then
+    expect(counts).toEqual({exported: 2, dropped: 1})
+  }, 15_000)
+
   it('abandons what is still in flight at the shutdown bound, counts it dropped, and returns in time', async () => {
     // #given a sink that never answers in time
     const target = await sink({respond: () => ({status: 200, delayMs: 8_000})})
