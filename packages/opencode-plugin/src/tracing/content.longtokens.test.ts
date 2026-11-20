@@ -61,3 +61,43 @@ describe('over-long tokens are redacted whole', () => {
     expect(scrub(text)).toBe(text)
   })
 })
+
+describe('URL userinfo can only be in the authority', () => {
+  const FILL = 'p4ss'.repeat(100)
+
+  it.each([
+    ['a query on the host with no slash', 'https://example.com?next=user@evil.test'],
+    ['a fragment on the host with no slash', 'https://example.com#frag@x'],
+    ['a long query with an @, no slash after the host', `https://example.com?next=${FILL}@evil.test`],
+    ['a long fragment with an @, no slash after the host', `https://example.com#${FILL}@evil.test`],
+    ['an @ in the path', 'https://example.com/a@b'],
+    ['a query after a port', 'https://example.com:8443?u=a@b'],
+  ])('leaves the hostname alone for %s', (_label, url) => {
+    // #given a URL whose only @ is outside the authority
+    const text = `open ${url} now`
+
+    // #then nothing is redacted by the userinfo rule (an unrelated domain must not look like the destination)
+    expect(scrub(text)).toBe(text)
+  })
+
+  it.each([
+    ['a plain user and password', 'https://user:pass@example.com/path', `https://${REDACTION}@example.com/path`],
+    ['a percent-encoded userinfo', 'https://us%40er:p%3Fss%23w@example.com/', `https://${REDACTION}@example.com/`],
+    ['a userinfo over 256 characters', `https://user:${FILL}@example.com/x`, `https://${REDACTION}@example.com/x`],
+    ['a userinfo before a query', 'https://u:p@example.com?next=1', `https://${REDACTION}@example.com?next=1`],
+    ['a userinfo before a fragment', 'https://u:p@example.com#top', `https://${REDACTION}@example.com#top`],
+  ])('still redacts %s', (_label, url, expected) => {
+    // #then
+    expect(scrub(`open ${url} now`)).toBe(`open ${expected} now`)
+  })
+
+  it('leaves the other rules in charge of a secret in the query', () => {
+    // #given a secret query parameter on a URL with no userinfo, and a connection string
+    const query = scrub('GET https://example.com/cb?token=abcdef123456&x=1')
+    const conn = scrub('db postgres://admin:s3cret@db.internal:5432/app ok')
+
+    // #then the query-secret rule redacts the value, the host stays; the connection-string rule redacts its own
+    expect(query).toBe(`GET https://example.com/cb?token=${REDACTION}&x=1`)
+    expect(conn).toBe(`db ${REDACTION} ok`)
+  })
+})

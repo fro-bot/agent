@@ -746,8 +746,13 @@ function closingQuote(text: string, from: number, opener: string): number {
   return -1
 }
 
-/** URL userinfo: everything between `scheme://` and the `@`, whatever its length (the run stops at whitespace or a slash, so a scan never crosses into another candidate). */
-const URL_USERINFO = /([a-z][a-z0-9+.-]{1,15}:\/\/)[^\s/@"'\\]+@/gi
+/**
+ * URL userinfo: everything between `scheme://` and the `@`, whatever its length. Userinfo can only be in the authority, so the
+ * run stops at the first raw `/`, `?` or `#` (and at whitespace, quotes and a backslash): an `@` in a query, a fragment or a
+ * path is not userinfo, and treating it as one would erase the real hostname. Percent-encoded characters are allowed. The run
+ * cannot cross a delimiter, so a scan never reaches into another candidate and the rule stays linear.
+ */
+const URL_USERINFO = /([a-z][a-z0-9+.-]{1,15}:\/\/)[^\s/?#@"'\\]+@/gi
 
 /** A secret-like query parameter's value. */
 const QUERY_SECRET = new RegExp(
