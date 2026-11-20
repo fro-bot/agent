@@ -118,6 +118,11 @@ export interface SpanExporterOptions {
   readonly limits?: Partial<ExporterLimits>
   /** Called once if the circuit opens. Fixed text only. */
   readonly onStopped?: () => void
+  /** Test seams only; nothing in production sets them. */
+  readonly testing?: {
+    /** Cancelling a request cannot reach its socket: the delegate never lets go, as if its transport could not be stopped. */
+    readonly ignoreAgentDestroy?: boolean
+  }
 }
 
 export interface SpanExporter {
@@ -139,6 +144,8 @@ interface Queued {
 }
 
 /** The most content attributes omitted from one span to bring it under the body limit, and the smallest one worth omitting. */
+/** How long the delegate may take to let go of a cancelled request before the transport is given up on. */
+const DRAIN_GRACE_MS = 1_000
 const MAX_OMISSIONS = 32
 const MIN_OMIT_CHARS = 256
 
@@ -181,7 +188,10 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
   let dropped = 0
   let queue: Queued[] = []
   let queuedBytes = 0
-  let inFlight: {readonly done: Promise<void>; readonly size: number; abandoned: boolean} | undefined
+  // The batch the delegate holds. `counted` and "the delegate has let go" are separate facts: a batch is counted (exported or
+  // dropped) once, by whichever of its result, the watchdog or shutdown comes first, while `inFlight` stays set until the delegate
+  // has drained (its slot is free), because a batch handed to an occupied delegate is refused and its spans would be lost.
+  let inFlight: {readonly done: Promise<void>; readonly size: number; counted: boolean} | undefined
   let timer: NodeJS.Timeout | undefined
   let consecutiveFailures = 0
   let tripped = false
@@ -200,6 +210,8 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
   // once) and the headers function, which the transport awaits before EVERY request including each retry (once cancelled it
   // throws, so no further request is made). Both are used at the cleanup deadline.
   let cancelled = false
+  // Set while the request of a batch the watchdog gave up on is being cancelled: nothing may be sent until the delegate lets go.
+  let cancelling = false
   let agent: {readonly destroy: () => void} | undefined
   const makeAgent = httpAgentFactoryFromOptions({keepAlive: true, rejectUnauthorized: true})
 
@@ -209,7 +221,7 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
         url: options.url,
         // Read on every request, so each batch carries the totals as of its start.
         headers: async () => {
-          if (cancelled) throw new Error('export cancelled')
+          if (cancelled || cancelling) throw new Error('export cancelled')
           return options.reportCounts
             ? {...baseHeaders, [TRACE_COUNTS_HEADER]: formatCountsHeader(counts())}
             : baseHeaders
@@ -222,7 +234,7 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
         // turn it off: the credential in a local-mode header goes only to a destination whose certificate verified.
         agentFactory: async protocol => {
           const made = await makeAgent(protocol)
-          agent = made
+          agent = options.testing?.ignoreAgentDestroy === true ? undefined : made
           return made
         },
       },
@@ -287,12 +299,44 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
     return batch
   }
 
+  /**
+   * Cancels the request the delegate holds and waits, for a bound, until it has let go of its slot. Used when the watchdog gives
+   * up on a batch: the SDK's request timeout is an IDLE timeout on the socket, so a collector that keeps the connection active
+   * (a response that trickles) outlasts the watchdog, and the next batch handed to the delegate would be refused as over its
+   * concurrency limit. Destroying the agent closes every open socket, which ends the request, and the headers function refuses
+   * every request until the delegate has drained. If it has not drained within the grace period the transport cannot be stopped:
+   * the breaker trips (everything queued is counted dropped) and nothing more is sent.
+   */
+  async function cancelInFlight(): Promise<void> {
+    cancelling = true
+    try {
+      agent?.destroy()
+    } catch {
+      // The headers function still stops every further request.
+    }
+    const drained = await Promise.race([
+      exporter.forceFlush().then(
+        () => true,
+        () => true,
+      ),
+      sleep(DRAIN_GRACE_MS).then(() => false),
+    ])
+    if (drained) {
+      cancelling = false
+      return
+    }
+    cancelled = true
+    trip()
+  }
+
   function startBatch(): void {
     if (inFlight !== undefined || queue.length === 0 || tripped) return
     const batch = takeBatch()
-    const current = {abandoned: false, size: batch.length} as {done: Promise<void>; size: number; abandoned: boolean}
+    const current = {counted: false, size: batch.length} as {done: Promise<void>; size: number; counted: boolean}
+    /** Counts the batch, once, whatever order the result, the watchdog and shutdown come in. */
     const settle = (ok: boolean): void => {
-      if (current.abandoned) return
+      if (current.counted) return
+      current.counted = true
       if (ok) {
         exported += batch.length
         consecutiveFailures = 0
@@ -303,11 +347,11 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
       }
     }
     current.done = new Promise<void>(resolve => {
-      // A watchdog over the whole batch, in case a result never comes back: a lost result is a failed batch.
+      // A watchdog over the whole batch, in case a result never comes back: a lost result is a failed batch. The request is then
+      // cancelled and the next batch waits until the delegate has let go of it.
       const watchdog = setTimeout(() => {
         settle(false)
-        current.abandoned = true
-        resolve()
+        cancelInFlight().then(resolve, resolve)
       }, limits.requestTimeoutMs + 2_000)
       watchdog.unref()
       try {
@@ -483,9 +527,9 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
       } catch {
         // Nothing more can be done: the headers function stops every further request.
       }
-      if (inFlight !== undefined) {
-        if (!inFlight.abandoned) dropped += inFlight.size
-        inFlight.abandoned = true
+      if (inFlight !== undefined && !inFlight.counted) {
+        dropped += inFlight.size
+        inFlight.counted = true
       }
       dropped += queue.length
       queue = []
