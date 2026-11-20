@@ -340,11 +340,15 @@ function skipGap(text: string, from: number, layers: number): {readonly end: num
 /** The most a bracketed value (`{...}` or `[...]`) is scanned for its balanced close. Past it the end is not established and the string is withheld. */
 const MAX_STRUCTURE_VALUE_CHARS = 256 * 1024
 
+/** The deepest bracket nesting the scan follows. Deeper, the end of the value is not established and the string is withheld. */
+const MAX_BRACKET_DEPTH = 64
+
 /**
- * A value that begins with `{` or `[`, read by one forward scan to its balanced close: brackets count outside strings only, a
- * string ends at its own closing quote, and quotes are read at the escape depth the document is written in. Returns the index
- * after the close, or -1 when there is none within `MAX_STRUCTURE_VALUE_CHARS` or the shared `budget` (then the caller redacts
- * withholds the string). `budget.left` is the work all such scans of one text may do together, so a text of many
+ * A value that begins with `{` or `[`, read by one forward scan to its balanced close: brackets count outside strings only, each
+ * closer must be the one the innermost open bracket expects (`}` for `{`, `]` for `[`), a string ends at its own closing quote,
+ * and quotes are read at the escape depth the document is written in. Returns the index after the close, or -1 when there is
+ * none within `MAX_STRUCTURE_VALUE_CHARS` or the shared `budget`, a closer does not match, or the nesting is deeper than
+ * `MAX_BRACKET_DEPTH` (then the caller withholds the string). `budget.left` is the work all such scans of one text may do together, so a text of many
  * unterminated openers costs a constant multiple of its length, not a scan each.
  *
  * Escape depth: the first quote inside the value is preceded by `r` backslashes, and `r = 2^d - 1` for a document encoded `d`
@@ -355,6 +359,8 @@ const MAX_STRUCTURE_VALUE_CHARS = 256 * 1024
 function structureEnd(text: string, from: number, budget: {left: number}): number {
   const limit = Math.min(text.length, from + MAX_STRUCTURE_VALUE_CHARS)
   let layers = -1
+  // The closer each open bracket expects, innermost last: `}` (0x7d) for `{`, `]` (0x5d) for `[`.
+  const expected = new Uint8Array(MAX_BRACKET_DEPTH)
   let depth = 0
   /** Whether a quote after `run` backslashes delimits a string (true) or is escaped inside one (false); undefined: not at this depth. */
   const delimits = (run: number): boolean | undefined => {
@@ -393,8 +399,16 @@ function structureEnd(text: string, from: number, budget: {left: number}): numbe
       if (layers === -1) layers = 0
       if (layers === 0 && delimits(0) === true) inString = !inString
     } else if (!inString) {
-      if (code === 0x7b || code === 0x5b) depth += 1
-      else if ((code === 0x7d || code === 0x5d) && --depth === 0) return index + 1
+      if (code === 0x7b || code === 0x5b) {
+        if (depth === MAX_BRACKET_DEPTH) return -1
+        expected[depth] = code === 0x7b ? 0x7d : 0x5d
+        depth += 1
+      } else if (code === 0x7d || code === 0x5d) {
+        // A closer that is not the innermost open bracket's: the value is malformed and its end cannot be established.
+        depth -= 1
+        if (expected[depth] !== code) return -1
+        if (depth === 0) return index + 1
+      }
     }
     index += 1
   }
@@ -732,8 +746,13 @@ function closingQuote(text: string, from: number, opener: string): number {
   return -1
 }
 
-/** URL userinfo: everything between `scheme://` and the `@`. */
-const URL_USERINFO = /([a-z][a-z0-9+.-]{1,15}:\/\/)[^\s/@"'\\]{1,256}@/gi
+/**
+ * URL userinfo: everything between `scheme://` and the `@`, whatever its length. Userinfo can only be in the authority, so the
+ * run stops at the first raw `/`, `?` or `#` (and at whitespace, quotes and a backslash): an `@` in a query, a fragment or a
+ * path is not userinfo, and treating it as one would erase the real hostname. Percent-encoded characters are allowed. The run
+ * cannot cross a delimiter, so a scan never reaches into another candidate and the rule stays linear.
+ */
+const URL_USERINFO = /([a-z][a-z0-9+.-]{1,15}:\/\/)[^\s/?#@"'\\]+@/gi
 
 /** A secret-like query parameter's value. */
 const QUERY_SECRET = new RegExp(
@@ -754,7 +773,7 @@ const afterScheme = (match: RegExpExecArray, text: string): Range => {
  */
 export const SCRUB_PATTERNS: readonly ScrubMatcher[] = [
   pemMatcher(),
-  regexMatcher('github-token', /\b(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_\w{22,255})\b/g, wholeMatch, [
+  regexMatcher('github-token', /\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_\w{22,})\b/g, wholeMatch, [
     'ghp_',
     'gho_',
     'ghu_',
@@ -1225,6 +1244,8 @@ interface TreeWalk {
   redactions: number
   /** String leaves withheld because a sensitive value's end could not be established. */
   withheld: number
+  /** Entries dropped because every key they could take was occupied (see `freeKey`). */
+  droppedKeys: number
 }
 
 type TreeFailureReason = 'over-input-ceiling' | 'scrub-failed' | 'too-many-ranges'
@@ -1252,6 +1273,27 @@ function scrubLeaf(text: string, scrubber: Scrubber, walk: TreeWalk): string {
   return result.text
 }
 
+/** The most entries that may share one scrubbed key name (the plain name and the suffixes ` (2)` to ` (64)`). */
+const MAX_KEY_COLLISIONS = 64
+
+/**
+ * The key to write a scrubbed entry under, or undefined when there is none. Two distinct keys that differ only inside text the
+ * scrubber redacts become the same text, and the later entry would overwrite the earlier. THE RULE: this only ever returns an
+ * unoccupied key, so an entry is never overwritten, whether the occupant is a scrubbed key or a genuine input key that happens to
+ * look like a suffixed name (`name (2)`, before or after the colliding keys: a later genuine key is itself a collision with an
+ * occupied key and probes from its own name). A colliding key takes ` (2)`, ` (3)`... in order, skipping any that are taken. With
+ * every one up to ` (64)` taken, there is no free key: the caller drops the entry and counts it (`key-collision-overflow`). No
+ * original text is kept, and the probe is bounded.
+ */
+function freeKey(target: Record<string, unknown>, name: string): string | undefined {
+  if (!Object.hasOwn(target, name)) return name
+  for (let n = 2; n <= MAX_KEY_COLLISIONS; n += 1) {
+    const candidate = `${name} (${String(n)})`
+    if (!Object.hasOwn(target, candidate)) return candidate
+  }
+  return undefined
+}
+
 function scrubNode(value: unknown, depth: number, scrubber: Scrubber, walk: TreeWalk): unknown {
   walk.nodes += 1
   if (walk.nodes > MAX_REDACTION_NODES || depth > MAX_REDACTION_DEPTH) throw new TreeFailure('scrub-failed')
@@ -1268,9 +1310,13 @@ function scrubNode(value: unknown, depth: number, scrubber: Scrubber, walk: Tree
       if (isSensitiveKey(key, child)) {
         // The whole value goes, whatever its type; nothing inside it is read, and the marker is never scanned.
         walk.redactions += 1
-        copy[scrubLeaf(key, scrubber, walk)] = REDACTION
+        const slot = freeKey(copy, scrubLeaf(key, scrubber, walk))
+        if (slot === undefined) walk.droppedKeys += 1
+        else copy[slot] = REDACTION
       } else {
-        copy[scrubLeaf(key, scrubber, walk)] = scrubNode(child, depth + 1, scrubber, walk)
+        const slot = freeKey(copy, scrubLeaf(key, scrubber, walk))
+        if (slot === undefined) walk.droppedKeys += 1
+        else copy[slot] = scrubNode(child, depth + 1, scrubber, walk)
       }
     }
     return copy
@@ -1289,11 +1335,23 @@ export function scrubStructured(
   value: unknown,
   scrubber: Scrubber,
 ):
-  | {readonly ok: true; readonly value: unknown; readonly redactions: number; readonly withheld: number}
+  | {
+      readonly ok: true
+      readonly value: unknown
+      readonly redactions: number
+      readonly withheld: number
+      readonly droppedKeys: number
+    }
   | {readonly ok: false; readonly reason: TreeFailureReason} {
-  const walk: TreeWalk = {nodes: 0, redactions: 0, withheld: 0}
+  const walk: TreeWalk = {nodes: 0, redactions: 0, withheld: 0, droppedKeys: 0}
   try {
-    return {ok: true, value: scrubNode(value, 0, scrubber, walk), redactions: walk.redactions, withheld: walk.withheld}
+    return {
+      ok: true,
+      value: scrubNode(value, 0, scrubber, walk),
+      redactions: walk.redactions,
+      withheld: walk.withheld,
+      droppedKeys: walk.droppedKeys,
+    }
   } catch (error) {
     return {ok: false, reason: error instanceof TreeFailure ? error.reason : 'scrub-failed'}
   }
@@ -1341,6 +1399,8 @@ export function scrubSpan(
       tally.redactions += walked.redactions
       // Leaves withheld for an unbounded sensitive value are the marker in the output; the span says so once per attribute.
       if (walked.withheld > 0) tally.omitted.push(`${name}:sensitive-value-unbounded`)
+      // Entries dropped for want of a free key: counted once per attribute, with a fixed reason.
+      if (walked.droppedKeys > 0) tally.omitted.push(`${name}:key-collision-overflow`)
       // Already scrubbed, leaf by leaf: only serialized here, to bound it, never scanned.
       const json = serialize(walked.value)
       if (json === undefined) {

@@ -1,5 +1,4 @@
 import type {PendingSpan} from './content.js'
-
 import {describe, expect, it} from 'vitest'
 
 import {
@@ -22,6 +21,7 @@ import {
   scrubSpan,
   scrubWithMatchers,
 } from './content.js'
+import {minCpuMs} from './timing.testing.js'
 
 // Fixture secrets are assembled at run time so no scanner mistakes this file for a leak.
 const join = (...parts: string[]): string => parts.join('')
@@ -640,6 +640,7 @@ describe('a secret-named field is removed whole, not in part', () => {
 describe('adversarial timing: growth, not a ceiling', () => {
   const SMALL = 20_000
   const LARGE = 160_000
+  /** Linear growth for an 8x size is about 8; quadratic is 64. The limit sits at three times linear. */
   const GROWTH_LIMIT = 24
   /** Below this, a timing is noise and only the absolute ceiling applies. */
   const NOISE_MS = 3
@@ -659,7 +660,11 @@ describe('adversarial timing: growth, not a ceiling', () => {
     'github-token': [
       ['dense matches, one every 41 characters', rep(join('ghp_', 'aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5 '))],
       ['prefix, 35 chars (one short)', run('ghp_', 'a', 35)],
-      ['prefix, 300 chars (over the bound)', run('ghp_', 'a', 300)],
+      ['prefix, 300 chars', run('ghp_', 'a', 300)],
+      ['one long run after the prefix', n => `ghp_${'a'.repeat(n)}`],
+      ['one long run, then an underscore (the boundary fails after the whole run)', n => `ghp_${'a'.repeat(n)}_`],
+      ['runs ending in an underscore, repeated', rep(`ghp_${'a'.repeat(300)}_ `)],
+      ['fine-grained run ending in a dash, repeated', rep(`github_pat_${'a'.repeat(300)}- `)],
       ['prefix, 40 chars, glued', run('ghp_', 'a', 40)],
       ['fine-grained, 21 chars', run('github_pat_', 'a', 21)],
       ['prefix repeated', rep('ghp_')],
@@ -704,10 +709,12 @@ describe('adversarial timing: growth, not a ceiling', () => {
       ['scheme, one long run', n => `mongodb+srv://${'a'.repeat(n)}`],
     ],
     'url-userinfo': [
-      ['dense matches, one every 12 characters', rep('a://u:p@h/ ')],
-      ['255 chars and no @', run('a://', 'b', 255)],
-      ['257 chars and no @', run('a://', 'b', 257)],
-      ['scheme repeated', rep('a://')],
+      ['dense matches, one every 12 characters', rep('https://u:p@h/ ')],
+      ['255 chars and no @', run('https://', 'b', 255)],
+      ['257 chars and no @', run('https://', 'b', 257)],
+      ['one long run and no @', n => `https://${'b'.repeat(n)}`],
+      ['one long userinfo then an @', n => `https://${'b'.repeat(n)}@`],
+      ['scheme repeated', rep('https://')],
       ['16-char scheme', rep('abcdefghijklmnop://')],
     ],
     'url-query-secret': [
@@ -747,6 +754,17 @@ describe('adversarial timing: growth, not a ceiling', () => {
         n => String.raw`{\\\\\\\\"password\\\\\\\\":${String.raw`\\\\n `.repeat(Math.ceil(n / 6))}1}`,
       ],
       ['a quoted key, whitespace, then an opener never closed', n => `"password":${' \n'.repeat(Math.ceil(n / 4))}{[`],
+      [
+        'deep alternating nesting, balanced',
+        n => `password: ${'{"a":['.repeat(Math.ceil(n / 12))}1${']}'.repeat(Math.ceil(n / 12))}`,
+      ],
+      [
+        'deep alternating nesting, mismatched at the end',
+        n => `password: ${'{"a":['.repeat(Math.ceil(n / 12))}1${'}]'.repeat(Math.ceil(n / 12))}`,
+      ],
+      ['mismatched pairs, repeated', rep('password: {"a": [1}] ')],
+      ['nesting at the depth bound, repeated', rep(`token: ${'['.repeat(64)}${']'.repeat(64)} `)],
+      ['nesting past the depth bound, repeated', rep(`token: ${'['.repeat(65)}${']'.repeat(65)} `)],
       ['a long run of openers, no close', n => `password: ${'{['.repeat(Math.ceil(n / 2))}`],
       ['unbalanced openers, one per line', rep('password: {[ x\n')],
       ['unbalanced openers, all on one line', rep('secret: {[ pad ')],
@@ -786,7 +804,7 @@ describe('adversarial timing: growth, not a ceiling', () => {
   }
 
   /** A span whose one content attribute carries `text` the way a tool result does, scrubbed through the whole path. */
-  const through = (scrubber: ReturnType<typeof createScrubber>, text: string): number => {
+  const through = (scrubber: ReturnType<typeof createScrubber>, text: string, attempts = 3): number => {
     const span: PendingSpan = {
       traceId: 't',
       spanId: 's',
@@ -799,14 +817,18 @@ describe('adversarial timing: growth, not a ceiling', () => {
       status: {code: 'unset'},
       events: [],
     }
-    let best = Number.POSITIVE_INFINITY
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      const started = performance.now()
+    // CPU time, the least of a few runs after a warm-up (see `timing.testing.ts` for why, and how a load-proof test still fails
+    // on a real regression).
+    return minCpuMs(() => {
       scrubSpan(span, scrubber)
-      best = Math.min(best, performance.now() - started)
-    }
-    return best
+    }, attempts)
   }
+
+  /** Whether growth from `small` to `large` is over the limit (and the shape is big enough for the ratio to mean anything). */
+  const overLimit = (small: number, large: number): boolean =>
+    large > CEILING_MS || (large > NOISE_MS * GROWTH_LIMIT && large / Math.max(small, NOISE_MS) > GROWTH_LIMIT)
+  /** The measurement that decides a suspect shape: many more runs, so one disturbed run cannot condemn it. */
+  const RECHECK_ATTEMPTS = 15
 
   it('has adversarial inputs for every pattern', () => {
     // #given the pattern list and the input table
@@ -822,18 +844,25 @@ describe('adversarial timing: growth, not a ceiling', () => {
       const scrubber = createScrubber({env: {}})
       const offenders: string[] = []
       for (const [name, make] of inputs[pattern.id] ?? []) {
-        // #when the same shape is scrubbed at two sizes eight times apart
-        const small = through(scrubber, make(SMALL))
-        const large = through(scrubber, make(LARGE))
+        // #when the same shape is scrubbed at two sizes eight times apart (a few runs each)
+        const smallText = make(SMALL)
+        const largeText = make(LARGE)
+        let small = through(scrubber, smallText)
+        let large = through(scrubber, largeText)
 
-        // #then the time grew about eight-fold, not sixty-four-fold, and stayed under the ceiling
-        const grew = large / Math.max(small, NOISE_MS)
-        if (large > CEILING_MS || (large > NOISE_MS * GROWTH_LIMIT && grew > GROWTH_LIMIT)) {
+        // #then the time grew about eight-fold, not sixty-four-fold, and stayed under the ceiling; a shape that looks over the
+        // limit is measured again, many more times, and only the least of all its runs counts (CPU time over the ceiling is real
+        // at once: load does not add CPU time)
+        if (overLimit(small, large) && large <= CEILING_MS) {
+          small = Math.min(small, through(scrubber, smallText, RECHECK_ATTEMPTS))
+          large = Math.min(large, through(scrubber, largeText, RECHECK_ATTEMPTS))
+        }
+        if (overLimit(small, large)) {
           offenders.push(`${name}: ${small.toFixed(1)} ms at ${SMALL}, ${large.toFixed(1)} ms at ${LARGE}`)
         }
       }
       expect(offenders).toEqual([])
-    })
+    }, 60_000)
   }
 
   it('the literal pass grows linearly with a long literal whose near-matches fill the text', () => {
