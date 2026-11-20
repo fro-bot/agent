@@ -1661,11 +1661,23 @@ export function extractPromptMessage(prompt: unknown): Json | undefined {
   return text === undefined ? undefined : {role: 'user', parts: [{type: 'text', content: text}]}
 }
 
-/** Identity the Action supplies, as the attributes every span of its runs carries. */
+/**
+ * Identity the Action supplies, as the attributes every span of its runs carries: the `fro_bot.*` names, and a mirror of each
+ * under `langfuse.trace.metadata.<key>`. Langfuse's OTLP ingestion (`extractMetadata` in langfuse/langfuse
+ * `OtelIngestionProcessor.ts`) reads every `langfuse.trace.metadata.*` attribute of every span into that span's metadata at the top
+ * level, where it is shown and filterable, and treats a span carrying one as a trace update; a string value is kept as sent
+ * (JSON-decoding applies only to its own SDKs). The values are strings and the very same ones as their twins, so they pass the
+ * same scrubber and identifier bounds. The keys are short and stable.
+ */
 export const actionIdentityAttributes = (identity: ActionIdentity): Record<string, string> => ({
   'fro_bot.repository': identity.repository,
   'fro_bot.run.id': identity.runId,
   'fro_bot.run.attempt': identity.attempt,
   'fro_bot.job': identity.job,
   'fro_bot.trigger': identity.trigger,
+  'langfuse.trace.metadata.repository': identity.repository,
+  'langfuse.trace.metadata.run_id': identity.runId,
+  'langfuse.trace.metadata.run_attempt': identity.attempt,
+  'langfuse.trace.metadata.job': identity.job,
+  'langfuse.trace.metadata.trigger': identity.trigger,
 })

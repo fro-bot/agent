@@ -489,6 +489,45 @@ describe('identity', () => {
     }
   })
 
+  it('mirrors the run identity into Langfuse trace metadata on every span in Action mode, with the same values', () => {
+    // #given the three record kinds
+    const records: SpanRecord[] = [chat(), tool(), invoke()]
+
+    // #then each carries the five short keys (strings, as Langfuse keeps a string metadata value as sent), equal to their twins
+    for (const record of records) {
+      const {attributes} = exported(record, IDENTITY)
+      expect(attributes).toMatchObject({
+        'langfuse.trace.metadata.repository': 'fro-bot/agent',
+        'langfuse.trace.metadata.run_id': '4242',
+        'langfuse.trace.metadata.run_attempt': '2',
+        'langfuse.trace.metadata.job': 'fro-bot',
+        'langfuse.trace.metadata.trigger': 'issue_comment',
+      })
+      expect(attributes['langfuse.trace.metadata.repository']).toBe(attributes['fro_bot.repository'])
+      expect(attributes['langfuse.trace.metadata.run_id']).toBe(attributes['fro_bot.run.id'])
+      expect(attributes['langfuse.trace.metadata.run_attempt']).toBe(attributes['fro_bot.run.attempt'])
+      expect(attributes['langfuse.trace.metadata.job']).toBe(attributes['fro_bot.job'])
+      expect(attributes['langfuse.trace.metadata.trigger']).toBe(attributes['fro_bot.trigger'])
+    }
+  })
+
+  it('sets no Langfuse trace metadata in local mode, where there is no run identity', () => {
+    for (const record of [chat(), tool(), invoke()]) {
+      const names = Object.keys(exported(record).attributes)
+      expect(names.filter(name => name.startsWith('langfuse.trace.metadata'))).toEqual([])
+    }
+  })
+
+  it('scrubs the mirrored values like every other string, and bounds nothing the twins do not', () => {
+    // #given an identity whose job carries a secret shape
+    const secret = ['ghp_', 'aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5'].join('')
+    const span = exported(chat(), {...IDENTITY, job: `job-${secret}`})
+
+    // #then neither the twin nor the mirror holds it, and the two agree
+    expect(JSON.stringify(span.attributes)).not.toContain(secret)
+    expect(span.attributes['langfuse.trace.metadata.job']).toBe(span.attributes['fro_bot.job'])
+  })
+
   it('records every span of a replayed fixture without losing the grouping key', () => {
     // #given the nested-subagent fixture
     const observations = recordedFixtures['subagent-nested']?.observations ?? []
