@@ -192,6 +192,16 @@ describe.skipIf(!runnable)('tracing in a real opencode V2', () => {
       expect(readSpan?.parentSpanId).toBe(root?.spanId)
       expect(dispatch?.parentSpanId).toBe(root?.spanId)
       expect(child?.parentSpanId).toBe(dispatch?.spanId)
+      // The root carries the turn's final answer (the response to the subagent's report, run in the same execution), and the
+      // child carries its own: Langfuse shows a trace's output from the root span.
+      const answerOf = (span: DecodedSpan | undefined): unknown => {
+        const raw = span?.attrs['gen_ai.output.messages']
+        return typeof raw === 'string' ? JSON.parse(raw) : undefined
+      }
+      expect(answerOf(root)).toEqual([
+        {role: 'assistant', parts: [{type: 'text', content: 'parent follow-on after the report'}]},
+      ])
+      expect(answerOf(child)).toEqual([{role: 'assistant', parts: [{type: 'text', content: 'REPORT-KID-T1 done'}]}])
       // The child's span starts at or before its dispatching tool span ended, and ends after it: a background job.
       expect(child?.endMs).toBeGreaterThan(dispatch?.endMs ?? Number.POSITIVE_INFINITY)
       const chats = spans.filter(span => span.attrs['gen_ai.operation.name'] === 'chat')

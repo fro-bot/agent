@@ -409,6 +409,51 @@ describe('agent spans', () => {
   })
 })
 
+describe('the root span’s output', () => {
+  it('carries the final answer as one assistant message of text parts, in the GenAI shape', () => {
+    // #given an invoke span whose turn ended ok with an answer of two text parts
+    const span = exported(invoke({finalAnswer: ['first part', 'second part']}))
+
+    // #then the output is the pinned convention's shape: one assistant message, text parts, no reasoning, no tool calls
+    expect(JSON.parse(String(span.attributes['gen_ai.output.messages']))).toEqual([
+      {
+        role: 'assistant',
+        parts: [
+          {type: 'text', content: 'first part'},
+          {type: 'text', content: 'second part'},
+        ],
+      },
+    ])
+  })
+
+  it('sets no output attribute when there is no final answer', () => {
+    expect(exported(invoke()).attributes['gen_ai.output.messages']).toBeUndefined()
+    expect(exported(invoke({finalAnswer: []})).attributes['gen_ai.output.messages']).toBeUndefined()
+  })
+
+  it('sets no output on an error or interrupted root even if a record carried one', () => {
+    for (const status of ['error', 'interrupted'] as const) {
+      expect(exported(invoke({status, finalAnswer: ['x']})).attributes['gen_ai.output.messages']).toBeUndefined()
+    }
+    expect(
+      exported(invoke({marks: ['incomplete'], finalAnswer: ['x']})).attributes['gen_ai.output.messages'],
+    ).toBeUndefined()
+  })
+
+  it('bounds the output with the same limit as a model span’s output, and scrubs it like any content', () => {
+    // #given a huge answer, and one holding a secret shape
+    const secret = ['ghp_', 'aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5'].join('')
+    const huge = 'word '.repeat(200_000)
+    const asRoot = exported(invoke({finalAnswer: [huge]}))
+    const asChat = exported(chat({texts: [huge]}))
+    const leaky = exported(invoke({finalAnswer: [`the key is ${secret}`]}))
+
+    // #then the root's output is held to exactly what a model span's would be, and the secret never leaves
+    expect(asRoot.attributes['gen_ai.output.messages']).toBe(asChat.attributes['gen_ai.output.messages'])
+    expect(JSON.stringify(leaky.attributes)).not.toContain(secret)
+  })
+})
+
 describe('identity', () => {
   it('puts the session id, the root session id and the agent on every span of a subagent', () => {
     // #given the three record kinds of a child session
