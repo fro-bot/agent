@@ -24,6 +24,8 @@
 import type {ReadableSpan, SpanProcessor} from '@opentelemetry/sdk-trace-base'
 import type {ScrubbedSpan} from './content.js'
 
+import {Buffer} from 'node:buffer'
+
 import {ROOT_CONTEXT, SpanKind, SpanStatusCode, trace, TraceFlags} from '@opentelemetry/api'
 import {OTLPExporterBase} from '@opentelemetry/otlp-exporter-base'
 import {createOtlpHttpExportDelegate, httpAgentFactoryFromOptions} from '@opentelemetry/otlp-exporter-base/node-http'
@@ -31,7 +33,7 @@ import {JsonTraceSerializer} from '@opentelemetry/otlp-transformer'
 import {resourceFromAttributes} from '@opentelemetry/resources'
 import {AlwaysOnSampler, BasicTracerProvider} from '@opentelemetry/sdk-trace-base'
 
-import {MARKER} from './content.js'
+import {CONTENT_ATTRIBUTE_NAMES, MARKER} from './content.js'
 
 /**
  * The request header that carries the plugin's running totals to the Action's relay, in Action mode only.
@@ -147,7 +149,7 @@ interface Queued {
 /** How long the delegate may take to let go of a cancelled request before the transport is given up on. */
 const DRAIN_GRACE_MS = 1_000
 const MAX_OMISSIONS = 32
-const MIN_OMIT_CHARS = 256
+const MIN_OMIT_BYTES = 256
 
 const hrTime = (ms: number): [number, number] => {
   const seconds = Math.floor(ms / 1000)
@@ -159,22 +161,29 @@ const sleep = async (ms: number): Promise<void> =>
     setTimeout(resolve, ms).unref()
   })
 
-/** The span without its single largest string or string-list attribute, which it names in the omission marker; or undefined. */
-function omitLargest(span: ScrubbedSpan): ScrubbedSpan | undefined {
+/** What an attribute costs on the wire: its key and its value as JSON, in UTF-8 bytes (the OTLP JSON encodes a string as JSON does). */
+const wireBytes = (name: string, value: string): number =>
+  Buffer.byteLength(JSON.stringify(name), 'utf8') + Buffer.byteLength(JSON.stringify(value), 'utf8')
+
+/**
+ * The span without the content attribute that costs the most bytes on the wire, which it names in the omission marker; or
+ * undefined. Only the content attributes are candidates (never identity, outcome or any other metadata), ranked by encoded bytes
+ * saved, not by character count: escaped or multi-byte text costs far more than its length says.
+ */
+function omitLargestContent(span: ScrubbedSpan): ScrubbedSpan | undefined {
   let largest: string | undefined
   let weight = 0
-  for (const [name, value] of Object.entries(span.attributes)) {
-    if (name === MARKER.omitted) continue
-    let size = 0
-    if (typeof value === 'string') size = value.length
-    else if (typeof value === 'object') for (const item of value) size += item.length
-    if (size > weight) {
+  for (const name of CONTENT_ATTRIBUTE_NAMES) {
+    const value = span.attributes[name]
+    if (typeof value !== 'string') continue
+    const bytes = wireBytes(name, value)
+    if (bytes > weight) {
       largest = name
-      weight = size
+      weight = bytes
     }
   }
-  // Something small is not what made the span too large: nothing left to omit.
-  if (largest === undefined || weight < MIN_OMIT_CHARS) return undefined
+  // Nothing of content is left to omit: whatever makes the span too large is not something that can be taken out.
+  if (largest === undefined || weight < MIN_OMIT_BYTES) return undefined
   const attributes: Record<string, string | number | boolean | readonly string[]> = {}
   for (const [name, value] of Object.entries(span.attributes)) if (name !== largest) attributes[name] = value
   const marked = span.attributes[MARKER.omitted]
@@ -478,7 +487,7 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
           queuedBytes += size
           break
         }
-        const trimmed = attempt < MAX_OMISSIONS ? omitLargest(candidate) : undefined
+        const trimmed = attempt < MAX_OMISSIONS ? omitLargestContent(candidate) : undefined
         if (trimmed === undefined) {
           dropped += 1
           return

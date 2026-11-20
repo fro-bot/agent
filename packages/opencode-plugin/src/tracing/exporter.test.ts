@@ -919,6 +919,51 @@ describe('a request never exceeds the collector’s body limit', () => {
     )
   }, 30_000)
 
+  it('omits the content attribute that costs the most on the wire, not the metadata that is longest in characters', async () => {
+    // #given a span over the limit whose longest attribute by characters is metadata (800,000 plain characters, 800 KB encoded), and
+    // whose costliest is content: 700,000 control characters are 4.2 MB encoded (six bytes each) in fewer characters
+    const target = await sink()
+    const exporter = exporterFor({url: target.url, limits: {...FAST, requestTimeoutMs: 20_000}})
+    exporter.export(
+      span({
+        attributes: {
+          'fro_bot.note': 'm'.repeat(800_000),
+          'gen_ai.output.messages': '\u0001'.repeat(700_000),
+          'gen_ai.tool.name': 'read',
+        },
+      }),
+    )
+
+    // #when
+    const counts = await exporter.close(15_000)
+
+    // #then the content went, the metadata stayed whole, and the marker names only the content
+    expect(counts).toEqual({exported: 1, dropped: 0})
+    const [sent] = target.accepted().flatMap(request => spansOf(request))
+    expect(attr(sent as Decoded, 'gen_ai.output.messages')).toBeUndefined()
+    expect(String(attr(sent as Decoded, 'fro_bot.note'))).toHaveLength(800_000)
+    expect(attr(sent as Decoded, 'gen_ai.tool.name')).toBe('read')
+    expect(JSON.stringify(attr(sent as Decoded, 'fro_bot.content.omitted'))).toContain(
+      'gen_ai.output.messages:span-too-large',
+    )
+    expect(Math.max(...target.accepted().map(bytesOf))).toBeLessThanOrEqual(LIMIT)
+  }, 30_000)
+
+  it('drops, and counts, a span that is too large because of an attribute that is not content', async () => {
+    // #given a span over the limit whose size is all metadata, and an ordinary span
+    const target = await sink()
+    const exporter = exporterFor({url: target.url, limits: {...FAST, requestTimeoutMs: 20_000}})
+    exporter.export(span({attributes: {'fro_bot.note': '\u0001'.repeat(700_000), 'gen_ai.tool.name': 'read'}}))
+    exporter.export(span())
+
+    // #when
+    const counts = await exporter.close(10_000)
+
+    // #then nothing was taken out of it, it was never sent, and it is counted
+    expect(counts).toEqual({exported: 1, dropped: 1})
+    expect(target.received()).toBe(1)
+  }, 30_000)
+
   it('drops, and counts, a span that is too large with nothing left to omit', async () => {
     // #given a span whose NAME is over the limit (a name is not content the exporter can omit), and an ordinary span
     const target = await sink()

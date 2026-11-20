@@ -3,7 +3,7 @@ import type {ChatRecord, InvokeRecord, SpanRecord, ToolRecord} from './turn-mode
 
 import {describe, expect, it} from 'vitest'
 
-import {createScrubber, MARKER} from './content.js'
+import {CONTENT_ATTRIBUTE_NAMES, createScrubber, MARKER} from './content.js'
 import {GENAI_SEMCONV_REVISION, toExportSpan, toPendingSpan} from './genai-attributes.js'
 import {omittedContent, snapshotPrompt, snapshotRequest, snapshotToolArguments, snapshotToolResult} from './snapshot.js'
 import {recordedFixtures} from './turn-model.fixtures.js'
@@ -406,6 +406,39 @@ describe('agent spans', () => {
       'fro_bot.turn.standalone': 'compaction',
       'fro_bot.outcome': 'interrupted',
     })
+  })
+})
+
+describe('the content attribute list', () => {
+  it('names exactly the content attributes the spans set', () => {
+    // #given a model span and a tool span with every kind of content, and an agent span with a prompt and an answer
+    const secretFree = (text: string): string => text
+    const spans = [
+      exported(
+        chat({
+          texts: [secretFree('answer')],
+          request: {
+            system: [{text: 'system'}],
+            messages: [{role: 'user', parts: [{type: 'text', text: 'hi'}]}],
+            tools: {read: {description: 'reads', parameters: {type: 'object'}}},
+          },
+        }),
+      ),
+      exported(tool({input: {path: 'a'}, result: {content: 'body'}})),
+      exported(invoke({finalAnswer: ['done']})),
+    ]
+
+    // #then every `gen_ai.*` content attribute they set is in the list, and every one in the list was set by one of them
+    const contentLike = new Set(
+      spans.flatMap(span =>
+        Object.keys(span.attributes).filter(name =>
+          /^gen_ai\.(?:input\.messages|output\.messages|system_instructions|tool\.definitions|tool\.call\.(?:arguments|result))$/.test(
+            name,
+          ),
+        ),
+      ),
+    )
+    expect([...contentLike].toSorted()).toEqual([...CONTENT_ATTRIBUTE_NAMES].toSorted())
   })
 })
 

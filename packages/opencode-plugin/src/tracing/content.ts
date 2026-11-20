@@ -55,6 +55,20 @@ export const CONTENT_MAX_CHARS = {
   prompt: 64 * 1024,
 } as const
 
+/**
+ * The attributes that carry captured content (the model's input, output, instructions and tool definitions, and a call's
+ * arguments and result), as `genai-attributes.ts` sets them. The exporter may omit one of these, and only these, to bring an
+ * oversized span under the collector's body limit; identity, outcome, marker and every other attribute is never a candidate.
+ */
+export const CONTENT_ATTRIBUTE_NAMES = [
+  'gen_ai.input.messages',
+  'gen_ai.output.messages',
+  'gen_ai.system_instructions',
+  'gen_ai.tool.definitions',
+  'gen_ai.tool.call.arguments',
+  'gen_ai.tool.call.result',
+] as const
+
 /** Added to a cut string; counted against the bound so the result stays under it. */
 const TRUNCATION_OVERHEAD = 40
 const TRUNCATION_SUFFIX = (removed: number): string => `…[truncated ${removed} chars]`
