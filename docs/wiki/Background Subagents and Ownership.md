@@ -56,6 +56,8 @@ Reconciliation repairs a missed settlement, not a missed adoption. The ledger re
 
 V2's `ledger-reconcile-v2.ts` and `shell-jobs-v2.ts` perform the corresponding session and shell checks. Shared notice parsers (`subagent-notice.ts`, `shell-notice.ts`) recognize upstream completion messages that can wake the parent. Ledger settlement and the parent's response to a notice are separate events: a child can stop before the notice is queued, and the parent's old terminal reply says nothing about the next turn.
 
+The Action also keeps a read-only diagnostic log of subagent notices (`src/features/agent/subagent-notice-log.ts`). It is never an input to settlement. It writes one `Subagent notice observed` line per notice (parent and child ids, the tag's `state`, `metadata.state`, whether the body carries `Background work still running`, and the Action's classification) and one `Subagent notices by child` line when the event stream stops. A 2.3.0 server reports a mid-flight child as `state="running"` in the tag with `metadata.state: "completed"`; the settlement reader trusts the metadata, so these lines are how a premature settlement is told from a terminal one. The body and description are untrusted and never logged.
+
 An unexpected stream end records an observation gap. An empty ledger cannot disprove an unobserved dispatch, so missing observations are retained as uncertainty instead of silently being interpreted as no work.
 
 ## V2 release is directory-based
