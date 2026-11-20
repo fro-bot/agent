@@ -65,13 +65,6 @@ export interface InvokeRecord extends RecordBase {
   /** Set when this turn's subagent report was consumed by another turn's execution. */
   readonly reportDeliveredInTrace?: string | undefined
   readonly standalone?: 'compaction' | 'generate' | undefined
-  /**
-   * The turn's final answer: the text parts of the last primary model response of this agent's turn, when that response stopped
-   * asking for tools and the turn ended ok. Absent for a turn that ended in an error or an interrupt, was closed incomplete, whose
-   * last response only (or also) asked for tools, or whose last response's text was not captured whole (`final-output-omitted`).
-   * It is what Langfuse shows as the trace's output, from the root span.
-   */
-  readonly finalAnswer?: readonly string[] | undefined
 }
 
 export interface ChatRecord extends RecordBase {
@@ -267,8 +260,6 @@ interface InvokeState {
   continuationOf: string | undefined
   reportDeliveredInTrace: string | undefined
   standalone: 'compaction' | 'generate' | undefined
-  /** The last primary response's text, while it is the last and stopped asking for tools; see `InvokeRecord.finalAnswer`. */
-  finalAnswer: readonly string[] | undefined
 }
 
 interface TraceState {
@@ -484,7 +475,6 @@ export function createTurnModel(options: {
       continuationOf: undefined,
       reportDeliveredInTrace: undefined,
       standalone: undefined,
-      finalAnswer: undefined,
     }
   }
 
@@ -619,31 +609,7 @@ export function createTurnModel(options: {
       continuationOf: invoke.continuationOf,
       reportDeliveredInTrace: invoke.reportDeliveredInTrace,
       standalone: invoke.standalone,
-      // Only a turn that ended ok and whole has an answer: an error or an interrupt gets none, and none is invented.
-      finalAnswer:
-        invoke.status === 'ok' && !invoke.marks.has('incomplete') && !extraMarks.includes('incomplete')
-          ? invoke.finalAnswer
-          : undefined,
     })
-  }
-
-  /**
-   * Each primary response that ends ok replaces its invoke's answer: its text parts if it stopped asking for tools, nothing if
-   * it asked for any (the turn is not over, or ended on a call). A title, compaction or generate request never counts, and a
-   * response that did not end ok leaves the answer alone (the turn's own status decides whether one is shown at all).
-   */
-  function recordFinalAnswer(request: RequestState, status: SpanStatus): void {
-    if (request.requestKind !== 'primary' || status !== 'ok') return
-    const node = sessions.get(request.sessionId)
-    if (node === undefined) return
-    const invoke = invokeOf(node, request.trace)
-    if (request.gaps.has('output-omitted')) {
-      invoke.finalAnswer = undefined
-      invoke.gaps.add('final-output-omitted')
-      return
-    }
-    invoke.finalAnswer = request.toolCalls.length === 0 && request.texts.length > 0 ? request.texts : undefined
-    invoke.gaps.delete('final-output-omitted')
   }
 
   function emitRequest(
@@ -655,7 +621,6 @@ export function createTurnModel(options: {
   ): void {
     if (request.closed) return
     request.closed = true
-    recordFinalAnswer(request, status)
     // The request's output moves into its record: it no longer counts against what open requests hold.
     heldOutputChars = Math.max(0, heldOutputChars - request.outputChars)
     request.trace.openSpans = Math.max(0, request.trace.openSpans - 1)

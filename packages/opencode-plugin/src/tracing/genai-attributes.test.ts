@@ -411,7 +411,7 @@ describe('agent spans', () => {
 
 describe('the content attribute list', () => {
   it('names exactly the content attributes the spans set', () => {
-    // #given a model span and a tool span with every kind of content, and an agent span with a prompt and an answer
+    // #given a model span and a tool span with every kind of content
     const secretFree = (text: string): string => text
     const spans = [
       exported(
@@ -425,10 +425,9 @@ describe('the content attribute list', () => {
         }),
       ),
       exported(tool({input: {path: 'a'}, result: {content: 'body'}})),
-      exported(invoke({finalAnswer: ['done']})),
     ]
 
-    // #then every `gen_ai.*` content attribute they set is in the list, and every one in the list was set by one of them
+    // #then every `gen_ai.*` content attribute they set is in the list, and every one in the list was set by one of them (the agent span sets only the prompt, the same input attribute)
     const contentLike = new Set(
       spans.flatMap(span =>
         Object.keys(span.attributes).filter(name =>
@@ -439,51 +438,6 @@ describe('the content attribute list', () => {
       ),
     )
     expect([...contentLike].toSorted()).toEqual([...CONTENT_ATTRIBUTE_NAMES].toSorted())
-  })
-})
-
-describe('the root span’s output', () => {
-  it('carries the final answer as one assistant message of text parts, in the GenAI shape', () => {
-    // #given an invoke span whose turn ended ok with an answer of two text parts
-    const span = exported(invoke({finalAnswer: ['first part', 'second part']}))
-
-    // #then the output is the pinned convention's shape: one assistant message, text parts, no reasoning, no tool calls
-    expect(JSON.parse(String(span.attributes['gen_ai.output.messages']))).toEqual([
-      {
-        role: 'assistant',
-        parts: [
-          {type: 'text', content: 'first part'},
-          {type: 'text', content: 'second part'},
-        ],
-      },
-    ])
-  })
-
-  it('sets no output attribute when there is no final answer', () => {
-    expect(exported(invoke()).attributes['gen_ai.output.messages']).toBeUndefined()
-    expect(exported(invoke({finalAnswer: []})).attributes['gen_ai.output.messages']).toBeUndefined()
-  })
-
-  it('sets no output on an error or interrupted root even if a record carried one', () => {
-    for (const status of ['error', 'interrupted'] as const) {
-      expect(exported(invoke({status, finalAnswer: ['x']})).attributes['gen_ai.output.messages']).toBeUndefined()
-    }
-    expect(
-      exported(invoke({marks: ['incomplete'], finalAnswer: ['x']})).attributes['gen_ai.output.messages'],
-    ).toBeUndefined()
-  })
-
-  it('bounds the output with the same limit as a model span’s output, and scrubs it like any content', () => {
-    // #given a huge answer, and one holding a secret shape
-    const secret = ['ghp_', 'aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5'].join('')
-    const huge = 'word '.repeat(200_000)
-    const asRoot = exported(invoke({finalAnswer: [huge]}))
-    const asChat = exported(chat({texts: [huge]}))
-    const leaky = exported(invoke({finalAnswer: [`the key is ${secret}`]}))
-
-    // #then the root's output is held to exactly what a model span's would be, and the secret never leaves
-    expect(asRoot.attributes['gen_ai.output.messages']).toBe(asChat.attributes['gen_ai.output.messages'])
-    expect(JSON.stringify(leaky.attributes)).not.toContain(secret)
   })
 })
 

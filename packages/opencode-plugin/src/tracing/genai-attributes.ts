@@ -254,14 +254,6 @@ function invokeSpan(record: InvokeRecord, options: AttributeOptions): PendingSpa
     if (messages.length > 0)
       attributes['gen_ai.input.messages'] = contentAttribute(messages, CONTENT_MAX_CHARS.prompt, true)
   }
-  // The turn's final answer, as the span's output: Langfuse shows a trace's output from its root span. `gen_ai.output.messages` is
-  // Opt-In on an invoke-agent span in the pinned revision, and says not to synthesize output for a failed operation: none for an
-  // error, an interrupt or an incomplete turn (the model already leaves `finalAnswer` unset then; this guards a hand-built record).
-  if (record.status === 'ok' && !record.marks.includes('incomplete') && record.finalAnswer !== undefined) {
-    const output = extractOutputMessages({texts: record.finalAnswer, reasoning: [], toolCalls: []})
-    if (output !== undefined)
-      attributes['gen_ai.output.messages'] = contentAttribute(output, CONTENT_MAX_CHARS.outputMessages)
-  }
 
   return {
     traceId: record.traceId,
