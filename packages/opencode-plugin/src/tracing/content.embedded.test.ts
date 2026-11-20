@@ -17,6 +17,7 @@ import {
   type PendingSpan,
   type Scrubber,
 } from './content.js'
+import {minCpuMs} from './timing.testing.js'
 
 // Fixture secrets are assembled at run time so no scanner mistakes this file for a leak.
 const join = (...parts: string[]): string => parts.join('')
@@ -315,13 +316,13 @@ describe('a value whose end cannot be established withholds the whole string', (
   it('stays linear on many such openers on one line', () => {
     // #given 4,000 unbalanced openers on one long line, then 4x as many
     const unit = 'secret: {[ pad '
+    // CPU time, the least of five runs (see `timing.testing.ts`): load on the machine cannot fail it.
     const time = (n: number): number => {
       const text = unit.repeat(n)
-      const started = performance.now()
-      scrubber.scrub(text)
-      return performance.now() - started
+      return minCpuMs(() => {
+        scrubber.scrub(text)
+      })
     }
-    time(500)
     const small = Math.max(time(4_000), 1)
     const large = time(16_000)
 
