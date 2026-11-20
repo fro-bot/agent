@@ -128,21 +128,25 @@ inputs:
     required: false
   trace-endpoint:
     description: >-
-      Turns on tracing of the run. The full URL of your OpenTelemetry collector's traces route (for example
-      `https://collector.example.com/v1/traces`). Empty (the default) means no tracing. The traces hold the prompts, tool
-      results and model output of the run, so send them only to a collector you control. The URL must use `https`, or `http`
-      to a loopback IP address such as `127.0.0.1` for a collector on the runner that needs no credential. A URL that has a
-      username or password, a fragment or port 0, or that is not accepted for any other reason, turns tracing off with one
-      warning; it never fails the run. The Action's own relay process holds this URL and sends the traces on.
+      Sends a trace of the run to your OpenTelemetry collector. The full URL of its traces route, for example
+      `https://collector.example.com/v1/traces`. Empty (the default) means no tracing. The traces hold the prompts, tool
+      results and model output of the run, so send them only to a collector you control. The URL must be `https`, or `http`
+      to a loopback IP address such as `127.0.0.1` for a collector on the runner that needs no credential. A URL with a
+      username, password or fragment, port 0, or any other fault turns tracing off with one warning; it never fails the
+      run. This release accepts the input and starts the relay, but the pinned plugin does not send traces yet. No traces
+      are sent until a later release of this Action that includes a plugin with tracing. Do not configure a production
+      credential for it yet.
     required: false
     default: ''
   trace-headers:
     description: >-
       The credential for the collector in `trace-endpoint`, one header per line in the form `Name: value`, for example
-      `Authorization: Basic <base64>`. Keep it in a secret, and give it a key that can only write traces to one project.
-      The relay adds these headers to what it sends; the agent is never given them. A header the relay must set itself
-      (such as `Host` or `Content-Type`), a line that is not `Name: value`, or any header with an `http` endpoint turns
-      tracing off with one warning that names the line. Ignored when `trace-endpoint` is empty.
+      `Authorization: Basic <base64>`. Keep it in a secret, and use a credential that can only write traces to one project.
+      The headers go to the Action's relay process only. They are not passed to the OpenCode server or the plugin. With
+      `isolate-agent: true` the agent cannot read them. Without it the agent runs as the same user as the Action and can
+      read them, and every span, so set `isolate-agent: true` to keep the credential from the agent. A header the relay
+      sets itself (such as `Host` or `Content-Type`), a line that is not `Name: value`, or any header with an `http`
+      endpoint turns tracing off with one warning that names the line. Ignored when `trace-endpoint` is empty.
     required: false
     default: ''
   opencode-config:
