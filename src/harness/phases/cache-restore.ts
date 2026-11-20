@@ -1,6 +1,7 @@
 import type {OpenCodeV2ServerHandle} from '@fro-bot/runtime'
 import type {MetricsCollector} from '../../features/observability/index.js'
 import type {RepoSkillsSource} from '../../services/setup/repo-skills.js'
+import type {ActionTracingSource} from '../../services/setup/tracing.js'
 import type {CacheResult} from '../../shared/types.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {SandboxLifecycle} from './sandbox-lifecycle.js'
@@ -46,7 +47,12 @@ export interface CacheRestorePhaseResult {
 export async function runCacheRestore(
   bootstrap: BootstrapPhaseResult,
   metrics: MetricsCollector,
-  repoSkills: RepoSkillsSource | null = null,
+  repoSkills: RepoSkillsSource | null,
+  /**
+   * What the server's plugin is told about tracing: off, or on with the running relay's port and the run's identity. Decided
+   * by `run.ts` (the one place that has the routed context and the relay) and required here so a start cannot skip it.
+   */
+  tracing: ActionTracingSource,
 ): Promise<CacheRestorePhaseResult | null> {
   const cacheComponents = buildCacheKeyComponents()
 
@@ -155,7 +161,7 @@ export async function runCacheRestore(
   }
 
   // The caller owns the live server from here: the execution loop runs on it and cleanup shuts it down.
-  return startV2Server(bootstrap, workspacePath, storagePath, cacheResult, cacheStatus, repoSkills)
+  return startV2Server(bootstrap, workspacePath, storagePath, cacheResult, cacheStatus, repoSkills, tracing)
 }
 
 async function startV2Server(
@@ -165,6 +171,7 @@ async function startV2Server(
   cacheResult: CacheResult,
   cacheStatus: 'corrupted' | 'hit' | 'miss',
   repoSkills: RepoSkillsSource | null,
+  tracing: ActionTracingSource,
 ): Promise<CacheRestorePhaseResult | null> {
   const serverLogger = createLogger({phase: 'server-bootstrap'})
   const {inputs, opencodeResult} = bootstrap
@@ -190,6 +197,7 @@ async function startV2Server(
     repoSkills,
     runId: getGitHubRunId(),
     runAttempt: getGitHubRunAttempt(),
+    tracing,
     logger: serverLogger,
     maskSecret: value => core.setSecret(value),
     sandbox,

@@ -75,6 +75,19 @@ export interface OutputModeMigrationState {
 
 export type ResponseMode = 'github' | 'none'
 
+/**
+ * The parsed `trace-endpoint` and `trace-headers` inputs. Off covers an empty endpoint and every input the relay's own rules
+ * refuse (the parser has already warned once). On carries the collector's traces URL and its credential headers, held for the
+ * relay alone: the headers are masked secrets and are never logged.
+ */
+export type TracingInputs =
+  | {readonly enabled: false}
+  | {
+      readonly enabled: true
+      readonly url: string
+      readonly headers: readonly {readonly name: string; readonly value: string}[]
+    }
+
 // Action inputs (parsed and validated) - per RFC-001, RFC-013
 export interface ActionInputs {
   readonly githubToken: string
@@ -116,6 +129,8 @@ export interface ActionInputs {
   // The resolved `agent-state-home` input: an absolute directory inside the checkout that becomes the isolated agent's
   // `XDG_STATE_HOME`. Null when unset, and always null without `isolate-agent` (the input is ignored there).
   readonly agentStateHome: string | null
+  // Opt-in tracing of the run (the `trace-endpoint` and `trace-headers` inputs). Off unless the operator set an endpoint.
+  readonly tracing: TracingInputs
 }
 
 // Action outputs

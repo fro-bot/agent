@@ -41,7 +41,7 @@ import path from 'node:path'
 import process from 'node:process'
 import {DatabaseSync} from 'node:sqlite'
 import {fileURLToPath} from 'node:url'
-import {clearHeldClaims, resolveSystematicSkillsDirsV2} from '@fro-bot/runtime'
+import {ACTION_TRACING_OFF, clearHeldClaims, resolveSystematicSkillsDirsV2} from '@fro-bot/runtime'
 import {afterAll, beforeAll, describe, expect, it, vi} from 'vitest'
 import pin from '../../../packages/runtime/src/shared/opencode-v2-pin.json'
 import {createExecAdapter} from '../../services/setup/adapters.js'
@@ -322,7 +322,13 @@ async function restoreV1DatabaseWithHeldClaim(box: Sandbox): Promise<void> {
   // A V2 server alone creates V2 tables, so boot one on the V1 seed once: it applies its schema and imports the seed.
   const {startOpenCodeV2Server} = await import('@fro-bot/runtime')
   const booted = await startOpenCodeV2Server(
-    {binaryPath: BINARY as string, directory: box.repo, expectedPluginIds: [], env: box.env},
+    {
+      binaryPath: BINARY as string,
+      directory: box.repo,
+      expectedPluginIds: [],
+      tracingHost: ACTION_TRACING_OFF,
+      env: box.env,
+    },
     createMockLogger(),
   )
   const handle = unwrapOk(booted)
@@ -424,6 +430,7 @@ describe.skipIf(!hasBinary)('startActionOpenCodeV2 against the real stock binary
       env: box.env,
       runId: 1,
       runAttempt: 1,
+      tracing: ACTION_TRACING_OFF,
       logger,
       deps: {
         startServer: async (spawnOptions, spawnLogger) => {
@@ -556,6 +563,7 @@ describe.skipIf(!hasBinary)('startActionOpenCodeV2 against the real stock binary
       env: box.env,
       runId: 2,
       runAttempt: 1,
+      tracing: ACTION_TRACING_OFF,
       logger: createMockLogger(),
       deps: {
         startServer: async (spawnOptions, spawnLogger) => {
@@ -637,6 +645,7 @@ describe.skipIf(!hasBinary)('startActionOpenCodeV2 against the real stock binary
       env: box.env,
       runId: 3,
       runAttempt: 1,
+      tracing: ACTION_TRACING_OFF,
       logger: createMockLogger(),
       deps: {
         startServer: async (spawnOptions, spawnLogger) => {
@@ -700,6 +709,7 @@ describe.skipIf(!hasBinary)('startActionOpenCodeV2 against the real stock binary
       env: box.env,
       runId: 4,
       runAttempt: 1,
+      tracing: ACTION_TRACING_OFF,
       logger: createMockLogger(),
       deps: {
         startServer: async (spawnOptions, spawnLogger) => {
@@ -959,6 +969,7 @@ describe.skipIf(!hasBinary)('repo skills against the real stock binary (fro-bot/
       env: box.env,
       runId: 50,
       runAttempt: 1,
+      tracing: ACTION_TRACING_OFF,
       logger,
       ...(options.repoSkills === undefined ? {} : {repoSkills: options.repoSkills}),
       deps: {
@@ -1423,6 +1434,7 @@ describe.skipIf(!hasBinary)('provider restriction against the real stock binary'
       env: box.env,
       runId: 60,
       runAttempt: 1,
+      tracing: ACTION_TRACING_OFF,
       logger: createMockLogger(),
       deps: {
         startServer: async (spawnOptions, spawnLogger) => {

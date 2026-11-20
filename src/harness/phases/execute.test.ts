@@ -123,6 +123,7 @@ function createBootstrap(
       repoSkills: false,
       isolateAgent: false,
       agentStateHome: null,
+      tracing: {enabled: false},
     },
     logger: mocks.logger,
     opencodeResult: {path: 'opencode', version: '1.0.0'},

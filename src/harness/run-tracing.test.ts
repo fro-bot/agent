@@ -1,10 +1,11 @@
-import type {OpenCodeV2ServerHandle, OwnershipLedger} from '@fro-bot/runtime'
+import type {OpenCodeV2ServerHandle, OwnershipLedger, TracingInputs} from '@fro-bot/runtime'
 import type {Logger} from '../shared/logger.js'
 import type {BootstrapPhaseResult} from './phases/bootstrap.js'
 import type {CacheRestorePhaseResult} from './phases/cache-restore.js'
 import type {RoutingPhaseResult} from './phases/routing.js'
 import type {SandboxLifecycle} from './phases/sandbox-lifecycle.js'
 import type {TraceRelayProcess, TraceRelayStopResult} from './phases/trace-relay-process.js'
+import {ACTION_TRACING_OFF} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {serializeLoggerCalls} from '../shared/test-helpers.js'
 import {run, TRACE_RELAY_STOP_WAIT_MS} from './run.js'
@@ -16,6 +17,9 @@ const TRACE_RELAY = {
   url: `https://${ENDPOINT_HOST_CANARY}/api/public/otel/v1/traces`,
   headers: [{name: 'Authorization', value: CREDENTIAL_CANARY}],
 }
+
+// What the parsed `trace-endpoint` and `trace-headers` inputs hold for a traced run (the parser has its own tests).
+const TRACED_INPUTS: TracingInputs = {enabled: true, ...TRACE_RELAY}
 
 const EXPOSURE_WARNING =
   'Tracing is on without isolate-agent: the agent can read the collector credential and the content of every span'
@@ -121,7 +125,7 @@ vi.mock('./phases/trace-relay-process.js', async importOriginal => ({
   startTraceRelayProcess: vi.fn(),
 }))
 
-function createBootstrap(sandbox?: SandboxLifecycle): BootstrapPhaseResult {
+function createBootstrap(sandbox?: SandboxLifecycle, tracing: TracingInputs = TRACED_INPUTS): BootstrapPhaseResult {
   return {
     inputs: {
       githubToken: 'github-token',
@@ -147,6 +151,7 @@ function createBootstrap(sandbox?: SandboxLifecycle): BootstrapPhaseResult {
       repoSkills: false,
       isolateAgent: sandbox !== undefined,
       agentStateHome: null,
+      tracing,
     },
     logger: {info: vi.fn(), debug: vi.fn(), warning: vi.fn(), error: vi.fn()},
     opencodeResult: {path: 'opencode', version: '2.2.5'},
@@ -268,6 +273,9 @@ async function arrange(
     readonly sandbox?: SandboxLifecycle
     readonly routingSkipped?: boolean
     readonly cacheRestoreFails?: boolean
+    /** The parsed tracing inputs. A run traces by default in this file; `untraced` is the run with the inputs empty. */
+    readonly tracing?: TracingInputs
+    readonly untraced?: boolean
   } = {},
 ) {
   const {runBootstrap} = await import('./phases/bootstrap.js')
@@ -283,7 +291,9 @@ async function arrange(
   const {runCleanup} = await import('./phases/cleanup.js')
   const {runReleaseV2} = await import('./phases/release-v2.js')
 
-  vi.mocked(runBootstrap).mockResolvedValue(createBootstrap(options.sandbox))
+  vi.mocked(runBootstrap).mockResolvedValue(
+    createBootstrap(options.sandbox, options.untraced === true ? {enabled: false} : (options.tracing ?? TRACED_INPUTS)),
+  )
   vi.mocked(runRouting).mockResolvedValue(
     options.routingSkipped === true
       ? ({skipped: true, skipReason: 'unsupported', skipMessage: 'x'} as unknown as RoutingPhaseResult)
@@ -381,6 +391,19 @@ async function sequence(sandboxRelease: {mock: {invocationCallOrder: number[]}})
     .map(([name]) => name)
 }
 
+/** The tracing host the run handed the server start (the fourth argument of the cache-restore phase). */
+async function hostGiven(): Promise<unknown> {
+  const {runCacheRestore} = await import('./phases/cache-restore.js')
+  expect(vi.mocked(runCacheRestore)).toHaveBeenCalledTimes(1)
+  return vi.mocked(runCacheRestore).mock.calls[0]?.[3]
+}
+
+/** What the server start would be told right now: a source is read at this moment, as the spawn reads it. */
+async function hostAtSpawn(): Promise<unknown> {
+  const given = await hostGiven()
+  return typeof given === 'function' ? (given as () => unknown)() : given
+}
+
 describe('run with tracing', () => {
   beforeEach(async () => {
     vi.clearAllMocks()
@@ -394,9 +417,13 @@ describe('run with tracing', () => {
       './phases/trace-relay-process.js',
     )
     vi.mocked(startTraceRelayProcess).mockImplementation(actual.startTraceRelayProcess)
+    // The facts the run identity is read from outside the routed context: the job and the attempt of this runner.
+    vi.stubEnv('GITHUB_JOB', 'review')
+    vi.stubEnv('GITHUB_RUN_ATTEMPT', '3')
   })
 
   afterEach(() => {
+    vi.unstubAllEnvs()
     vi.restoreAllMocks()
   })
 
@@ -411,7 +438,7 @@ describe('run with tracing', () => {
     vi.mocked(startTraceRelayProcess).mockResolvedValue({success: true, data: relay})
 
     // #when
-    const exitCode = await run({traceRelay: TRACE_RELAY})
+    const exitCode = await run()
 
     // #then the relay started before the server could, and stopped after the server's release, before cleanup
     expect(exitCode).toBe(0)
@@ -423,12 +450,167 @@ describe('run with tracing', () => {
     expect(stop).toHaveBeenCalledWith({serverKilled: false})
   })
 
+  describe('the host the plugin is told about', () => {
+    const ON = {
+      host: 'action',
+      tracing: 'on',
+      relayPort: 5151,
+      identity: {repository: 'owner/repo', runId: '123', attempt: '3', job: 'review', trigger: 'pull_request'},
+    } as const
+
+    it('is on, with the relay port and the identity of the routed run, once the relay is up', async () => {
+      // #given a relay that starts
+      const {startTraceRelayProcess} = await import('./phases/trace-relay-process.js')
+      await arrange()
+      vi.mocked(startTraceRelayProcess).mockResolvedValue({success: true, data: fakeRelay().relay})
+
+      // #when
+      await run()
+
+      // #then the server start was handed the declaration, not the credential
+      expect(await hostAtSpawn()).toEqual(ON)
+    })
+
+    it('reads each identity field from where it is authoritative, never from the process environment or the payload', async () => {
+      // #given a routed run whose repository, run id and event differ from what the process environment says
+      const {startTraceRelayProcess} = await import('./phases/trace-relay-process.js')
+      const {runRouting} = await import('./phases/routing.js')
+      await arrange()
+      const routed = createRouting()
+      vi.mocked(runRouting).mockResolvedValue({
+        ...routed,
+        triggerResult: {
+          ...routed.triggerResult,
+          context: {
+            ...(routed.triggerResult as {context: object}).context,
+            repo: {owner: 'routed', repo: 'thing'},
+            eventName: 'issue_comment',
+            raw: {repository: {full_name: 'payload/ignored'}},
+          },
+        },
+        agentContext: {...routed.agentContext, runId: '555'},
+      } as RoutingPhaseResult)
+      vi.stubEnv('GITHUB_REPOSITORY', 'env/ignored')
+      vi.stubEnv('GITHUB_RUN_ID', '1')
+      vi.stubEnv('GITHUB_EVENT_NAME', 'schedule')
+      vi.stubEnv('GITHUB_RUN_ATTEMPT', '4')
+      vi.stubEnv('GITHUB_JOB', 'remediate')
+      vi.stubEnv('INPUT_MATRIX-CONTEXT', '')
+      vi.mocked(startTraceRelayProcess).mockResolvedValue({success: true, data: fakeRelay().relay})
+
+      // #when
+      await run()
+
+      // #then repository, run id and trigger are the routed ones; the attempt and the job are this runner's own
+      expect(await hostAtSpawn()).toEqual({
+        ...ON,
+        identity: {repository: 'routed/thing', runId: '555', attempt: '4', job: 'remediate', trigger: 'issue_comment'},
+      })
+    })
+
+    it('is off, and starts no relay, when the inputs leave tracing off', async () => {
+      const {startTraceRelayProcess} = await import('./phases/trace-relay-process.js')
+      await arrange({untraced: true})
+
+      await run()
+
+      expect(await hostAtSpawn()).toEqual(ACTION_TRACING_OFF)
+      expect(vi.mocked(startTraceRelayProcess)).not.toHaveBeenCalled()
+    })
+
+    it('is off at the spawn, with no second warning from the run, when the relay dies after it was ready and before the server starts', async () => {
+      // #given a relay that reports ready, then crashes while cache restore, repair and server preparation are awaited
+      const {startTraceRelayProcess} = await import('./phases/trace-relay-process.js')
+      const {runCacheRestore} = await import('./phases/cache-restore.js')
+      await arrange()
+      let crashed = false
+      const stop = vi.fn(async (): Promise<TraceRelayStopResult> => ({outcome: 'already-exited', counts: 'incomplete'}))
+      const relay: TraceRelayProcess = {pid: 4242, port: 5151, crashed: () => crashed, stop}
+      vi.mocked(startTraceRelayProcess).mockResolvedValue({success: true, data: relay})
+      const phase = vi.mocked(runCacheRestore).getMockImplementation()
+      const seen: unknown[] = []
+      vi.mocked(runCacheRestore).mockImplementation(async (...args) => {
+        // the host as the phase received it while the relay is still up, then the relay dies in the window
+        seen.push(typeof args[3] === 'function' ? (args[3] as () => unknown)() : args[3])
+        crashed = true
+        return phase === undefined ? null : phase(...args)
+      })
+
+      // #when
+      const exitCode = await run()
+
+      // #then a reading while the relay was up is on, the reading at the spawn is off, and the run went on
+      expect(seen[0]).toEqual(ON)
+      expect(await hostAtSpawn()).toEqual(ACTION_TRACING_OFF)
+      expect(exitCode).toBe(0)
+      // and the run added no warning of its own about it: the exposure warning (the relay was up when it was given out) is the
+      // only tracing warning the run logs, and the supervisor's crash warning is the one signal of the crash
+      const tracingWarnings = everyLogged('warning').map(call => String(call[0]))
+      expect(tracingWarnings.filter(message => /trac/i.test(message))).toEqual([EXPOSURE_WARNING])
+    })
+
+    it('is off when the relay fails to start, with the supervisor having warned once', async () => {
+      const {startTraceRelayProcess} = await import('./phases/trace-relay-process.js')
+      await arrange()
+      vi.mocked(startTraceRelayProcess).mockResolvedValue({success: false, error: {kind: 'ready-timeout'}})
+
+      const exitCode = await run()
+
+      expect(exitCode).toBe(0)
+      expect(await hostAtSpawn()).toEqual(ACTION_TRACING_OFF)
+    })
+
+    it('is off when the relay bundle fails its check, and no relay is spawned', async () => {
+      // #given the real supervisor and a bundle that is not fit to run
+      const {checkTraceRelayBundle} = await import('./phases/trace-relay-bundle.js')
+      vi.mocked(checkTraceRelayBundle).mockResolvedValue(false)
+      await arrange()
+
+      // #when
+      await run()
+
+      // #then
+      expect(await hostAtSpawn()).toEqual(ACTION_TRACING_OFF)
+    })
+
+    it('is off, with one fixed warning and no relay, when the run identity is incomplete', async () => {
+      // #given a runner with no job
+      const {startTraceRelayProcess} = await import('./phases/trace-relay-process.js')
+      vi.stubEnv('GITHUB_JOB', '')
+      await arrange()
+
+      // #when
+      const exitCode = await run()
+
+      // #then the run goes on untraced: no relay, the plugin told off, and one warning that quotes nothing
+      expect(exitCode).toBe(0)
+      expect(vi.mocked(startTraceRelayProcess)).not.toHaveBeenCalled()
+      expect(await hostAtSpawn()).toEqual(ACTION_TRACING_OFF)
+      const warnings = everyLogged('warning').map(call => String(call[0]))
+      expect(warnings.filter(message => /run identity/i.test(message))).toEqual([
+        'Tracing is off: the run identity (repository, run, attempt, job and trigger) is incomplete',
+      ])
+    })
+
+    it('carries neither a header value nor the collector host in what the server start is given', async () => {
+      const {startTraceRelayProcess} = await import('./phases/trace-relay-process.js')
+      await arrange()
+      vi.mocked(startTraceRelayProcess).mockResolvedValue({success: true, data: fakeRelay().relay})
+
+      await run()
+
+      const given = JSON.stringify(await hostAtSpawn())
+      expect(given).not.toContain(CREDENTIAL_CANARY)
+      expect(given).not.toContain(ENDPOINT_HOST_CANARY)
+    })
+  })
+
   it('hands the supervisor the validated config and a trace-relay logger, and nothing else about the run', async () => {
     const {startTraceRelayProcess} = await import('./phases/trace-relay-process.js')
     await arrange()
     vi.mocked(startTraceRelayProcess).mockResolvedValue({success: true, data: fakeRelay().relay})
 
-    await run({traceRelay: TRACE_RELAY})
+    await run()
 
     const call = vi.mocked(startTraceRelayProcess).mock.calls[0]?.[0]
     expect(call?.config).toEqual(TRACE_RELAY)
@@ -448,7 +630,7 @@ describe('run with tracing', () => {
       await arrange(withSandbox === undefined ? {} : {sandbox: fakeSandbox().sandbox})
       vi.mocked(startTraceRelayProcess).mockResolvedValue({success: true, data: fakeRelay().relay})
 
-      await run({traceRelay: TRACE_RELAY})
+      await run()
 
       // the check is not run by the run itself: the supervisor asks it, once the config is accepted
       expect(vi.mocked(checkTraceRelayBundle)).not.toHaveBeenCalled()
@@ -470,7 +652,7 @@ describe('run with tracing', () => {
     await arrange({sandbox})
 
     // #when an isolated run asks for tracing
-    const exitCode = await run({traceRelay: TRACE_RELAY})
+    const exitCode = await run()
 
     // #then it went on exactly as an untraced run: the server started and nothing was declined (the launch's stop was
     // registered before the start and has nothing left to stop)
@@ -490,7 +672,7 @@ describe('run with tracing', () => {
   it('never checks the relay bundle when tracing is off, in an isolated run or not', async () => {
     const {checkTraceRelayBundle} = await import('./phases/trace-relay-bundle.js')
     const {sandbox} = fakeSandbox()
-    await arrange({sandbox})
+    await arrange({sandbox, untraced: true})
 
     await run()
 
@@ -500,7 +682,7 @@ describe('run with tracing', () => {
   it('starts no relay process when tracing is off', async () => {
     const {startTraceRelayProcess} = await import('./phases/trace-relay-process.js')
     const {sandbox, registerSignalStop} = fakeSandbox()
-    await arrange({sandbox})
+    await arrange({sandbox, untraced: true})
 
     const exitCode = await run()
 
@@ -516,7 +698,7 @@ describe('run with tracing', () => {
     vi.useFakeTimers()
     try {
       const {sandbox, registerSignalStop} = fakeSandbox()
-      await arrange({sandbox})
+      await arrange({sandbox, untraced: true})
 
       // #when an untraced run finishes without the clock moving
       const exitCode = await run()
@@ -534,7 +716,7 @@ describe('run with tracing', () => {
     const {startTraceRelayProcess} = await import('./phases/trace-relay-process.js')
     await arrange({routingSkipped: true})
 
-    await run({traceRelay: TRACE_RELAY})
+    await run()
 
     expect(vi.mocked(startTraceRelayProcess)).not.toHaveBeenCalled()
   })
@@ -548,7 +730,7 @@ describe('run with tracing', () => {
     await arrange()
 
     // #when the run is traced
-    const exitCode = await run({traceRelay: TRACE_RELAY})
+    const exitCode = await run()
 
     // #then the run went on exactly as an untraced one: server start, execution, cleanup with no decline
     expect(exitCode).toBe(0)
@@ -571,7 +753,7 @@ describe('run with tracing', () => {
   it('does not log the exposure warning when the relay failed to start, because no credential was handed out', async () => {
     await arrange()
 
-    await run({traceRelay: TRACE_RELAY})
+    await run()
 
     expect(everyLogged('warning').map(call => call[0])).not.toContain(EXPOSURE_WARNING)
   })
@@ -589,7 +771,7 @@ describe('run with tracing', () => {
     vi.mocked(startTraceRelayProcess).mockResolvedValue({success: true, data: relay})
 
     // #when
-    const exitCode = await run({traceRelay: TRACE_RELAY})
+    const exitCode = await run()
 
     // #then it ends as an untraced run would
     expect(exitCode).toBe(0)
@@ -607,7 +789,7 @@ describe('run with tracing', () => {
     const {relay, stop} = fakeRelay()
     vi.mocked(startTraceRelayProcess).mockResolvedValue({success: true, data: relay})
 
-    const exitCode = await run({traceRelay: TRACE_RELAY})
+    const exitCode = await run()
 
     expect(exitCode).toBe(1)
     expect(stop).toHaveBeenCalledTimes(1)
@@ -620,7 +802,7 @@ describe('run with tracing', () => {
     const {relay, stop} = fakeRelay()
     vi.mocked(startTraceRelayProcess).mockResolvedValue({success: true, data: relay})
 
-    const exitCode = await run({traceRelay: TRACE_RELAY})
+    const exitCode = await run()
 
     expect(exitCode).toBe(1)
     expect(stop).toHaveBeenCalledTimes(1)
@@ -637,7 +819,7 @@ describe('run with tracing', () => {
     const {relay, stop} = fakeRelay()
     vi.mocked(startTraceRelayProcess).mockResolvedValue({success: true, data: relay})
 
-    await run({traceRelay: TRACE_RELAY})
+    await run()
 
     expect(stop).toHaveBeenCalledWith({serverKilled: true})
   })
@@ -665,7 +847,7 @@ describe('run with tracing', () => {
       const {relay, stop} = fakeRelay()
       vi.mocked(startTraceRelayProcess).mockResolvedValue({success: true, data: relay})
 
-      await run({traceRelay: TRACE_RELAY})
+      await run()
 
       expect(stop).toHaveBeenCalledWith({serverKilled: killed})
     },
@@ -682,7 +864,7 @@ describe('run with tracing', () => {
     })
     vi.mocked(startTraceRelayProcess).mockResolvedValue({success: true, data: relay})
 
-    const exitCode = await run({traceRelay: TRACE_RELAY})
+    const exitCode = await run()
 
     expect(exitCode).toBe(0)
     expect(stop).toHaveBeenCalledTimes(1)
@@ -693,7 +875,7 @@ describe('run with tracing', () => {
     async function untracedBaseline(executeError?: Error) {
       const {runCleanup} = await import('./phases/cleanup.js')
       const {sandbox, release} = fakeSandbox()
-      await arrange({sandbox, ...(executeError === undefined ? {} : {executeError})})
+      await arrange({sandbox, untraced: true, ...(executeError === undefined ? {} : {executeError})})
       const exitCode = await run()
       const cleanup = vi.mocked(runCleanup).mock.calls[0]?.[0]
       return {
@@ -725,7 +907,7 @@ describe('run with tracing', () => {
 
         // #when the run goes on
         let finished: number | undefined
-        const running = run({traceRelay: TRACE_RELAY}).then(code => {
+        const running = run().then(code => {
           finished = code
         })
         await vi.advanceTimersByTimeAsync(10)
@@ -755,7 +937,7 @@ describe('run with tracing', () => {
       const {relay, stop} = fakeRelay({stop: async () => finishedStop.promise})
       vi.mocked(startTraceRelayProcess).mockResolvedValue({success: true, data: relay})
       let finished = false
-      const running = run({traceRelay: TRACE_RELAY}).then(code => {
+      const running = run().then(code => {
         finished = true
         return code
       })
@@ -779,7 +961,7 @@ describe('run with tracing', () => {
       vi.mocked(startTraceRelayProcess).mockResolvedValue({success: true, data: relay})
 
       // #when the run reaches the point after the relay started
-      await run({traceRelay: TRACE_RELAY})
+      await run()
 
       // #then exactly one stop was registered, and calling it (what the signal teardown does) stops the relay as killed
       expect(registerSignalStop).toHaveBeenCalledTimes(1)
@@ -795,7 +977,7 @@ describe('run with tracing', () => {
       await arrange({sandbox})
       vi.mocked(startTraceRelayProcess).mockResolvedValue({success: false, error: {kind: 'spawn-failed'}})
 
-      await run({traceRelay: TRACE_RELAY})
+      await run()
 
       expect(registerSignalStop).toHaveBeenCalledTimes(1)
       expect(orderOf(registerSignalStop)).toBeLessThan(orderOf(vi.mocked(startTraceRelayProcess)))
@@ -813,7 +995,7 @@ describe('run with tracing', () => {
             finishStart = resolve
           }),
       )
-      const running = run({traceRelay: TRACE_RELAY})
+      const running = run()
       await vi.waitFor(() => expect(vi.mocked(startTraceRelayProcess)).toHaveBeenCalledTimes(1))
       const signal = vi.mocked(startTraceRelayProcess).mock.calls[0]?.[0].signal
       expect(signal?.aborted).toBe(false)
@@ -849,7 +1031,7 @@ describe('run with tracing', () => {
             finishStart = resolve
           }),
       )
-      const running = run({traceRelay: TRACE_RELAY})
+      const running = run()
       await vi.waitFor(() => expect(vi.mocked(startTraceRelayProcess)).toHaveBeenCalledTimes(1))
 
       const stopping = registerSignalStop.mock.calls[0]?.[0]()
@@ -865,7 +1047,7 @@ describe('run with tracing', () => {
       await arrange()
       vi.mocked(startTraceRelayProcess).mockResolvedValue({success: true, data: fakeRelay().relay})
 
-      await expect(run({traceRelay: TRACE_RELAY})).resolves.toBe(0)
+      await expect(run()).resolves.toBe(0)
     })
 
     it('does not warn about exposure when isolation was requested, whether or not the lifecycle object reached this point', async () => {
@@ -875,7 +1057,7 @@ describe('run with tracing', () => {
       await arrange()
       vi.mocked(startTraceRelayProcess).mockResolvedValue({success: true, data: fakeRelay().relay})
 
-      await run({traceRelay: TRACE_RELAY})
+      await run()
 
       expect(everyLogged('warning').map(call => call[0])).not.toContain(EXPOSURE_WARNING)
     })
@@ -888,7 +1070,7 @@ describe('run with tracing', () => {
       vi.mocked(startTraceRelayProcess).mockResolvedValue({success: true, data: fakeRelay().relay})
 
       // #when
-      await run({traceRelay: TRACE_RELAY})
+      await run()
 
       // #then the warning is logged once, before the server starts
       const exposure = (loggers.all as Logger[]).flatMap(logger =>
@@ -908,7 +1090,7 @@ describe('run with tracing', () => {
       vi.mocked(startTraceRelayProcess).mockResolvedValue({success: true, data: fakeRelay().relay})
 
       // #when
-      await run({traceRelay: TRACE_RELAY})
+      await run()
 
       // #then there is none
       expect(everyLogged('warning').map(call => call[0])).not.toContain(EXPOSURE_WARNING)
@@ -920,7 +1102,7 @@ describe('run with tracing', () => {
     await arrange()
     vi.mocked(startTraceRelayProcess).mockResolvedValue({success: true, data: fakeRelay().relay})
 
-    await run({traceRelay: TRACE_RELAY})
+    await run()
 
     for (const canary of [ENDPOINT_HOST_CANARY, CREDENTIAL_CANARY, 'Authorization']) {
       expect(allLoggedText()).not.toContain(canary)

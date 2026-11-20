@@ -8,6 +8,12 @@
     "declarationMap": true,
     "outDir": "./dist"
   },
-  "include": ["src/**/*.ts", "src/**/*.json", "../../src/**/*.ts"],
+  "include": [
+    "src/**/*.ts",
+    "src/**/*.json",
+    "../../src/**/*.ts",
+    "../opencode-plugin/src/integration.fixture.ts",
+    "../opencode-plugin/src/tracing/tracing.integration.fixture.ts"
+  ],
   "exclude": ["dist", "node_modules"]
 }

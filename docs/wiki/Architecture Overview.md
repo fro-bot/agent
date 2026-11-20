@@ -383,7 +383,7 @@ The harness release workflows (`harness-release.yaml`, `harness-integrate.yaml`)
 
 ## Build and Bundle
 
-The project uses `tsdown` (a Rolldown-based bundler) to produce `dist/main.js`, `dist/post.js`, `dist/key-proxy.js`, and `dist/sandbox-view.js`. The `dist/` directory is committed to the repository — GitHub Actions requires it. CI validates that `dist/` stays in sync with source by running `bun run build` and checking for diffs.
+The project uses `tsdown` (a Rolldown-based bundler) to produce `dist/main.js`, `dist/post.js`, `dist/key-proxy.js`, `dist/trace-relay.js`, and `dist/sandbox-view.js`. The `dist/` directory is committed to the repository — GitHub Actions requires it. CI validates that `dist/` stays in sync with source by running `bun run build` and checking for diffs.
 
 The runtime package (`packages/runtime/`) is consumed as a workspace dependency via its TypeScript source — no separate build step is required for development, though it has its own `tsdown` config for publishing.
 
