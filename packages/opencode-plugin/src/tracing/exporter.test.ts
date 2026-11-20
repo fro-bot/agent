@@ -1,15 +1,16 @@
 import type {Socket} from 'node:net'
 import type {ScrubbedSpan} from './content.js'
 import type {SpanExporter, SpanExporterOptions} from './exporter.js'
+import {Buffer} from 'node:buffer'
 import {createServer as createHttpServer} from 'node:http'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
 import {opensslAvailable, startOtlpSink, startTlsSink, type OtlpSink, type SinkRequest} from '../integration.fixture.js'
 import {scrubbedBrand} from './content.js'
 import {
+  COLLECTOR_BODY_LIMIT_BYTES,
   createSpanExporter,
   DEFAULT_EXPORTER_LIMITS,
-  estimateSpanBytes,
   formatCountsHeader,
   SDK_SPAN_LIMITS,
   TRACE_COUNTS_HEADER,
@@ -535,12 +536,12 @@ describe('failure, overflow and shutdown', () => {
   }, 15_000)
 
   it('drops a span when the queue’s byte budget would be exceeded', async () => {
-    // #given a byte budget that fits one large span
+    // #given a byte budget that fits one large span (its encoded size, plus a little)
     const target = await sink({respond: () => ({status: 200, delayMs: 300})})
     const big = span({attributes: {'gen_ai.input.messages': 'x'.repeat(10_000)}})
     const exporter = exporterFor({
       url: target.url,
-      limits: {...FAST, maxQueueBytes: estimateSpanBytes(big) + 100, maxBatchSpans: 1},
+      limits: {...FAST, maxQueueBytes: 10_700, maxBatchSpans: 1},
     })
 
     // #when the first goes in flight, then two large spans arrive
@@ -803,4 +804,155 @@ describe('every queued batch is sent, one at a time, in order', () => {
       `exported=${2 * BATCH};dropped=0`,
     ])
   }, 20_000)
+})
+
+describe('a request never exceeds the collector’s body limit', () => {
+  const LIMIT = DEFAULT_EXPORTER_LIMITS.maxBatchBytes
+  const bytesOf = (request: SinkRequest): number => Buffer.byteLength(request.text, 'utf8')
+  /** Text that is legal but far larger encoded than it looks: every character costs two to six bytes on the wire. */
+  const ADVERSARIAL: readonly [string, (n: number) => string][] = [
+    ['CJK (3 bytes a character)', n => '漢'.repeat(n)],
+    ['emoji (4 bytes, two UTF-16 units)', n => '😀'.repeat(n / 2)],
+    ['quotes (escaped, 2 bytes)', n => '"'.repeat(n)],
+    ['backslashes (escaped, 2 bytes)', n => '\\'.repeat(n)],
+    [String.raw`control characters (\u0001, 6 bytes)`, n => '\u0001'.repeat(n)],
+    [String.raw`NUL (\u0000, 6 bytes)`, n => '\u0000'.repeat(n)],
+    ['lone surrogates (6 bytes)', n => '\uD800'.repeat(n)],
+    ['U+2028 (3 bytes)', n => '\u2028'.repeat(n)],
+    ['JSON inside a string', n => JSON.stringify({a: ['"x"', String.raw`\y`], b: 'c'}).repeat(n / 30)],
+  ]
+
+  it('pins the limit under the collector’s refusal threshold, with headroom, and under the relay’s own cap', () => {
+    // #given the front proxy refuses a body over 4.5 MiB with a final 413
+    // #then the plugin's limit leaves at least half a mebibyte of headroom, and the relay accepts at least that much
+    expect(COLLECTOR_BODY_LIMIT_BYTES).toBe(4_718_592)
+    expect(LIMIT).toBe(4_000_000)
+    expect(LIMIT).toBeLessThanOrEqual(COLLECTOR_BODY_LIMIT_BYTES - 512 * 1024)
+  })
+
+  it.each(ADVERSARIAL)(
+    'keeps every body under the limit for %s, and delivers every span',
+    async (_label, make) => {
+      // #given 24 spans of 100,000 characters each of the nasty text (up to 600 KB encoded each: seven or more would pass the limit)
+      const target = await sink()
+      const exporter = exporterFor({url: target.url, limits: {...FAST, requestTimeoutMs: 20_000}})
+      const spans = Array.from({length: 24}, () => span({attributes: {'gen_ai.output.messages': make(100_000)}}))
+
+      // #when
+      for (const item of spans) exporter.export(item)
+      await vi.waitFor(
+        () => {
+          const {exported, dropped} = exporter.counts()
+          expect(exported + dropped).toBe(spans.length)
+        },
+        {timeout: 30_000, interval: 20},
+      )
+
+      // #then every request is within the limit, nothing was lost, and the requests are well filled (not one span a request)
+      expect(exporter.counts()).toEqual({exported: spans.length, dropped: 0})
+      const bodies = target.accepted().map(bytesOf)
+      expect(Math.max(...bodies)).toBeLessThanOrEqual(LIMIT)
+      const received = target.accepted().flatMap(request => spansOf(request))
+      expect(received).toHaveLength(spans.length)
+    },
+    60_000,
+  )
+
+  it('counts the size exactly: a limit equal to a batch’s encoded size takes the batch, one byte less does not', async () => {
+    // #given the encoded size of a request of three spans of mixed nasty text
+    const mixed = (): ScrubbedSpan[] => [
+      span({attributes: {'gen_ai.output.messages': '漢'.repeat(3_000)}}),
+      span({attributes: {'gen_ai.output.messages': '\u0001'.repeat(2_000), 'gen_ai.tool.name': String.raw`a"b\c`}}),
+      span({
+        attributes: {'gen_ai.input.messages': '😀'.repeat(1_500)},
+        events: [{name: 'exception', timeMs: 1_700_000_000_100, attributes: {'exception.message': '\n\t"'}}],
+      }),
+    ]
+    const measure = await sink()
+    const measuring = exporterFor({url: measure.url, limits: {...FAST, maxBatchSpans: 3, maxBatchBytes: 50_000_000}})
+    for (const item of mixed()) measuring.export(item)
+    await measuring.close(5_000)
+    const exact = bytesOf(measure.accepted()[0] as SinkRequest)
+    expect(spansOf(measure.accepted()[0] as SinkRequest)).toHaveLength(3)
+
+    // #when exporters are limited to exactly that many bytes, and to one fewer
+    const atLimit = await sink()
+    const atExporter = exporterFor({url: atLimit.url, limits: {...FAST, maxBatchSpans: 3, maxBatchBytes: exact}})
+    for (const item of mixed()) atExporter.export(item)
+    await atExporter.close(5_000)
+    const under = await sink()
+    const underExporter = exporterFor({url: under.url, limits: {...FAST, maxBatchSpans: 3, maxBatchBytes: exact - 1}})
+    for (const item of mixed()) underExporter.export(item)
+    await underExporter.close(5_000)
+
+    // #then the first sends one request of exactly that size; the second needs two, neither over the limit
+    expect(atLimit.accepted().map(bytesOf)).toEqual([exact])
+    expect(under.accepted()).toHaveLength(2)
+    expect(Math.max(...under.accepted().map(bytesOf))).toBeLessThanOrEqual(exact - 1)
+  })
+
+  it('sends a span that is too large on its own with its content omitted and marked, and still counts it exported', async () => {
+    // #given one span whose encoded size is over the limit by itself (800,000 control characters, about 4.8 MB), and an ordinary one
+    const target = await sink()
+    const exporter = exporterFor({url: target.url, limits: {...FAST, requestTimeoutMs: 20_000}})
+    const huge = span({
+      attributes: {
+        'gen_ai.output.messages': '\u0001'.repeat(800_000),
+        'gen_ai.tool.name': 'read',
+        'fro_bot.outcome': 'ok',
+      },
+    })
+
+    // #when
+    exporter.export(huge)
+    exporter.export(span())
+    const counts = await exporter.close(15_000)
+
+    // #then both arrived, the big one without its content, its other attributes and an omission marker intact, all under the limit
+    expect(counts).toEqual({exported: 2, dropped: 0})
+    expect(Math.max(...target.accepted().map(bytesOf))).toBeLessThanOrEqual(LIMIT)
+    const [first] = target.accepted().flatMap(request => spansOf(request))
+    expect(attr(first as Decoded, 'gen_ai.output.messages')).toBeUndefined()
+    expect(attr(first as Decoded, 'gen_ai.tool.name')).toBe('read')
+    expect(JSON.stringify(attr(first as Decoded, 'fro_bot.content.omitted'))).toContain(
+      'gen_ai.output.messages:span-too-large',
+    )
+  }, 30_000)
+
+  it('drops, and counts, a span that is too large with nothing left to omit', async () => {
+    // #given a span whose NAME is over the limit (a name is not content the exporter can omit), and an ordinary span
+    const target = await sink()
+    const exporter = exporterFor({url: target.url, limits: {...FAST, requestTimeoutMs: 20_000}})
+    exporter.export(span({name: 'x'.repeat(4_100_000)}))
+    exporter.export(span())
+
+    // #when
+    const counts = await exporter.close(10_000)
+
+    // #then the oversized one is counted dropped and never sent (no 413), and the ordinary one arrived
+    expect(counts).toEqual({exported: 1, dropped: 1})
+    expect(target.received()).toBe(1)
+  }, 30_000)
+
+  it('fills a request close to the limit with ordinary spans', async () => {
+    // #given 120 spans of about 100 KB of plain text each (12 MB in all), and a batch size that does not get in the way
+    const target = await sink()
+    const exporter = exporterFor({
+      url: target.url,
+      limits: {...FAST, requestTimeoutMs: 20_000, maxQueueSpans: 1_000, maxBatchSpans: 200},
+    })
+    for (let index = 0; index < 120; index += 1)
+      exporter.export(span({attributes: {'gen_ai.input.messages': 'a'.repeat(100_000)}}))
+
+    // #when
+    const counts = await exporter.close(20_000)
+
+    // #then every request but the last is within one span of the limit, so batching is not given up
+    expect(counts).toEqual({exported: 120, dropped: 0})
+    const bodies = target.accepted().map(bytesOf)
+    for (const body of bodies.slice(0, -1)) {
+      expect(body).toBeGreaterThan(LIMIT - 110_000)
+      expect(body).toBeLessThanOrEqual(LIMIT)
+    }
+  }, 40_000)
 })

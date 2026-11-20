@@ -31,6 +31,8 @@ import {JsonTraceSerializer} from '@opentelemetry/otlp-transformer'
 import {resourceFromAttributes} from '@opentelemetry/resources'
 import {AlwaysOnSampler, BasicTracerProvider} from '@opentelemetry/sdk-trace-base'
 
+import {MARKER} from './content.js'
+
 /**
  * The request header that carries the plugin's running totals to the Action's relay, in Action mode only.
  * MIRRORS `TRACE_RELAY_COUNTS_HEADER` and `formatTraceRelayCountsHeader` in `packages/runtime/src/agent/trace-relay-wire.ts`,
@@ -56,9 +58,14 @@ export interface ExporterLimits {
   /** Spans waiting for export. A span past this is dropped and counted. */
   readonly maxQueueSpans: number
   /** Estimated bytes waiting for export. */
+  /** Encoded bytes waiting for export (each span counted at the size it will have on the wire). */
   readonly maxQueueBytes: number
   readonly maxBatchSpans: number
-  /** Estimated bytes in one batch. A single span over it goes alone. */
+  /**
+   * The most bytes in one request BODY, as encoded on the wire (UTF-8 bytes of the OTLP JSON, envelope included). Exact, not
+   * estimated: every span is serialized once when it is queued, and a batch closes before its body would pass this. A span that
+   * alone would pass it has its content omitted (see `exportSpan`) or is dropped; nothing over the limit is ever sent.
+   */
   readonly maxBatchBytes: number
   /** From the first queued span to its batch. Short, so a trace is visible soon after the turn. */
   readonly batchIntervalMs: number
@@ -71,11 +78,18 @@ export interface ExporterLimits {
   readonly maxConsecutiveFailures: number
 }
 
+/**
+ * The most the collector's front proxy accepts in one request body: 4.5 MiB. Over it the answer is 413, which is final, so the
+ * batch is lost. (Measured there: 4,192,616 bytes accepted, 5 MiB refused.) `maxBatchBytes` stays at least half a mebibyte under
+ * it, and under the Action relay's own body cap (16 MiB, `trace-relay.ts`); `runtime-parity.test.ts` pins both relations.
+ */
+export const COLLECTOR_BODY_LIMIT_BYTES = 4_718_592
+
 export const DEFAULT_EXPORTER_LIMITS: ExporterLimits = {
   maxQueueSpans: 512,
   maxQueueBytes: 32 * 1024 * 1024,
   maxBatchSpans: 32,
-  maxBatchBytes: 4 * 1024 * 1024,
+  maxBatchBytes: 4_000_000,
   batchIntervalMs: 1_000,
   requestTimeoutMs: 10_000,
   maxConsecutiveFailures: 3,
@@ -124,20 +138,9 @@ interface Queued {
   readonly size: number
 }
 
-/** A span's size as the exporter budgets it: the characters it holds, not the encoded request. */
-export function estimateSpanBytes(span: ScrubbedSpan): number {
-  let size = 256 + span.name.length
-  for (const [name, value] of Object.entries(span.attributes)) {
-    size += 24 + name.length
-    if (typeof value === 'string') size += value.length
-    else if (typeof value !== 'number' && typeof value !== 'boolean') for (const item of value) size += item.length + 4
-  }
-  for (const event of span.events) {
-    size += 64 + event.name.length
-    for (const [name, text] of Object.entries(event.attributes)) size += name.length + text.length
-  }
-  return size + (span.status.message?.length ?? 0)
-}
+/** The most content attributes omitted from one span to bring it under the body limit, and the smallest one worth omitting. */
+const MAX_OMISSIONS = 32
+const MIN_OMIT_CHARS = 256
 
 const hrTime = (ms: number): [number, number] => {
   const seconds = Math.floor(ms / 1000)
@@ -148,6 +151,29 @@ const sleep = async (ms: number): Promise<void> =>
   new Promise(resolve => {
     setTimeout(resolve, ms).unref()
   })
+
+/** The span without its single largest string or string-list attribute, which it names in the omission marker; or undefined. */
+function omitLargest(span: ScrubbedSpan): ScrubbedSpan | undefined {
+  let largest: string | undefined
+  let weight = 0
+  for (const [name, value] of Object.entries(span.attributes)) {
+    if (name === MARKER.omitted) continue
+    let size = 0
+    if (typeof value === 'string') size = value.length
+    else if (typeof value === 'object') for (const item of value) size += item.length
+    if (size > weight) {
+      largest = name
+      weight = size
+    }
+  }
+  // Something small is not what made the span too large: nothing left to omit.
+  if (largest === undefined || weight < MIN_OMIT_CHARS) return undefined
+  const attributes: Record<string, string | number | boolean | readonly string[]> = {}
+  for (const [name, value] of Object.entries(span.attributes)) if (name !== largest) attributes[name] = value
+  const marked = span.attributes[MARKER.omitted]
+  attributes[MARKER.omitted] = [...(typeof marked === 'object' ? marked : []), `${largest}:span-too-large`]
+  return {...span, attributes}
+}
 
 export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
   const limits: ExporterLimits = {...DEFAULT_EXPORTER_LIMITS, ...options.limits}
@@ -204,12 +230,14 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
     ),
   )
 
-  let pendingSize = 0
+  // The span the SDK just finished, handed over by the processor to `build`, which sizes it before it is queued.
+  let ended: ReadableSpan | undefined
+  // The bytes of a request body that are not spans (the resource and the scope); derived from the first span, see `spanBytes`.
+  let envelopeBytes = 0
   const processor: SpanProcessor = {
     onStart: () => {},
     onEnd: span => {
-      queue.push({span, size: pendingSize})
-      queuedBytes += pendingSize
+      ended = span
     },
     forceFlush: async () => {},
     shutdown: async () => {},
@@ -245,11 +273,12 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
 
   function takeBatch(): Queued[] {
     const batch: Queued[] = []
-    let bytes = 0
+    // The body is the envelope, the spans' own JSON, and a comma between each pair: exact, so the sum is the request's size.
+    let bytes = envelopeBytes
     while (queue.length > 0 && batch.length < limits.maxBatchSpans) {
       const next = queue[0]
       if (next === undefined) break
-      if (batch.length > 0 && bytes + next.size > limits.maxBatchBytes) break
+      if (batch.length > 0 && bytes + batch.length + next.size > limits.maxBatchBytes) break
       batch.push(next)
       bytes += next.size
       queue.shift()
@@ -322,43 +351,96 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
     timer.unref()
   }
 
+  /** Hands the SDK a span with the ids the turn model chose, and returns what it ended up with, or undefined. */
+  function build(span: ScrubbedSpan): ReadableSpan | undefined {
+    const parent =
+      span.parentSpanId === undefined
+        ? ROOT_CONTEXT
+        : trace.setSpanContext(ROOT_CONTEXT, {
+            traceId: span.traceId,
+            spanId: span.parentSpanId,
+            traceFlags: TraceFlags.SAMPLED,
+          })
+    nextTraceId = span.traceId
+    nextSpanId = span.spanId
+    ended = undefined
+    const sdkSpan = tracer.startSpan(
+      span.name,
+      {
+        kind: span.kind === 'client' ? SpanKind.CLIENT : SpanKind.INTERNAL,
+        startTime: hrTime(span.startMs),
+        attributes: {...span.attributes} as Record<string, string | number | boolean | string[]>,
+      },
+      // Always explicit: an ambient context another library registered in this process must never become a parent.
+      parent,
+    )
+    if (span.status.code === 'error') {
+      sdkSpan.setStatus({
+        code: SpanStatusCode.ERROR,
+        ...(span.status.message === undefined ? {} : {message: span.status.message}),
+      })
+    }
+    for (const event of span.events) sdkSpan.addEvent(event.name, {...event.attributes}, hrTime(event.timeMs))
+    // `end` hands the finished span to the processor above, which leaves it in `ended`.
+    sdkSpan.end(hrTime(span.endMs))
+    const finished = ended
+    ended = undefined
+    return finished
+  }
+
+  function encodedLength(spans: ReadableSpan[]): number {
+    const body = JsonTraceSerializer.serializeRequest(spans)
+    if (body === undefined) throw new Error('nothing to encode')
+    return body.byteLength
+  }
+
+  /**
+   * The span's own bytes in a request body, exact: the body of a request holding it alone, less the envelope (the resource and the
+   * scope, the same for every span). The envelope is derived once, from the first span: a request of one span is `E + a`, of the
+   * same span twice `E + 2a + 1` (a comma), so `a` is the difference less one and `E` is what is left. The sum for a batch of n is
+   * then `E + (a1 + ... + an) + (n - 1)`, which is what the delegate's serializer produces (pinned by `exporter.test.ts`).
+   */
+  function spanBytes(readable: ReadableSpan): number {
+    const alone = encodedLength([readable])
+    if (envelopeBytes === 0) {
+      const twice = encodedLength([readable, readable])
+      envelopeBytes = alone - (twice - alone - 1)
+    }
+    return alone - envelopeBytes
+  }
+
   function exportSpan(span: ScrubbedSpan): void {
     try {
-      const size = estimateSpanBytes(span)
-      if (closed || tripped || queue.length >= limits.maxQueueSpans || queuedBytes + size > limits.maxQueueBytes) {
+      if (closed || tripped || queue.length >= limits.maxQueueSpans) {
         dropped += 1
         return
       }
-      const parent =
-        span.parentSpanId === undefined
-          ? ROOT_CONTEXT
-          : trace.setSpanContext(ROOT_CONTEXT, {
-              traceId: span.traceId,
-              spanId: span.parentSpanId,
-              traceFlags: TraceFlags.SAMPLED,
-            })
-      nextTraceId = span.traceId
-      nextSpanId = span.spanId
-      pendingSize = size
-      const sdkSpan = tracer.startSpan(
-        span.name,
-        {
-          kind: span.kind === 'client' ? SpanKind.CLIENT : SpanKind.INTERNAL,
-          startTime: hrTime(span.startMs),
-          attributes: {...span.attributes} as Record<string, string | number | boolean | string[]>,
-        },
-        // Always explicit: an ambient context another library registered in this process must never become a parent.
-        parent,
-      )
-      if (span.status.code === 'error') {
-        sdkSpan.setStatus({
-          code: SpanStatusCode.ERROR,
-          ...(span.status.message === undefined ? {} : {message: span.status.message}),
-        })
+      // Sized once, exactly, before it is queued. A span that alone would pass the body limit has its largest content omitted,
+      // again and again up to a bound, so the span itself still arrives; one that cannot be brought under is dropped and counted.
+      let candidate = span
+      for (let attempt = 0; ; attempt += 1) {
+        const readable = build(candidate)
+        if (readable === undefined) {
+          dropped += 1
+          return
+        }
+        const size = spanBytes(readable)
+        if (envelopeBytes + size <= limits.maxBatchBytes) {
+          if (queuedBytes + size > limits.maxQueueBytes) {
+            dropped += 1
+            return
+          }
+          queue.push({span: readable, size})
+          queuedBytes += size
+          break
+        }
+        const trimmed = attempt < MAX_OMISSIONS ? omitLargest(candidate) : undefined
+        if (trimmed === undefined) {
+          dropped += 1
+          return
+        }
+        candidate = trimmed
       }
-      for (const event of span.events) sdkSpan.addEvent(event.name, {...event.attributes}, hrTime(event.timeMs))
-      // `end` hands the finished span to the processor above, which queues it.
-      sdkSpan.end(hrTime(span.endMs))
       schedule()
     } catch {
       dropped += 1

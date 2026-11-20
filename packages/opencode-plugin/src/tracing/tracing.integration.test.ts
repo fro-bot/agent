@@ -415,6 +415,10 @@ describe.skipIf(!runnable)('tracing in a real opencode V2', () => {
           .split('\n')
           .find(text => text.includes('tracing stopped')) ?? ''
       expect(line).toContain(`exported ${spans.length} spans`)
+
+      // #and the batches are as full as the span limit allows: every request but the last carries 32 spans
+      const perRequest = h.sink.accepted().map(request => decodeSpans([request]).length)
+      for (const count of perRequest.slice(0, -1)) expect(count).toBe(32)
     })
   }, 120_000)
 

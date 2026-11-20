@@ -1,3 +1,5 @@
+import {readFileSync} from 'node:fs'
+import path from 'node:path'
 import {
   ACTION_TRACING_OFF,
   buildTracingLauncherValue,
@@ -15,7 +17,12 @@ import {
 } from '@fro-bot/runtime'
 import {describe, expect, it} from 'vitest'
 
-import {formatCountsHeader, TRACE_COUNTS_HEADER} from './exporter.js'
+import {
+  COLLECTOR_BODY_LIMIT_BYTES,
+  DEFAULT_EXPORTER_LIMITS,
+  formatCountsHeader,
+  TRACE_COUNTS_HEADER,
+} from './exporter.js'
 import {
   MAX_IDENTITY_FIELD_CHARS,
   MAX_LAUNCHER_CHARS,
@@ -134,6 +141,21 @@ describe('the launcher document, as the runtime writes it and the plugin reads i
       log: () => undefined,
     })
     expect(direct).toEqual({mode: 'off', reason: 'launcher-identity-invalid'})
+  })
+})
+
+describe('the request body limits', () => {
+  it('keeps the plugin’s batch limit under the relay’s body cap, which is under nothing it could be refused by', () => {
+    // #given the relay's cap, read from its source (the constant is not exported from the runtime package)
+    const source = readFileSync(path.resolve(import.meta.dirname, '../../../runtime/src/agent/trace-relay.ts'), 'utf8')
+    const cap = /maxRequestBodyBytes:\s*(\d+)\s*\*\s*1024\s*\*\s*1024/.exec(source)
+    expect(cap).not.toBeNull()
+    const relayCap = Number(cap?.[1]) * 1024 * 1024
+
+    // #then plugin limit <= relay cap, and plugin limit < the collector's front-proxy refusal threshold with headroom
+    expect(DEFAULT_EXPORTER_LIMITS.maxBatchBytes).toBeLessThanOrEqual(relayCap)
+    expect(DEFAULT_EXPORTER_LIMITS.maxBatchBytes).toBeLessThanOrEqual(COLLECTOR_BODY_LIMIT_BYTES - 512 * 1024)
+    expect(relayCap).toBe(16 * 1024 * 1024)
   })
 })
 
