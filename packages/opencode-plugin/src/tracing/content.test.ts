@@ -709,12 +709,12 @@ describe('adversarial timing: growth, not a ceiling', () => {
       ['scheme, one long run', n => `mongodb+srv://${'a'.repeat(n)}`],
     ],
     'url-userinfo': [
-      ['dense matches, one every 12 characters', rep('a://u:p@h/ ')],
-      ['255 chars and no @', run('a://', 'b', 255)],
-      ['257 chars and no @', run('a://', 'b', 257)],
-      ['one long run and no @', n => `a://${'b'.repeat(n)}`],
-      ['one long userinfo then an @', n => `a://${'b'.repeat(n)}@`],
-      ['scheme repeated', rep('a://')],
+      ['dense matches, one every 12 characters', rep('https://u:p@h/ ')],
+      ['255 chars and no @', run('https://', 'b', 255)],
+      ['257 chars and no @', run('https://', 'b', 257)],
+      ['one long run and no @', n => `https://${'b'.repeat(n)}`],
+      ['one long userinfo then an @', n => `https://${'b'.repeat(n)}@`],
+      ['scheme repeated', rep('https://')],
       ['16-char scheme', rep('abcdefghijklmnop://')],
     ],
     'url-query-secret': [
