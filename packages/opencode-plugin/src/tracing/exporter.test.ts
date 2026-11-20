@@ -1205,6 +1205,31 @@ describe('a collector that keeps the socket active past the watchdog', () => {
     await target.stop()
   }, 30_000)
 
+  it('does not announce a stop after shutdown has finished, when the grace period for an uncancellable request ends later', async () => {
+    // #given a request that cannot be cancelled, whose watchdog has fired (its batch counted, the grace period running)
+    const target = await trickler(() => true)
+    const stopped = vi.fn()
+    const exporter = exporterFor({
+      url: target.url,
+      limits: {...WATCHDOG_LIMITS, maxConsecutiveFailures: 50},
+      onStopped: stopped,
+      testing: {ignoreAgentDestroy: true},
+    })
+    const total = 4
+    for (let index = 0; index < total; index += 1) exporter.export(span())
+    await vi.waitFor(() => expect(exporter.counts().dropped).toBe(2), {timeout: WATCHDOG_MS + 3_000, interval: 10})
+
+    // #when shutdown finishes inside the grace period, and the grace period then runs out
+    const counts = await exporter.close(300)
+    await sleep(1_500)
+
+    // #then shutdown's own cancellation stands: no stop is announced after close() has returned, and no count moved
+    expect(counts).toEqual({exported: 0, dropped: total})
+    expect(stopped).not.toHaveBeenCalled()
+    expect(exporter.counts()).toEqual({exported: 0, dropped: total})
+    await target.stop()
+  }, 30_000)
+
   it('counts a span dropped once when shutdown arrives after the watchdog already counted its batch', async () => {
     // #given the first batch stalls past the watchdog while later ones succeed
     const target = await trickler(index => index === 0)

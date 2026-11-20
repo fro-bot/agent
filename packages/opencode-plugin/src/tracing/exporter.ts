@@ -278,7 +278,9 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
   const tracer = provider.getTracer('fro-bot-opencode-plugin')
 
   function trip(): void {
-    if (tripped) return
+    // Shutdown's permanent cancellation (`cancelled`) already counted the queue and returned the totals: a stop announced after
+    // close() has returned would report a state the caller no longer sees.
+    if (tripped || cancelled) return
     tripped = true
     dropped += queue.length
     queue = []
@@ -334,8 +336,8 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
       cancelling = false
       return
     }
-    cancelled = true
     trip()
+    cancelled = true
   }
 
   function startBatch(): void {
