@@ -383,6 +383,41 @@ describe.skipIf(!runnable)('tracing in a real opencode V2', () => {
   /** A simple turn: one prompt, one answer. Returns once the root span is at the sink, or the stop has run. */
   const simpleSteps: FakeStep[] = [{all: ['S-ONE'], text: 'simple answer'}]
 
+  it('exports every span of a turn that fills three or more batches, and the stop line says nothing was dropped', async () => {
+    // #given one model response that calls `read` 70 times, so the turn has well over three batches of 32 spans
+    const steps: FakeStep[] = [
+      {all: ['B-ONE'], none: [NOT_TOOL], tools: Array.from({length: 70}, () => readTool('README.md'))},
+      {all: ['B-ONE', NOT_TOOL], text: 'seventy reads done'},
+    ]
+    await run({steps}, async h => {
+      writeFileSync(path.join(h.sandbox.repo, 'README.md'), 'a short readme\n')
+      const session = await h.session()
+
+      // #when the turn runs to its end and the server stops
+      await prompt(h.api, session, 'B-ONE read the readme seventy times')
+      await waitUntil(
+        'the turn root span',
+        () => h.spans().some(isRoot),
+        60_000,
+        () => `spans so far: ${h.spans().length}\nserver stderr:\n${h.server.stderr().slice(-1_500)}`,
+      )
+      await sleep(1_500)
+      await h.stop()
+
+      // #then all 70 tool spans and the rest arrived, and the plugin says it dropped none
+      const spans = h.spans()
+      expect(spans.filter(span => span.name === 'execute_tool read')).toHaveLength(70)
+      expect(spans.length).toBeGreaterThanOrEqual(74)
+      expect(h.server.stderr()).toMatch(/tracing stopped, exported \d+ spans, dropped 0(?!\d)/)
+      const line =
+        h.server
+          .stderr()
+          .split('\n')
+          .find(text => text.includes('tracing stopped')) ?? ''
+      expect(line).toContain(`exported ${spans.length} spans`)
+    })
+  }, 120_000)
+
   it('completes the session and reports dropped spans when the destination refuses every connection', async () => {
     // #given an Action launcher whose relay address has nothing listening
     const closed = await startOtlpSink()

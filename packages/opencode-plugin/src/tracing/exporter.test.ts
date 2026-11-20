@@ -639,3 +639,168 @@ describe('failure, overflow and shutdown', () => {
     expect(DEFAULT_EXPORTER_LIMITS.requestTimeoutMs).toBeGreaterThan(8_000)
   })
 })
+
+describe('every queued batch is sent, one at a time, in order', () => {
+  const BATCH = DEFAULT_EXPORTER_LIMITS.maxBatchSpans
+
+  /**
+   * Waits until every span is counted, the way a running turn does (the exporter is NOT closed: the loop that sends the
+   * queue on its own is what is under test, not the drain at shutdown).
+   */
+  const settled = async (exporter: SpanExporter, total: number): Promise<void> => {
+    await vi.waitFor(
+      () => {
+        const {exported, dropped} = exporter.counts()
+        expect(exported + dropped).toBe(total)
+      },
+      {timeout: 20_000, interval: 10},
+    )
+  }
+
+  /** The span ids received, request by request, flattened: the order the collector saw them in. */
+  const received = (target: OtlpSink): string[] =>
+    target.accepted().flatMap(request => spansOf(request).map(item => item.spanId))
+
+  it.each([
+    ['3 full batches', 3, 0],
+    ['4 full batches', 4, 0],
+    ['10 full batches', 10, 0],
+    ['3 full batches against a slow collector (200 ms a request)', 3, 200],
+    ['4 full batches against a slow collector (200 ms a request)', 4, 200],
+  ])(
+    'delivers %s once each, in order, with nothing dropped',
+    async (_label, batches, delayMs) => {
+      // #given a collector (fast, or slow) and an exporter that has `batches` full batches queued behind one another
+      const target = await sink({respond: () => ({status: 200, ...(delayMs === 0 ? {} : {delayMs})})})
+      const exporter = exporterFor({url: target.url, limits: {...FAST, requestTimeoutMs: 8_000}})
+      const spans = Array.from({length: batches * BATCH}, () => span())
+
+      // #when they are all exported in the same tick, and the exporter sends them on its own
+      for (const item of spans) exporter.export(item)
+      await settled(exporter, batches * BATCH)
+
+      // #then every span was delivered exactly once, in the order it was exported, in `batches` requests, one in flight at a time
+      expect(exporter.counts()).toEqual({exported: batches * BATCH, dropped: 0})
+      expect(target.accepted()).toHaveLength(batches)
+      expect(received(target)).toEqual(spans.map(item => item.spanId))
+      expect(target.peakConcurrent()).toBe(1)
+    },
+    30_000,
+  )
+
+  it('delivers batches that queue up while an earlier one is in flight, without a drain', async () => {
+    // #given a slow collector and 100 spans (three full batches and a part)
+    const target = await sink({respond: () => ({status: 200, delayMs: 60})})
+    const exporter = exporterFor({url: target.url})
+    const spans = Array.from({length: 100}, () => span())
+
+    // #when they are exported and the exporter is left to send on its own
+    for (const item of spans) exporter.export(item)
+    await vi.waitFor(
+      () => {
+        expect(exporter.counts().exported).toBe(100)
+      },
+      {timeout: 10_000},
+    )
+
+    // #then all of them arrived, in order, with nothing dropped
+    expect(exporter.counts()).toEqual({exported: 100, dropped: 0})
+    expect(received(target)).toEqual(spans.map(item => item.spanId))
+  }, 20_000)
+
+  it('counts only the batch that failed when later batches are queued behind it, and sends the rest', async () => {
+    // #given a collector that refuses the first batch for good (422) and takes the rest, with four full batches queued
+    const target = await sink({respond: n => ({status: n === 1 ? 422 : 200})})
+    const exporter = exporterFor({url: target.url})
+    const spans = Array.from({length: 4 * BATCH}, () => span())
+
+    // #when
+    for (const item of spans) exporter.export(item)
+    await settled(exporter, 4 * BATCH)
+
+    // #then exactly the first batch is dropped; the three behind it are delivered, in order
+    expect(exporter.counts()).toEqual({exported: 3 * BATCH, dropped: BATCH})
+    expect(target.received()).toBe(4)
+    expect(received(target)).toEqual(spans.slice(BATCH).map(item => item.spanId))
+  }, 20_000)
+
+  it('sends the batches queued behind one that timed out', async () => {
+    // #given a collector that holds the first request past the request timeout, then answers normally
+    const target = await sink({respond: n => (n === 1 ? {status: 200, hold: true} : {status: 200})})
+    const exporter = exporterFor({url: target.url, limits: {...FAST, requestTimeoutMs: 300}})
+    const spans = Array.from({length: 3 * BATCH}, () => span())
+
+    // #when
+    for (const item of spans) exporter.export(item)
+    await settled(exporter, 3 * BATCH)
+
+    // #then the timed-out batch is the only one dropped, and the two behind it are delivered in order
+    expect(exporter.counts()).toEqual({exported: 2 * BATCH, dropped: BATCH})
+    expect(received(target)).toEqual(spans.slice(BATCH).map(item => item.spanId))
+  }, 20_000)
+
+  it('flushes several queued batches inside a drain bound', async () => {
+    // #given five full batches queued and a fast collector
+    const target = await sink()
+    const exporter = exporterFor({url: target.url})
+    const spans = Array.from({length: 5 * BATCH}, () => span())
+    for (const item of spans) exporter.export(item)
+
+    // #when the final flush is given one second, the pipeline's drain bound
+    const started = Date.now()
+    const counts = await exporter.close(1_000)
+    const elapsed = Date.now() - started
+
+    // #then every span went inside the bound
+    expect(counts).toEqual({exported: 5 * BATCH, dropped: 0})
+    expect(elapsed).toBeLessThan(1_000)
+  })
+
+  it('counts what a drain bound cuts off as dropped, once, and sends the batches it reached in order', async () => {
+    // #given ten full batches and a collector that takes 250 ms a request, with a 1 s bound
+    const target = await sink({respond: () => ({status: 200, delayMs: 250})})
+    const exporter = exporterFor({url: target.url})
+    const spans = Array.from({length: 10 * BATCH}, () => span())
+    for (const item of spans) exporter.export(item)
+
+    // #when
+    const counts = await exporter.close(1_000)
+
+    // #then every span is counted exactly once, the batches that got through are the first ones in order, and the rest are dropped
+    expect(counts.exported + counts.dropped).toBe(10 * BATCH)
+    expect(counts.exported).toBeGreaterThanOrEqual(2 * BATCH)
+    expect(counts.dropped).toBeGreaterThan(0)
+    expect(received(target)).toEqual(spans.slice(0, received(target).length).map(item => item.spanId))
+  }, 10_000)
+
+  it('stops after consecutive failures and counts everything queued behind them as dropped, once each', async () => {
+    // #given a collector that refuses every batch, a circuit of three, and six full batches queued
+    const target = await sink({respond: () => ({status: 422})})
+    const exporter = exporterFor({url: target.url, limits: {...FAST, maxConsecutiveFailures: 3}})
+    for (let index = 0; index < 6 * BATCH; index += 1) exporter.export(span())
+
+    // #when
+    await settled(exporter, 6 * BATCH)
+
+    // #then three batches were tried, the circuit opened, and all 6 x 32 spans are counted dropped exactly once
+    expect(exporter.counts()).toEqual({exported: 0, dropped: 6 * BATCH})
+    expect(target.received()).toBe(3)
+  }, 20_000)
+
+  it('reports the running totals in the counts header on each of the batches', async () => {
+    // #given an Action-mode exporter and three full batches
+    const target = await sink()
+    const exporter = exporterFor({url: target.url, reportCounts: true})
+    for (let index = 0; index < 3 * BATCH; index += 1) exporter.export(span())
+
+    // #when
+    await settled(exporter, 3 * BATCH)
+
+    // #then the header on request n carries what the exporter had counted before it was sent
+    expect(target.accepted().map(request => request.headers[TRACE_COUNTS_HEADER])).toEqual([
+      'exported=0;dropped=0',
+      `exported=${BATCH};dropped=0`,
+      `exported=${2 * BATCH};dropped=0`,
+    ])
+  }, 20_000)
+})

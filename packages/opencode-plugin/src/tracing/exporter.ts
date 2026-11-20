@@ -17,7 +17,8 @@
  * does not follow redirects and the delegate does not either (pinned by `exporter.test.ts`), so the credential in a
  * local-mode header goes only to the URL in the settings file, which must be `https` for a remote collector with
  * certificate verification left at the platform default (`settings.ts` accepts nothing else). The relay's `503` is
- * therefore a retry and its `422` a drop. One batch is in flight at a time, far under the relay's refusal threshold of eight.
+ * therefore a retry and its `422` a drop. One batch is in flight at a time, far under the relay's refusal threshold of eight;
+ * the next one starts only after the delegate has finished with the last (see `startBatch`).
  */
 
 import type {ReadableSpan, SpanProcessor} from '@opentelemetry/sdk-trace-base'
@@ -286,7 +287,14 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
           result => {
             clearTimeout(watchdog)
             settle(result.code === 0)
-            resolve()
+            // The delegate calls this from inside the promise it keeps in its own in-flight set (`otlp-export-delegate.js`:
+            // `this._promiseQueue.pushPromise(this._transport.send(...).then(response => { ...resultCallback(...) }))`), and
+            // takes that promise out of the set only AFTER it settles (`bounded-queue-export-promise-handler.js`:
+            // `promise.then(popPromise, popPromise)`). Starting the next batch from here would find the set still full and be
+            // refused with `Concurrent export limit reached` (a whole batch counted dropped). So the batch is not over until the
+            // delegate says nothing is in flight: `forceFlush()` is `Promise.all` over that set, and the set's own removal was
+            // registered on the same promise first, so by the time it resolves the entry is gone.
+            exporter.forceFlush().then(resolve, resolve)
           },
         )
       } catch {
