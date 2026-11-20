@@ -202,5 +202,15 @@ export type Observation = ObservationBase &
      * Not an event of OpenCode: the pipeline lost an observation (its inbox was full, it was malformed, the model failed on it)
      * and tells the model so, in its place in the sequence. `sessionIds` undefined means it cannot say whose it was: every session.
      */
-    | {readonly kind: 'loss'; readonly sessionIds: readonly string[] | undefined; readonly reason: string}
+    | {
+        readonly kind: 'loss'
+        readonly sessionIds: readonly string[] | undefined
+        readonly reason: string
+        /**
+         * The receive time of the newest primary request hook lost for each named session. Hook times of a session never decrease, so
+         * a later hook of that session with an earlier time means the clock went back, even though the hook that would have shown
+         * it is gone. Per session: sessions share a clock, not an order.
+         */
+        readonly hookAt?: ReadonlyMap<string, number> | undefined
+      }
   )

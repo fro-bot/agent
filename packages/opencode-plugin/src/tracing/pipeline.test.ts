@@ -1212,6 +1212,51 @@ describe('an observation the pipeline drops is told to the model, in order, by a
     )
   })
 
+  it('never shows a prefix as the whole: a dropped suffix of a bound request’s text withholds the request’s step data (the review’s case)', async () => {
+    // #given a bound request with a text prefix, an inbox that fills so the suffix is dropped, and then the step ending as stop
+    const {sink, spans} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber, limits: {maxInbox: 1}})
+    const send = async (observation: Observation): Promise<void> => {
+      pipeline.observe(observation)
+      await new Promise<void>(resolve => setTimeout(resolve, 3))
+    }
+    await send({kind: 'execution.started', at: 1, sessionId: session})
+    await send(base()[1] as Observation)
+    await send({
+      kind: 'step.started',
+      at: 3,
+      started: 2,
+      sessionId: session,
+      messageId: 's1',
+      agent: 'build',
+      model: 'm',
+      provider: 'p',
+    })
+    await send({kind: 'output', at: 4, sessionId: session, messageId: 's1', part: 'text', text: 'prefix'})
+    pipeline.observe({kind: 'usage', at: 5, sessionId: session})
+    pipeline.observe({kind: 'output', at: 6, sessionId: session, messageId: 's1', part: 'text', text: 'suffix'})
+    await flush()
+    await send({
+      kind: 'step.ended',
+      at: 7,
+      sessionId: session,
+      messageId: 's1',
+      finish: 'stop',
+      rawFinish: 'stop',
+      usage: USAGE,
+      cost: 0,
+    })
+    await send({kind: 'execution.ended', at: 8, sessionId: session, outcome: 'succeeded'})
+    pipeline.stop()
+
+    // #then the suffix really was dropped, and the span carries neither the prefix nor a finish reason
+    expect(pipeline.stats().observationsDropped).toBeGreaterThan(0)
+    const chat = chatSpan(spans)
+    expect(JSON.stringify(spans)).not.toContain('prefix')
+    expect(chat?.attributes['gen_ai.response.finish_reasons']).toBeUndefined()
+    expect(chat?.attributes['fro_bot.span.gaps']).toContain('step-binding-uncertain')
+  })
+
   it('tells the model about an observation it failed on, before anything else it sees', async () => {
     // #given a request waiting for its step, and a step.started that reads fine at the door and throws inside the model
     const {sink, spans} = collectingSink()

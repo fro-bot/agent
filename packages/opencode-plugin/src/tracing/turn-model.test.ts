@@ -2309,9 +2309,9 @@ describe('a step belongs to the latest primary hook at or before its own start t
     step(s, 'p', 'm1', 100, 'first')
     step(s, 'p', 'm2', 200, 'second')
     hook(s, 'p', 400)
-    step(s, 'p', 'mA', 400, 'A output')
+    step(s, 'p', 'mA', 401, 'A output')
     hook(s, 'p', 500)
-    step(s, 'p', 'mB', 500, 'B output')
+    step(s, 'p', 'mB', 501, 'B output')
     s.ended('p')
 
     // #when
@@ -2417,6 +2417,30 @@ describe('a step belongs to the latest primary hook at or before its own start t
     expect(JSON.stringify(records)).not.toContain('FOREIGN')
   })
 
+  it('withholds the step that starts in its own hook’s millisecond when an orphan hook is still waiting before it (the cost of the equality rule)', () => {
+    // #given an orphan hook that never gets a step, and the next hook whose step started exactly at its time
+    const s = script()
+    s.started('p')
+    hook(s, 'p', 100)
+    hook(s, 'p', 300)
+    step(s, 'p', 'm9', 300, 'maybe the orphan’s')
+    hook(s, 'p', 400)
+    step(s, 'p', 'm10', 400, 'next one is fine')
+    s.ended('p')
+
+    // #when
+    const {records} = replay(s.out, {flush: false})
+
+    // #then the ambiguous step is withheld and both hooks are marked; the next request, with nothing waiting before it, binds
+    expect(JSON.stringify(records)).not.toContain('maybe the orphan')
+    expect(
+      primaries(records)
+        .filter(chat => chat.gaps.includes('step-binding-uncertain'))
+        .map(chat => chat.start),
+    ).toEqual([100, 300])
+    expect(chatWith(records, 'next one is fine')?.messageId).toBe('m10')
+  })
+
   it('lets a pending primary that never saw a step survive the execution boundary without taking the next execution’s step', () => {
     // #given a primary with no step, the execution ending (a title keeps the session), and a new execution with its own request
     const s = script()
@@ -2426,7 +2450,7 @@ describe('a step belongs to the latest primary hook at or before its own start t
     s.ended('p')
     s.started('p')
     hook(s, 'p', 300)
-    step(s, 'p', 'm9', 300, 'its own first step')
+    step(s, 'p', 'm9', 301, 'its own first step')
     s.ended('p')
 
     // #when
@@ -2627,7 +2651,7 @@ describe('a step belongs to the latest primary hook at or before its own start t
     s.text('p', 'm1', 'one')
     s.stepEnded('p', 'm1')
     hook(s, 'p', 300)
-    step(s, 'p', 'm3', 300, 'third')
+    step(s, 'p', 'm3', 301, 'third')
     s.ended('p')
 
     // #when
@@ -2644,8 +2668,8 @@ describe('a step belongs to the latest primary hook at or before its own start t
     for (const at of [100, 200, 300, 400, 500]) hook(s, 'p', at)
     step(s, 'p', 'm1', 100, 'evicted one')
     step(s, 'p', 'm2', 250, 'between')
-    step(s, 'p', 'm3', 300, 'three')
-    step(s, 'p', 'm5', 500, 'five')
+    step(s, 'p', 'm3', 301, 'three')
+    step(s, 'p', 'm5', 501, 'five')
     s.ended('p')
 
     // #when
@@ -2657,6 +2681,48 @@ describe('a step belongs to the latest primary hook at or before its own start t
     expect(chatWith(records, 'five')?.messageId).toBe('m5')
     expect(chats(records).filter(chat => chat.gaps.includes('step-binding-uncertain'))).toHaveLength(2)
     expect(model.stats().hookTimes).toBeLessThanOrEqual(3)
+  })
+
+  it('keeps the newest evicted time as a floor: a step at or below it binds nothing, so an evicted tie cannot hide', () => {
+    // #given two hooks in the same millisecond, the first evicted from a record of three by two later hooks, and a step at that time
+    const s = script()
+    s.started('p')
+    hook(s, 'p', 199)
+    hook(s, 'p', 199)
+    hook(s, 'p', 300)
+    hook(s, 'p', 400)
+    step(s, 'p', 'm1', 199, 'EITHER OF THE TWO')
+    step(s, 'p', 'm3', 300, 'three')
+    step(s, 'p', 'm4', 400, 'four')
+    s.ended('p')
+
+    // #when
+    const {records} = replay(s.out, {limits: {maxHookTimes: 3}, flush: false})
+
+    // #then the step could be the evicted hook's or the retained one's, so it is on no span; later hooks still bind
+    expect(JSON.stringify(records)).not.toContain('EITHER OF THE TWO')
+    expect(chatWith(records, 'four')?.messageId).toBe('m4')
+  })
+
+  it('counts an evicted hook that is still waiting as an earlier waiting hook for the equality rule', () => {
+    // #given hook 1 at 194 whose step starts at 195, hook 2 at 195, and a record of three evicting hook 1 before its step arrives
+    const s = script()
+    s.started('p')
+    hook(s, 'p', 154)
+    step(s, 'p', 'm0', 154, 'zero')
+    hook(s, 'p', 194)
+    hook(s, 'p', 195)
+    hook(s, 'p', 260)
+    hook(s, 'p', 267)
+    step(s, 'p', 'm1', 195, 'HOOK ONES TEXT')
+    s.ended('p')
+
+    // #when
+    const {records} = replay(s.out, {limits: {maxHookTimes: 3}, flush: false})
+
+    // #then the step could be the evicted hook's or hook 2's, so it is on no span
+    expect(JSON.stringify(records)).not.toContain('HOOK ONES TEXT')
+    expect(chatWith(records, 'zero')?.messageId).toBe('m0')
   })
 
   it('keeps a subagent’s hooks in its own record: its times never resolve a parent’s step', () => {
@@ -2693,6 +2759,435 @@ describe('a step belongs to the latest primary hook at or before its own start t
     expect(chatWith(records, 'parent two')?.sessionId).toBe('p')
   })
 
+  describe('a step that starts in the same millisecond as a later hook', () => {
+    const uncertain = (records: readonly SpanRecord[]) =>
+      primaries(records).filter(chat => chat.gaps.includes('step-binding-uncertain'))
+
+    it('binds nothing and marks both requests when the earlier one is still waiting (the review’s case)', () => {
+      // #given hook 1 at 100, its attempt started and finished at 101, hook 2 at 101, then step 1's delayed start (started 101), text, end
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      hook(s, 'p', 101)
+      step(s, 'p', 'm1', 101, 'ONE')
+      s.ended('p')
+
+      // #when
+      const {records} = replay(s.out, {flush: false})
+
+      // #then neither request carries ONE: the step could be either one's, and both say so
+      expect(JSON.stringify(records)).not.toContain('"ONE"')
+      expect(uncertain(records).map(chat => chat.start)).toEqual([100, 101])
+      for (const chat of uncertain(records)) expectNoStepData(chat)
+    })
+
+    it('marks every waiting request up to and including the equal-time one in a chain, and no later one', () => {
+      // #given four hooks, the first three waiting, a step that started at the third's time, and a fourth hook after it
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      hook(s, 'p', 101)
+      hook(s, 'p', 102)
+      hook(s, 'p', 150)
+      step(s, 'p', 'm1', 102, 'ONE')
+      step(s, 'p', 'm4', 150, 'FOUR')
+      s.ended('p')
+
+      // #when
+      const {records} = replay(s.out, {flush: false})
+
+      // #then the first three are marked; the fourth, strictly later than the step, binds its own step
+      expect(uncertain(records).map(chat => chat.start)).toEqual([100, 101, 102])
+      expect(JSON.stringify(records)).not.toContain('"ONE"')
+      expect(chatWith(records, 'FOUR')?.messageId).toBe('m4')
+    })
+
+    it('marks the earlier waiting request and the equal-time one, not a hook that is strictly later than the step', () => {
+      // #given an older waiting hook, a hook at the step's start time, and a hook after it
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 50)
+      hook(s, 'p', 100)
+      hook(s, 'p', 101)
+      step(s, 'p', 'm1', 100, 'ONE')
+      step(s, 'p', 'm3', 101, 'THREE')
+      s.ended('p')
+
+      // #when
+      const {records} = replay(s.out, {flush: false})
+
+      // #then
+      expect(uncertain(records).map(chat => chat.start)).toEqual([50, 100])
+      expect(chatWith(records, 'THREE')?.messageId).toBe('m3')
+    })
+
+    it('withholds nothing in an ordinary run, where a step shares its own hook’s millisecond and the earlier request has its step', () => {
+      // #given steps that start at exactly their hook's time, delivered in order, back to back in the same millisecond or the next
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      step(s, 'p', 'm1', 100, 'ONE')
+      hook(s, 'p', 100 + 1)
+      step(s, 'p', 'm2', 101, 'TWO')
+      hook(s, 'p', 102)
+      step(s, 'p', 'm3', 102, 'THREE')
+      s.ended('p')
+
+      // #when
+      const {records} = replay(s.out, {flush: false})
+
+      // #then each carries its own
+      expect(uncertain(records)).toHaveLength(0)
+      expect(chatWith(records, 'ONE')?.messageId).toBe('m1')
+      expect(chatWith(records, 'TWO')?.messageId).toBe('m2')
+      expect(chatWith(records, 'THREE')?.messageId).toBe('m3')
+    })
+
+    it('treats a refused earlier hook as waiting too: its step could be the one that arrives', () => {
+      // #given a cap of one span held by a tool call, so hook 1 at 100 is refused; the call ends, hook 2 at 101 is admitted, and
+      // the refused request's delayed step arrives (started 101)
+      const s = script()
+      s.started('p')
+      s.toolNamed('p', 'c0')
+      s.toolCalled('p', 'c0')
+      hook(s, 'p', 100)
+      s.toolEnded('p', 'c0')
+      hook(s, 'p', 101)
+      step(s, 'p', 'm1', 101, 'ONE')
+      s.ended('p')
+
+      // #when
+      const {records, model} = replay(s.out, {limits: CAP, flush: false})
+
+      // #then the step's text is on no span, and the admitted request says why
+      expect(model.stats().droppedSpans).toBe(1)
+      expect(JSON.stringify(records)).not.toContain('"ONE"')
+      expect(uncertain(records).map(chat => chat.start)).toEqual([101])
+    })
+
+    it('marks both requests that share the newest time and bind nothing (a tie)', () => {
+      // #given two hooks in the same millisecond and a step that started in it
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      hook(s, 'p', 100)
+      step(s, 'p', 'm1', 100, 'ONE')
+      s.ended('p')
+
+      // #when
+      const {records} = replay(s.out, {flush: false})
+
+      // #then
+      expect(uncertain(records)).toHaveLength(2)
+    })
+  })
+
+  describe('a wall clock that goes backwards', () => {
+    it('does not let an orphan hook before the rollback take the step after it (the review’s case)', () => {
+      // #given hook 1 at 100 that never gets a step, the clock stepping back, hook 2 at 90, and its attempt starting at 101
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      hook(s, 'p', 90)
+      step(s, 'p', 'm2', 101, 'SECOND')
+      s.ended('p')
+
+      // #when
+      const {records} = replay(s.out, {flush: false})
+
+      // #then nobody carries SECOND; both requests are uncertain
+      expect(JSON.stringify(records)).not.toContain('"SECOND"')
+      expect(primaries(records).filter(chat => chat.gaps.includes('step-binding-uncertain'))).toHaveLength(2)
+    })
+
+    it('does not let a step from before the rollback, delivered after it, bind the request hooked after it', () => {
+      // #given step 1 (started 101) delayed past the rollback hook at 90
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      hook(s, 'p', 90)
+      step(s, 'p', 'm1', 101, 'ONE')
+      s.ended('p')
+
+      // #when
+      const {records} = replay(s.out, {flush: false})
+
+      // #then
+      expect(JSON.stringify(records)).not.toContain('"ONE"')
+    })
+
+    it('withholds a step that starts before the previous one (steps run in order), and everything that is then ambiguous', () => {
+      // #given two steps in a session whose second started before the first (steps run one after another)
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 200)
+      step(s, 'p', 'm1', 200, 'ONE')
+      hook(s, 'p', 210)
+      hook(s, 'p', 215)
+      step(s, 'p', 'm2', 150, 'TWO')
+      step(s, 'p', 'm3', 215, 'THREE')
+      s.ended('p')
+
+      // #when
+      const {records} = replay(s.out, {flush: false})
+
+      // #then the first keeps its own; nothing after the discontinuity is trusted, and the hooks still waiting say so
+      expect(chatWith(records, 'ONE')?.messageId).toBe('m1')
+      expect(JSON.stringify(records)).not.toMatch(/"(TWO|THREE)"/)
+      expect(
+        primaries(records)
+          .filter(chat => chat.gaps.includes('step-binding-uncertain'))
+          .map(chat => chat.start),
+      ).toEqual([210, 215])
+    })
+
+    it('does not mistake ordinary lag for a rollback: a step older than a hook that already has its step is fine', () => {
+      // #given hook 2 observed before step 1's events, as the pull loop makes routine
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      hook(s, 'p', 150)
+      step(s, 'p', 'm1', 100, 'ONE')
+      step(s, 'p', 'm2', 150, 'TWO')
+      s.ended('p')
+
+      // #when
+      const {records} = replay(s.out, {flush: false})
+
+      // #then
+      expect(chatWith(records, 'ONE')?.messageId).toBe('m1')
+      expect(chatWith(records, 'TWO')?.messageId).toBe('m2')
+    })
+
+    it('sees a rollback that follows a LOST hook: the loss marker carries the lost hook’s time', () => {
+      // #given hook 1 at 100 with its step bound, hook 2 LOST (its marker carries its time, 200), the clock stepping back, hook 3 at
+      // 150, then hook 2's delayed step (started 201), which would resolve to hook 3
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      step(s, 'p', 'm1', 100, 'one')
+      s.out.push({kind: 'loss', sessionIds: ['p'], reason: 'inbox-full', hookAt: new Map([['p', 200]]), at: 200})
+      hook(s, 'p', 150)
+      step(s, 'p', 'm2', 201, 'TWO')
+      s.ended('p')
+
+      // #when
+      const {records} = replay(s.out, {flush: false})
+
+      // #then nobody carries TWO, and the request hooked after the loss says why
+      expect(JSON.stringify(records)).not.toContain('"TWO"')
+      expect(
+        primaries(records)
+          .filter(chat => chat.gaps.includes('step-binding-uncertain'))
+          .map(chat => chat.start),
+      ).toEqual([150])
+    })
+
+    it('treats a lost hook like a refused one: its time stays in the record, so its step cannot land on a hook that shares it', () => {
+      // #given hook 1 at 100 with its step bound, hook 2 LOST at 164, hook 3 recorded at the very same time, and hook 2's step
+      // (started 164) delivered afterwards
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      step(s, 'p', 'm1', 100, 'one')
+      s.out.push({kind: 'loss', sessionIds: ['p'], reason: 'inbox-full', hookAt: new Map([['p', 164]]), at: 164})
+      hook(s, 'p', 164)
+      step(s, 'p', 'm2', 164, 'LOST HOOKS TEXT')
+      s.ended('p')
+
+      // #when
+      const {records} = replay(s.out, {flush: false})
+
+      // #then the step could be either's, so it binds nothing and the recorded request says so
+      expect(JSON.stringify(records)).not.toContain('LOST HOOKS TEXT')
+      expect(
+        primaries(records)
+          .filter(chat => chat.gaps.includes('step-binding-uncertain'))
+          .map(chat => chat.start),
+      ).toEqual([164])
+    })
+
+    it('keeps a lost hook’s time for a session the model has not seen yet, so a later hook that is earlier shows the rollback', () => {
+      // #given the FIRST hook of a session lost (its marker names its time, 212) before anything of the session was seen, then
+      // the clock stepping back, a hook at 148, and a step started at 166 (which belongs to the lost hook)
+      const s = script()
+      s.out.push({kind: 'loss', sessionIds: ['p'], reason: 'inbox-full', hookAt: new Map([['p', 212]]), at: 212})
+      s.started('p')
+      hook(s, 'p', 148)
+      step(s, 'p', 'm0', 166, 'LOST FIRST HOOKS TEXT')
+      s.ended('p')
+
+      // #when
+      const {records} = replay(s.out, {flush: false})
+
+      // #then nobody carries it, and the hook that followed the loss says why
+      expect(JSON.stringify(records)).not.toContain('LOST FIRST HOOKS TEXT')
+      expect(primaries(records).filter(chat => chat.gaps.includes('step-binding-uncertain'))).toHaveLength(1)
+    })
+
+    it('does not mistake a loss of something else for a hook: a lost event’s time says nothing about later hooks', () => {
+      // #given a loss with no hook time, then an ordinary hook and step
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      step(s, 'p', 'm1', 100, 'one')
+      s.lost(['p'], 'inbox-full')
+      hook(s, 'p', 150)
+      step(s, 'p', 'm2', 150, 'two')
+      s.ended('p')
+
+      // #when
+      const {records} = replay(s.out, {flush: false})
+
+      // #then
+      expect(chatWith(records, 'two')?.messageId).toBe('m2')
+    })
+
+    it('starts the next execution clean after a rollback', () => {
+      // #given a rollback in one execution and a new execution with an ordinary request
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      s.request('p', 'title', {at: 101})
+      hook(s, 'p', 90)
+      s.ended('p')
+      s.started('p')
+      hook(s, 'p', 500)
+      step(s, 'p', 'm9', 500, 'its own first step')
+      s.ended('p')
+
+      // #when
+      const {records} = replay(s.out, {flush: false})
+
+      // #then
+      expect(chatWith(records, 'its own first step')?.messageId).toBe('m9')
+    })
+  })
+
+  describe('a loss reported while a request is bound and still running', () => {
+    it('withholds the request’s step data entirely, so a prefix is never shown as the whole (the review’s case)', () => {
+      // #given a bound request with a text prefix, a loss (the suffix was dropped), then the step ending as stop
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      s.stepStarted('p', 'm1', 100)
+      s.text('p', 'm1', 'prefix')
+      s.lost(['p'], 'inbox-full')
+      s.stepEnded('p', 'm1')
+      s.ended('p')
+
+      // #when
+      const {records} = replay(s.out, {flush: false})
+
+      // #then no text, no finish reason, an incomplete outcome and the same gap as any uncertain request
+      expect(JSON.stringify(records)).not.toContain('prefix')
+      expect(primaries(records)).toHaveLength(1)
+      for (const chat of primaries(records)) expectNoStepData(chat)
+    })
+
+    it('leaves a request that ended before the loss alone, and marks only the ones still running', () => {
+      // #given request 1 ended, request 2 bound and running, a loss, request 3 hooked after it
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      step(s, 'p', 'm1', 100, 'one')
+      hook(s, 'p', 200)
+      s.stepStarted('p', 'm2', 200)
+      s.text('p', 'm2', 'two prefix')
+      s.lost(['p'], 'inbox-full')
+      s.stepEnded('p', 'm2')
+      hook(s, 'p', 300)
+      step(s, 'p', 'm3', 300, 'three')
+      s.ended('p')
+
+      // #when
+      const {records} = replay(s.out, {flush: false})
+
+      // #then
+      expect(chatWith(records, 'one')?.finishReason).toBe('stop')
+      expect(chatWith(records, 'three')?.finishReason).toBe('stop')
+      expect(JSON.stringify(records)).not.toContain('two prefix')
+      expect(primaries(records).filter(chat => chat.gaps.includes('step-binding-uncertain'))).toHaveLength(1)
+    })
+
+    it('hands back the second owner of a bound request’s tool arguments when it turns uncertain', () => {
+      // #given a bound request that asked for a tool with object arguments, then a loss
+      const s = script()
+      const input = {path: 'a'}
+      s.started('p')
+      hook(s, 'p', 100)
+      s.stepStarted('p', 'm1', 100)
+      s.toolNamed('p', 'c1')
+      s.toolCalled('p', 'c1', {messageId: 'm1', input})
+      s.lost(['p'], 'inbox-full')
+      s.stepEnded('p', 'm1')
+      s.ended('p')
+
+      // #when
+      const {model} = replay(s.out, {flush: false})
+
+      // #then
+      expect(model.takeDiscarded()).toContain(input)
+    })
+
+    it('applies a loss that names no session to a bound request of every session', () => {
+      // #given two sessions with a bound request each and an unnamed loss
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      s.stepStarted('p', 'mp', 100)
+      s.text('p', 'mp', 'p prefix')
+      s.started('q')
+      hook(s, 'q', 110)
+      s.stepStarted('q', 'mq', 110)
+      s.text('q', 'mq', 'q prefix')
+      s.lost(undefined, 'identifier-too-long')
+      s.stepEnded('p', 'mp')
+      s.stepEnded('q', 'mq')
+      s.ended('p')
+      s.ended('q')
+
+      // #when
+      const {records} = replay(s.out, {flush: false})
+
+      // #then
+      expect(JSON.stringify(records)).not.toMatch(/(p|q) prefix/)
+      expect(chats(records).filter(chat => chat.gaps.includes('step-binding-uncertain'))).toHaveLength(2)
+    })
+  })
+
+  it('records a request that fails after output, whose retry hook arrives before its step events, as closed with a named gap and nothing misattributed', () => {
+    // #given the retry hook delivered ahead of the step.started and text of the attempt it follows (the source publishes the
+    // failure after the retry hook), then step.failed, and the second attempt
+    const s = script()
+    s.started('p')
+    hook(s, 'p', 100)
+    retry(s, 'p')
+    s.stepStarted('p', 'm1', 100)
+    s.text('p', 'm1', 'FIRST OUTPUT')
+    s.out.push({
+      kind: 'step.failed',
+      sessionId: 'p',
+      messageId: 'm1',
+      error: {type: 'provider.internal', message: 'x'},
+      at: lastAt(s.out) + 1,
+    })
+    hook(s, 'p', 200)
+    step(s, 'p', 'm2', 200, 'SECOND OUTPUT')
+    s.ended('p')
+
+    // #when
+    const {records} = replay(s.out, {flush: false})
+
+    // #then the first span has no text and says its output is missing; the second has only its own
+    const [first, second] = primaries(records)
+    expect(first?.texts).toEqual([])
+    expect(first?.gaps).toContain('output')
+    expect(first?.status).toBe('error')
+    expect(second?.texts).toEqual(['SECOND OUTPUT'])
+    expect(JSON.stringify(records)).not.toContain('FIRST OUTPUT')
+  })
+
   /** A parent that dispatches a child whose observations are buffered until the dispatch link arrives. */
   const bufferedChild = (): ReturnType<typeof script> => {
     const s = script()
@@ -2725,8 +3220,8 @@ describe('a step belongs to the latest primary hook at or before its own start t
     s.delivered('kid', 'mk')
     hook(s, 'kid', 150)
     hook(s, 'kid', 250)
-    step(s, 'kid', 'k2', 250, 'second kid text')
     step(s, 'kid', 'k1', 150, 'first kid text')
+    step(s, 'kid', 'k2', 250, 'second kid text')
     s.ended('kid')
     link(s)
 

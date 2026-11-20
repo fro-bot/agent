@@ -249,6 +249,28 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
     }
   }
 
+  /** The receive time of a primary request hook, when `observation` is one: the loss of a hook is told with its time. */
+  const hookTimeOf = (observation: Observation): number | undefined => {
+    try {
+      return isPlainRecord(observation) && observation.kind === 'request' && observation.requestKind === 'primary'
+        ? atOf(observation)
+        : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /** A marker's lost-hook times with `time` for `session` folded in (the newest per session); nothing for a drop with no session. */
+  const hookTimes = (
+    known: ReadonlyMap<string, number> | undefined,
+    session: string | undefined,
+    time: number | undefined,
+  ): {hookAt?: ReadonlyMap<string, number>} => {
+    const merged = new Map(known)
+    if (session !== undefined && time !== undefined) merged.set(session, Math.max(time, merged.get(session) ?? time))
+    return merged.size === 0 ? {} : {hookAt: merged}
+  }
+
   /** The most sessions one marker names; past it the marker names none, which means every session. */
   const MAX_MARKER_SESSIONS = 32
 
@@ -272,7 +294,7 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
             : merged.sessionIds.length >= MAX_MARKER_SESSIONS
               ? undefined
               : [...merged.sessionIds, session]
-      const joined: Observation = {...merged, sessionIds}
+      const joined: Observation = {...merged, sessionIds, ...hookTimes(merged.hookAt, session, hookTimeOf(observation))}
       if (position === 'tail') inbox[inbox.length - 1] = {observation: joined, chars: 0}
       else inbox[0] = {observation: joined, chars: 0}
       return
@@ -282,6 +304,7 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
       at: atOf(observation),
       sessionIds: session === undefined ? undefined : [session],
       reason,
+      ...hookTimes(undefined, session, hookTimeOf(observation)),
     }
     if (position === 'tail') inbox.push({observation: marker, chars: 0})
     else inbox.unshift({observation: marker, chars: 0})
