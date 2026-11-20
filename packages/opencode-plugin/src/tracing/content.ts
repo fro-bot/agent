@@ -746,8 +746,8 @@ function closingQuote(text: string, from: number, opener: string): number {
   return -1
 }
 
-/** URL userinfo: everything between `scheme://` and the `@`. */
-const URL_USERINFO = /([a-z][a-z0-9+.-]{1,15}:\/\/)[^\s/@"'\\]{1,256}@/gi
+/** URL userinfo: everything between `scheme://` and the `@`, whatever its length (the run stops at whitespace or a slash, so a scan never crosses into another candidate). */
+const URL_USERINFO = /([a-z][a-z0-9+.-]{1,15}:\/\/)[^\s/@"'\\]+@/gi
 
 /** A secret-like query parameter's value. */
 const QUERY_SECRET = new RegExp(
@@ -768,7 +768,7 @@ const afterScheme = (match: RegExpExecArray, text: string): Range => {
  */
 export const SCRUB_PATTERNS: readonly ScrubMatcher[] = [
   pemMatcher(),
-  regexMatcher('github-token', /\b(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_\w{22,255})\b/g, wholeMatch, [
+  regexMatcher('github-token', /\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_\w{22,})\b/g, wholeMatch, [
     'ghp_',
     'gho_',
     'ghu_',
