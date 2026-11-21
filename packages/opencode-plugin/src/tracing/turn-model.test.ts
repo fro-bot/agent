@@ -3983,6 +3983,91 @@ describe('a step belongs to the latest primary hook at or before its own start t
       })
     })
 
+    /** The next execution's start event, stamped `at` by the server. */
+    const startedAt = (s: ReturnType<typeof script>, at: number): void => {
+      s.out.push({kind: 'execution.started', sessionId: 'p', at})
+    }
+
+    /** A first execution with a step and a title that keeps its trace, ending at 200, and the next execution's first hook seen first. */
+    const crossBoundary = (b1Hook: number, startAt: number, b2Hook: number, firstStart: number) => {
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      step(s, 'p', 'mA', 100, 'A TEXT')
+      s.request('p', 'title', {at: 120})
+      hook(s, 'p', b1Hook)
+      endedAt(s, 200)
+      startedAt(s, startAt)
+      hook(s, 'p', b2Hook)
+      step(s, 'p', 'mB1', firstStart, 'B1 RESPONSE')
+      step(s, 'p', 'mB2', b2Hook + 10, 'B2 RESPONSE')
+      s.ended('p')
+      return s
+    }
+    /** The clock stepped back after A's end stamped 200: B starts at `startAt`, B1's hook reads 190 and B1's step starts at 205. */
+    const rolledBackAcrossBoundary = (startAt: number) => crossBoundary(190, startAt, 205, 205)
+
+    it('withholds the next execution when it starts before the previous one ended: the clock stepped back across the boundary', () => {
+      // #given A ends at 200, the clock steps back, B starts at 185 and B1's hook reads 190, seen before A's end event; B1's step
+      // starts at 205, in the millisecond of B2's hook
+      const s = rolledBackAcrossBoundary(185)
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then A keeps its step; B1 (hook 190, settled by the end event) and B2 carry no step data; neither response is on a span
+      expect(chatWith(records, 'A TEXT')?.messageId).toBe('mA')
+      expect(JSON.stringify(records)).not.toMatch(/B1 RESPONSE|B2 RESPONSE/)
+      const later = primaries(records).filter(candidate => candidate.start >= 190)
+      expect(later.map(chat => chat.start)).toEqual([190, 205])
+      for (const chat of later) expectNoStepData(chat)
+      expect(model.stats().withholds).toBe(1)
+    })
+
+    it('withholds an execution that starts in the millisecond the previous one ended: the safe side', () => {
+      // #given
+      const s = rolledBackAcrossBoundary(200)
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then
+      expect(JSON.stringify(records)).not.toMatch(/B1 RESPONSE|B2 RESPONSE/)
+      expect(model.stats().withholds).toBe(1)
+    })
+
+    it('does not withhold an execution that starts after the previous one ended', () => {
+      // #given an ordinary clock, with B1's hook seen before A's end event, and each step starting after its own hook
+      const s = crossBoundary(220, 210, 240, 225)
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then the hooks bind their own steps
+      expect(model.stats().withholds).toBe(0)
+      expect(['B1 RESPONSE', 'B2 RESPONSE'].map(text => chatWith(records, text)?.messageId)).toEqual(['mB1', 'mB2'])
+    })
+
+    it('keeps no more kept sessions than the idle limit allows when their traces close', () => {
+      // #given an idle limit of one and two sessions whose traces close at an end event that the next hook overtook
+      const s = script()
+      for (const session of ['a', 'b']) s.started(session)
+      for (const session of ['a', 'b']) {
+        s.request(session, 'primary', {at: 100})
+        s.stepStarted(session, `m-${session}`, 100)
+        s.stepEnded(session, `m-${session}`)
+        s.request(session, 'primary', {at: 210})
+      }
+
+      // #when both end at 200
+      for (const session of ['a', 'b'])
+        s.out.push({kind: 'execution.ended', sessionId: session, outcome: 'succeeded', at: 200})
+      const {model} = replay(s.out, {limits: {maxIdleSessions: 1}, flush: false})
+
+      // #then one idle record remains
+      expect(model.stats()).toMatchObject({sessions: 1, openTraces: 0})
+    })
+
     it('never gives a step to the request of a hook the execution boundary settled', () => {
       // #given an abandoned request kept by a title, the execution's end, and a step that resolves to its hook
       const s = script()
@@ -3990,7 +4075,7 @@ describe('a step belongs to the latest primary hook at or before its own start t
       hook(s, 'p', 100)
       s.request('p', 'title', {at: 101})
       endedAt(s, 200)
-      s.started('p')
+      startedAt(s, 210)
       step(s, 'p', 'late', 150, 'LATE RESPONSE')
       s.ended('p')
 

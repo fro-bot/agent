@@ -288,6 +288,7 @@ interface Case {
   readonly stepBacks: number
   readonly boundaries: number
   readonly noSurvivors: number
+  readonly crossings: number
 }
 
 function build(seed: number, config: Config): Case {
@@ -299,6 +300,7 @@ function build(seed: number, config: Config): Case {
   let order = 0
   let boundaries = 0
   let noSurvivors = 0
+  const crossBacks = new Map<number, number>()
   const lagChoice = pick<number>(
     random,
     adversarial
@@ -370,10 +372,11 @@ function build(seed: number, config: Config): Case {
       first !== undefined &&
       before !== undefined &&
       after !== undefined &&
-      eventTimes(before).last < after.t &&
+      eventTimes(before).last <= after.t - 2 &&
       random() < 0.4
     ) {
-      const tEnd = after.t - 1
+      // The first execution ends two milliseconds before the next hook and the next starts one before it.
+      const tEnd = after.t - 2
       // Half of them have no survivor: the first execution's trace closes at its end and the session with it, unless the record
       // still holds a hook of the next execution.
       const survivor = random() < 0.5
@@ -402,8 +405,13 @@ function build(seed: number, config: Config): Case {
           sessionId: session,
           outcome: 'succeeded',
         })),
-        marker(session, tEnd, wall => ({kind: 'execution.started', at: wall(tEnd), sessionId: session})),
+        marker(session, tEnd + 1, wall => ({kind: 'execution.started', at: wall(tEnd + 1), sessionId: session})),
       )
+      // Half of the surviving ones step the clock back across the boundary: the next execution starts, by the wall clock, before
+      // the end, and its first hook reads before it too but after the last hook of the first. Without a survivor the session is
+      // forgotten at the end and nothing remembers it: the documented residual (turn-model.ts), not generated.
+      const room = after.t - before.t - 1
+      if (survivor && room >= 3 && random() < 0.5) crossBacks.set(tEnd, int(random, 3, room))
       boundaries += 1
       noSurvivors += survivor ? 0 : 1
     }
@@ -533,6 +541,12 @@ function build(seed: number, config: Config): Case {
       }
     }
   }
+  let crossings = 0
+  for (const [from, size] of crossBacks) {
+    if (rollbackAt.has(from)) continue
+    rollbackAt.set(from, size)
+    crossings += 1
+  }
   const points = [...rollbackAt.entries()].sort((a, b) => a[0] - b[0])
   const wall = (t: number): number => {
     let offset = 0
@@ -587,7 +601,7 @@ function build(seed: number, config: Config): Case {
       })
     } else observations.push(observation)
   }
-  return {seed, plans, observations, limits, dropped, rollbacks, stepBacks, boundaries, noSurvivors}
+  return {seed, plans, observations, limits, dropped, rollbacks, stepBacks, boundaries, noSurvivors, crossings}
 }
 
 const SEEDS = 20_000
@@ -673,6 +687,7 @@ describe('the step join over generated sessions', () => {
     let stepBacks = 0
     let boundaries = 0
     let noSurvivors = 0
+    let crossings = 0
     let withheld = 0
     let sameMs = 0
     let bigRecord = 0
@@ -687,6 +702,7 @@ describe('the step join over generated sessions', () => {
       stepBacks += generated.stepBacks
       boundaries += generated.boundaries
       noSurvivors += generated.noSurvivors
+      crossings += generated.crossings
       const problems: unknown[] = []
       let hooked = 0
       let finishedPrimaries = 0
@@ -742,7 +758,7 @@ describe('the step join over generated sessions', () => {
     }
     if (process.env.FRO_BOT_JOIN_STATS === '1') {
       process.stdout.write(
-        `join stats: ${JSON.stringify({checked, uncertain, kept, dropped, rollbacks, stepBacks, boundaries, noSurvivors, withheld, sameMs, bigRecord, children, zeroRuns, slowStarts})}\n`,
+        `join stats: ${JSON.stringify({checked, uncertain, kept, dropped, rollbacks, stepBacks, boundaries, noSurvivors, crossings, withheld, sameMs, bigRecord, children, zeroRuns, slowStarts})}\n`,
       )
     }
     // The generator exercises what it claims to.
@@ -754,6 +770,7 @@ describe('the step join over generated sessions', () => {
     expect(stepBacks).toBeGreaterThan(SEEDS / 20)
     expect(boundaries).toBeGreaterThan(SEEDS / 20)
     expect(noSurvivors).toBeGreaterThan(SEEDS / 40)
+    expect(crossings).toBeGreaterThan(SEEDS / 40)
     expect(sameMs).toBeGreaterThan(SEEDS / 8)
     expect(bigRecord).toBeGreaterThan(SEEDS / 200)
     expect(children).toBeGreaterThan(SEEDS / 10)

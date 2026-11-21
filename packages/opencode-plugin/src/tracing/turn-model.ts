@@ -411,6 +411,8 @@ interface SessionNode {
   withheld: boolean
   /** The newest primary hook time this session was told of, recorded or not: what an execution's end is compared with. */
   newestHookAt: number
+  /** When the session's latest execution ended, by the end event's own time. */
+  lastEndedAt: number
   nextAttempt: number
   lastActivity: number
 }
@@ -573,6 +575,7 @@ export function createTurnModel(options: {
       hooks: [],
       withheld: false,
       newestHookAt: Number.NEGATIVE_INFINITY,
+      lastEndedAt: Number.NEGATIVE_INFINITY,
       nextAttempt: 1,
       lastActivity: at,
     }
@@ -823,6 +826,8 @@ export function createTurnModel(options: {
       }
     }
     traces.delete(trace)
+    // A session kept above for its record is idle now: the idle limit holds at this point too, not only at allocation.
+    for (const node of trace.nodes.values()) if (sessions.get(node.id) === node && isIdle(node)) enforceIdleBound(node)
   }
 
   function rememberTombstone(childId: string, traceId: string): void {
@@ -1114,6 +1119,9 @@ export function createTurnModel(options: {
   function onExecutionStarted(o: Extract<Observation, {kind: 'execution.started'}>): void {
     const node = route(o)
     if (node === undefined) return
+    // An execution cannot start before the previous one ended (or in the same millisecond, in any recording): the clock stepped
+    // back across the boundary, and the previous end event settles hooks by a time that no longer orders them.
+    if (o.at <= node.lastEndedAt) withhold(node)
     if (node.active === undefined) beginExecution(node, o.at)
   }
 
@@ -1260,6 +1268,10 @@ export function createTurnModel(options: {
   //      so a step that resolves to it binds nothing, and it counts for trigger 1 and 2: its own step is awaited), and the session's unfinished requests are
   //      marked uncertain (the loss may have been a request's `step.started` or part of its output, which would show as the whole).
   //   4. A step whose `started` is missing or not a finite number: an event the join cannot place.
+  //   5. An execution that starts at or before the previous one's end (by the events' own times; no recording has a gap under
+  //      45 ms): the clock stepped back across the boundary, so the end event settles hooks by a time that no longer orders them.
+  //      (Residual, undetectable: a step-back after the start, and one across a boundary whose session was forgotten at its end,
+  //      which nothing remembers.)
   //   Also: the hook record is bounded (`maxHookTimes`); evicting a hook that was never consumed withholds (its step could still
   //   arrive and there would be nothing to compare it with).
   // Not a trigger: a request refused at the span cap. Its hook is recorded with no request, so its step resolves to it and binds
@@ -1369,6 +1381,7 @@ export function createTurnModel(options: {
   /** The execution ended: what waited for a step that cannot be trusted is closed, as incomplete, and the withhold is over. */
   function closeUncertain(node: SessionNode, at: number): void {
     node.nextAttempt = 1
+    node.lastEndedAt = at
     // A hook at or after the end time is the next execution's, observed before this event (hooks are direct calls, events a pull
     // loop). While the session was withheld such hooks were not recorded, and their steps would find a clean record: the withhold
     // then carries over to the next execution's end, and what is that execution's is left open.
