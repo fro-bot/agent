@@ -222,6 +222,8 @@ export interface TurnModelStats {
   /** Refused primary requests still holding a place for their step events. */
   /** Primary request hook times held across sessions (bounded per session by `maxHookTimes`). */
   readonly hookTimes: number
+  /** Hook entries that still reference a request: only requests that are open. */
+  readonly historyRequestsHeld: number
   /** Times a session was withheld (see "Binding steps to requests"): zero in any run whose steps and hooks the join could place. */
   readonly withholds: number
   /** Steps bound to a request and still open, across sessions: each is released when its step ends or fails. */
@@ -373,10 +375,13 @@ interface ToolNote {
   after?: Extract<Observation, {kind: 'tool.after'}> | undefined
 }
 
-/** One primary request hook: when the plugin received it, and the request it opened (none when the span cap refused it). */
+/**
+ * One primary request hook: when the plugin received it, and the request it opened while that request is open. None when the span
+ * cap refused it or a loss stood for it, and none once the request closed: the record keeps no payload alive.
+ */
 interface HookRecord {
   readonly at: number
-  readonly request: RequestState | undefined
+  request: RequestState | undefined
   /** A step has been bound at this hook or a later one: its own step is done with, or will never come (steps run in order). */
   consumed: boolean
 }
@@ -667,6 +672,8 @@ export function createTurnModel(options: {
   ): void {
     if (request.closed) return
     request.closed = true
+    const hook = sessions.get(request.sessionId)?.hooks.find(candidate => candidate.request === request)
+    if (hook !== undefined) hook.request = undefined
     // The request's output moves into its record: it no longer counts against what open requests hold.
     heldOutputChars = Math.max(0, heldOutputChars - request.outputChars)
     request.trace.openSpans = Math.max(0, request.trace.openSpans - 1)
@@ -777,6 +784,7 @@ export function createTurnModel(options: {
           undefined,
           marks,
         )
+        removeRequest(node, request)
       }
       for (const tool of [...node.tools.values()].filter(candidate => candidate.trace === trace)) {
         node.tools.delete(tool.callId)
@@ -1358,9 +1366,13 @@ export function createTurnModel(options: {
   const oldestPending = (node: SessionNode, kind: RequestKind): RequestState | undefined =>
     node.requests.find(request => request.requestKind === kind && !request.closed && request.messageId === undefined)
 
+  /** A closed request leaves the session's records: a session can outlive the trace the request belonged to. */
   function removeRequest(node: SessionNode, request: RequestState): void {
     const index = node.requests.indexOf(request)
     if (index !== -1) node.requests.splice(index, 1)
+    if (request.messageId !== undefined && node.stepOwner.get(request.messageId) === request) {
+      node.stepOwner.delete(request.messageId)
+    }
   }
 
   function onRetry(o: Extract<Observation, {kind: 'retry'}>): void {
@@ -1407,7 +1419,6 @@ export function createTurnModel(options: {
     if (o.finish === undefined) request.gaps.add('finishReason')
     if (o.usage === undefined) request.gaps.add('usage')
     emitRequest(request, o.at, 'ok')
-    node.stepOwner.delete(o.messageId)
     removeRequest(node, request)
     touch(request.trace, o.at)
   }
@@ -1419,7 +1430,6 @@ export function createTurnModel(options: {
     request.usage = o.usage
     request.gaps.add('finishReason')
     emitRequest(request, o.at, o.error.type === 'aborted' ? 'interrupted' : 'error', o.error)
-    node.stepOwner.delete(o.messageId)
     removeRequest(node, request)
     touch(request.trace, o.at)
   }
@@ -1900,6 +1910,10 @@ export function createTurnModel(options: {
       bufferedSessions: buffered.size,
       bufferedBytes,
       hookTimes: [...sessions.values()].reduce((sum, node) => sum + node.hooks.length, 0),
+      historyRequestsHeld: [...sessions.values()].reduce(
+        (sum, node) => sum + node.hooks.filter(hook => hook.request !== undefined).length,
+        0,
+      ),
       withholds,
       openSteps: [...sessions.values()].reduce((sum, node) => sum + node.stepOwner.size, 0),
       tombstones: tombstones.size,

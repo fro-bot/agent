@@ -609,9 +609,28 @@ describe('the step join over generated sessions', () => {
       const {plans, observations, limits} = generated
       dropped += generated.dropped
       rollbacks += generated.rollbacks
-      const {records, model} = replay(observations, {limits})
-      const byTag = chatsByTag(records.filter((record): record is ChatRecord => record.kind === 'chat'))
       const problems: unknown[] = []
+      let hooked = 0
+      let finishedPrimaries = 0
+      const {records, model} = replay(observations, {
+        limits,
+        afterEach: (live, finished, observation) => {
+          if (observation.kind === 'request' && observation.requestKind === 'primary') hooked += 1
+          for (const record of finished) {
+            if (record.kind === 'chat' && record.requestKind === 'primary') finishedPrimaries += 1
+          }
+          const {openTraces, historyRequestsHeld} = live.stats()
+          // The hook record references only requests that are still open, and none once a root span is out and nothing else runs.
+          if (historyRequestsHeld > hooked - finishedPrimaries)
+            problems.push({historyRequestsHeld, hooked, finishedPrimaries})
+          const rootEmitted = finished.some(
+            record => record.kind === 'invoke_agent' && record.parentSpanId === undefined,
+          )
+          if (rootEmitted && openTraces === 0 && historyRequestsHeld !== 0)
+            problems.push({afterRoot: historyRequestsHeld})
+        },
+      })
+      const byTag = chatsByTag(records.filter((record): record is ChatRecord => record.kind === 'chat'))
       for (const [session, plan] of plans) {
         children += session.startsWith('k') ? 1 : 0
         bigRecord += plan.length > 64 ? 1 : 0
