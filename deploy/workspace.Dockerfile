@@ -238,7 +238,7 @@ FROM version-gate AS runtime
 WORKDIR /app
 
 # Pinned tool versions (track the runtime constants noted in the header).
-ARG SYSTEMATIC_VERSION=3.35.2
+ARG SYSTEMATIC_VERSION=3.36.0
 
 # System packages come from the base image's Alpine 3.24 branch and are not
 # pinned: the branch index drops older versions, so exact pins would break the
@@ -271,7 +271,7 @@ RUN apk add --no-cache \
 # Package managers for agent tasks: Bun (the binary `build-deps` verified) and npm 12. The base's bundled npm 11,
 # yarn and corepack are removed, because npm 11's own dependency tree carries HIGH CVEs that overrides can't reach
 # (#2117). The V2 plugin install below uses OpenCode's in-process arborist, not this npm.
-ARG NPM_VERSION=12.2.2
+ARG NPM_VERSION=12.2.3
 COPY --from=build-deps /usr/local/bin/bun /usr/local/bin/bun
 RUN set -euo pipefail \
     && case "${NPM_VERSION}" in \

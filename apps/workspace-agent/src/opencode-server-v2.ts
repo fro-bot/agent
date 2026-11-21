@@ -41,6 +41,7 @@ import {
   SYSTEMATIC_PACKAGE,
   SYSTEMATIC_V2_PLUGIN_ID,
   verifyPermissionRules,
+  WORKSPACE_TRACING_HOST,
 } from '@fro-bot/runtime/workspace-v2'
 import {MAX_CONFIG_FILE_BYTES, readOptionalBoundedFile, readOptionalSecretBlob} from './config.js'
 import {
@@ -533,6 +534,8 @@ export async function runSupervisedOpencodeV2(options: RunSupervisedOpencodeV2Op
             binaryPath,
             directory: rootDir,
             expectedPluginIds: WORKSPACE_V2_EXPECTED_PLUGIN_IDS,
+            // The plugin stays off in the workspace; the spawn writes the launcher variable that says so.
+            tracingHost: WORKSPACE_TRACING_HOST,
             config: built.data.content,
             env: buildOpencodeV2Env(parentEnv, databasePath),
             port,

@@ -15,7 +15,7 @@ import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import {fileURLToPath} from 'node:url'
-import {startOpenCodeV2Server, type OpenCodeV2ServerHandle} from '@fro-bot/runtime'
+import {ACTION_TRACING_OFF, startOpenCodeV2Server, type OpenCodeV2ServerHandle} from '@fro-bot/runtime'
 import {afterAll, beforeAll, describe, expect, it, vi} from 'vitest'
 import {startTlsUpstream, type TlsUpstream} from '../../../packages/runtime/src/agent/key-proxy-test-kit.js'
 import {createMockLogger, unwrapOk} from '../../shared/test-helpers.js'
@@ -118,6 +118,7 @@ describe.skipIf(!enabled)('the key proxy against the real OpenCode V2 binary', (
         binaryPath: BINARY ?? '',
         directory: workspace,
         expectedPluginIds: [],
+        tracingHost: ACTION_TRACING_OFF,
         env: {
           PATH: process.env.PATH,
           HOME: home,

@@ -3,11 +3,35 @@ import type {SyncIo} from './sync-opencode-v2-pin.ts'
 import {readFileSync} from 'node:fs'
 
 import {describe, expect, it, vi} from 'vitest'
-import {EXIT_USAGE, main, parseArgs, parsePin, parseSha256Sums, syncPinDigests} from './sync-opencode-v2-pin.ts'
+import {
+  EXIT_USAGE,
+  main,
+  parseArgs,
+  parsePin,
+  parseSha256Sums,
+  syncCloneDeps,
+  syncPinDigests,
+} from './sync-opencode-v2-pin.ts'
 
 const OLD = 'a'.repeat(64)
 const NEW_X64 = 'b'.repeat(64)
 const NEW_ARM = 'c'.repeat(64)
+
+const UPSTREAM = 'https://github.com/anomalyco/opencode.git'
+const OTHER = 'https://github.com/example/unrelated.git'
+
+function cloneDepsText(version: string): string {
+  const manifest = {
+    version: '1.0.0',
+    updatedAt: '2026-11-20T00:00:00.000Z',
+    dependencies: [
+      {name: 'server', resolvedVersion: version, repoUrl: UPSTREAM, ref: `v${version}`, packagePath: 'packages/server'},
+      {name: 'other', resolvedVersion: '0.0.1', repoUrl: OTHER, ref: 'v0.0.1'},
+      {name: 'plugin', resolvedVersion: version, repoUrl: UPSTREAM, ref: `v${version}`, packagePath: 'packages/plugin'},
+    ],
+  }
+  return `${JSON.stringify(manifest, null, 2)}\n`
+}
 
 describe('parseSha256Sums', () => {
   it('reads two-space, binary-marker and ./-prefixed lines and lower-cases the digest', () => {
@@ -65,6 +89,43 @@ describe('syncPinDigests', () => {
   })
 })
 
+describe('syncCloneDeps', () => {
+  it('sets resolvedVersion and ref on every upstream entry and leaves the rest of the file alone', () => {
+    // #given a manifest pinned to 2.2.0 with two upstream entries and one unrelated entry
+    const before = cloneDepsText('2.2.0')
+
+    // #when synced to 2.3.0
+    const after = syncCloneDeps(before, '2.3.0')
+
+    // #then both upstream entries move, and the unrelated entry, updatedAt and formatting are untouched
+    expect(after).toBe(cloneDepsText('2.3.0'))
+    expect((JSON.parse(after) as {dependencies: unknown[]}).dependencies[1]).toEqual({
+      name: 'other',
+      resolvedVersion: '0.0.1',
+      repoUrl: OTHER,
+      ref: 'v0.0.1',
+    })
+  })
+
+  it('returns identical bytes when the manifest is already in step', () => {
+    // #given a manifest already at 2.3.0
+    const before = cloneDepsText('2.3.0')
+
+    // #when / #then syncing to 2.3.0 changes nothing
+    expect(syncCloneDeps(before, '2.3.0')).toBe(before)
+  })
+
+  it.each([
+    ['unparseable JSON', '{nope'],
+    ['a non-object', '[]'],
+    ['no dependencies array', '{"version": "1.0.0"}'],
+    ['a non-object entry', '{"dependencies": ["x"]}'],
+  ])('rejects %s, naming the file', (_label, text) => {
+    // #given a malformed manifest / #when / #then
+    expect(() => syncCloneDeps(text, '2.3.0')).toThrow('.slim/clonedeps.json')
+  })
+})
+
 describe('parsePin', () => {
   it('accepts the committed pin file', () => {
     // #given the real pin file
@@ -98,13 +159,22 @@ interface Harness {
   readonly io: SyncIo
   readonly fetchMock: ReturnType<typeof vi.fn>
   readonly writes: string[]
+  readonly cloneDepsWrites: string[]
   readonly out: string[]
   readonly err: string[]
 }
 
-/** CLI harness: the pin file starts as `file`, and `sums` (or a thrown error) is what every fetch returns. */
-function harness(file: string, sums: string | Error | {readonly status: number}): Harness {
+/**
+ * CLI harness: the pin file starts as `file`, the source clone manifest as `cloneDeps` (in step with the pin's version
+ * by default), and `sums` (or a thrown error) is what every fetch returns.
+ */
+function harness(
+  file: string,
+  sums: string | Error | {readonly status: number},
+  cloneDeps: string | (() => string) = () => cloneDepsText((JSON.parse(file) as {version: string}).version),
+): Harness {
   const writes: string[] = []
+  const cloneDepsWrites: string[] = []
   const out: string[] = []
   const err: string[] = []
   const fetchMock = vi.fn(async () => {
@@ -116,10 +186,12 @@ function harness(file: string, sums: string | Error | {readonly status: number})
     fetch: fetchMock,
     readPin: () => file,
     writePin: contents => writes.push(contents),
+    readCloneDeps: typeof cloneDeps === 'string' ? () => cloneDeps : cloneDeps,
+    writeCloneDeps: contents => cloneDepsWrites.push(contents),
     stdout: text => out.push(text),
     stderr: text => err.push(text),
   }
-  return {io, fetchMock, writes, out, err}
+  return {io, fetchMock, writes, cloneDepsWrites, out, err}
 }
 
 const upstreamSums = `${NEW_X64}  ${X64}\n${NEW_ARM}  ${ARM}\n`
@@ -231,5 +303,81 @@ describe('main', () => {
     expect(await main([], h.io)).toBe(1)
     expect(h.writes).toEqual([])
     expect(h.err.join('')).toContain('sync-opencode-v2-pin:')
+  })
+
+  it('a version bump writes the pin and the manifest, with the same version in both', async () => {
+    // #given a pin bumped to 2.3.0 with a manifest still at 2.2.0
+    const h = harness(pinText('2.3.0', OLD, OLD), upstreamSums, cloneDepsText('2.2.0'))
+
+    // #when / #then
+    expect(await main([], h.io)).toBe(0)
+    expect(h.writes).toEqual([pinText('2.3.0', NEW_X64, NEW_ARM)])
+    expect(h.cloneDepsWrites).toEqual([cloneDepsText('2.3.0')])
+  })
+
+  it('writes only the manifest when the pin is current but the manifest lags', async () => {
+    // #given a pin that matches upstream and a manifest one version behind
+    const h = harness(pinText('2.3.0', NEW_X64, NEW_ARM), upstreamSums, cloneDepsText('2.2.0'))
+
+    // #when / #then
+    expect(await main([], h.io)).toBe(0)
+    expect(h.writes).toEqual([])
+    expect(h.cloneDepsWrites).toEqual([cloneDepsText('2.3.0')])
+  })
+
+  it('writes the manifest at the explicit version', async () => {
+    // #given in-step files at 2.2.0
+    const h = harness(pinText('2.2.0', NEW_X64, NEW_ARM), upstreamSums)
+
+    // #when run with an explicit newer version
+    expect(await main(['2.3.0'], h.io)).toBe(0)
+
+    // #then the manifest follows the requested version
+    expect(h.cloneDepsWrites).toEqual([cloneDepsText('2.3.0')])
+  })
+
+  it('writes neither file when both are already current', async () => {
+    // #given a pin and a manifest both in step
+    const h = harness(pinText('2.3.0', NEW_X64, NEW_ARM), upstreamSums, cloneDepsText('2.3.0'))
+
+    // #when / #then no diff is produced
+    expect(await main([], h.io)).toBe(0)
+    expect(h.writes).toEqual([])
+    expect(h.cloneDepsWrites).toEqual([])
+  })
+
+  it('--check exits 1 when only the manifest lags, and writes nothing', async () => {
+    // #given a pin that matches upstream and a stale manifest
+    const h = harness(pinText('2.3.0', NEW_X64, NEW_ARM), upstreamSums, cloneDepsText('2.2.0'))
+
+    // #when / #then
+    expect(await main(['--check'], h.io)).toBe(1)
+    expect(h.err.join('')).toContain('.slim/clonedeps.json')
+    expect(h.writes).toEqual([])
+    expect(h.cloneDepsWrites).toEqual([])
+  })
+
+  it('a malformed manifest exits 1, names the file and writes nothing, not even the pin', async () => {
+    // #given a bumped pin with stale digests and an unreadable manifest
+    const h = harness(pinText('2.3.0', OLD, OLD), upstreamSums, '{nope')
+
+    // #when / #then the half-updated state never reaches disk
+    expect(await main([], h.io)).toBe(1)
+    expect(h.err.join('')).toContain('.slim/clonedeps.json')
+    expect(h.writes).toEqual([])
+    expect(h.cloneDepsWrites).toEqual([])
+  })
+
+  it('a missing manifest exits 1, names the file and writes nothing', async () => {
+    // #given a manifest that cannot be read
+    const h = harness(pinText('2.3.0', OLD, OLD), upstreamSums, () => {
+      throw new Error('ENOENT: no such file or directory')
+    })
+
+    // #when / #then
+    expect(await main([], h.io)).toBe(1)
+    expect(h.err.join('')).toContain('.slim/clonedeps.json')
+    expect(h.writes).toEqual([])
+    expect(h.cloneDepsWrites).toEqual([])
   })
 })

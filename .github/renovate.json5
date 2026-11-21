@@ -189,6 +189,15 @@
       },
     },
     {
+      // The plugin inlines the OpenTelemetry SDK into its lazily loaded tracing chunk, so these packages move together:
+      // the SDK packages pin each other's versions and `deps.onlyBundle` in the plugin's tsdown config names them all.
+      // A release that adds a transitive package fails the plugin build until that list is updated, which is the point.
+      matchFileNames: ['packages/opencode-plugin/package.json'],
+      matchPackageNames: ['@opentelemetry/**'],
+      groupName: 'OpenTelemetry SDK (opencode-plugin)',
+      semanticCommitType: 'build',
+    },
+    {
       // The plugin package's `effect` follows `@opencode/plugin`'s exact pin (rule above), never its own latest.
       // `effect` v3 in other manifests keeps updating.
       matchFileNames: ['packages/opencode-plugin/package.json'],

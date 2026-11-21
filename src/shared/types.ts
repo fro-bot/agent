@@ -19,5 +19,6 @@ export type {
   RunContext,
   RunSummary,
   TokenUsage,
+  TracingInputs,
   ValidationResult,
 } from '@fro-bot/runtime'

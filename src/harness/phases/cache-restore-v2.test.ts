@@ -2,6 +2,7 @@ import type {OpenCodeV2ServerHandle, OpenCodeV2ShutdownResult} from '@fro-bot/ru
 import type {ActionInputs, CacheResult} from '../../shared/types.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
 import * as path from 'node:path'
+import {ACTION_TRACING_OFF} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMetricsCollector} from '../../features/observability/index.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
@@ -75,6 +76,7 @@ function inputs(overrides: Partial<ActionInputs> = {}): ActionInputs {
     repoSkills: false,
     isolateAgent: false,
     agentStateHome: null,
+    tracing: {enabled: false},
     storeConfig: {enabled: false, bucket: '', region: '', prefix: 'fro-bot-state'},
     ...overrides,
   }
@@ -142,7 +144,7 @@ describe('runCacheRestore on OpenCode V2', () => {
     const {runCacheRestore} = await import('./cache-restore.js')
 
     // #when
-    await runCacheRestore(bootstrap(V2_VERSION), createMetricsCollector())
+    await runCacheRestore(bootstrap(V2_VERSION), createMetricsCollector(), null, ACTION_TRACING_OFF)
 
     // #then
     const call = mocks.startActionOpenCodeV2.mock.calls[0]?.[0] as Record<string, unknown>
@@ -175,12 +177,32 @@ describe('runCacheRestore on OpenCode V2', () => {
     }
 
     // #when restoring with it, then without it
-    await runCacheRestore(bootstrap(V2_VERSION), createMetricsCollector(), repoSkills)
-    await runCacheRestore(bootstrap(V2_VERSION), createMetricsCollector())
+    await runCacheRestore(bootstrap(V2_VERSION), createMetricsCollector(), repoSkills, ACTION_TRACING_OFF)
+    await runCacheRestore(bootstrap(V2_VERSION), createMetricsCollector(), null, ACTION_TRACING_OFF)
 
     // #then the V2 start received the source the first time, and null the second
     expect(mocks.startActionOpenCodeV2.mock.calls[0]?.[0]).toMatchObject({repoSkills})
     expect(mocks.startActionOpenCodeV2.mock.calls[1]?.[0]).toMatchObject({repoSkills: null})
+  })
+
+  it('threads the tracing host to the V2 start unchanged, off or on with the relay port and run identity', async () => {
+    // #given an off host and an on host
+    mocks.startActionOpenCodeV2.mockResolvedValue({success: true, data: v2Handle().handle})
+    const {runCacheRestore} = await import('./cache-restore.js')
+    const on = {
+      host: 'action',
+      tracing: 'on',
+      relayPort: 43_210,
+      identity: {repository: 'owner/repo', runId: '777', attempt: '2', job: 'review', trigger: 'pull_request'},
+    } as const
+
+    // #when restoring with each
+    await runCacheRestore(bootstrap(V2_VERSION), createMetricsCollector(), null, ACTION_TRACING_OFF)
+    await runCacheRestore(bootstrap(V2_VERSION), createMetricsCollector(), null, on)
+
+    // #then the V2 start received exactly what the run decided
+    expect(mocks.startActionOpenCodeV2.mock.calls[0]?.[0]).toMatchObject({tracing: ACTION_TRACING_OFF})
+    expect(mocks.startActionOpenCodeV2.mock.calls[1]?.[0]).toMatchObject({tracing: on})
   })
 
   it.each([
@@ -195,7 +217,7 @@ describe('runCacheRestore on OpenCode V2', () => {
       const {runCacheRestore} = await import('./cache-restore.js')
 
       // #when restoring
-      await runCacheRestore(bootstrap(V2_VERSION, {}, credential), createMetricsCollector())
+      await runCacheRestore(bootstrap(V2_VERSION, {}, credential), createMetricsCollector(), null, ACTION_TRACING_OFF)
 
       // #then the V2 start received the bootstrap disposition, not one resolved from the environment
       expect(mocks.startActionOpenCodeV2.mock.calls[0]?.[0]).toMatchObject({credential})
@@ -218,7 +240,7 @@ describe('runCacheRestore on OpenCode V2', () => {
     const {runCacheRestore} = await import('./cache-restore.js')
 
     // #when
-    await runCacheRestore(bootstrap(V2_VERSION), createMetricsCollector())
+    await runCacheRestore(bootstrap(V2_VERSION), createMetricsCollector(), null, ACTION_TRACING_OFF)
 
     // #then
     expect(order).toEqual(['checkpoint', 'spawn'])
@@ -231,7 +253,7 @@ describe('runCacheRestore on OpenCode V2', () => {
     const {runCacheRestore} = await import('./cache-restore.js')
 
     // #when
-    const result = await runCacheRestore(bootstrap(V2_VERSION), createMetricsCollector())
+    const result = await runCacheRestore(bootstrap(V2_VERSION), createMetricsCollector(), null, ACTION_TRACING_OFF)
 
     // #then the server is left running for the loop and nothing failed
     expect(result).toMatchObject({serverHandle: handle})
@@ -248,7 +270,7 @@ describe('runCacheRestore on OpenCode V2', () => {
     const {runCacheRestore} = await import('./cache-restore.js')
 
     // #when
-    const result = await runCacheRestore(bootstrap(V2_VERSION), createMetricsCollector())
+    const result = await runCacheRestore(bootstrap(V2_VERSION), createMetricsCollector(), null, ACTION_TRACING_OFF)
 
     // #then
     expect(result).toBeNull()
@@ -260,7 +282,7 @@ describe('runCacheRestore on OpenCode V2', () => {
     mocks.startActionOpenCodeV2.mockResolvedValue({success: true, data: v2Handle().handle})
     const {runCacheRestore} = await import('./cache-restore.js')
 
-    await runCacheRestore(bootstrap(V2_VERSION, {model: null}), createMetricsCollector())
+    await runCacheRestore(bootstrap(V2_VERSION, {model: null}), createMetricsCollector(), null, ACTION_TRACING_OFF)
 
     expect(mocks.startActionOpenCodeV2.mock.calls[0]?.[0]).toMatchObject({model: null})
   })

@@ -152,7 +152,7 @@ jobs:
         uses: ./.github/actions/setup
       # A second tool-cache toolchain on PATH, so the suite can check that the agent's PATH mirrors the runner's.
       - name: Setup uv
-        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           enable-cache: false
       # pnpm under the runner home (~/setup-pnpm), next to the Bun the setup action installs (~/.bun): the suite checks that
@@ -289,7 +289,7 @@ jobs:
           v2_version="$(node -p 'JSON.parse(fs.readFileSync("packages/runtime/src/shared/opencode-v2-pin.json", "utf8")).version')"
           oc_version="$(opencode --version)"
           echo "opencode --version: ${oc_version} (pin: ${v2_version})"
-          if echo "${oc_version}" | grep -qF "harness"; then
+          if grep -qF "harness" <<<"${oc_version}"; then
             echo "REGRESSION: the Action default installed a harness build: ${oc_version}"
             exit 1
           fi
@@ -362,8 +362,8 @@ jobs:
             exit 1
           fi
           test "$status" -ne 0
-          echo "$output" | grep -q '"msg":"gateway startup failed"'
-          if echo "$output" | grep -q "ERR_MODULE_NOT_FOUND"; then
+          grep -q '"msg":"gateway startup failed"' <<<"$output"
+          if grep -q "ERR_MODULE_NOT_FOUND" <<<"$output"; then
             echo "REGRESSION: module resolution failed (ERR_MODULE_NOT_FOUND)"
             exit 1
           fi
@@ -391,11 +391,11 @@ jobs:
               echo "ASSERTION REJECTED: expected gateway exit 1 in $scenario, got $status"
               return 2
             fi
-            if ! echo "$output" | grep -Fq '"msg":"gateway startup failed"'; then
+            if ! grep -Fq '"msg":"gateway startup failed"' <<<"$output"; then
               echo "ASSERTION REJECTED: structured startup-failure message missing in $scenario"
               return 2
             fi
-            if echo "$output" | grep -Fq "ERR_MODULE_NOT_FOUND"; then
+            if grep -Fq "ERR_MODULE_NOT_FOUND" <<<"$output"; then
               echo "ASSERTION REJECTED: module resolution failed (ERR_MODULE_NOT_FOUND) in $scenario"
               return 2
             fi
@@ -508,7 +508,7 @@ jobs:
             echo "REGRESSION: operator-route-smoke exited $status — one or more operator routes are not registered in the shipped image"
             exit 1
           fi
-          if ! echo "$output" | grep -qE '^operator-route-smoke: all [0-9]+ operator routes registered$'; then
+          if ! grep -qE '^operator-route-smoke: all [0-9]+ operator routes registered$' <<<"$output"; then
             echo "REGRESSION: operator-route-smoke did not print the expected success marker"
             exit 1
           fi
@@ -519,7 +519,7 @@ jobs:
           # The HEALTHCHECK's mitmproxy probe relies on the base image's busybox `nc -z`
           # (no netcat package is installed): exit 0 on an open port, non-zero on a closed one.
           healthcheck="$(docker inspect --format '{{json .Config.Healthcheck.Test}}' fro-bot-gateway:smoke)"
-          if ! echo "$healthcheck" | grep -Fq 'nc -z mitmproxy 8080'; then
+          if ! grep -Fq 'nc -z mitmproxy 8080' <<<"$healthcheck"; then
             echo "REGRESSION: image HEALTHCHECK no longer contains the 'nc -z mitmproxy 8080' probe this step asserts: $healthcheck"
             exit 1
           fi
@@ -692,8 +692,8 @@ jobs:
             echo "REGRESSION: /healthz did not return 200 within 30s"
             exit 1
           fi
-          echo "$logs" | grep -q "workspace-agent listening on 0.0.0.0:9100"
-          if echo "$logs" | grep -q "ERR_MODULE_NOT_FOUND"; then
+          grep -q "workspace-agent listening on 0.0.0.0:9100" <<<"$logs"
+          if grep -q "ERR_MODULE_NOT_FOUND" <<<"$logs"; then
             echo "REGRESSION: module resolution failed (ERR_MODULE_NOT_FOUND)"
             exit 1
           fi
@@ -701,10 +701,10 @@ jobs:
           oc_version="$(docker exec "$cid" opencode --version)"
           echo "opencode --version: ${oc_version}"
           # Auth absent (no secret mounted) → fail-soft: boots, logs auth: absent.
-          echo "$logs" | grep -q "auth: absent"
+          grep -q "auth: absent" <<<"$logs"
           # No model/provider overlay → base config stands: updates disabled and
           # NO model field (deployer supplies it), and the overlay-absent log line.
-          echo "$logs" | grep -q "provider-overlay=none"
+          grep -q "provider-overlay=none" <<<"$logs"
           docker exec "$cid" sh -c 'grep -q "\"update\": \"disable\"" /home/opencode/.config/opencode/opencode.json'
           docker exec "$cid" sh -c '! grep -q "\"model\"" /home/opencode/.config/opencode/opencode.json'
           echo "OK: clone API up on :9100, opencode present, base config (no baked model), auth fail-soft"
@@ -768,8 +768,8 @@ jobs:
               process.exit(1)
             }
           ' "${v2_version}"
-          echo "${logs}" | grep -q "opencode-server-v2: ready"
-          if echo "${logs}" | grep -q "ERR_MODULE_NOT_FOUND"; then
+          grep -q "opencode-server-v2: ready" <<<"${logs}"
+          if grep -q "ERR_MODULE_NOT_FOUND" <<<"${logs}"; then
             echo "REGRESSION: module resolution failed (ERR_MODULE_NOT_FOUND)"
             exit 1
           fi
@@ -777,7 +777,7 @@ jobs:
           # 3. The binary is stock V2 at the pin: no +harness build.
           oc_version="$(docker exec "$cid" opencode --version)"
           echo "opencode --version: ${oc_version}"
-          if echo "${oc_version}" | grep -qF "harness"; then
+          if grep -qF "harness" <<<"${oc_version}"; then
             echo "REGRESSION: V2 image reports a harness build: ${oc_version}"
             exit 1
           fi
@@ -898,7 +898,7 @@ jobs:
             *"provider credentials provisioned"*) : ;;
             *) echo "REGRESSION: the supervisor did not log credential provisioning"; exit 1 ;;
           esac
-          if echo "${logs}" | grep -qF "${smoke_key}"; then
+          if grep -qF "${smoke_key}" <<<"${logs}"; then
             echo "REGRESSION: the provider key leaked into the workspace logs"
             exit 1
           fi
@@ -993,10 +993,10 @@ jobs:
           logs="$(docker logs "$cid" 2>&1)"
           echo "--- workspace logs ---"; echo "$logs"
           [ "$ok" = "true" ] || { echo "REGRESSION: /healthz down with auth provisioned"; exit 1; }
-          echo "$logs" | grep -q "auth: present"
+          grep -q "auth: present" <<<"$logs"
           # No auth.json under the agent home; the secret must NOT appear in logs.
           docker exec "$cid" sh -c '! test -e /home/opencode/.local/share/opencode/auth.json'
-          if echo "$logs" | grep -q "sk-dummy-not-real"; then
+          if grep -q "sk-dummy-not-real" <<<"$logs"; then
             echo "REGRESSION: auth secret leaked into logs"; exit 1
           fi
           echo "OK: valid auth blob → validated, auth: present, no auth.json written, no secret in logs"
@@ -1018,7 +1018,7 @@ jobs:
           set -e
           echo "--- output ---"; echo "$output"
           [ "$status" -ne 0 ] || { echo "REGRESSION: malformed auth blob did not fail startup"; exit 1; }
-          echo "$output" | grep -q "auth secret is present but invalid"
+          grep -q "auth secret is present but invalid" <<<"$output"
           echo "OK: malformed auth blob rejected at startup"
       - name: Smoke-test model + provider overlay (cliproxyapi-shaped config applied)
         run: |
@@ -1045,7 +1045,7 @@ jobs:
           logs="$(docker logs "$cid" 2>&1)"
           echo "--- workspace logs ---"; echo "$logs"
           [ "$ok" = "true" ] || { echo "REGRESSION: /healthz down with config overlay"; exit 1; }
-          echo "$logs" | grep -q "provider-overlay=merged-into-config-file"
+          grep -q "provider-overlay=merged-into-config-file" <<<"$logs"
           # Effective config carries the overlaid model + provider baseURL, AND the
           # hostile overlay could NOT re-enable autoupdate.
           docker exec "$cid" sh -c 'grep -q "\"model\": \"anthropic/claude-sonnet-4-6\"" /home/opencode/.config/opencode/opencode.json'
@@ -1068,7 +1068,7 @@ jobs:
           set -e
           echo "--- output ---"; echo "$output"
           [ "$status" -ne 0 ] || { echo "REGRESSION: malformed config overlay did not fail startup"; exit 1; }
-          echo "$output" | grep -q "WORKSPACE_OPENCODE_CONFIG is not valid JSON"
+          grep -q "WORKSPACE_OPENCODE_CONFIG is not valid JSON" <<<"$output"
           echo "OK: malformed config overlay rejected at startup"
       - name: Smoke-test combined auth + model + provider overlay
         run: |
@@ -1093,8 +1093,8 @@ jobs:
           logs="$(docker logs "$cid" 2>&1)"
           echo "--- workspace logs ---"; echo "$logs"
           [ "$ok" = "true" ] || { echo "REGRESSION: /healthz down with combined auth+model+overlay"; exit 1; }
-          echo "$logs" | grep -q "auth: present"
-          echo "$logs" | grep -q "provider-overlay=merged-into-config-file"
+          grep -q "auth: present" <<<"$logs"
+          grep -q "provider-overlay=merged-into-config-file" <<<"$logs"
           docker exec "$cid" sh -c '! test -e /home/opencode/.local/share/opencode/auth.json'
           docker exec "$cid" sh -c 'grep -q "\"model\": \"anthropic/claude-sonnet-4-6\"" /home/opencode/.config/opencode/opencode.json'
           docker exec "$cid" sh -c 'grep -q "cliproxy.fro.bot/v1" /home/opencode/.config/opencode/opencode.json'
@@ -1121,7 +1121,7 @@ jobs:
           logs="$(docker logs "$cid" 2>&1)"
           echo "--- workspace logs ---"; echo "$logs"
           [ "$ok" = "true" ] || { echo "REGRESSION: /healthz down with model-only overlay"; exit 1; }
-          echo "$logs" | grep -q "provider-overlay=none"
+          grep -q "provider-overlay=none" <<<"$logs"
           docker exec "$cid" sh -c 'grep -q "\"model\": \"anthropic/claude-sonnet-4-6\"" /home/opencode/.config/opencode/opencode.json'
           docker exec "$cid" sh -c '! grep -q "\"provider\"" /home/opencode/.config/opencode/opencode.json'
           docker exec "$cid" sh -c 'grep -q "\"update\": \"disable\"" /home/opencode/.config/opencode/opencode.json'
@@ -1147,7 +1147,7 @@ jobs:
           logs="$(docker logs "$cid" 2>&1)"
           echo "--- workspace logs ---"; echo "$logs"
           [ "$ok" = "true" ] || { echo "REGRESSION: /healthz down with whitespace-only auth"; exit 1; }
-          echo "$logs" | grep -q "auth: absent"
+          grep -q "auth: absent" <<<"$logs"
           docker exec "$cid" sh -c '! test -f /home/opencode/.local/share/opencode/auth.json'
           echo "OK: whitespace auth file treated as absent — clone-only boots, no auth.json written"
       - name: Version gate (the default builds the pin; a harness, V1, unpinned or non-V2 version aborts before any download)
@@ -1165,7 +1165,7 @@ jobs:
             args=(--no-cache --progress=plain --target version-gate -f deploy/workspace.Dockerfile -t fro-bot-workspace:version-gate-test .)
             if [ -n "${build_arg}" ]; then args=(--build-arg "${build_arg}" "${args[@]}"); fi
             gate_output="$(docker build "${args[@]}" 2>&1)" || { echo "${gate_output}"; echo "REGRESSION: the gate refused '${build_arg}'"; exit 1; }
-            echo "${gate_output}" | grep -qF "OpenCode V2 version: ${pin}" || { echo "${gate_output}"; echo "REGRESSION: the gate did not resolve ${pin} for '${build_arg}'"; exit 1; }
+            grep -qF "OpenCode V2 version: ${pin}" <<<"${gate_output}" || { echo "${gate_output}"; echo "REGRESSION: the gate did not resolve ${pin} for '${build_arg}'"; exit 1; }
             echo "OK: gate resolved ${pin} for '${build_arg}'"
           done
 
@@ -1177,11 +1177,11 @@ jobs:
             }
             echo "--- docker build output for OPENCODE_VERSION='${bad_version}' (expected failure) ---"
             echo "${build_output}"
-            echo "${build_output}" | grep -qF "${pin_file}" || { echo "REGRESSION: the failure does not name ${pin_file}"; exit 1; }
+            grep -qF "${pin_file}" <<<"${build_output}" || { echo "REGRESSION: the failure does not name ${pin_file}"; exit 1; }
             if [ "${bad_version}" = "2.0.0" ]; then
-              echo "${build_output}" | grep -qF "is not the pinned V2 version ${pin}" || { echo "REGRESSION: 2.0.0 was not refused as a pin mismatch"; exit 1; }
+              grep -qF "is not the pinned V2 version ${pin}" <<<"${build_output}" || { echo "REGRESSION: 2.0.0 was not refused as a pin mismatch"; exit 1; }
             fi
-            if echo "${build_output}" | grep -qE 'curl -fsSL|apk add|SHA256 mismatch'; then
+            if grep -qE 'curl -fsSL|apk add|SHA256 mismatch' <<<"${build_output}"; then
               echo "REGRESSION: a download step ran before the version gate refused '${bad_version}'"
               exit 1
             fi
