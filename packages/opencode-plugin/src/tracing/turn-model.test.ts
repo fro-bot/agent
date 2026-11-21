@@ -3838,6 +3838,151 @@ describe('a step belongs to the latest primary hook at or before its own start t
       expect(model.stats().withholds).toBe(1)
     })
 
+    /** A first execution with one step, then the next execution's first hook observed before the first execution's end event. */
+    const overtakenNoSurvivor = (tail: (s: ReturnType<typeof script>) => void, endAtMs = 200) => {
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      step(s, 'p', 'mA', 100, 'A TEXT')
+      hook(s, 'p', 210)
+      endedAt(s, endAtMs)
+      s.started('p')
+      tail(s)
+      return s
+    }
+
+    it('withholds the next execution when no title keeps the session and B1’s step starts in B2’s millisecond', () => {
+      // #given the end event arriving after B1's hook, A's trace closing with nothing else keeping the session, and B1's step
+      // starting in the millisecond of B2's hook
+      const s = overtakenNoSurvivor(t => {
+        hook(t, 'p', 220)
+        step(t, 'p', 'mB1', 220, 'B1 RESPONSE')
+        step(t, 'p', 'mB2', 230, 'B2 RESPONSE')
+        t.ended('p')
+      })
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then B1's request, closed by A's trace, is empty with the gap `output`; B2's carries no step data; B1's response is on no span
+      const [first, second] = primaries(records).filter(candidate => candidate.start >= 210)
+      expect(first).toMatchObject({start: 210, texts: [], messageId: undefined, usage: undefined})
+      expect(first?.gaps).toContain('output')
+      expect(second?.start).toBe(220)
+      expectNoStepData(second as ChatRecord)
+      expect(JSON.stringify(records)).not.toMatch(/B1 RESPONSE|B2 RESPONSE/)
+      expect(chatWith(records, 'A TEXT')?.messageId).toBe('mA')
+      expect(model.stats().withholds).toBe(1)
+    })
+
+    it('keeps a withheld session through the close of the trace that nothing else keeps alive', () => {
+      // #given a withheld session whose next execution's hooks were swallowed before the end event, and no title
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      hook(s, 'p', 105)
+      step(s, 'p', 'mA', 105, 'A TEXT')
+      hook(s, 'p', 210)
+      hook(s, 'p', 220)
+      endedAt(s, 200)
+      s.started('p')
+      hook(s, 'p', 300)
+      step(s, 'p', 'mB2', 300, 'B2 RESPONSE')
+      s.ended('p')
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then
+      expect(JSON.stringify(records)).not.toContain('B2 RESPONSE')
+      for (const chat of primaries(records).filter(candidate => candidate.start >= 300)) expectNoStepData(chat)
+      expect(model.stats().withholds).toBe(1)
+    })
+
+    it('forgets a session at the close of its trace when every hook is settled and it is not withheld', () => {
+      // #given two executions, each with its own request and step, the end event arriving before the next hook
+      const s = script()
+      s.turn('p', '1')
+      s.turn('p', '2')
+
+      // #when
+      const {model} = replay(s.out, {flush: false})
+
+      // #then nothing of the session is left
+      expect(model.stats()).toMatchObject({
+        sessions: 0,
+        openTraces: 0,
+        hookTimes: 0,
+        historyRequestsHeld: 0,
+        openSteps: 0,
+      })
+    })
+
+    it('forgets the session at the idle bound when its record was kept for an unsettled hook', () => {
+      // #given a session kept at the close of A's trace by B1's hook, which is later than the end time
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      step(s, 'p', 'mA', 100, 'A TEXT')
+      hook(s, 'p', 210)
+      endedAt(s, 200)
+      const limits = {sessionIdleMs: 1_000}
+      const kept = replay(s.out, {limits, flush: false}).model.stats()
+      s.tick(2_000)
+
+      // #when the idle time passes
+      const {model} = replay(s.out, {limits, flush: false})
+
+      // #then
+      expect(kept).toMatchObject({sessions: 1, hookTimes: 2, historyRequestsHeld: 0})
+      expect(model.stats()).toMatchObject({sessions: 0, hookTimes: 0, historyRequestsHeld: 0})
+    })
+
+    describe('with ordinary gaps and the same overtaking order', () => {
+      const ordinary = (order: 'one hook before the step' | 'both hooks before the step') => {
+        const s = script()
+        s.started('p')
+        hook(s, 'p', 100)
+        step(s, 'p', 'mA', 115, 'A TEXT')
+        hook(s, 'p', 150)
+        if (order === 'both hooks before the step') hook(s, 'p', 200)
+        endedAt(s, 135)
+        s.started('p')
+        step(s, 'p', 'mB1', 165, 'B1 TEXT')
+        if (order === 'one hook before the step') hook(s, 'p', 200)
+        step(s, 'p', 'mB2', 215, 'B2 TEXT')
+        s.ended('p')
+        return replay(s.out, {flush: false})
+      }
+
+      it('exports B1 empty and B2 whole when only B1’s hook overtook the end event', () => {
+        // #when
+        const {records, model} = ordinary('one hook before the step')
+
+        // #then B1's request was closed by A's trace and its step bound nothing; B2 binds its own
+        const [, first, second] = primaries(records)
+        expect(first).toMatchObject({start: 150, texts: [], messageId: undefined})
+        expect(first?.gaps).toContain('output')
+        expect(second).toMatchObject({start: 200, texts: ['B2 TEXT'], messageId: 'mB2'})
+        expect(JSON.stringify(records)).not.toContain('B1 TEXT')
+        expect(model.stats().withholds).toBe(0)
+      })
+
+      it('exports both empty, with no foreign content, when both hooks overtook it', () => {
+        // #when
+        const {records, model} = ordinary('both hooks before the step')
+
+        // #then both requests were closed by A's trace
+        const [, first, second] = primaries(records)
+        for (const chat of [first, second]) {
+          expect(chat).toMatchObject({texts: [], messageId: undefined})
+          expect(chat?.gaps).toContain('output')
+        }
+        expect(JSON.stringify(records)).not.toMatch(/B1 TEXT|B2 TEXT/)
+        expect(model.stats().withholds).toBe(0)
+      })
+    })
+
     it('never gives a step to the request of a hook the execution boundary settled', () => {
       // #given an abandoned request kept by a title, the execution's end, and a step that resolves to its hook
       const s = script()

@@ -810,7 +810,15 @@ export function createTurnModel(options: {
     for (const node of trace.nodes.values()) {
       node.active = node.active?.trace === trace ? undefined : node.active
       if (node.traces.size === 0 && node.childOf?.trace === trace) sessions.delete(node.id)
-      else if (node.traces.size === 0 && node.pending.length === 0 && node.requests.every(r => r.closed)) {
+      else if (
+        node.traces.size === 0 &&
+        node.pending.length === 0 &&
+        node.requests.every(r => r.closed) &&
+        // The record is kept while it holds a hook no step has settled (the next execution's, seen before this end) or the
+        // session is withheld: the idle bounds forget it.
+        !node.withheld &&
+        node.hooks.every(hook => hook.consumed)
+      ) {
         sessions.delete(node.id)
       }
     }

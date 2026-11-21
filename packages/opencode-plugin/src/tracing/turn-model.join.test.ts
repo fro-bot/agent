@@ -287,6 +287,7 @@ interface Case {
   readonly rollbacks: number
   readonly stepBacks: number
   readonly boundaries: number
+  readonly noSurvivors: number
 }
 
 function build(seed: number, config: Config): Case {
@@ -297,6 +298,7 @@ function build(seed: number, config: Config): Case {
   const entries: {item: Item; delivery: number; order: number}[] = []
   let order = 0
   let boundaries = 0
+  let noSurvivors = 0
   const lagChoice = pick<number>(
     random,
     adversarial
@@ -355,7 +357,7 @@ function build(seed: number, config: Config): Case {
         outcome: 'succeeded',
       })),
     )
-    // A second execution in the same session: the first ends in the millisecond before the next hook, and a pending title keeps
+    // A second execution in the same session: the first ends in the millisecond before the next hook, and a pending title may keep
     // its trace and the session. Its end event is pulled with the rest of the events, so the next execution's hooks, which are
     // direct calls, may be observed before it.
     const plan = plans.get(session) ?? []
@@ -372,8 +374,11 @@ function build(seed: number, config: Config): Case {
       random() < 0.4
     ) {
       const tEnd = after.t - 1
-      items.push(
-        {
+      // Half of them have no survivor: the first execution's trace closes at its end and the session with it, unless the record
+      // still holds a hook of the next execution.
+      const survivor = random() < 0.5
+      if (survivor) {
+        items.push({
           session,
           channel: 'hook',
           t: first.t - 1,
@@ -388,7 +393,9 @@ function build(seed: number, config: Config): Case {
             provider: 'p',
             content: {messages: []},
           }),
-        },
+        })
+      }
+      items.push(
         marker(session, tEnd, wall => ({
           kind: 'execution.ended',
           at: wall(tEnd),
@@ -398,6 +405,7 @@ function build(seed: number, config: Config): Case {
         marker(session, tEnd, wall => ({kind: 'execution.started', at: wall(tEnd), sessionId: session})),
       )
       boundaries += 1
+      noSurvivors += survivor ? 0 : 1
     }
     deliver(items)
     if (!withChild) continue
@@ -579,7 +587,7 @@ function build(seed: number, config: Config): Case {
       })
     } else observations.push(observation)
   }
-  return {seed, plans, observations, limits, dropped, rollbacks, stepBacks, boundaries}
+  return {seed, plans, observations, limits, dropped, rollbacks, stepBacks, boundaries, noSurvivors}
 }
 
 const SEEDS = 20_000
@@ -664,6 +672,7 @@ describe('the step join over generated sessions', () => {
     let rollbacks = 0
     let stepBacks = 0
     let boundaries = 0
+    let noSurvivors = 0
     let withheld = 0
     let sameMs = 0
     let bigRecord = 0
@@ -677,6 +686,7 @@ describe('the step join over generated sessions', () => {
       rollbacks += generated.rollbacks
       stepBacks += generated.stepBacks
       boundaries += generated.boundaries
+      noSurvivors += generated.noSurvivors
       const problems: unknown[] = []
       let hooked = 0
       let finishedPrimaries = 0
@@ -732,7 +742,7 @@ describe('the step join over generated sessions', () => {
     }
     if (process.env.FRO_BOT_JOIN_STATS === '1') {
       process.stdout.write(
-        `join stats: ${JSON.stringify({checked, uncertain, kept, dropped, rollbacks, stepBacks, boundaries, withheld, sameMs, bigRecord, children, zeroRuns, slowStarts})}\n`,
+        `join stats: ${JSON.stringify({checked, uncertain, kept, dropped, rollbacks, stepBacks, boundaries, noSurvivors, withheld, sameMs, bigRecord, children, zeroRuns, slowStarts})}\n`,
       )
     }
     // The generator exercises what it claims to.
@@ -743,6 +753,7 @@ describe('the step join over generated sessions', () => {
     expect(rollbacks).toBeGreaterThan(SEEDS / 20)
     expect(stepBacks).toBeGreaterThan(SEEDS / 20)
     expect(boundaries).toBeGreaterThan(SEEDS / 20)
+    expect(noSurvivors).toBeGreaterThan(SEEDS / 40)
     expect(sameMs).toBeGreaterThan(SEEDS / 8)
     expect(bigRecord).toBeGreaterThan(SEEDS / 200)
     expect(children).toBeGreaterThan(SEEDS / 10)
