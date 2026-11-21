@@ -382,7 +382,7 @@ interface ToolNote {
 interface HookRecord {
   readonly at: number
   request: RequestState | undefined
-  /** A step has been bound at this hook or a later one: its own step is done with, or will never come (steps run in order). */
+  /** A step has resolved to this hook (bound or not), or its execution ended after it: its own step is done with, or will never come. */
   consumed: boolean
 }
 
@@ -409,6 +409,10 @@ interface SessionNode {
    * exactly as long as the record does.
    */
   withheld: boolean
+  /** The newest primary hook time this session was told of, recorded or not: what an execution's end is compared with. */
+  newestHookAt: number
+  /** When the session's latest execution ended, by the end event's own time. */
+  lastEndedAt: number
   nextAttempt: number
   lastActivity: number
 }
@@ -570,6 +574,8 @@ export function createTurnModel(options: {
       stepOwner: new Map(),
       hooks: [],
       withheld: false,
+      newestHookAt: Number.NEGATIVE_INFINITY,
+      lastEndedAt: Number.NEGATIVE_INFINITY,
       nextAttempt: 1,
       lastActivity: at,
     }
@@ -578,7 +584,7 @@ export function createTurnModel(options: {
     const lost = earlyLostHooks.get(sessionId)
     if (lost !== undefined) {
       earlyLostHooks.delete(sessionId)
-      recordHook(node, lost, undefined)
+      recordHook(node, lost, undefined, true)
     }
     enforceIdleBound(node)
     return node
@@ -807,11 +813,21 @@ export function createTurnModel(options: {
     for (const node of trace.nodes.values()) {
       node.active = node.active?.trace === trace ? undefined : node.active
       if (node.traces.size === 0 && node.childOf?.trace === trace) sessions.delete(node.id)
-      else if (node.traces.size === 0 && node.pending.length === 0 && node.requests.every(r => r.closed)) {
+      else if (
+        node.traces.size === 0 &&
+        node.pending.length === 0 &&
+        node.requests.every(r => r.closed) &&
+        // The record is kept while it holds a hook no step has settled (the next execution's, seen before this end) or the
+        // session is withheld: the idle bounds forget it.
+        !node.withheld &&
+        node.hooks.every(hook => hook.consumed)
+      ) {
         sessions.delete(node.id)
       }
     }
     traces.delete(trace)
+    // A session kept above for its record is idle now: the idle limit holds at this point too, not only at allocation.
+    for (const node of trace.nodes.values()) if (sessions.get(node.id) === node && isIdle(node)) enforceIdleBound(node)
   }
 
   function rememberTombstone(childId: string, traceId: string): void {
@@ -1103,6 +1119,9 @@ export function createTurnModel(options: {
   function onExecutionStarted(o: Extract<Observation, {kind: 'execution.started'}>): void {
     const node = route(o)
     if (node === undefined) return
+    // An execution cannot start before the previous one ended (or in the same millisecond, in any recording): the clock stepped
+    // back across the boundary, and the previous end event settles hooks by a time that no longer orders them.
+    if (o.at <= node.lastEndedAt) withhold(node)
     if (node.active === undefined) beginExecution(node, o.at)
   }
 
@@ -1208,7 +1227,7 @@ export function createTurnModel(options: {
     node.requests.push(request)
     if (o.requestKind === 'primary') {
       if (node.withheld) request.bindUncertain = true
-      else recordHook(node, o.at, request)
+      recordHook(node, o.at, request)
     }
   }
 
@@ -1218,10 +1237,11 @@ export function createTurnModel(options: {
   // joined to its request by TIME, never by arrival order. A `step.started` carries `started`, the server's clock at the start of
   // its attempt, taken after the request hook returned and before the provider was called: hook(n) <= started(n) <= hook(n+1) in
   // real time, as integers of the same clock. So a step belongs to the session's LATEST primary hook whose receive time is at or
-  // before `started`, and the one way that is wrong is `started(n) == hook(n+1)`, a step that starts, runs and ends in the very
-  // millisecond the next hook arrives (the gap between hook(n) and `started(n)` can be anything, another plugin's hook may sit in
-  // it). Arrival order cannot be used: the hook is a direct call and the events come through a pull loop, so hook(n+1) is often
-  // seen before step.started(n).
+  // before `started`, provided every earlier hook already has its step. It is wrong only when an earlier hook's step is the one in
+  // hand: `started(n) == hook(n+1)` (a step that starts, runs and ends in the very millisecond the next hook arrives; the gap
+  // between hook(n) and `started(n)` can be anything, another plugin's hook may sit in it), or a wall clock that stepped back
+  // between hook(n) and `started(n)`, so that hook(n+1) reads earlier than `started(n)`. Arrival order cannot be used: the hook is
+  // a direct call and the events come through a pull loop, so hook(n+1) is often seen before step.started(n).
   //
   // A step binds the request of that hook if it is still open and has no step, and the session is not withheld. Otherwise it binds
   // nothing and its later events (by message id) are ignored. A step older than every recorded hook binds nothing, and nothing
@@ -1231,28 +1251,35 @@ export function createTurnModel(options: {
   // not finished (waiting or bound) and every later one exports no step data: only the hook's own agent, model, provider and
   // request, an incomplete outcome and the gap `step-binding-uncertain`, with no synthesized finish reason. It clears only on an
   // observed `execution.ended` for the session, and then the hook record restarts empty. It is set by exactly these triggers:
-  //   1. An ambiguous step: `started` equals the time of the latest hook at or before it AND an earlier hook is still unconsumed.
-  //      That earlier hook may own the step (it started, ran and ended in the millisecond the later hook arrived). A hook is
-  //      consumed when a step is bound at it or at a later hook; steps of a session arrive in publish order, so ordinarily every
-  //      earlier hook has had its step and nothing is ever withheld. `hook(n+1) - hook(n) <= 1` needs no rule of its own: the step
-  //      that could be mistaken for it arrives with `started` equal to the later hook's time, which this trigger catches, whether
-  //      or not hook(n)'s step event was ever seen. Over-withholding (an orphan hook that never gets a step, as after a recovery,
-  //      then a step in its successor's millisecond) is accepted; under-withholding is not.
+  //   1. An ambiguous step: it resolves to a hook and an EARLIER hook is still unconsumed. That earlier hook may own the step
+  //      (equal-millisecond start, or a clock step-back between its hook and its start). A hook is consumed when a step has
+  //      resolved to it, bound or not (a refused or lost hook's time-only entry too), or when its execution ended before it. Steps of a
+  //      session arrive in publish order, so ordinarily every earlier hook has had its step and nothing is ever withheld; a hook
+  //      observed AHEAD of earlier step events is not an earlier hook of any step before it. Over-withholding is accepted: an
+  //      abandoned request (a hook that never gets a step, as after a recovery) withholds the session at its next step, until the
+  //      execution ends. Under-withholding is not.
   //   2. The clock went backwards: a primary hook earlier than the previous one. Old-epoch steps may still be in flight and no
-  //      time can be trusted. (Residual, undetectable: a rollback between a hook and its own step's `started` while an older orphan
-  //      hook waits, and one smaller than the gap between a step's start and the next hook with that step delayed past the hook.)
+  //      time can be trusted. (A step-back that leaves the later hook later than the previous one is trigger 1's: the step in flight
+  //      finds its own hook still waiting. Residual, undetectable: one across an execution boundary that reads the next execution's
+  //      hook before the previous end event's time and after the previous hook.)
   //   3. A loss without complete evidence: a loss marker that is a broadcast (it names no session: an unattributed drop, or more
   //      sessions than a marker can hold), or whose lost-hook times no longer fit. A marker that names its session and carries the
   //      time of every primary hook it stands for does not withhold: the hook is recorded like a refused one (it holds no request,
-  //      so a step that resolves to it binds nothing, and it counts for trigger 1 and 2), and the session's unfinished requests are
+  //      so a step that resolves to it binds nothing, and it counts for trigger 1 and 2: its own step is awaited), and the session's unfinished requests are
   //      marked uncertain (the loss may have been a request's `step.started` or part of its output, which would show as the whole).
   //   4. A step whose `started` is missing or not a finite number: an event the join cannot place.
+  //   5. An execution that starts at or before the previous one's end (by the events' own times; no recording has a gap under
+  //      45 ms): the clock stepped back across the boundary, so the end event settles hooks by a time that no longer orders them.
+  //      (Residual, undetectable: a step-back after the start, and one across a boundary whose session was forgotten at its end,
+  //      which nothing remembers.)
   //   Also: the hook record is bounded (`maxHookTimes`); evicting a hook that was never consumed withholds (its step could still
   //   arrive and there would be nothing to compare it with).
   // Not a trigger: a request refused at the span cap. Its hook is recorded with no request, so its step resolves to it and binds
   // nothing; whether that step could be someone else's is trigger 1's question like any other.
 
-  function recordHook(node: SessionNode, at: number, request: RequestState | undefined): void {
+  function recordHook(node: SessionNode, at: number, request: RequestState | undefined, lost = false): void {
+    // A lost hook is told by an event, in event order: its time says nothing about the clock, only that the hook happened.
+    node.newestHookAt = lost ? Math.max(node.newestHookAt, at) : at
     if (node.withheld) return
     const newest = node.hooks.at(-1)
     if (newest !== undefined && at < newest.at) {
@@ -1297,12 +1324,12 @@ export function createTurnModel(options: {
     while (index >= 0 && (node.hooks[index]?.at ?? Number.POSITIVE_INFINITY) > started) index -= 1
     const found = node.hooks[index]
     if (found === undefined) return undefined
-    if (found.at === started && node.hooks.slice(0, index).some(hook => !hook.consumed)) {
+    const waiting = node.hooks.findIndex(hook => !hook.consumed)
+    if (waiting !== -1 && waiting < index) {
       withhold(node)
       return undefined
     }
-    // Steps run in order: whatever precedes this hook has had its step, or never will.
-    for (const hook of node.hooks.slice(0, index + 1)) hook.consumed = true
+    found.consumed = true
     return found
   }
 
@@ -1319,7 +1346,7 @@ export function createTurnModel(options: {
       if (node !== undefined) {
         if (broadcast) withhold(node)
         else {
-          if (lostHook !== undefined) recordHook(node, lostHook, undefined)
+          if (lostHook !== undefined) recordHook(node, lostHook, undefined, true)
           markUnfinished(node)
         }
       } else if (buffered.has(sessionId)) {
@@ -1354,9 +1381,22 @@ export function createTurnModel(options: {
   /** The execution ended: what waited for a step that cannot be trusted is closed, as incomplete, and the withhold is over. */
   function closeUncertain(node: SessionNode, at: number): void {
     node.nextAttempt = 1
-    node.withheld = false
+    node.lastEndedAt = at
+    // A hook at or after the end time is the next execution's, observed before this event (hooks are direct calls, events a pull
+    // loop). While the session was withheld such hooks were not recorded, and their steps would find a clean record: the withhold
+    // then carries over to the next execution's end, and what is that execution's is left open.
+    const carriesOver = node.withheld && node.newestHookAt >= at
+    node.withheld = carriesOver
+    // A step is published before its execution's end, so a hook of that execution that still has none never gets it. `at` is the
+    // end event's own server time, taken when it was published; the next execution's hooks come after it. A hook at exactly that
+    // time is left alone: it may be the next execution's. A settled hook never receives a step.
+    for (const hook of node.hooks) {
+      if (hook.at >= at) continue
+      hook.consumed = true
+      hook.request = undefined
+    }
     for (const request of [...node.requests]) {
-      if (!request.bindUncertain || request.closed) continue
+      if (!request.bindUncertain || request.closed || (carriesOver && request.start >= at)) continue
       request.gaps.add('output')
       emitRequest(request, at, 'interrupted', undefined, ['incomplete'])
       removeRequest(node, request)

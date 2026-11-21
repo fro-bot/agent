@@ -2299,8 +2299,36 @@ describe('a step belongs to the latest primary hook at or before its own start t
     expect(chatWith(records, 'one')?.messageId).toBe('m1')
   })
 
-  it('does not shift later steps when a refused request’s step.started never comes, and both later requests are admitted (the second review’s case)', () => {
-    // #given a cap of two: both slots filled, R refused, both slots freed by their steps, then A and B admitted; R's start is lost
+  it('does not shift later steps when a refused request’s step.started is delivered, and both later requests are admitted (the second review’s case)', () => {
+    // #given a cap of two: both slots filled, R refused, both slots freed by their steps, R's step discarded, then A and B admitted
+    const s = script()
+    s.started('p')
+    hook(s, 'p', 100)
+    hook(s, 'p', 200)
+    hook(s, 'p', 300)
+    step(s, 'p', 'm1', 100, 'first')
+    step(s, 'p', 'm2', 200, 'second')
+    s.stepStarted('p', 'mR', 300)
+    hook(s, 'p', 400)
+    step(s, 'p', 'mA', 401, 'A output')
+    hook(s, 'p', 500)
+    step(s, 'p', 'mB', 501, 'B output')
+    s.ended('p')
+
+    // #when
+    const {records, model} = replay(s.out, {limits: {maxOpenSpansPerTrace: 2}, flush: false})
+
+    // #then A and B were both admitted, each carries its own output, and nothing of R's exists
+    expect(chatWith(records, 'A output')?.messageId).toBe('mA')
+    expect(chatWith(records, 'B output')?.messageId).toBe('mB')
+    expect(chatWith(records, 'first')?.messageId).toBe('m1')
+    expect(chatWith(records, 'second')?.messageId).toBe('m2')
+    expect(primaries(records)).toHaveLength(4)
+    expect(model.stats().withholds).toBe(0)
+  })
+
+  it('withholds when a refused request’s step.started never comes: the later step could be its own', () => {
+    // #given the same, with R's step never delivered
     const s = script()
     s.started('p')
     hook(s, 'p', 100)
@@ -2315,14 +2343,14 @@ describe('a step belongs to the latest primary hook at or before its own start t
     s.ended('p')
 
     // #when
-    const {records} = replay(s.out, {limits: {maxOpenSpansPerTrace: 2}, flush: false})
+    const {records, model} = replay(s.out, {limits: {maxOpenSpansPerTrace: 2}, flush: false})
 
-    // #then A and B were both admitted, each carries its own output, and nothing of R's exists
-    expect(chatWith(records, 'A output')?.messageId).toBe('mA')
-    expect(chatWith(records, 'B output')?.messageId).toBe('mB')
+    // #then what was bound before the step that could not be placed keeps its step, and nothing after it carries one
     expect(chatWith(records, 'first')?.messageId).toBe('m1')
     expect(chatWith(records, 'second')?.messageId).toBe('m2')
-    expect(primaries(records)).toHaveLength(4)
+    expect(JSON.stringify(records)).not.toMatch(/A output|B output/)
+    expect(model.stats().withholds).toBe(1)
+    for (const chat of primaries(records).filter(candidate => candidate.start >= 400)) expectNoStepData(chat)
   })
 
   it('binds nothing for a delayed step after a trace-cap eviction and a reopening with no execution.ended (the third review’s case)', () => {
@@ -2417,7 +2445,7 @@ describe('a step belongs to the latest primary hook at or before its own start t
     expect(JSON.stringify(records)).not.toContain('FOREIGN')
   })
 
-  it('withholds the session when a step starts in its own hook’s millisecond and an orphan hook is still waiting before it (the cost of the equality rule)', () => {
+  it('withholds the session when a step starts in its own hook’s millisecond and an orphan hook is still waiting before it (the cost of the abandoned-request rule)', () => {
     // #given an orphan hook that never gets a step, and the next hook whose step started exactly at its time
     const s = script()
     s.started('p')
@@ -2644,6 +2672,7 @@ describe('a step belongs to the latest primary hook at or before its own start t
     s.stepStarted('p', 'm1', 100)
     retry(s, 'p')
     hook(s, 'p', 200)
+    s.stepStarted('p', 'm1', 200)
     s.text('p', 'm1', 'one')
     s.stepEnded('p', 'm1')
     hook(s, 'p', 300)
@@ -3610,6 +3639,495 @@ describe('a step belongs to the latest primary hook at or before its own start t
       expect(model.stats().withholds).toBe(1)
     })
   })
+
+  describe('a step with an earlier hook that has no step: whatever the clock says, its owner cannot be told apart', () => {
+    it('does not give a delayed step to the request hooked after a clock step-back (the review’s case)', () => {
+      // #given hook 1 at 100 whose attempt started at 115, a clock that stepped back so hook 2 reads 110, and hook 1's step after it
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      hook(s, 'p', 110)
+      step(s, 'p', 'old-message', 115, 'OLD RESPONSE')
+      step(s, 'p', 'new-message', 116, 'NEW RESPONSE')
+      s.ended('p')
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then neither request carries a step's text, message id or usage, both name the gap, and the session was withheld
+      expect(JSON.stringify(records)).not.toMatch(/OLD RESPONSE|NEW RESPONSE/)
+      expect(primaries(records)).toHaveLength(2)
+      for (const chat of primaries(records)) expectNoStepData(chat)
+      expect(model.stats().withholds).toBe(1)
+    })
+
+    it('does the same when the earlier hook is a refused request’s', () => {
+      // #given a cap of one: hook 1 open, hook 2 refused, hook 1's step ends, hook 3 admitted at a time before the refused one's start
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      hook(s, 'p', 105)
+      step(s, 'p', 'm1', 100, 'one')
+      hook(s, 'p', 110)
+      step(s, 'p', 'refused-message', 115, 'REFUSED RESPONSE')
+      s.ended('p')
+
+      // #when
+      const {records, model} = replay(s.out, {limits: CAP, flush: false})
+
+      // #then
+      expect(chatWith(records, 'one')?.messageId).toBe('m1')
+      expect(JSON.stringify(records)).not.toContain('REFUSED RESPONSE')
+      expectNoStepData(primaries(records).find(chat => chat.start === 110) as ChatRecord)
+      expect(model.stats().withholds).toBe(1)
+    })
+
+    it('does the same when the earlier hook is a lost one’s, which a loss marker named', () => {
+      // #given hook 2 lost with its time carried by the marker, hook 3 admitted, and the lost request's step after it
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      step(s, 'p', 'm1', 100, 'one')
+      s.out.push({kind: 'loss', sessionIds: ['p'], reason: 'x', hookAt: new Map([['p', 105]]), at: 105})
+      hook(s, 'p', 110)
+      step(s, 'p', 'lost-message', 115, 'LOST RESPONSE')
+      s.ended('p')
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then
+      expect(chatWith(records, 'one')?.messageId).toBe('m1')
+      expect(JSON.stringify(records)).not.toContain('LOST RESPONSE')
+      expect(model.stats().withholds).toBe(1)
+    })
+
+    it('withholds the next step of an abandoned request, even when it starts well after its own hook', () => {
+      // #given a hook that never gets a step, and the next request whose step starts strictly after its own hook
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      hook(s, 'p', 200)
+      step(s, 'p', 'm1', 250, 'AFTER THE ABANDONED ONE')
+      s.ended('p')
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then
+      expect(JSON.stringify(records)).not.toContain('AFTER THE ABANDONED ONE')
+      for (const chat of primaries(records)) expectNoStepData(chat)
+      expect(model.stats().withholds).toBe(1)
+    })
+
+    it('does not carry an abandoned request into the next execution of the session', () => {
+      // #given an abandoned hook, the execution's end (a title keeps the session), and a new execution with an ordinary step
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      s.request('p', 'title', {at: 101})
+      s.ended('p')
+      s.started('p')
+      hook(s, 'p', 300)
+      step(s, 'p', 'm1', 350, 'NEXT EXECUTION')
+      s.ended('p')
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then
+      expect(chatWith(records, 'NEXT EXECUTION')?.messageId).toBe('m1')
+      expect(model.stats().withholds).toBe(0)
+    })
+
+    /** The end event of the first execution, stamped `at` by the server, delivered after the hooks that follow it. */
+    const endedAt = (s: ReturnType<typeof script>, at: number): void => {
+      s.out.push({kind: 'execution.ended', sessionId: 'p', outcome: 'succeeded', at})
+    }
+
+    /** A first execution with a step and a title that keeps its trace, then the next execution's first hook overtaking the end. */
+    const overtaken = (secondHook: number, firstStart: number) => {
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      step(s, 'p', 'mA', 100, 'A TEXT')
+      s.request('p', 'title', {at: 150})
+      hook(s, 'p', 210)
+      endedAt(s, 200)
+      s.started('p')
+      hook(s, 'p', secondHook)
+      step(s, 'p', 'mB1', firstStart, 'B1 RESPONSE')
+      step(s, 'p', 'mB2', secondHook + 10, 'B2 RESPONSE')
+      s.ended('p')
+      return s
+    }
+
+    it('does not settle the next execution’s first hook when the previous end event arrives after it (the review’s case)', () => {
+      // #given the first step of the next execution starting in the millisecond its second hook arrived
+      const s = overtaken(220, 220)
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then hook 2 is not given hook 1's response: the session is withheld, and the two requests carry no step data
+      expect(chatWith(records, 'A TEXT')?.messageId).toBe('mA')
+      expect(JSON.stringify(records)).not.toMatch(/B1 RESPONSE|B2 RESPONSE/)
+      for (const chat of primaries(records).filter(candidate => candidate.start >= 210)) expectNoStepData(chat)
+      expect(model.stats().withholds).toBe(1)
+    })
+
+    it('binds ordinary back-to-back executions normally when the end event arrives after the next execution’s hook', () => {
+      // #given the same order, with each step starting after its own hook
+      const s = overtaken(220, 215)
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then
+      expect(['A TEXT', 'B1 RESPONSE', 'B2 RESPONSE'].map(text => chatWith(records, text)?.messageId)).toEqual([
+        'mA',
+        'mB1',
+        'mB2',
+      ])
+      expect(model.stats().withholds).toBe(0)
+    })
+
+    it('leaves a hook at exactly the end time unsettled: the safe side', () => {
+      // #given an abandoned hook at the end time of its execution, and the next execution's ordinary step
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 200)
+      s.request('p', 'title', {at: 201})
+      endedAt(s, 200)
+      s.started('p')
+      hook(s, 'p', 300)
+      step(s, 'p', 'm1', 300, 'NEXT')
+      s.ended('p')
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then
+      expect(JSON.stringify(records)).not.toContain('NEXT')
+      expect(model.stats().withholds).toBe(1)
+    })
+
+    it('keeps a withheld session withheld when the next execution’s hooks were swallowed before the previous end event arrived', () => {
+      // #given a withheld session whose next execution's hooks (210, 220) arrive before the first execution's end event (200), a
+      // hook after it, and a step of the swallowed 220 starting in that hook's millisecond
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      hook(s, 'p', 105)
+      step(s, 'p', 'mA', 105, 'A TEXT')
+      s.request('p', 'title', {at: 160})
+      hook(s, 'p', 210)
+      hook(s, 'p', 220)
+      endedAt(s, 200)
+      s.started('p')
+      hook(s, 'p', 300)
+      step(s, 'p', 'mB2', 300, 'B2 RESPONSE')
+      s.ended('p')
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then the second execution carries no step data, and the response is on no span
+      expect(JSON.stringify(records)).not.toContain('B2 RESPONSE')
+      for (const chat of primaries(records).filter(candidate => candidate.start >= 210)) expectNoStepData(chat)
+      expect(model.stats().withholds).toBe(1)
+    })
+
+    /** A first execution with one step, then the next execution's first hook observed before the first execution's end event. */
+    const overtakenNoSurvivor = (tail: (s: ReturnType<typeof script>) => void, endAtMs = 200) => {
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      step(s, 'p', 'mA', 100, 'A TEXT')
+      hook(s, 'p', 210)
+      endedAt(s, endAtMs)
+      s.started('p')
+      tail(s)
+      return s
+    }
+
+    it('withholds the next execution when no title keeps the session and B1’s step starts in B2’s millisecond', () => {
+      // #given the end event arriving after B1's hook, A's trace closing with nothing else keeping the session, and B1's step
+      // starting in the millisecond of B2's hook
+      const s = overtakenNoSurvivor(t => {
+        hook(t, 'p', 220)
+        step(t, 'p', 'mB1', 220, 'B1 RESPONSE')
+        step(t, 'p', 'mB2', 230, 'B2 RESPONSE')
+        t.ended('p')
+      })
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then B1's request, closed by A's trace, is empty with the gap `output`; B2's carries no step data; B1's response is on no span
+      const [first, second] = primaries(records).filter(candidate => candidate.start >= 210)
+      expect(first).toMatchObject({start: 210, texts: [], messageId: undefined, usage: undefined})
+      expect(first?.gaps).toContain('output')
+      expect(second?.start).toBe(220)
+      expectNoStepData(second as ChatRecord)
+      expect(JSON.stringify(records)).not.toMatch(/B1 RESPONSE|B2 RESPONSE/)
+      expect(chatWith(records, 'A TEXT')?.messageId).toBe('mA')
+      expect(model.stats().withholds).toBe(1)
+    })
+
+    it('keeps a withheld session through the close of the trace that nothing else keeps alive', () => {
+      // #given a withheld session whose next execution's hooks were swallowed before the end event, and no title
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      hook(s, 'p', 105)
+      step(s, 'p', 'mA', 105, 'A TEXT')
+      hook(s, 'p', 210)
+      hook(s, 'p', 220)
+      endedAt(s, 200)
+      s.started('p')
+      hook(s, 'p', 300)
+      step(s, 'p', 'mB2', 300, 'B2 RESPONSE')
+      s.ended('p')
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then
+      expect(JSON.stringify(records)).not.toContain('B2 RESPONSE')
+      for (const chat of primaries(records).filter(candidate => candidate.start >= 300)) expectNoStepData(chat)
+      expect(model.stats().withholds).toBe(1)
+    })
+
+    it('forgets a session at the close of its trace when every hook is settled and it is not withheld', () => {
+      // #given two executions, each with its own request and step, the end event arriving before the next hook
+      const s = script()
+      s.turn('p', '1')
+      s.turn('p', '2')
+
+      // #when
+      const {model} = replay(s.out, {flush: false})
+
+      // #then nothing of the session is left
+      expect(model.stats()).toMatchObject({
+        sessions: 0,
+        openTraces: 0,
+        hookTimes: 0,
+        historyRequestsHeld: 0,
+        openSteps: 0,
+      })
+    })
+
+    it('forgets the session at the idle bound when its record was kept for an unsettled hook', () => {
+      // #given a session kept at the close of A's trace by B1's hook, which is later than the end time
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      step(s, 'p', 'mA', 100, 'A TEXT')
+      hook(s, 'p', 210)
+      endedAt(s, 200)
+      const limits = {sessionIdleMs: 1_000}
+      const kept = replay(s.out, {limits, flush: false}).model.stats()
+      s.tick(2_000)
+
+      // #when the idle time passes
+      const {model} = replay(s.out, {limits, flush: false})
+
+      // #then
+      expect(kept).toMatchObject({sessions: 1, hookTimes: 2, historyRequestsHeld: 0})
+      expect(model.stats()).toMatchObject({sessions: 0, hookTimes: 0, historyRequestsHeld: 0})
+    })
+
+    describe('with ordinary gaps and the same overtaking order', () => {
+      const ordinary = (order: 'one hook before the step' | 'both hooks before the step') => {
+        const s = script()
+        s.started('p')
+        hook(s, 'p', 100)
+        step(s, 'p', 'mA', 115, 'A TEXT')
+        hook(s, 'p', 150)
+        if (order === 'both hooks before the step') hook(s, 'p', 200)
+        endedAt(s, 135)
+        s.started('p')
+        step(s, 'p', 'mB1', 165, 'B1 TEXT')
+        if (order === 'one hook before the step') hook(s, 'p', 200)
+        step(s, 'p', 'mB2', 215, 'B2 TEXT')
+        s.ended('p')
+        return replay(s.out, {flush: false})
+      }
+
+      it('exports B1 empty and B2 whole when only B1’s hook overtook the end event', () => {
+        // #when
+        const {records, model} = ordinary('one hook before the step')
+
+        // #then B1's request was closed by A's trace and its step bound nothing; B2 binds its own
+        const [, first, second] = primaries(records)
+        expect(first).toMatchObject({start: 150, texts: [], messageId: undefined})
+        expect(first?.gaps).toContain('output')
+        expect(second).toMatchObject({start: 200, texts: ['B2 TEXT'], messageId: 'mB2'})
+        expect(JSON.stringify(records)).not.toContain('B1 TEXT')
+        expect(model.stats().withholds).toBe(0)
+      })
+
+      it('exports both empty, with no foreign content, when both hooks overtook it', () => {
+        // #when
+        const {records, model} = ordinary('both hooks before the step')
+
+        // #then both requests were closed by A's trace
+        const [, first, second] = primaries(records)
+        for (const chat of [first, second]) {
+          expect(chat).toMatchObject({texts: [], messageId: undefined})
+          expect(chat?.gaps).toContain('output')
+        }
+        expect(JSON.stringify(records)).not.toMatch(/B1 TEXT|B2 TEXT/)
+        expect(model.stats().withholds).toBe(0)
+      })
+    })
+
+    /** The next execution's start event, stamped `at` by the server. */
+    const startedAt = (s: ReturnType<typeof script>, at: number): void => {
+      s.out.push({kind: 'execution.started', sessionId: 'p', at})
+    }
+
+    /** A first execution with a step and a title that keeps its trace, ending at 200, and the next execution's first hook seen first. */
+    const crossBoundary = (b1Hook: number, startAt: number, b2Hook: number, firstStart: number) => {
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      step(s, 'p', 'mA', 100, 'A TEXT')
+      s.request('p', 'title', {at: 120})
+      hook(s, 'p', b1Hook)
+      endedAt(s, 200)
+      startedAt(s, startAt)
+      hook(s, 'p', b2Hook)
+      step(s, 'p', 'mB1', firstStart, 'B1 RESPONSE')
+      step(s, 'p', 'mB2', b2Hook + 10, 'B2 RESPONSE')
+      s.ended('p')
+      return s
+    }
+    /** The clock stepped back after A's end stamped 200: B starts at `startAt`, B1's hook reads 190 and B1's step starts at 205. */
+    const rolledBackAcrossBoundary = (startAt: number) => crossBoundary(190, startAt, 205, 205)
+
+    it('withholds the next execution when it starts before the previous one ended: the clock stepped back across the boundary', () => {
+      // #given A ends at 200, the clock steps back, B starts at 185 and B1's hook reads 190, seen before A's end event; B1's step
+      // starts at 205, in the millisecond of B2's hook
+      const s = rolledBackAcrossBoundary(185)
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then A keeps its step; B1 (hook 190, settled by the end event) and B2 carry no step data; neither response is on a span
+      expect(chatWith(records, 'A TEXT')?.messageId).toBe('mA')
+      expect(JSON.stringify(records)).not.toMatch(/B1 RESPONSE|B2 RESPONSE/)
+      const later = primaries(records).filter(candidate => candidate.start >= 190)
+      expect(later.map(chat => chat.start)).toEqual([190, 205])
+      for (const chat of later) expectNoStepData(chat)
+      expect(model.stats().withholds).toBe(1)
+    })
+
+    it('withholds an execution that starts in the millisecond the previous one ended: the safe side', () => {
+      // #given
+      const s = rolledBackAcrossBoundary(200)
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then
+      expect(JSON.stringify(records)).not.toMatch(/B1 RESPONSE|B2 RESPONSE/)
+      expect(model.stats().withholds).toBe(1)
+    })
+
+    it('does not withhold an execution that starts after the previous one ended', () => {
+      // #given an ordinary clock, with B1's hook seen before A's end event, and each step starting after its own hook
+      const s = crossBoundary(220, 210, 240, 225)
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then the hooks bind their own steps
+      expect(model.stats().withholds).toBe(0)
+      expect(['B1 RESPONSE', 'B2 RESPONSE'].map(text => chatWith(records, text)?.messageId)).toEqual(['mB1', 'mB2'])
+    })
+
+    it('keeps no more kept sessions than the idle limit allows when their traces close', () => {
+      // #given an idle limit of one and two sessions whose traces close at an end event that the next hook overtook
+      const s = script()
+      for (const session of ['a', 'b']) s.started(session)
+      for (const session of ['a', 'b']) {
+        s.request(session, 'primary', {at: 100})
+        s.stepStarted(session, `m-${session}`, 100)
+        s.stepEnded(session, `m-${session}`)
+        s.request(session, 'primary', {at: 210})
+      }
+
+      // #when both end at 200
+      for (const session of ['a', 'b'])
+        s.out.push({kind: 'execution.ended', sessionId: session, outcome: 'succeeded', at: 200})
+      const {model} = replay(s.out, {limits: {maxIdleSessions: 1}, flush: false})
+
+      // #then one idle record remains
+      expect(model.stats()).toMatchObject({sessions: 1, openTraces: 0})
+    })
+
+    it('never gives a step to the request of a hook the execution boundary settled', () => {
+      // #given an abandoned request kept by a title, the execution's end, and a step that resolves to its hook
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      s.request('p', 'title', {at: 101})
+      endedAt(s, 200)
+      startedAt(s, 210)
+      step(s, 'p', 'late', 150, 'LATE RESPONSE')
+      s.ended('p')
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then the step bound nothing
+      expect(JSON.stringify(records)).not.toContain('LATE RESPONSE')
+      expect(model.stats()).toMatchObject({openSteps: 0, withholds: 0})
+    })
+
+    it('binds every step to its own hook when hooks are observed ahead of earlier steps, however late the steps start', () => {
+      // #given both hooks seen before either step, each step starting well after its own hook
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      hook(s, 'p', 200)
+      hook(s, 'p', 300)
+      step(s, 'p', 'm1', 150, 'one')
+      step(s, 'p', 'm2', 250, 'two')
+      step(s, 'p', 'm3', 350, 'three')
+      s.ended('p')
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then
+      expect(['one', 'two', 'three'].map(text => chatWith(records, text)?.messageId)).toEqual(['m1', 'm2', 'm3'])
+      expect(model.stats().withholds).toBe(0)
+    })
+
+    it('binds the second attempt of a retried request: the failed attempt’s step is its own hook’s', () => {
+      // #given hook, step.started of attempt 1, the retry hook, step.started of attempt 2 (the message id is reused), output, end
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      s.stepStarted('p', 'm1', 100)
+      retry(s, 'p')
+      hook(s, 'p', 1800)
+      s.stepStarted('p', 'm1', 1800)
+      s.text('p', 'm1', 'recovered')
+      s.stepEnded('p', 'm1')
+      s.ended('p')
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then
+      expect(chatWith(records, 'recovered')?.attempt).toBe(2)
+      expect(model.stats().withholds).toBe(0)
+    })
+  })
 })
 
 describe('the join against every recorded scenario, with the scripted provider’s own account of whose each step was', () => {
@@ -3624,7 +4142,7 @@ describe('the join against every recorded scenario, with the scripted provider�
     // #given the recording and what the scripted provider says each step answered
     const fixture = recordedFixtures[name]
     const truth = fixture?.truth ?? []
-    const {records} = replay(fixture?.observations ?? [])
+    const {records, model} = replay(fixture?.observations ?? [], {flush: false})
 
     // #when the primary chats of each session are ranked by when their request hook arrived
     const bySession = new Map<string, ChatRecord[]>()
@@ -3654,5 +4172,6 @@ describe('the join against every recorded scenario, with the scripted provider�
     }
     expect(bound).toBeGreaterThan(0)
     expect(chats(records).filter(chat => chat.gaps.includes('step-binding-uncertain'))).toHaveLength(0)
+    expect(model.stats().withholds).toBe(0)
   })
 })

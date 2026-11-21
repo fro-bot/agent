@@ -23,8 +23,10 @@ import {replay} from './turn-model.testing.js'
 //     step included), each replaced by the loss marker the pipeline would send. Invariants: no span ever carries another
 //     request's content, and a span that shows a finish reason and output has ALL of its request's text.
 //
-// Rollbacks are generated at least as large as the gap since the previous hook, so the hook lands at or before it: a smaller one,
-// that leaves the next hook later than a delayed step's start, is the documented residual (turn-model.ts) and not generated.
+// Two kinds of rollback are generated. One is at least as large as the gap since the previous hook, so the hook lands at or before
+// it. The other steps back after a slow step's start and before the next hook, so the next hook reads after the previous hook
+// and before that step's start, and the step, delivered after the hook, is the earlier hook's but resolves to the later one.
+// A session may also run a second execution whose first hook is observed before the first execution's end event.
 //
 // Every case is reproducible from its seed, which is in the failure message.
 
@@ -283,6 +285,10 @@ interface Case {
   readonly limits: Partial<TurnModelLimits>
   readonly dropped: number
   readonly rollbacks: number
+  readonly stepBacks: number
+  readonly boundaries: number
+  readonly noSurvivors: number
+  readonly crossings: number
 }
 
 function build(seed: number, config: Config): Case {
@@ -292,6 +298,9 @@ function build(seed: number, config: Config): Case {
   const plans = new Map<string, readonly HookPlan[]>()
   const entries: {item: Item; delivery: number; order: number}[] = []
   let order = 0
+  let boundaries = 0
+  let noSurvivors = 0
+  const crossBacks = new Map<number, number>()
   const lagChoice = pick<number>(
     random,
     adversarial
@@ -350,6 +359,62 @@ function build(seed: number, config: Config): Case {
         outcome: 'succeeded',
       })),
     )
+    // A second execution in the same session: the first ends in the millisecond before the next hook, and a pending title may keep
+    // its trace and the session. Its end event is pulled with the rest of the events, so the next execution's hooks, which are
+    // direct calls, may be observed before it.
+    const plan = plans.get(session) ?? []
+    const split = int(random, 1, Math.max(1, plan.length - 1))
+    const first = plan[0]
+    const before = plan[split - 1]
+    const after = plan[split]
+    if (
+      adversarial &&
+      first !== undefined &&
+      before !== undefined &&
+      after !== undefined &&
+      eventTimes(before).last <= after.t - 2 &&
+      random() < 0.4
+    ) {
+      // The first execution ends two milliseconds before the next hook and the next starts one before it.
+      const tEnd = after.t - 2
+      // Half of them have no survivor: the first execution's trace closes at its end and the session with it, unless the record
+      // still holds a hook of the next execution.
+      const survivor = random() < 0.5
+      if (survivor) {
+        items.push({
+          session,
+          channel: 'hook',
+          t: first.t - 1,
+          droppable: false,
+          make: wall => ({
+            kind: 'request',
+            at: wall(first.t - 1),
+            sessionId: session,
+            requestKind: 'title',
+            agent: 'build',
+            model: 'm',
+            provider: 'p',
+            content: {messages: []},
+          }),
+        })
+      }
+      items.push(
+        marker(session, tEnd, wall => ({
+          kind: 'execution.ended',
+          at: wall(tEnd),
+          sessionId: session,
+          outcome: 'succeeded',
+        })),
+        marker(session, tEnd + 1, wall => ({kind: 'execution.started', at: wall(tEnd + 1), sessionId: session})),
+      )
+      // Half of the surviving ones step the clock back across the boundary: the next execution starts, by the wall clock, before
+      // the end, and its first hook reads before it too but after the last hook of the first. Without a survivor the session is
+      // forgotten at the end and nothing remembers it: the documented residual (turn-model.ts), not generated.
+      const room = after.t - before.t - 1
+      if (survivor && room >= 3 && random() < 0.5) crossBacks.set(tEnd, int(random, 3, room))
+      boundaries += 1
+      noSurvivors += survivor ? 0 : 1
+    }
     deliver(items)
     if (!withChild) continue
 
@@ -462,6 +527,26 @@ function build(seed: number, config: Config): Case {
       }
     }
   }
+  // The second kind: a step-back between a slow step's start and the next hook, small enough that the hook still reads after the
+  // previous hook, large enough that it reads before the step's start.
+  let stepBacks = 0
+  if (adversarial && random() < 0.7) {
+    for (const [, plan] of plans) {
+      for (const hook of plan.slice(1)) {
+        const previous = plan[hook.index - 1]
+        if (previous === undefined || previous.fate === 'orphan' || rollbackAt.has(hook.t - 1)) continue
+        if (previous.tStart - previous.t < 2 || eventTimes(previous).last >= hook.t || random() >= 0.6) continue
+        rollbackAt.set(hook.t - 1, int(random, hook.t - previous.tStart + 1, hook.t - previous.t - 1))
+        stepBacks += 1
+      }
+    }
+  }
+  let crossings = 0
+  for (const [from, size] of crossBacks) {
+    if (rollbackAt.has(from)) continue
+    rollbackAt.set(from, size)
+    crossings += 1
+  }
   const points = [...rollbackAt.entries()].sort((a, b) => a[0] - b[0])
   const wall = (t: number): number => {
     let offset = 0
@@ -516,7 +601,7 @@ function build(seed: number, config: Config): Case {
       })
     } else observations.push(observation)
   }
-  return {seed, plans, observations, limits, dropped, rollbacks}
+  return {seed, plans, observations, limits, dropped, rollbacks, stepBacks, boundaries, noSurvivors, crossings}
 }
 
 const SEEDS = 20_000
@@ -599,6 +684,11 @@ describe('the step join over generated sessions', () => {
     let kept = 0
     let dropped = 0
     let rollbacks = 0
+    let stepBacks = 0
+    let boundaries = 0
+    let noSurvivors = 0
+    let crossings = 0
+    let withheld = 0
     let sameMs = 0
     let bigRecord = 0
     let children = 0
@@ -609,6 +699,10 @@ describe('the step join over generated sessions', () => {
       const {plans, observations, limits} = generated
       dropped += generated.dropped
       rollbacks += generated.rollbacks
+      stepBacks += generated.stepBacks
+      boundaries += generated.boundaries
+      noSurvivors += generated.noSurvivors
+      crossings += generated.crossings
       const problems: unknown[] = []
       let hooked = 0
       let finishedPrimaries = 0
@@ -657,13 +751,14 @@ describe('the step join over generated sessions', () => {
           }
         }
       }
+      withheld += model.stats().withholds > 0 ? 1 : 0
       const held = model.stats().hookTimes
       if (held > (limits.maxHookTimes ?? 64) * 5) problems.push({hookTimes: held})
       expect({seed, limits, problems}).toEqual({seed, limits, problems: []})
     }
     if (process.env.FRO_BOT_JOIN_STATS === '1') {
       process.stdout.write(
-        `join stats: ${JSON.stringify({checked, uncertain, kept, dropped, rollbacks, sameMs, bigRecord, children, zeroRuns, slowStarts})}\n`,
+        `join stats: ${JSON.stringify({checked, uncertain, kept, dropped, rollbacks, stepBacks, boundaries, noSurvivors, crossings, withheld, sameMs, bigRecord, children, zeroRuns, slowStarts})}\n`,
       )
     }
     // The generator exercises what it claims to.
@@ -672,6 +767,10 @@ describe('the step join over generated sessions', () => {
     expect(kept).toBeGreaterThan(SEEDS)
     expect(dropped).toBeGreaterThan(SEEDS / 8)
     expect(rollbacks).toBeGreaterThan(SEEDS / 20)
+    expect(stepBacks).toBeGreaterThan(SEEDS / 20)
+    expect(boundaries).toBeGreaterThan(SEEDS / 20)
+    expect(noSurvivors).toBeGreaterThan(SEEDS / 40)
+    expect(crossings).toBeGreaterThan(SEEDS / 40)
     expect(sameMs).toBeGreaterThan(SEEDS / 8)
     expect(bigRecord).toBeGreaterThan(SEEDS / 200)
     expect(children).toBeGreaterThan(SEEDS / 10)
