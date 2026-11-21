@@ -1,5 +1,5 @@
 import type {Observation, Usage} from './observation.js'
-import type {ChatRecord, InvokeRecord, SpanRecord, ToolRecord} from './turn-model.js'
+import type {ChatRecord, InvokeRecord, SpanRecord, ToolRecord, TurnModelLimits} from './turn-model.js'
 
 import {describe, expect, it} from 'vitest'
 
@@ -3199,6 +3199,152 @@ describe('a step belongs to the latest primary hook at or before its own start t
     expect(first?.status).toBe('error')
     expect(second?.texts).toEqual(['SECOND OUTPUT'])
     expect(JSON.stringify(records)).not.toContain('FIRST OUTPUT')
+  })
+
+  describe('the withhold state: set by exactly four triggers, cleared only by the session’s own execution.ended', () => {
+    /** An execution whose first hook is already past, then the trigger, then a request that follows it, then the end. */
+    const withTrigger = (trigger: (s: ReturnType<typeof script>) => void) => {
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      trigger(s)
+      hook(s, 'p', 400)
+      step(s, 'p', 'm2', 400, 'AFTER THE TRIGGER')
+      return s
+    }
+    const triggers: readonly (readonly [string, (s: ReturnType<typeof script>) => void, Partial<TurnModelLimits>])[] = [
+      [
+        'an ambiguous step',
+        s => {
+          hook(s, 'p', 150)
+          step(s, 'p', 'm1', 150, 'AMBIGUOUS')
+        },
+        {},
+      ],
+      ['a hook earlier than the previous one', s => hook(s, 'p', 90), {}],
+      ['a broadcast loss marker', s => s.lost(undefined), {}],
+      [
+        'a marker whose evidence is incomplete',
+        s => s.out.push({kind: 'loss', sessionIds: ['p'], reason: 'x', incomplete: true, at: lastAt(s.out) + 1}),
+        {},
+      ],
+      [
+        'a step with no usable start time',
+        s => s.out.push({kind: 'step.started', sessionId: 'p', messageId: 'mx', at: lastAt(s.out) + 1}),
+        {},
+      ],
+      [
+        'evicting a hook that never had its step',
+        s => {
+          hook(s, 'p', 110)
+          hook(s, 'p', 120)
+        },
+        {maxHookTimes: 2},
+      ],
+    ]
+
+    it.each(triggers)('is set by %s, and the request after it carries no step data', (_name, trigger, limits) => {
+      // #given
+      const s = withTrigger(trigger)
+      s.ended('p')
+
+      // #when
+      const {records, model} = replay(s.out, {limits, flush: false})
+
+      // #then the session was withheld, nothing after the trigger carries a step, and the record is empty after the end
+      expect(model.stats().withholds).toBeGreaterThan(0)
+      expect(JSON.stringify(records)).not.toMatch(/AFTER THE TRIGGER|AMBIGUOUS/)
+      for (const chat of primaries(records)) expectNoStepData(chat)
+      expect(model.stats().hookTimes).toBe(0)
+    })
+
+    it.each(triggers)(
+      'is cleared by the session’s execution.ended after %s: the next execution binds normally',
+      (_name, trigger, limits) => {
+        // #given the trigger, the end, and a clean execution of the same session
+        const s = withTrigger(trigger)
+        s.ended('p')
+        s.started('p')
+        hook(s, 'p', 900)
+        step(s, 'p', 'm9', 900, 'CLEAN EXECUTION')
+        s.ended('p')
+
+        // #when
+        const {records} = replay(s.out, {limits, flush: false})
+
+        // #then
+        expect(chatWith(records, 'CLEAN EXECUTION')?.messageId).toBe('m9')
+        expect(chatWith(records, 'CLEAN EXECUTION')?.gaps).not.toContain('step-binding-uncertain')
+      },
+    )
+
+    it('does not withhold for a loss marker that names its session and carries the time of the primary hook it lost', () => {
+      // #given
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      step(s, 'p', 'm1', 100, 'one')
+      s.out.push({kind: 'loss', sessionIds: ['p'], reason: 'x', hookAt: new Map([['p', 200]]), at: 200})
+      step(s, 'p', 'm2', 200, 'the lost request’s own step')
+      hook(s, 'p', 300)
+      step(s, 'p', 'm3', 300, 'three')
+      s.ended('p')
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then
+      expect(model.stats().withholds).toBe(0)
+      expect(chatWith(records, 'three')?.messageId).toBe('m3')
+      expect(JSON.stringify(records)).not.toContain('the lost request’s own step')
+    })
+
+    it('keeps the known lost-hook times of a broadcast marker for the sessions they belong to', () => {
+      // #given a broadcast marker carrying the lost hook time of an unseen session
+      const s = script()
+      s.out.push({kind: 'loss', sessionIds: undefined, reason: 'x', hookAt: new Map([['q', 212]]), at: 212})
+      s.started('q')
+      hook(s, 'q', 148)
+      step(s, 'q', 'm0', 166, 'LOST FIRST HOOKS TEXT')
+      s.ended('q')
+
+      // #when
+      const {records} = replay(s.out, {flush: false})
+
+      // #then the hook that came after the lost one (earlier than it: a rollback) withholds the session
+      expect(JSON.stringify(records)).not.toContain('LOST FIRST HOOKS TEXT')
+    })
+
+    it('leaves a subagent’s session unaffected by its parent’s withhold', () => {
+      // #given a parent withheld by a clock rollback and a dispatched child with an ordinary turn
+      const s = script()
+      s.prompt('p', 'mp')
+      s.enqueued('p', 'mp', 'user')
+      s.started('p')
+      s.delivered('p', 'mp')
+      hook(s, 'p', 100)
+      s.stepStarted('p', 'sp1', 100)
+      s.toolBefore('p', 'c1', 'subagent', 'sp1')
+      s.toolAfter('p', 'c1', 'subagent', 'kid')
+      s.toolEnded('p', 'c1', {childSessionId: 'kid'})
+      s.created('kid', 'p')
+      s.prompt('kid', 'mk')
+      s.enqueued('kid', 'mk', 'user')
+      s.started('kid')
+      s.delivered('kid', 'mk')
+      hook(s, 'p', 90)
+      hook(s, 'kid', 150)
+      step(s, 'kid', 'sk', 150, 'child text')
+      s.ended('kid')
+      s.ended('p')
+
+      // #when
+      const {records} = replay(s.out, {flush: false})
+
+      // #then the child binds; the parent's requests carry nothing
+      expect(chatWith(records, 'child text')?.messageId).toBe('sk')
+      for (const chat of primaries(records, 'p')) expectNoStepData(chat)
+    })
   })
 
   /** A parent that dispatches a child whose observations are buffered until the dispatch link arrives. */
