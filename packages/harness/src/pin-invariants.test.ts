@@ -6,6 +6,10 @@ interface HarnessConfig {
   readonly base_version: string
 }
 
+interface OpenCodeV2Pin {
+  readonly version: string
+}
+
 interface CloneDepsEntry {
   readonly name: string
   readonly resolvedVersion: string
@@ -18,8 +22,10 @@ interface CloneDepsManifest {
 }
 
 const config = JSON.parse(readFileSync(new URL('../harness.config.json', import.meta.url), 'utf8')) as HarnessConfig
+const v2PinPath = new URL('../../runtime/src/shared/opencode-v2-pin.json', import.meta.url)
 const cloneDepsPath = new URL('../../../.slim/clonedeps.json', import.meta.url)
 const renovatePath = new URL('../../../.github/renovate.json5', import.meta.url)
+const v2Pin = JSON.parse(readFileSync(v2PinPath, 'utf8')) as OpenCodeV2Pin
 const cloneDeps = JSON.parse(readFileSync(cloneDepsPath, 'utf8')) as CloneDepsManifest
 const renovateText = readFileSync(renovatePath, 'utf8')
 
@@ -56,7 +62,7 @@ function compareDottedVersions(left: string, right: string): number {
 }
 
 // ---------------------------------------------------------------------------
-// .slim/clonedeps.json — read-only upstream source clone pin
+// .slim/clonedeps.json — read-only upstream source clone pin (OpenCode V2)
 // ---------------------------------------------------------------------------
 
 // Shared by both cases below so the "ignores unrelated entries" case exercises
@@ -67,13 +73,13 @@ function filterUpstreamEntries(entries: readonly CloneDepsEntry[]): readonly Clo
   return entries.filter(entry => entry.repoUrl === config.source_repo)
 }
 
-describe('clonedeps pin matches the harness base version', () => {
-  it('every OpenCode upstream entry has resolvedVersion and ref matching base_version', () => {
-    // #given the harness base version and the clonedeps entries that point at the OpenCode upstream repo
+describe('clonedeps pin matches the OpenCode V2 pin', () => {
+  it('every OpenCode upstream entry has resolvedVersion and ref matching the V2 pin version', () => {
+    // #given the V2 pin version and the clonedeps entries that point at the OpenCode upstream repo
     const upstreamEntries = filterUpstreamEntries(cloneDeps.dependencies)
-    const expectedRef = `v${config.base_version}`
+    const expectedRef = `v${v2Pin.version}`
 
-    // #when / #then every upstream entry must be pinned to the current base version
+    // #when / #then every upstream entry must be pinned to the V2 version the Action runs
     if (upstreamEntries.length === 0) {
       throw new Error(
         `.slim/clonedeps.json: expected at least one dependency with repoUrl "${config.source_repo}", found none`,
@@ -83,12 +89,12 @@ describe('clonedeps pin matches the harness base version', () => {
     for (const entry of upstreamEntries) {
       expect(
         entry.resolvedVersion,
-        `.slim/clonedeps.json: dependency "${entry.name}" has resolvedVersion "${entry.resolvedVersion}", expected "${config.base_version}" (harness.config.json base_version)`,
-      ).toBe(config.base_version)
+        `.slim/clonedeps.json: dependency "${entry.name}" has resolvedVersion "${entry.resolvedVersion}", expected "${v2Pin.version}" (opencode-v2-pin.json version)`,
+      ).toBe(v2Pin.version)
 
       expect(
         entry.ref,
-        `.slim/clonedeps.json: dependency "${entry.name}" has ref "${entry.ref}", expected "${expectedRef}" (derived from harness.config.json base_version)`,
+        `.slim/clonedeps.json: dependency "${entry.name}" has ref "${entry.ref}", expected "${expectedRef}" (derived from opencode-v2-pin.json version)`,
       ).toBe(expectedRef)
     }
   })

@@ -1,0 +1,1 @@
+const e=/^[\x21-\x7E]+$/,t=/%(?:2f|5c|2e|3b|25)/i;function n(n,r,i){if(n===void 0||r===void 0||!e.test(r)||r.includes(`#`)||!r.startsWith(`/`)||r.startsWith(`//`))return!1;let a=r.indexOf(`?`),o=a===-1?r:r.slice(0,a),s=a===-1?``:r.slice(a+1);return o.includes(`;`)||o.includes(`\\`)||t.test(o)||o.split(`/`).slice(1).some(e=>e===``||e===`.`||e===`..`)?!1:i(n,o,s)}export{n as t};

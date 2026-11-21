@@ -429,6 +429,7 @@ describe('run -> post handoff: session state is saved only for a run that starte
           prepare: vi.fn(),
           launch: vi.fn(),
           startKeyProxy: vi.fn(),
+          registerSignalStop: vi.fn(),
           release: vi.fn(async () => {
             options.recordState?.('restored')
             return {stop: 'stopped' as const, restore: 'restored' as const}

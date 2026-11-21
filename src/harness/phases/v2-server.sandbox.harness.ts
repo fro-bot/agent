@@ -14,7 +14,7 @@ import * as fs from 'node:fs'
 import http from 'node:http'
 import path from 'node:path'
 import {DatabaseSync} from 'node:sqlite'
-import {startOpenCodeV2Server} from '@fro-bot/runtime'
+import {ACTION_TRACING_OFF, startOpenCodeV2Server} from '@fro-bot/runtime'
 
 export const PRELUDE = String.raw`R(){ echo "RESULT $1 $2 $3"; }; ev(){ head -c 240 | tr '\n\r\t' '   '; }; `
 export const q = (value: string): string => `'${value.replaceAll("'", String.raw`'\''`)}'`
@@ -224,6 +224,7 @@ export async function startScriptedSession(options: ScriptedSessionOptions): Pro
         binaryPath: options.binary,
         directory: workspace,
         expectedPluginIds: [],
+        tracingHost: ACTION_TRACING_OFF,
         env: options.env,
         sandbox: context.spec,
         signal: context.signal,

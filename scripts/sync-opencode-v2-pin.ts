@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
 // Regenerates the per-asset sha256 digests in packages/runtime/src/shared/opencode-v2-pin.json from the upstream
-// release's SHA256SUMS. Renovate changes only `version`, then runs this as `bun run postupgrade` on the update branch
+// release's SHA256SUMS, and moves the OpenCode entries of .slim/clonedeps.json (the read-only source clone manifest) to
+// the same version. Renovate changes only `version`, then runs this as `bun run postupgrade` on the update branch
 // (.github/renovate.json5, the OpenCode V2 pin rule). It also runs by hand:
 //
 //   bun scripts/sync-opencode-v2-pin.ts            # rewrite the digests for the pinned version
@@ -10,6 +11,9 @@
 //
 // The only option is `--check`, and at most one positional version is accepted. Anything else (`--help`, `--check=true`,
 // a second positional) exits 2 with a usage line, before the pin is read, fetched or written.
+//
+// Both files are read and both results computed before either is written, so a malformed manifest or a failed fetch
+// leaves the pin untouched. The pin is written first, then the manifest; `updatedAt` in the manifest is not touched.
 //
 // The set of assets is whatever the file already lists: this script never adds or drops an asset, and it fails when the
 // release has no SHA256SUMS line for one. The Dockerfile's `opencode-v2` stage and the Action's installOpenCode
@@ -22,6 +26,9 @@ import process from 'node:process'
 import {fileURLToPath} from 'node:url'
 
 const PIN_PATH = fileURLToPath(new URL('../packages/runtime/src/shared/opencode-v2-pin.json', import.meta.url))
+const CLONEDEPS_PATH = fileURLToPath(new URL('../.slim/clonedeps.json', import.meta.url))
+const CLONEDEPS_NAME = '.slim/clonedeps.json'
+const UPSTREAM_REPO_URL = 'https://github.com/anomalyco/opencode.git'
 const RELEASE_BASE_URL = 'https://github.com/anomalyco/opencode/releases/download'
 const FETCH_TIMEOUT_MS = 30_000
 const SEMVER = /^\d+\.\d+\.\d+$/
@@ -79,6 +86,31 @@ export function syncPinDigests(pin: OpenCodeV2Pin, sums: ReadonlyMap<string, str
   return {version: pin.version, assets}
 }
 
+/**
+ * The source clone manifest text with `resolvedVersion` and `ref` of every upstream OpenCode entry set to `version`.
+ * Other entries and fields keep their values and order; the output is 2-space JSON with a trailing newline, so a manifest
+ * already in step comes back byte-identical.
+ */
+export function syncCloneDeps(text: string, version: string): string {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch (error) {
+    throw new Error(`${CLONEDEPS_NAME}: not valid JSON (${error instanceof Error ? error.message : String(error)})`)
+  }
+  const manifest = typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : {}
+  const {dependencies} = manifest
+  if (!Array.isArray(dependencies)) throw new Error(`${CLONEDEPS_NAME}: \`dependencies\` must be an array`)
+  const synced = (dependencies as unknown[]).map(entry => {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      throw new Error(`${CLONEDEPS_NAME}: every dependency must be an object`)
+    }
+    const record = entry as Record<string, unknown>
+    return record.repoUrl === UPSTREAM_REPO_URL ? {...record, resolvedVersion: version, ref: `v${version}`} : record
+  })
+  return `${JSON.stringify({...manifest, dependencies: synced}, null, 2)}\n`
+}
+
 function serializePin(pin: OpenCodeV2Pin): string {
   return `${JSON.stringify(pin, null, 2)}\n`
 }
@@ -121,6 +153,8 @@ export interface SyncIo {
   ) => Promise<Pick<Response, 'ok' | 'status' | 'text'>>
   readonly readPin: () => string
   readonly writePin: (contents: string) => void
+  readonly readCloneDeps: () => string
+  readonly writeCloneDeps: (contents: string) => void
   readonly stdout: (text: string) => void
   readonly stderr: (text: string) => void
 }
@@ -129,8 +163,18 @@ const defaultIo: SyncIo = {
   fetch: async (url, init) => fetch(url, {...init, redirect: 'follow'}),
   readPin: () => readFileSync(PIN_PATH, 'utf8'),
   writePin: contents => writeFileSync(PIN_PATH, contents),
+  readCloneDeps: () => readFileSync(CLONEDEPS_PATH, 'utf8'),
+  writeCloneDeps: contents => writeFileSync(CLONEDEPS_PATH, contents),
   stdout: text => process.stdout.write(text),
   stderr: text => process.stderr.write(text),
+}
+
+function readCloneDeps(io: SyncIo): string {
+  try {
+    return io.readCloneDeps()
+  } catch (error) {
+    throw new Error(`${CLONEDEPS_NAME}: cannot be read (${error instanceof Error ? error.message : String(error)})`)
+  }
 }
 
 async function fetchSums(io: SyncIo, version: string): Promise<ReadonlyMap<string, string>> {
@@ -142,7 +186,8 @@ async function fetchSums(io: SyncIo, version: string): Promise<ReadonlyMap<strin
 
 /**
  * Run the CLI and return its exit code: 0 on success, 1 on a failed sync or a stale `--check`, 2 on a rejected command
- * line. The arguments are validated before any read, fetch or write, and the pin is written only after a successful fetch.
+ * line. The arguments are validated before any read, fetch or write. Both files are read and both results computed
+ * before the first write, so nothing is written when the pin, the manifest or the fetch fails.
  */
 export async function main(argv: readonly string[], io: SyncIo = defaultIo): Promise<number> {
   const parsed = parseArgs(argv)
@@ -153,19 +198,27 @@ export async function main(argv: readonly string[], io: SyncIo = defaultIo): Pro
   try {
     const rawCurrent = io.readPin()
     const current = parsePin(JSON.parse(rawCurrent))
+    const rawCloneDeps = readCloneDeps(io)
     const requested = parsed.kind === 'sync' ? parsed.version : undefined
     const target: OpenCodeV2Pin = {version: requested ?? current.version, assets: current.assets}
+    const nextCloneDeps = syncCloneDeps(rawCloneDeps, target.version)
     const next = syncPinDigests(target, await fetchSums(io, target.version))
-    const changed = serializePin(next) !== serializePin(current)
+    const pinChanged = serializePin(next) !== serializePin(current)
+    const cloneDepsChanged = nextCloneDeps !== rawCloneDeps
 
     if (parsed.kind === 'check') {
-      if (changed) throw new Error(`opencode-v2-pin.json disagrees with the v${current.version} SHA256SUMS`)
+      if (pinChanged) throw new Error(`opencode-v2-pin.json disagrees with the v${current.version} SHA256SUMS`)
+      if (cloneDepsChanged) throw new Error(`${CLONEDEPS_NAME} is not pinned to v${current.version}`)
       io.stdout(`opencode-v2-pin.json matches the v${current.version} SHA256SUMS\n`)
       return 0
     }
-    if (changed) io.writePin(serializePin(next))
+    if (pinChanged) io.writePin(serializePin(next))
+    if (cloneDepsChanged) io.writeCloneDeps(nextCloneDeps)
+    const rewritten = [pinChanged ? 'opencode-v2-pin.json' : '', cloneDepsChanged ? CLONEDEPS_NAME : '']
     io.stdout(
-      changed ? `rewrote opencode-v2-pin.json for v${next.version}\n` : 'opencode-v2-pin.json is already current\n',
+      rewritten.some(name => name !== '')
+        ? `rewrote ${rewritten.filter(name => name !== '').join(' and ')} for v${next.version}\n`
+        : `opencode-v2-pin.json and ${CLONEDEPS_NAME} are already current\n`,
     )
     return 0
   } catch (error) {

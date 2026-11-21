@@ -46,14 +46,18 @@ function parseConventionalCommit(message: string): ParsedCommit | null {
 
 function resolveReleaseTypeForParsedCommit(parsed: ParsedCommit): ReleaseType {
   // Explicit suppressions win over the breaking marker. This mirrors .releaserc.yaml's
-  // analyzeCommits.releaseRules: `breaking: true` is listed first, but the scoped `build(dev)`
-  // and `skip` suppression rules are evaluated after it and win on a match (confirmed against the
+  // analyzeCommits.releaseRules: `breaking: true` is listed first, but the scoped `build(dev)`,
+  // `skip` and `opencode-plugin` suppression rules are evaluated after it and win on a match (confirmed against the
   // real @semantic-release/commit-analyzer -- see scripts/release/release-policy.test.ts).
   if (parsed.type === 'build' && parsed.scope === 'dev') {
     return 'none'
   }
 
   if (parsed.type === 'skip') {
+    return 'none'
+  }
+
+  if (parsed.scope === 'opencode-plugin') {
     return 'none'
   }
 

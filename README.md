@@ -72,7 +72,10 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
+          model: anthropic/claude-sonnet-4-6
 ```
+
+`model` picks the provider and model the run uses. The provider needs credentials, from the secret or from `opencode-config`. Leave it out and the run uses `opencode/big-pickle`, a free model that needs no credentials, whatever the secret holds. To try the Action with no provider account, pass `auth-json: '{}'` and no `model`.
 
 ### 3. Mention the agent
 
@@ -167,7 +170,7 @@ Provide inputs via the `with:` block. Only `github-token` and `auth-json` are re
 A few inputs most workflows touch:
 
 - **`prompt`** — custom prompt; required for `schedule` and `workflow_dispatch`.
-- **`agent`** / **`model`** — override the agent (a primary agent, not a subagent) or the model (`provider/model`).
+- **`agent`** / **`model`** — choose the agent (a primary agent, not a subagent) or the model (`provider/model`). With no `model`, the run uses `opencode/big-pickle`, a free model that needs no credentials. Supplying credentials in `auth-json` does not change that: set `model` to run on your own provider. The Action leaves every built-in provider enabled unless you restrict them in `opencode-config`; see [Choosing a model and restricting providers](docs/wiki/Setup%20and%20Configuration.md#choosing-a-model-and-restricting-providers).
 - **`timeout`** — OpenCode execution timeout in milliseconds; governs the Action's internal execution deadline only, not the whole GitHub Actions job. Default `1800000` (30 minutes); `0` disables the Action-internal execution deadline. Set the job's `timeout-minutes` as the whole-job/process backstop, with headroom beyond this value for setup, fallback response delivery, and cleanup.
 - **`response-mode`** — `github` (default) posts exactly one comment or review; `none` suppresses all GitHub writes and uses the run log as the response surface.
 - **`brokered-push-extra-paths`** — optional comma-separated relative path prefixes to add to the brokered-push allowlist; defaults to empty. Protected surfaces are hard-denied at the root by prefix screening and within opted-in prefixes by path-segment/basename screening; files admitted by the default allowlist remain governed by the default rules. Do not stage secrets or execution surfaces.
@@ -178,7 +181,7 @@ A few inputs most workflows touch:
 | Input | Required | Default | Description |
 | --- | --- | --- | --- |
 | `github-token` | Yes | — | GitHub token (App installation token or PAT) with write permissions |
-| `auth-json` | Yes | — | JSON object mapping provider IDs to auth configs |
+| `auth-json` | Yes | — | JSON object mapping provider IDs to auth configs. These credentials are used only by a model on those providers: set `model` to choose one. Pass `{}` to run on the free default model with no credentials |
 | `trusted-head-sha` | No | — | Trusted same-repository PR head SHA anchor used for brokered pushes; empty when unavailable |
 | `prompt` | No | — | Custom prompt for the agent |
 | `output-mode` | No | `auto` | Requested delivery mode for `schedule`/`workflow_dispatch` runs (`auto`, `working-dir`, `branch-pr`) |
@@ -193,7 +196,7 @@ A few inputs most workflows touch:
 | `s3-sse-kms-key-id` | No | — | Customer-managed KMS key ID for SSE-KMS. Requires the effective mode to be `aws:kms`: on a custom endpoint the default is `AES256`, so also set `s3-sse-encryption: aws:kms` |
 | `s3-sse-encryption` | No | Endpoint-dependent | `aws:kms` (AWS S3) or `AES256` (custom endpoints) |
 | `agent` | No | — | Agent to use (a primary agent, not a subagent). Defaults to OpenCode's built-in `build` agent |
-| `model` | No | — | Model override in `provider/model` format |
+| `model` | No | `opencode/big-pickle` | Model to run, in `provider/model` format. The default is a free model that needs no credentials; supplying `auth-json` does not change it, so set `model` to run on your own provider |
 | `timeout` | No | `1800000` | OpenCode execution timeout in milliseconds; Action-internal only, not the job timeout (`0` = no Action-internal deadline) |
 | `opencode-version` | No | Source-pinned (stock OpenCode V2) | OpenCode CLI version to install. Unset, and `latest`, mean the stock OpenCode V2 release pinned in the Action (digest-verified). Only that recorded release is supported: the exact pin, with or without a leading `v`, is accepted, and any other version fails input parsing before anything is downloaded. A V1 value (a stock `1.x` version or a `+harness.`/`-harness.` build) fails the same way, with an error saying the Action no longer runs V1. See [Moving to OpenCode V2](#moving-to-opencode-v2). Setup runs on every invocation (gh auth, git identity and the Systematic config are applied each time), and the Action runs the binary setup provides, not one already on the runner. |
 | `systematic-version` | No | Source-pinned | Systematic plugin version to register |
@@ -201,7 +204,7 @@ A few inputs most workflows touch:
 | `repo-skills` | No | `false` | OpenCode V2 only. Load the repository's `.agents/skills` on trusted runs: `schedule` and `workflow_dispatch`, or a same-repository `pull_request`, `issue_comment` or `issues` event from an `OWNER`, `MEMBER` or `COLLABORATOR`. Skills always come from the default branch, freshly fetched from the base repository on every run — never the checkout, a dispatched branch or a PR head. They are copied into a run-scoped directory (symlinks rejected, size bounded, bundled skill names protected) that is removed when the run ends; project config stays disabled |
 | `isolate-agent` | No | `false` | Run the OpenCode server and every tool it starts as a separate unprivileged local user. GitHub-hosted Linux runners with passwordless `sudo` only (not self-hosted, container jobs, macOS or Windows); the run fails before setup on anything else. Requires `persist-credentials: false` (and the default `lfs: false`) on checkout and a published `fro-bot/agent@<ref>`: a local `uses: ./` install, or any alias to one, is refused, because the Action's own files must not be writable by the agent. The agent sees a read-only view of the filesystem except the checkout and its own directories; treat the writable checkout as untrusted in later workflow steps. Provisioned credentials stay readable by the model; the provider key does not (a key proxy holds it; the run fails before setup if `auth-json` or `opencode-config` has a provider the proxy can't serve, such as Bedrock or Vertex, or a setting that would skip the proxy). Don't run two isolated steps in one job. See [Withholding is not an OS boundary](docs/wiki/Setup%20and%20Configuration.md#withholding-is-not-an-os-boundary) |
 | `agent-state-home` | No | — | With `isolate-agent: true`, an absolute directory inside the checkout used as the agent's `XDG_STATE_HOME`: created if missing, handed to the agent for the run and taken back after, so state a tool keeps there (a run record, a ledger) stays in the checkout. A relative path, a path outside the checkout or a symlink fails the run; ignored without `isolate-agent` |
-| `opencode-config` | No | — | JSON deep-merged into the OpenCode config |
+| `opencode-config` | No | — | JSON deep-merged into the OpenCode config. Add `enabled_providers` or `disabled_providers` to restrict which providers a run can use; see [Choosing a model and restricting providers](docs/wiki/Setup%20and%20Configuration.md#choosing-a-model-and-restricting-providers) |
 | `systematic-config` | No | — | JSON deep-merged into the Systematic plugin config |
 | `dedup-window` | No | `600000` | Skip a run if the agent already ran for the same PR/issue within this window (ms); `0` disables |
 | `response-mode` | No | `github` | `github` posts one comment/review; `none` suppresses all GitHub writes |

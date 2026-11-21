@@ -70,6 +70,12 @@ export type SandboxPreflightResult =
   | {readonly ok: true; readonly tools: SandboxToolPaths}
   | {readonly ok: false; readonly check: SandboxPreflightCheck; readonly message: string}
 
+/** What the published-install walk needs: where the Action was started from, and `lstat` and `realpath` to look at it. */
+export type InstallLocationDeps = Pick<
+  SandboxPreflightDeps,
+  'bundleDir' | 'cwd' | 'env' | 'invokedAs' | 'lstat' | 'realpath'
+>
+
 export interface SandboxPreflightDeps {
   readonly exec: ExecAdapter
   readonly env: NodeJS.ProcessEnv
@@ -246,7 +252,10 @@ const MANIFEST_NAMES = ['action.yaml', 'action.yml'] as const
  * comparison is reliable because the runner builds the directory from the same `Name` and `Ref` strings it reports, joining
  * a ref containing `/` as nested directories.
  */
-async function checkActionLocation(deps: SandboxPreflightDeps): Promise<SandboxPreflightResult | null> {
+async function checkActionLocation(
+  deps: InstallLocationDeps,
+  extraScripts: readonly string[] = [],
+): Promise<SandboxPreflightResult | null> {
   const advice =
     'use a published `fro-bot/agent@<ref>` (GitHub-hosted Linux only) instead of a local `uses: ./` install, so the Action is not stored where the agent user can write'
   const refuse = (reason: string): SandboxPreflightResult => fail('action-location', `${reason}; ${advice}`)
@@ -315,7 +324,7 @@ async function checkActionLocation(deps: SandboxPreflightDeps): Promise<SandboxP
   if (manifests.length === 0) return refuse(`${installRoot} has no action.yaml or action.yml`)
   if (manifests.some(kind => kind !== 'file'))
     return refuse(`the action manifest in ${installRoot} is not a regular file`)
-  for (const script of RUNNER_ENTRY_SCRIPTS) {
+  for (const script of [...RUNNER_ENTRY_SCRIPTS, ...extraScripts]) {
     const kind = await deps.lstat(path.join(installRoot, script))
     if (kind !== 'file') return refuse(`${path.join(installRoot, script)} is not a regular file`)
   }
@@ -331,6 +340,23 @@ async function checkActionLocation(deps: SandboxPreflightDeps): Promise<SandboxP
     return refuse(`the running bundle is in ${deps.bundleDir}, not in ${canonicalBundle}`)
   }
   return null
+}
+
+/**
+ * True when the Action is a published install (every rule of the `isolate-agent` location check above) and each of
+ * `scripts` (paths relative to the install root, like `dist/trace-relay.js`) is also a regular file reached without a symlink.
+ * For an entry file that is optional (the trace relay), so the preflight's own list is not made to require it. Never throws;
+ * the reason a check failed is not returned, because the callers log a fixed line.
+ */
+export async function isInstalledEntryScriptUsable(
+  deps: InstallLocationDeps,
+  scripts: readonly string[],
+): Promise<boolean> {
+  try {
+    return (await checkActionLocation(deps, scripts)) === null
+  } catch {
+    return false
+  }
 }
 
 async function resolveTools(
@@ -356,6 +382,27 @@ async function resolveTools(
   return {ok: true, paths: resolved as SandboxToolPaths}
 }
 
+/** The real filesystem view of the running install: what `isInstalledEntryScriptUsable` and the preflight both read. */
+export function createInstallLocationDeps(): InstallLocationDeps {
+  const location = discoverActionLocation({argv: process.argv, moduleUrl: import.meta.url})
+  return {
+    env: process.env,
+    ...location,
+    lstat: async absolutePath => {
+      try {
+        const stats = await fs.lstat(absolutePath)
+        if (stats.isSymbolicLink()) return 'symlink'
+        if (stats.isDirectory()) return 'directory'
+        return stats.isFile() ? 'file' : 'other'
+      } catch {
+        return null
+      }
+    },
+    realpath: async absolutePath => fs.realpath(absolutePath),
+    cwd: process.cwd(),
+  }
+}
+
 export function createSandboxPreflightDeps(
   exec: ExecAdapter,
   logger: Logger,
@@ -376,10 +423,10 @@ export function createSandboxPreflightDeps(
   | 'probeView'
   | 'logger'
 > {
-  const location = discoverActionLocation({argv: process.argv, moduleUrl: import.meta.url})
+  const install = createInstallLocationDeps()
   return {
     exec,
-    env: process.env,
+    env: install.env,
     platform: process.platform,
     uid: typeof process.geteuid === 'function' ? process.geteuid() : null,
     isExecutable: async absolutePath => {
@@ -407,20 +454,12 @@ export function createSandboxPreflightDeps(
         return null
       }
     },
-    ...location,
-    lstat: async absolutePath => {
-      try {
-        const stats = await fs.lstat(absolutePath)
-        if (stats.isSymbolicLink()) return 'symlink'
-        if (stats.isDirectory()) return 'directory'
-        return stats.isFile() ? 'file' : 'other'
-      } catch {
-        return null
-      }
-    },
-    realpath: async absolutePath => fs.realpath(absolutePath),
-    cwd: process.cwd(),
-    probeView: createViewProbe({exec, logger, env: process.env, bundleDir: location.bundleDir}),
+    bundleDir: install.bundleDir,
+    invokedAs: install.invokedAs,
+    lstat: install.lstat,
+    realpath: install.realpath,
+    cwd: install.cwd,
+    probeView: createViewProbe({exec, logger, env: process.env, bundleDir: install.bundleDir}),
     logger,
   }
 }
