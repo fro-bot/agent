@@ -222,6 +222,8 @@ export interface TurnModelStats {
   /** Refused primary requests still holding a place for their step events. */
   /** Primary request hook times held across sessions (bounded per session by `maxHookTimes`). */
   readonly hookTimes: number
+  /** Times a session was withheld (see "Binding steps to requests"): zero in any run whose steps and hooks the join could place. */
+  readonly withholds: number
   /** Steps bound to a request and still open, across sessions: each is released when its step ends or fails. */
   readonly openSteps: number
   readonly tombstones: number
@@ -375,7 +377,7 @@ interface ToolNote {
 interface HookRecord {
   readonly at: number
   readonly request: RequestState | undefined
-  /** A step has resolved to this hook or to a later one: its own step is done with, or will never come (steps run in order). */
+  /** A step has been bound at this hook or a later one: its own step is done with, or will never come (steps run in order). */
   consumed: boolean
 }
 
@@ -397,12 +399,11 @@ interface SessionNode {
   readonly stepOwner: Map<string, RequestState>
   /** The session's primary request hooks, in the order they arrived: the step join's record (see "Binding steps to requests"). */
   readonly hooks: HookRecord[]
-  /** The newest evicted hook whose step had not been accounted for: it may still be the owner of a step at a later hook's time. */
-  evictedPending: number | undefined
-  /** The newest time evicted from `hooks`: a step at or below it has lost the hooks that could tell whose it is. */
-  evictedFloor: number | undefined
-  /** The clock went backwards in this execution: time joins are withheld until it ends (see "Binding steps to requests"). */
-  clockBroken: boolean
+  /**
+   * This session binds nothing until its execution ends (see "Binding steps to requests"). Stored with the hook record, so it lives
+   * exactly as long as the record does.
+   */
+  withheld: boolean
   nextAttempt: number
   lastActivity: number
 }
@@ -454,6 +455,7 @@ export function createTurnModel(options: {
   const traces = new Set<TraceState>()
   /** Lost hooks' times for sessions with no node yet, newest per session, bounded: applied when the session's node is created. */
   const earlyLostHooks = new Map<string, number>()
+  let withholds = 0
   const sessions = new Map<string, SessionNode>()
   const buffered = new Map<string, BufferedSession>()
   /** Session ids a `session.created` event said have a parent, before any dispatch link arrived. */
@@ -562,9 +564,7 @@ export function createTurnModel(options: {
       completed: new Set(),
       stepOwner: new Map(),
       hooks: [],
-      evictedFloor: undefined,
-      evictedPending: undefined,
-      clockBroken: false,
+      withheld: false,
       nextAttempt: 1,
       lastActivity: at,
     }
@@ -1198,151 +1198,83 @@ export function createTurnModel(options: {
     }
     if (o.content === undefined) request.gaps.add('request')
     node.requests.push(request)
-    if (o.requestKind === 'primary') recordHook(node, o.at, request)
+    if (o.requestKind === 'primary') {
+      if (node.withheld) request.bindUncertain = true
+      else recordHook(node, o.at, request)
+    }
   }
 
   // ------------------------------------------------------------------ binding steps to requests
   //
   // THE RULE. A primary request's hook carries no message id, and the step events that follow name only a message id, so a step is
-  // joined to its request by TIME, never by arrival order: a `step.started` carries `started`, the server's clock at the start of
-  // its attempt, taken after the request hook returned and before the provider was called. A step belongs to the session's
-  // LATEST primary hook whose receive time is at or before `started` (a hook at exactly `started` counts: the two share a
-  // millisecond whenever the hook returns at once, which is the usual case). Arrival order cannot be used: the hook is a direct call
-  // and the events come through a pull loop, so the plugin can see hook(n+1) before step.started(n) or step.ended(n).
+  // joined to its request by TIME, never by arrival order. A `step.started` carries `started`, the server's clock at the start of
+  // its attempt, taken after the request hook returned and before the provider was called: hook(n) <= started(n) <= hook(n+1) in
+  // real time, as integers of the same clock. So a step belongs to the session's LATEST primary hook whose receive time is at or
+  // before `started`, and the one way that is wrong is `started(n) == hook(n+1)`, a step that starts, runs and ends in the very
+  // millisecond the next hook arrives (the gap between hook(n) and `started(n)` can be anything, another plugin's hook may sit in
+  // it). Arrival order cannot be used: the hook is a direct call and the events come through a pull loop, so hook(n+1) is often
+  // seen before step.started(n).
   //
-  // The step binds a request only if that hook opened one that is still open and has no step yet, and nothing in the record makes
-  // the owner ambiguous. It binds nothing, and every later event of its message is ignored, when:
-  //   - `started` is missing or not a finite number;
-  //   - no recorded hook is at or before it (the hook was never seen, or its record was evicted: eviction is oldest first, so a
-  //     step cannot fall through to an OLDER hook), or it is at or below the newest evicted time (a hook that shared its time may
-  //     have been evicted: a floor, not just an absence);
-  //   - the hook was refused at the span cap, or its request already has a step, was closed by a `retry` hook, or lost its place;
-  //   - two hooks share the newest time at or before it (indistinguishable);
-  //   - the hook's time EQUALS `started` while an EARLIER hook is still waiting for its step (a step can start and finish and the
-  //     next hook arrive in one millisecond, so the step could be either's). The earlier waiting hooks and the equal-time one are
-  //     all marked uncertain. Ordinarily no earlier hook waits: steps of a session arrive in publish order, and a step that
-  //     resolves to a hook retires (`consumed`) every earlier hook, whose own step would have arrived before it. A hook that is
-  //     strictly earlier than `started` needs no such check: a step cannot have started before the hook that preceded it.
-  // Helper requests (title, compaction, generate) are other hook names and never enter the record.
+  // A step binds the request of that hook if it is still open and has no step, and the session is not withheld. Otherwise it binds
+  // nothing and its later events (by message id) are ignored. A step older than every recorded hook binds nothing, and nothing
+  // else: it cannot be confused with any recorded hook.
   //
-  // A loss the pipeline reports for the session (a loss that names none counts for every session) marks every primary request of it
-  // that has not ended as uncertain: one that waits for a step may have lost its `step.started`, and one that is bound may have
-  // lost part of its output, which would otherwise show as the whole. Hooks that arrive after the marker join normally. An
-  // uncertain request holds no step data (no output, finish reason, usage, status or error), only its own hook's metadata, an
-  // incomplete outcome and the gap `step-binding-uncertain`, and is closed when the execution ends.
-  //
-  // The clock: hook times of a session never decrease (hooks are sequential). A hook earlier than the newest recorded hook means
-  // the wall clock went back; old-epoch steps may still be in flight, so no time can be trusted afterwards: every request waiting
-  // is marked uncertain, the record is cleared, and the session binds nothing until its execution ends. No step-side check is
-  // made: a step compared with a hook cannot show a rollback without false positives (a step older than a newer hook is ordinary
-  // lag), and one step compared with the previous step added nothing the rules above did not already catch (tried, no case
-  // distinguished it). Residual, not detectable: a rollback between a hook and its own step's `started` while an older orphan hook
-  // waits; and a rollback smaller than the gap between a step's start and the next hook, with that step delayed past the hook.
-  //
-  // A hook the pipeline lost is told to the model with its time, and takes its place in the record as a refused one does: it
-  // keeps a later hook's step from landing on it, and a later hook that is earlier than it shows a rollback.
-  //
-  // The record is bounded per session (`maxHookTimes`) and dies with the session's node, not at an execution boundary: time makes
-  // boundaries irrelevant, a later step is later than an earlier hook whatever execution it belongs to.
+  // ONE WITHHOLD STATE. A session that is withheld binds nothing until its execution ends. Every primary request of it that has
+  // not finished (waiting or bound) and every later one exports no step data: only the hook's own agent, model, provider and
+  // request, an incomplete outcome and the gap `step-binding-uncertain`, with no synthesized finish reason. It clears only on an
+  // observed `execution.ended` for the session, and then the hook record restarts empty. It is set by exactly these triggers:
+  //   1. An ambiguous step: `started` equals the time of the latest hook at or before it AND an earlier hook is still unconsumed.
+  //      That earlier hook may own the step (it started, ran and ended in the millisecond the later hook arrived). A hook is
+  //      consumed when a step is bound at it or at a later hook; steps of a session arrive in publish order, so ordinarily every
+  //      earlier hook has had its step and nothing is ever withheld. `hook(n+1) - hook(n) <= 1` needs no rule of its own: the step
+  //      that could be mistaken for it arrives with `started` equal to the later hook's time, which this trigger catches, whether
+  //      or not hook(n)'s step event was ever seen. Over-withholding (an orphan hook that never gets a step, as after a recovery,
+  //      then a step in its successor's millisecond) is accepted; under-withholding is not.
+  //   2. The clock went backwards: a primary hook earlier than the previous one. Old-epoch steps may still be in flight and no
+  //      time can be trusted. (Residual, undetectable: a rollback between a hook and its own step's `started` while an older orphan
+  //      hook waits, and one smaller than the gap between a step's start and the next hook with that step delayed past the hook.)
+  //   3. A loss without complete evidence: a loss marker that is a broadcast (it names no session: an unattributed drop, or more
+  //      sessions than a marker can hold), or whose lost-hook times no longer fit. A marker that names its session and carries the
+  //      time of every primary hook it stands for does not withhold: the hook is recorded like a refused one (it holds no request,
+  //      so a step that resolves to it binds nothing, and it counts for trigger 1 and 2), and the session's unfinished requests are
+  //      marked uncertain (the loss may have been a request's `step.started` or part of its output, which would show as the whole).
+  //   4. A step whose `started` is missing or not a finite number: an event the join cannot place.
+  //   Also: the hook record is bounded (`maxHookTimes`); evicting a hook that was never consumed withholds (its step could still
+  //   arrive and there would be nothing to compare it with).
+  // Not a trigger: a request refused at the span cap. Its hook is recorded with no request, so its step resolves to it and binds
+  // nothing; whether that step could be someone else's is trigger 1's question like any other.
 
   function recordHook(node: SessionNode, at: number, request: RequestState | undefined): void {
+    if (node.withheld) return
     const newest = node.hooks.at(-1)
-    if (newest !== undefined && at < newest.at) breakClock(node)
+    if (newest !== undefined && at < newest.at) {
+      withhold(node)
+      return
+    }
     node.hooks.push({at, request, consumed: false})
-    // A request hooked once the clock is broken can never be joined by time: its step is not waited for.
-    if (node.clockBroken && request !== undefined) request.bindUncertain = true
     while (node.hooks.length > limits.maxHookTimes) {
       const gone = node.hooks.shift()
-      if (gone !== undefined) {
-        node.evictedFloor = Math.max(node.evictedFloor ?? gone.at, gone.at)
-        if (!gone.consumed) node.evictedPending = Math.max(node.evictedPending ?? gone.at, gone.at)
+      if (gone !== undefined && !gone.consumed) {
+        withhold(node)
+        return
       }
-      const evicted = gone?.request
-      // Its step would now resolve to nothing: it is not waited for.
-      if (evicted !== undefined && !evicted.closed && evicted.messageId === undefined) evicted.bindUncertain = true
     }
   }
 
-  /** The wall clock went backwards: nothing waiting can be told from what is still in flight, and no time can be trusted. */
-  function breakClock(node: SessionNode): void {
-    node.clockBroken = true
+  /** The session binds nothing until its execution ends: everything unfinished is uncertain, and so is everything that follows. */
+  function withhold(node: SessionNode): void {
+    if (!node.withheld) withholds += 1
+    node.withheld = true
     node.hooks.length = 0
-    node.evictedFloor = undefined
-    node.evictedPending = undefined
-    for (const request of node.requests) {
-      if (request.requestKind === 'primary' && !request.closed && request.messageId === undefined)
-        request.bindUncertain = true
-    }
+    markUnfinished(node)
   }
 
   /**
-   * Whether a hook's step may still arrive: until a step resolves to it or to a later hook. Whatever became of its request
-   * (closed by a retry hook, uncertain, refused, lost) does not change that: the step events are published whatever the plugin
-   * did with the request.
+   * Marks every primary request of the session that has not finished as uncertain. Its step data is withheld whole, so what it
+   * already holds is let go: the tool call arguments it shares with the tool spans are handed back (the chat span will not carry
+   * them).
    */
-  const isWaiting = (hook: HookRecord): boolean => !hook.consumed
-
-  /** A request a step can still be said to be of: open, step-less and trusted. Only such a request can be marked uncertain. */
-  const markable = (hook: HookRecord): RequestState | undefined => {
-    const {request} = hook
-    return request !== undefined && !request.closed && request.messageId === undefined && !request.bindUncertain
-      ? request
-      : undefined
-  }
-
-  /** The hook a step started at `started` binds, or undefined when it binds nothing. Marks what the step makes ambiguous. */
-  function resolveStep(node: SessionNode, started: number): HookRecord | undefined {
-    // Hooks at or below the floor are gone, tied ones among them: whose a step at that time is can no longer be told.
-    if (node.evictedFloor !== undefined && started <= node.evictedFloor) {
-      // It is the evicted hook's or a retained one that shares its time: nothing is bound, those retained are marked, and the
-      // step is over with for every hook it could be.
-      for (const hook of node.hooks) {
-        if (hook.at > started) break
-        const request = isWaiting(hook) ? markable(hook) : undefined
-        if (request !== undefined) request.bindUncertain = true
-        hook.consumed = true
-      }
-      if (node.evictedPending !== undefined && node.evictedPending <= started) node.evictedPending = undefined
-      return undefined
-    }
-    let index = -1
-    let tied: number[] = []
-    node.hooks.forEach((hook, position) => {
-      if (hook.at > started) return
-      const newest = index === -1 ? undefined : node.hooks[index]
-      if (newest === undefined || hook.at > newest.at) {
-        index = position
-        tied = []
-      } else if (hook.at === newest.at) tied.push(position)
-    })
-    const found = node.hooks[index]
-    if (found === undefined) return undefined
-    // The step belongs to this hook, to a tied one, or (equal time only) to an earlier waiting one.
-    const earlierWaiting = node.evictedPending !== undefined || node.hooks.slice(0, index).some(isWaiting)
-    const ambiguous = tied.length > 0 || (found.at === started && earlierWaiting)
-    // Through the last hook sharing the newest time: they are all candidates.
-    const through = Math.max(index, ...tied) + 1
-    if (ambiguous) {
-      for (const hook of node.hooks.slice(0, through)) {
-        const request = isWaiting(hook) ? markable(hook) : undefined
-        if (request !== undefined) request.bindUncertain = true
-      }
-    }
-    // Steps run in order: whatever precedes this hook has had its step, or never will.
-    for (const hook of node.hooks.slice(0, through)) hook.consumed = true
-    node.evictedPending = undefined
-    return ambiguous ? undefined : found
-  }
-
-  /**
-   * Marks every primary request of the session that has not ended as uncertain: the loss may have been its `step.started`, or part
-   * of its output. Its step data is withheld whole, so what it already holds is let go: the tool call arguments it shares with
-   * the tool spans are handed back (the chat span will not carry them).
-   */
-  function markUnfinished(node: SessionNode, lostHookAt: number | undefined): void {
-    // A hook that was lost leaves its time, as a refused one does: its step, when it comes, finds a hook that holds no request, or
-    // is ambiguous with a recorded hook that shares its time, and a time earlier than the record's newest is a rollback.
-    if (lostHookAt !== undefined && Number.isFinite(lostHookAt)) recordHook(node, lostHookAt, undefined)
+  function markUnfinished(node: SessionNode): void {
     for (const request of node.requests) {
       if (request.requestKind !== 'primary' || request.closed || request.bindUncertain) continue
       request.bindUncertain = true
@@ -1351,36 +1283,73 @@ export function createTurnModel(options: {
     }
   }
 
-  /** The pipeline lost something here in the sequence. A buffered child hears of it in its own buffer, in order. */
+  /** The hook a step started at `started` belongs to: the latest hook at or before it. Withholds when that is ambiguous. */
+  function resolveStep(node: SessionNode, started: number): HookRecord | undefined {
+    let index = node.hooks.length - 1
+    while (index >= 0 && (node.hooks[index]?.at ?? Number.POSITIVE_INFINITY) > started) index -= 1
+    const found = node.hooks[index]
+    if (found === undefined) return undefined
+    if (found.at === started && node.hooks.slice(0, index).some(hook => !hook.consumed)) {
+      withhold(node)
+      return undefined
+    }
+    // Steps run in order: whatever precedes this hook has had its step, or never will.
+    for (const hook of node.hooks.slice(0, index + 1)) hook.consumed = true
+    return found
+  }
+
+  /**
+   * The pipeline lost something here in the sequence. A buffered child hears of it in its own buffer, in order. A marker that
+   * names its sessions and the time of each primary hook it lost records those hooks and marks what is unfinished; a marker that
+   * does not (a broadcast, or one whose times no longer fit) withholds every session.
+   */
   function onLoss(o: Extract<Observation, {kind: 'loss'}>): void {
+    const broadcast = o.sessionIds === undefined || o.incomplete === true
     const named = (sessionId: string): void => {
-      const node = sessions.get(sessionId)
       const lostHook = o.hookAt?.get(sessionId)
-      if (node !== undefined) markUnfinished(node, lostHook)
-      else if (lostHook !== undefined && !buffered.has(sessionId)) {
-        earlyLostHooks.delete(sessionId)
-        earlyLostHooks.set(sessionId, Math.max(lostHook, earlyLostHooks.get(sessionId) ?? lostHook))
-        while (earlyLostHooks.size > limits.maxTombstones) {
-          const oldest = earlyLostHooks.keys().next()
-          if (oldest.done === true) break
-          earlyLostHooks.delete(oldest.value)
+      const node = sessions.get(sessionId)
+      if (node !== undefined) {
+        if (broadcast) withhold(node)
+        else {
+          if (lostHook !== undefined) recordHook(node, lostHook, undefined)
+          markUnfinished(node)
         }
-      } else if (buffered.has(sessionId)) bufferObservation(sessionId, {...o, sessionIds: [sessionId]})
+      } else if (buffered.has(sessionId)) {
+        bufferObservation(sessionId, {
+          ...o,
+          sessionIds: [sessionId],
+          hookAt: lostHook === undefined ? undefined : new Map([[sessionId, lostHook]]),
+          incomplete: broadcast,
+        })
+      } else if (lostHook !== undefined) rememberEarlyLostHook(sessionId, lostHook)
     }
     if (o.sessionIds !== undefined) {
       for (const sessionId of o.sessionIds) named(sessionId)
       return
     }
-    for (const node of sessions.values()) markUnfinished(node, undefined)
-    for (const sessionId of [...buffered.keys()]) named(sessionId)
+    // A broadcast reaches every session the model knows, and keeps the times it does carry for the sessions they belong to.
+    for (const sessionId of new Set([...sessions.keys(), ...buffered.keys(), ...(o.hookAt?.keys() ?? [])]))
+      named(sessionId)
   }
 
-  /** The execution ended: what waited for a step that cannot be trusted is closed, as incomplete, and a broken clock is over. */
+  /** A hook lost before its session was seen leaves its time all the same, applied when the session's node is created. */
+  function rememberEarlyLostHook(sessionId: string, at: number): void {
+    earlyLostHooks.delete(sessionId)
+    earlyLostHooks.set(sessionId, Math.max(at, earlyLostHooks.get(sessionId) ?? at))
+    while (earlyLostHooks.size > limits.maxTombstones) {
+      const oldest = earlyLostHooks.keys().next()
+      if (oldest.done === true) break
+      earlyLostHooks.delete(oldest.value)
+    }
+  }
+
+  /** The execution ended: what waited for a step that cannot be trusted is closed, as incomplete, and the withhold is over. */
   function closeUncertain(node: SessionNode, at: number): void {
     node.nextAttempt = 1
-    // What was recorded while the clock was broken is of no use to the next execution: those hooks' steps are over with.
-    if (node.clockBroken) node.hooks.length = 0
-    node.clockBroken = false
+    if (node.withheld) {
+      node.withheld = false
+      node.hooks.length = 0
+    }
     for (const request of [...node.requests]) {
       if (!request.bindUncertain || request.closed) continue
       request.gaps.add('output')
@@ -1414,8 +1383,12 @@ export function createTurnModel(options: {
 
   function onStepStarted(o: Extract<Observation, {kind: 'step.started'}>): void {
     const node = sessions.get(o.sessionId)
-    if (node === undefined || o.started === undefined || !Number.isFinite(o.started)) return
-    if (node.clockBroken) return
+    if (node === undefined) return
+    if (o.started === undefined || !Number.isFinite(o.started)) {
+      withhold(node)
+      return
+    }
+    if (node.withheld) return
     const request = resolveStep(node, o.started)?.request
     if (request === undefined || request.closed || request.messageId !== undefined || request.bindUncertain) return
     request.messageId = o.messageId
@@ -1930,6 +1903,7 @@ export function createTurnModel(options: {
       bufferedSessions: buffered.size,
       bufferedBytes,
       hookTimes: [...sessions.values()].reduce((sum, node) => sum + node.hooks.length, 0),
+      withholds,
       openSteps: [...sessions.values()].reduce((sum, node) => sum + node.stepOwner.size, 0),
       tombstones: tombstones.size,
       unresolvedDispatches: unresolved.size,

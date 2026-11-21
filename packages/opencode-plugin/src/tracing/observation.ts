@@ -212,5 +212,7 @@ export type Observation = ObservationBase &
          * it is gone. Per session: sessions share a clock, not an order.
          */
         readonly hookAt?: ReadonlyMap<string, number> | undefined
+        /** The marker names a session but cannot vouch for what it lost (a buffered child's copy of a broadcast). */
+        readonly incomplete?: boolean | undefined
       }
   )

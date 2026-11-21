@@ -2417,7 +2417,7 @@ describe('a step belongs to the latest primary hook at or before its own start t
     expect(JSON.stringify(records)).not.toContain('FOREIGN')
   })
 
-  it('withholds the step that starts in its own hook’s millisecond when an orphan hook is still waiting before it (the cost of the equality rule)', () => {
+  it('withholds the session when a step starts in its own hook’s millisecond and an orphan hook is still waiting before it (the cost of the equality rule)', () => {
     // #given an orphan hook that never gets a step, and the next hook whose step started exactly at its time
     const s = script()
     s.started('p')
@@ -2431,14 +2431,10 @@ describe('a step belongs to the latest primary hook at or before its own start t
     // #when
     const {records} = replay(s.out, {flush: false})
 
-    // #then the ambiguous step is withheld and both hooks are marked; the next request, with nothing waiting before it, binds
-    expect(JSON.stringify(records)).not.toContain('maybe the orphan')
-    expect(
-      primaries(records)
-        .filter(chat => chat.gaps.includes('step-binding-uncertain'))
-        .map(chat => chat.start),
-    ).toEqual([100, 300])
-    expect(chatWith(records, 'next one is fine')?.messageId).toBe('m10')
+    // #then the whole session is withheld until its execution ends: no request, the one after included, carries step data
+    expect(JSON.stringify(records)).not.toMatch(/maybe the orphan|next one is fine/)
+    expect(primaries(records)).toHaveLength(3)
+    for (const chat of primaries(records)) expectNoStepData(chat)
   })
 
   it('lets a pending primary that never saw a step survive the execution boundary without taking the next execution’s step', () => {
@@ -2661,13 +2657,11 @@ describe('a step belongs to the latest primary hook at or before its own start t
     expect(chatWith(records, 'third')?.attempt).toBe(1)
   })
 
-  it('bounds the hook record per session, oldest first: a step whose hook was dropped binds nothing, not an older hook', () => {
-    // #given a record of three hooks and five requests, the first two unmatched when they are evicted
+  it('bounds the hook record per session: evicting a hook that never got its step withholds the session', () => {
+    // #given a record of three hooks and five requests, none of which has had a step when the oldest are evicted
     const s = script()
     s.started('p')
     for (const at of [100, 200, 300, 400, 500]) hook(s, 'p', at)
-    step(s, 'p', 'm1', 100, 'evicted one')
-    step(s, 'p', 'm2', 250, 'between')
     step(s, 'p', 'm3', 301, 'three')
     step(s, 'p', 'm5', 501, 'five')
     s.ended('p')
@@ -2675,54 +2669,31 @@ describe('a step belongs to the latest primary hook at or before its own start t
     // #when
     const {records, model} = replay(s.out, {limits: {maxHookTimes: 3}, flush: false})
 
-    // #then steps older than every retained hook bind nothing; retained hooks still bind; evicted waiting requests are uncertain
-    expect(JSON.stringify(records)).not.toMatch(/"(evicted one|between)"/)
-    expect(chatWith(records, 'three')?.messageId).toBe('m3')
-    expect(chatWith(records, 'five')?.messageId).toBe('m5')
-    expect(chats(records).filter(chat => chat.gaps.includes('step-binding-uncertain'))).toHaveLength(2)
+    // #then nothing in the session carries step data, and the record is empty again at the end
+    expect(JSON.stringify(records)).not.toMatch(/"(three|five)"/)
+    expect(primaries(records)).toHaveLength(5)
+    for (const chat of primaries(records)) expectNoStepData(chat)
+    expect(model.stats().hookTimes).toBe(0)
+  })
+
+  it('evicts hooks that already had their step without withholding: a long session stays bound', () => {
+    // #given a record of three and ten requests, each with its own step in order
+    const s = script()
+    s.started('p')
+    for (let index = 1; index <= 10; index += 1) {
+      hook(s, 'p', index * 100)
+      step(s, 'p', `m${String(index)}`, index * 100, `text ${String(index)}`)
+    }
+    s.ended('p')
+
+    // #when
+    const {records, model} = replay(s.out, {limits: {maxHookTimes: 3}, flush: false})
+
+    // #then every request has its own step
+    expect(chats(records).filter(chat => chat.gaps.includes('step-binding-uncertain'))).toHaveLength(0)
+    expect(chatWith(records, 'text 10')?.messageId).toBe('m10')
+    expect(chatWith(records, 'text 1')?.messageId).toBe('m1')
     expect(model.stats().hookTimes).toBeLessThanOrEqual(3)
-  })
-
-  it('keeps the newest evicted time as a floor: a step at or below it binds nothing, so an evicted tie cannot hide', () => {
-    // #given two hooks in the same millisecond, the first evicted from a record of three by two later hooks, and a step at that time
-    const s = script()
-    s.started('p')
-    hook(s, 'p', 199)
-    hook(s, 'p', 199)
-    hook(s, 'p', 300)
-    hook(s, 'p', 400)
-    step(s, 'p', 'm1', 199, 'EITHER OF THE TWO')
-    step(s, 'p', 'm3', 300, 'three')
-    step(s, 'p', 'm4', 400, 'four')
-    s.ended('p')
-
-    // #when
-    const {records} = replay(s.out, {limits: {maxHookTimes: 3}, flush: false})
-
-    // #then the step could be the evicted hook's or the retained one's, so it is on no span; later hooks still bind
-    expect(JSON.stringify(records)).not.toContain('EITHER OF THE TWO')
-    expect(chatWith(records, 'four')?.messageId).toBe('m4')
-  })
-
-  it('counts an evicted hook that is still waiting as an earlier waiting hook for the equality rule', () => {
-    // #given hook 1 at 194 whose step starts at 195, hook 2 at 195, and a record of three evicting hook 1 before its step arrives
-    const s = script()
-    s.started('p')
-    hook(s, 'p', 154)
-    step(s, 'p', 'm0', 154, 'zero')
-    hook(s, 'p', 194)
-    hook(s, 'p', 195)
-    hook(s, 'p', 260)
-    hook(s, 'p', 267)
-    step(s, 'p', 'm1', 195, 'HOOK ONES TEXT')
-    s.ended('p')
-
-    // #when
-    const {records} = replay(s.out, {limits: {maxHookTimes: 3}, flush: false})
-
-    // #then the step could be the evicted hook's or hook 2's, so it is on no span
-    expect(JSON.stringify(records)).not.toContain('HOOK ONES TEXT')
-    expect(chatWith(records, 'zero')?.messageId).toBe('m0')
   })
 
   it('keeps a subagent’s hooks in its own record: its times never resolve a parent’s step', () => {
@@ -2781,7 +2752,7 @@ describe('a step belongs to the latest primary hook at or before its own start t
       for (const chat of uncertain(records)) expectNoStepData(chat)
     })
 
-    it('marks every waiting request up to and including the equal-time one in a chain, and no later one', () => {
+    it('withholds the whole session for a chain of waiting hooks, the later ones included', () => {
       // #given four hooks, the first three waiting, a step that started at the third's time, and a fourth hook after it
       const s = script()
       s.started('p')
@@ -2796,13 +2767,12 @@ describe('a step belongs to the latest primary hook at or before its own start t
       // #when
       const {records} = replay(s.out, {flush: false})
 
-      // #then the first three are marked; the fourth, strictly later than the step, binds its own step
-      expect(uncertain(records).map(chat => chat.start)).toEqual([100, 101, 102])
-      expect(JSON.stringify(records)).not.toContain('"ONE"')
-      expect(chatWith(records, 'FOUR')?.messageId).toBe('m4')
+      // #then no request carries step data, the fourth included
+      expect(uncertain(records).map(chat => chat.start)).toEqual([100, 101, 102, 150])
+      expect(JSON.stringify(records)).not.toMatch(/"(ONE|FOUR)"/)
     })
 
-    it('marks the earlier waiting request and the equal-time one, not a hook that is strictly later than the step', () => {
+    it('withholds the earlier waiting hook, the equal-time one and every later request', () => {
       // #given an older waiting hook, a hook at the step's start time, and a hook after it
       const s = script()
       s.started('p')
@@ -2817,8 +2787,8 @@ describe('a step belongs to the latest primary hook at or before its own start t
       const {records} = replay(s.out, {flush: false})
 
       // #then
-      expect(uncertain(records).map(chat => chat.start)).toEqual([50, 100])
-      expect(chatWith(records, 'THREE')?.messageId).toBe('m3')
+      expect(uncertain(records).map(chat => chat.start)).toEqual([50, 100, 101])
+      expect(JSON.stringify(records)).not.toMatch(/"(ONE|THREE)"/)
     })
 
     it('withholds nothing in an ordinary run, where a step shares its own hook’s millisecond and the earlier request has its step', () => {
@@ -2879,6 +2849,49 @@ describe('a step belongs to the latest primary hook at or before its own start t
 
       // #then
       expect(uncertain(records)).toHaveLength(2)
+    })
+  })
+
+  describe('the review’s two successive same-millisecond boundaries', () => {
+    it('never puts B’s output, message id or usage on C’s span, whatever order hooks and step events are observed in', () => {
+      // #given A's hook at 19, A's step 20..20, B's hook at 20, B's step 21..21, C's hook at 21, every hook observed before the
+      // step events (the pull loop lags)
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 19)
+      hook(s, 'p', 20)
+      hook(s, 'p', 21)
+      step(s, 'p', 'mA', 20, 'A TEXT')
+      step(s, 'p', 'mB', 21, 'B TEXT')
+      s.ended('p')
+
+      // #when
+      const {records} = replay(s.out, {flush: false})
+
+      // #then no span carries a text, message id or usage of a step: the join could not tell the owners apart
+      expect(JSON.stringify(records)).not.toMatch(/"(A|B) TEXT"/)
+      for (const chat of primaries(records)) {
+        expect(chat.messageId).toBeUndefined()
+        expect(chat.usage).toBeUndefined()
+        expect(chat.gaps).toContain('step-binding-uncertain')
+      }
+    })
+
+    it('does the same when another plugin’s slow hook separates our hook from its own step (a long hook-to-start gap)', () => {
+      // #given our hook at 0, its step started at 50 (another plugin's hook ran in between) and finished, the next hook at 50
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 0)
+      hook(s, 'p', 50)
+      step(s, 'p', 'm1', 50, 'FIRST TEXT')
+      s.ended('p')
+
+      // #when
+      const {records} = replay(s.out, {flush: false})
+
+      // #then the step could be either's: nobody carries it
+      expect(JSON.stringify(records)).not.toContain('FIRST TEXT')
+      for (const chat of primaries(records)) expectNoStepData(chat)
     })
   })
 

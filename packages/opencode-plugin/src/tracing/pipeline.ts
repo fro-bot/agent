@@ -86,6 +86,8 @@ export interface PipelineStats {
   readonly observationsOmitted: number
   /** Characters of raw text the inbox holds right now. */
   readonly inboxChars: number
+  /** Entries (session ids and lost-hook times) the loss markers in the inbox hold right now: bounded per marker. */
+  readonly markerEntries: number
 }
 
 export interface TracePipeline {
@@ -234,6 +236,9 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
   let recordsFailed = 0
   let tick: NodeJS.Timeout | undefined
 
+  /** The most sessions one marker names; past it the marker names none, which means every session. */
+  const MAX_MARKER_SESSIONS = 32
+
   const atOf = (observation: Observation): number => {
     try {
       return isPlainRecord(observation) && typeof observation.at === 'number' ? observation.at : now()
@@ -260,19 +265,22 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
     }
   }
 
-  /** A marker's lost-hook times with `time` for `session` folded in (the newest per session); nothing for a drop with no session. */
+  /**
+   * A marker's lost-hook times with `time` for `session` folded in (the newest per session); nothing for a drop with no session.
+   * At most MAX_MARKER_SESSIONS sessions: a time that does not fit is not kept, and the marker is then a broadcast (it names every
+   * session), which the model treats as evidence it cannot complete. A burst of drops cannot grow the marker.
+   */
   const hookTimes = (
     known: ReadonlyMap<string, number> | undefined,
     session: string | undefined,
     time: number | undefined,
   ): {hookAt?: ReadonlyMap<string, number>} => {
     const merged = new Map(known)
-    if (session !== undefined && time !== undefined) merged.set(session, Math.max(time, merged.get(session) ?? time))
+    if (session !== undefined && time !== undefined && (merged.has(session) || merged.size < MAX_MARKER_SESSIONS)) {
+      merged.set(session, Math.max(time, merged.get(session) ?? time))
+    }
     return merged.size === 0 ? {} : {hookAt: merged}
   }
-
-  /** The most sessions one marker names; past it the marker names none, which means every session. */
-  const MAX_MARKER_SESSIONS = 32
 
   /**
    * Tells the model, in order, that `observation` never reached it: a marker at the tail (it happened after everything queued)
@@ -508,6 +516,18 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
         release(left)
       }
     },
-    stats: () => ({observationsDropped, recordsFailed, observationsOmitted, inboxChars}),
+    stats: () => ({
+      observationsDropped,
+      recordsFailed,
+      observationsOmitted,
+      inboxChars,
+      markerEntries: inbox.reduce(
+        (sum, queued) =>
+          queued.observation.kind === 'loss'
+            ? sum + (queued.observation.sessionIds?.length ?? 0) + (queued.observation.hookAt?.size ?? 0)
+            : sum,
+        0,
+      ),
+    }),
   }
 }
