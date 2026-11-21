@@ -3740,6 +3740,123 @@ describe('a step belongs to the latest primary hook at or before its own start t
       expect(model.stats().withholds).toBe(0)
     })
 
+    /** The end event of the first execution, stamped `at` by the server, delivered after the hooks that follow it. */
+    const endedAt = (s: ReturnType<typeof script>, at: number): void => {
+      s.out.push({kind: 'execution.ended', sessionId: 'p', outcome: 'succeeded', at})
+    }
+
+    /** A first execution with a step and a title that keeps its trace, then the next execution's first hook overtaking the end. */
+    const overtaken = (secondHook: number, firstStart: number) => {
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      step(s, 'p', 'mA', 100, 'A TEXT')
+      s.request('p', 'title', {at: 150})
+      hook(s, 'p', 210)
+      endedAt(s, 200)
+      s.started('p')
+      hook(s, 'p', secondHook)
+      step(s, 'p', 'mB1', firstStart, 'B1 RESPONSE')
+      step(s, 'p', 'mB2', secondHook + 10, 'B2 RESPONSE')
+      s.ended('p')
+      return s
+    }
+
+    it('does not settle the next execution’s first hook when the previous end event arrives after it (the review’s case)', () => {
+      // #given the first step of the next execution starting in the millisecond its second hook arrived
+      const s = overtaken(220, 220)
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then hook 2 is not given hook 1's response: the session is withheld, and the two requests carry no step data
+      expect(chatWith(records, 'A TEXT')?.messageId).toBe('mA')
+      expect(JSON.stringify(records)).not.toMatch(/B1 RESPONSE|B2 RESPONSE/)
+      for (const chat of primaries(records).filter(candidate => candidate.start >= 210)) expectNoStepData(chat)
+      expect(model.stats().withholds).toBe(1)
+    })
+
+    it('binds ordinary back-to-back executions normally when the end event arrives after the next execution’s hook', () => {
+      // #given the same order, with each step starting after its own hook
+      const s = overtaken(220, 215)
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then
+      expect(['A TEXT', 'B1 RESPONSE', 'B2 RESPONSE'].map(text => chatWith(records, text)?.messageId)).toEqual([
+        'mA',
+        'mB1',
+        'mB2',
+      ])
+      expect(model.stats().withholds).toBe(0)
+    })
+
+    it('leaves a hook at exactly the end time unsettled: the safe side', () => {
+      // #given an abandoned hook at the end time of its execution, and the next execution's ordinary step
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 200)
+      s.request('p', 'title', {at: 201})
+      endedAt(s, 200)
+      s.started('p')
+      hook(s, 'p', 300)
+      step(s, 'p', 'm1', 300, 'NEXT')
+      s.ended('p')
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then
+      expect(JSON.stringify(records)).not.toContain('NEXT')
+      expect(model.stats().withholds).toBe(1)
+    })
+
+    it('keeps a withheld session withheld when the next execution’s hooks were swallowed before the previous end event arrived', () => {
+      // #given a withheld session whose next execution's hooks (210, 220) arrive before the first execution's end event (200), a
+      // hook after it, and a step of the swallowed 220 starting in that hook's millisecond
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      hook(s, 'p', 105)
+      step(s, 'p', 'mA', 105, 'A TEXT')
+      s.request('p', 'title', {at: 160})
+      hook(s, 'p', 210)
+      hook(s, 'p', 220)
+      endedAt(s, 200)
+      s.started('p')
+      hook(s, 'p', 300)
+      step(s, 'p', 'mB2', 300, 'B2 RESPONSE')
+      s.ended('p')
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then the second execution carries no step data, and the response is on no span
+      expect(JSON.stringify(records)).not.toContain('B2 RESPONSE')
+      for (const chat of primaries(records).filter(candidate => candidate.start >= 210)) expectNoStepData(chat)
+      expect(model.stats().withholds).toBe(1)
+    })
+
+    it('never gives a step to the request of a hook the execution boundary settled', () => {
+      // #given an abandoned request kept by a title, the execution's end, and a step that resolves to its hook
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      s.request('p', 'title', {at: 101})
+      endedAt(s, 200)
+      s.started('p')
+      step(s, 'p', 'late', 150, 'LATE RESPONSE')
+      s.ended('p')
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then the step bound nothing
+      expect(JSON.stringify(records)).not.toContain('LATE RESPONSE')
+      expect(model.stats()).toMatchObject({openSteps: 0, withholds: 0})
+    })
+
     it('binds every step to its own hook when hooks are observed ahead of earlier steps, however late the steps start', () => {
       // #given both hooks seen before either step, each step starting well after its own hook
       const s = script()

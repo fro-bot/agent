@@ -26,6 +26,7 @@ import {replay} from './turn-model.testing.js'
 // Two kinds of rollback are generated. One is at least as large as the gap since the previous hook, so the hook lands at or before
 // it. The other steps back after a slow step's start and before the next hook, so the next hook reads after the previous hook
 // and before that step's start, and the step, delivered after the hook, is the earlier hook's but resolves to the later one.
+// A session may also run a second execution whose first hook is observed before the first execution's end event.
 //
 // Every case is reproducible from its seed, which is in the failure message.
 
@@ -285,6 +286,7 @@ interface Case {
   readonly dropped: number
   readonly rollbacks: number
   readonly stepBacks: number
+  readonly boundaries: number
 }
 
 function build(seed: number, config: Config): Case {
@@ -294,6 +296,7 @@ function build(seed: number, config: Config): Case {
   const plans = new Map<string, readonly HookPlan[]>()
   const entries: {item: Item; delivery: number; order: number}[] = []
   let order = 0
+  let boundaries = 0
   const lagChoice = pick<number>(
     random,
     adversarial
@@ -352,6 +355,50 @@ function build(seed: number, config: Config): Case {
         outcome: 'succeeded',
       })),
     )
+    // A second execution in the same session: the first ends in the millisecond before the next hook, and a pending title keeps
+    // its trace and the session. Its end event is pulled with the rest of the events, so the next execution's hooks, which are
+    // direct calls, may be observed before it.
+    const plan = plans.get(session) ?? []
+    const split = int(random, 1, Math.max(1, plan.length - 1))
+    const first = plan[0]
+    const before = plan[split - 1]
+    const after = plan[split]
+    if (
+      adversarial &&
+      first !== undefined &&
+      before !== undefined &&
+      after !== undefined &&
+      eventTimes(before).last < after.t &&
+      random() < 0.4
+    ) {
+      const tEnd = after.t - 1
+      items.push(
+        {
+          session,
+          channel: 'hook',
+          t: first.t - 1,
+          droppable: false,
+          make: wall => ({
+            kind: 'request',
+            at: wall(first.t - 1),
+            sessionId: session,
+            requestKind: 'title',
+            agent: 'build',
+            model: 'm',
+            provider: 'p',
+            content: {messages: []},
+          }),
+        },
+        marker(session, tEnd, wall => ({
+          kind: 'execution.ended',
+          at: wall(tEnd),
+          sessionId: session,
+          outcome: 'succeeded',
+        })),
+        marker(session, tEnd, wall => ({kind: 'execution.started', at: wall(tEnd), sessionId: session})),
+      )
+      boundaries += 1
+    }
     deliver(items)
     if (!withChild) continue
 
@@ -532,7 +579,7 @@ function build(seed: number, config: Config): Case {
       })
     } else observations.push(observation)
   }
-  return {seed, plans, observations, limits, dropped, rollbacks, stepBacks}
+  return {seed, plans, observations, limits, dropped, rollbacks, stepBacks, boundaries}
 }
 
 const SEEDS = 20_000
@@ -616,6 +663,7 @@ describe('the step join over generated sessions', () => {
     let dropped = 0
     let rollbacks = 0
     let stepBacks = 0
+    let boundaries = 0
     let withheld = 0
     let sameMs = 0
     let bigRecord = 0
@@ -628,6 +676,7 @@ describe('the step join over generated sessions', () => {
       dropped += generated.dropped
       rollbacks += generated.rollbacks
       stepBacks += generated.stepBacks
+      boundaries += generated.boundaries
       const problems: unknown[] = []
       let hooked = 0
       let finishedPrimaries = 0
@@ -683,7 +732,7 @@ describe('the step join over generated sessions', () => {
     }
     if (process.env.FRO_BOT_JOIN_STATS === '1') {
       process.stdout.write(
-        `join stats: ${JSON.stringify({checked, uncertain, kept, dropped, rollbacks, stepBacks, withheld, sameMs, bigRecord, children, zeroRuns, slowStarts})}\n`,
+        `join stats: ${JSON.stringify({checked, uncertain, kept, dropped, rollbacks, stepBacks, boundaries, withheld, sameMs, bigRecord, children, zeroRuns, slowStarts})}\n`,
       )
     }
     // The generator exercises what it claims to.
@@ -693,6 +742,7 @@ describe('the step join over generated sessions', () => {
     expect(dropped).toBeGreaterThan(SEEDS / 8)
     expect(rollbacks).toBeGreaterThan(SEEDS / 20)
     expect(stepBacks).toBeGreaterThan(SEEDS / 20)
+    expect(boundaries).toBeGreaterThan(SEEDS / 20)
     expect(sameMs).toBeGreaterThan(SEEDS / 8)
     expect(bigRecord).toBeGreaterThan(SEEDS / 200)
     expect(children).toBeGreaterThan(SEEDS / 10)
