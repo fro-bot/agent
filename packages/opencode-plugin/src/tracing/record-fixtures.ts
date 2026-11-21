@@ -4,7 +4,7 @@
  * Used by `record-fixtures.integration.test.ts` (real binary only); never imported by the plugin.
  */
 
-import type {FakeStep} from '../integration.fixture.js'
+import type {FakeStep, RecordedRequest} from '../integration.fixture.js'
 import type {Observation} from './observation.js'
 
 import {execFileSync} from 'node:child_process'
@@ -25,6 +25,12 @@ export interface Recording {
   readonly observations: readonly Observation[]
   /** Counts read off the scripted provider, which the observations cannot show (for example provider attempts). */
   readonly facts?: Readonly<Record<string, number>>
+  /**
+   * Whose each step was, from the scripted provider and not from any time: the i-th primary request hook of a session is the one
+   * its i-th `step.started` belongs to (`request` is that 0-based i). Checked at recording time against the request number each
+   * text and tool call carries.
+   */
+  readonly truth?: readonly {readonly session: string; readonly message: string; readonly request: number}[]
 }
 
 interface Scenario {
@@ -446,6 +452,34 @@ function scenarios(): Scenario[] {
       facts: c => ({providerAttempts: c.providerRequests('J3-GEN')}),
     },
     {
+      name: 'tool-heavy',
+      description: 'One prompt, eight sequential tool steps and a final answer: many steps in one session.',
+      steps: [
+        ...[1, 2, 3, 4, 5, 6, 7, 8].map(n => ({
+          all: ['H-HEAVY'],
+          none: [`H-DONE-${String(n)}`],
+          tools: [readTool('README.md')],
+        })),
+        {all: ['H-HEAVY'], text: 'all eight done'},
+      ],
+      run: async c => {
+        await c.turn(await c.create(), 'H-HEAVY go')
+      },
+    },
+    {
+      name: 'failure-after-output',
+      description: 'A model request whose stream drops AFTER text started, then a normal retry or a second prompt.',
+      steps: [
+        {all: ['P-POST'], text: 'partial text', abortAfterText: true},
+        {all: ['P-POST'], text: 'recovered text'},
+      ],
+      run: async c => {
+        const session = await c.create()
+        await c.turn(session, 'P-POST first')
+        await sleep(2500)
+      },
+    },
+    {
       name: 'long-session',
       description: 'A retry, parallel large reads, a background subagent and a manual compaction in one session.',
       steps: [
@@ -483,7 +517,7 @@ async function record(scenario: Scenario, recorderDir: string, binary: string, w
   const file = path.join(workDir, `${scenario.name}.jsonl`)
   writeFileSync(file, '')
   const sandbox = makeSandbox()
-  const provider = await startFakeProvider()
+  const provider = await startFakeProvider({tagResponses: true})
   provider.script(scenario.steps)
   const server = await startOpenCodeServer({
     binary,
@@ -575,6 +609,7 @@ async function record(scenario: Scenario, recorderDir: string, binary: string, w
     name: scenario.name,
     description: scenario.description,
     observations: observations(),
+    truth: computeTruth(observations(), provider.requests),
     ...(facts === undefined ? {} : {facts}),
   }
 }
@@ -584,7 +619,7 @@ async function recordRestored(recorderDir: string, binary: string, workDir: stri
   const file = path.join(workDir, 'restored-session.jsonl')
   writeFileSync(file, '')
   const sandbox = makeSandbox()
-  const provider = await startFakeProvider()
+  const provider = await startFakeProvider({tagResponses: true})
   provider.script([
     {all: ['K-HIST'], text: 'history answer'},
     {all: ['K-NEW'], text: 'new answer'},
@@ -633,7 +668,63 @@ async function recordRestored(recorderDir: string, binary: string, workDir: stri
     description:
       "A restored session's first new turn: the request carries the restored history, and there is no title request.",
     observations,
+    truth: computeTruth(observations, provider.requests),
   }
+}
+
+/**
+ * Which request hook each step belongs to, read off the sequential runner and cross-checked against the provider. Per session the
+ * i-th primary `request` hook and the i-th `step.started` are a pair (a session's steps run one after another; the counts must
+ * agree or the scenario cannot be trusted). Each text carries `#r<n>` and each tool call id is `call_<n>_<i>`, where n is the
+ * number of the provider request that answered it: that request arrived after its own hook and before the next one, so the hook
+ * with the greatest receive time at or before its arrival must be the same pair. A step whose message was started twice (a
+ * pre-output retry reuses it) is checked by the count alone.
+ */
+export function computeTruth(
+  observations: readonly Observation[],
+  requests: readonly RecordedRequest[],
+): {session: string; message: string; request: number}[] {
+  const hooks = new Map<string, number[]>()
+  const steps = new Map<string, string[]>()
+  for (const o of observations) {
+    if (o.kind === 'request' && o.requestKind === 'primary')
+      hooks.set(o.sessionId, [...(hooks.get(o.sessionId) ?? []), o.at])
+    if (o.kind === 'step.started') steps.set(o.sessionId, [...(steps.get(o.sessionId) ?? []), o.messageId])
+  }
+  const tags = new Map<string, number>()
+  for (const o of observations) {
+    if (o.kind === 'output' && o.part === 'text') {
+      const tag = /#r(\d+)$/.exec(o.text)
+      if (tag?.[1] !== undefined) tags.set(`${o.sessionId}/${o.messageId}`, Number(tag[1]))
+    }
+    if (o.kind === 'tool.called' && o.messageId !== undefined) {
+      const tag = /^call_(\d+)_/.exec(o.callId)
+      if (tag?.[1] !== undefined) tags.set(`${o.sessionId}/${o.messageId}`, Number(tag[1]))
+    }
+  }
+  const truth: {session: string; message: string; request: number}[] = []
+  for (const [session, messages] of steps) {
+    const times = hooks.get(session) ?? []
+    if (times.length !== messages.length) {
+      throw new Error(`${session}: ${String(times.length)} primary hooks but ${String(messages.length)} step starts`)
+    }
+    messages.forEach((message, request) => {
+      truth.push({session, message, request})
+      const tagged = tags.get(`${session}/${message}`)
+      const arrival = tagged === undefined ? undefined : requests[tagged - 1]?.receivedAt
+      if (arrival === undefined || messages.filter(candidate => candidate === message).length > 1) return
+      let owner = -1
+      times.forEach((time, index) => {
+        if (time <= arrival) owner = index
+      })
+      if (owner !== request) {
+        throw new Error(
+          `${session}/${message}: ordinal pairs it with hook ${String(request)}, the provider with ${String(owner)}`,
+        )
+      }
+    })
+  }
+  return truth
 }
 
 /** Records every scenario, or only those named in `only`. */
@@ -680,7 +771,7 @@ export function normalizeRecording(recording: Recording): Recording {
   const observations = recording.observations.map(observation => {
     const copy: Record<string, unknown> = {}
     for (const [key, value] of Object.entries(observation)) {
-      if (key === 'at' && typeof value === 'number') copy[key] = Math.round(value - first)
+      if ((key === 'at' || key === 'started') && typeof value === 'number') copy[key] = Math.round(value - first)
       else if (key === 'bytes' && typeof value === 'number') copy[key] = Math.round(value / 100) * 100
       else if (ID_FIELDS.has(key) && typeof value === 'string') copy[key] = placeholder(value)
       else if (key === 'error' && typeof value === 'object' && value !== null && observation.kind !== 'tool.after') {
@@ -695,7 +786,13 @@ export function normalizeRecording(recording: Recording): Recording {
     }
     return copy as unknown as Observation
   })
-  return {...recording, observations}
+  // Every id the truth names appears in the observations, so the placeholders are already assigned.
+  const truth = recording.truth?.map(entry => ({
+    session: placeholder(entry.session),
+    message: placeholder(entry.message),
+    request: entry.request,
+  }))
+  return {...recording, observations, ...(truth === undefined ? {} : {truth})}
 }
 
 /** The committed fixtures module: one observation per line, so a review diff reads as a timeline. */
@@ -707,6 +804,7 @@ export function renderFixturesModule(recordings: readonly Recording[]): string {
         `  ${JSON.stringify(recording.name)}: {`,
         `    description: ${JSON.stringify(recording.description)},`,
         ...(recording.facts === undefined ? [] : [`    facts: ${JSON.stringify(recording.facts)},`]),
+        ...(recording.truth === undefined ? [] : [`    truth: ${JSON.stringify(recording.truth)},`]),
         '    observations: [',
         ...lines,
         '    ],',
@@ -727,6 +825,8 @@ export interface RecordedFixture {
   readonly description: string
   /** Counts the observations cannot show, read off the scripted provider when recording. */
   readonly facts?: Readonly<Record<string, number>>
+  /** Whose each step was, from the scripted provider (see \`computeTruth\`): the 0-based request hook of the session it answers. */
+  readonly truth?: readonly {readonly session: string; readonly message: string; readonly request: number}[]
   readonly observations: readonly Observation[]
 }
 

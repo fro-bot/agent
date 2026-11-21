@@ -214,6 +214,25 @@ describe('model spans', () => {
     expect(ok.attributes['gen_ai.response.finish_reasons']).toBeUndefined()
   })
 
+  it('reports no finish reason, not an interrupted one, for a span whose step data was withheld because binding was uncertain', () => {
+    // #given an uncertain chat: interrupted and incomplete, with the gap, and no finish reason
+    const span = exported(
+      chat({
+        status: 'interrupted',
+        gaps: ['step-binding-uncertain'],
+        marks: ['incomplete'],
+        finishReason: undefined,
+        rawFinishReason: undefined,
+        usage: undefined,
+      }),
+    )
+
+    // #then the response's finish reason is unknown, not "interrupted"
+    expect(span.attributes['gen_ai.response.finish_reasons']).toBeUndefined()
+    expect(span.attributes['fro_bot.span.gaps']).toEqual(['step-binding-uncertain'])
+    expect(span.attributes['gen_ai.usage.input_tokens']).toBeUndefined()
+  })
+
   it('carries a failed call as an error status, an error type and an exception event', () => {
     // #given
     const span = exported(

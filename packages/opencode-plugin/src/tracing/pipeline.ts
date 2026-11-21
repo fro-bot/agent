@@ -86,6 +86,8 @@ export interface PipelineStats {
   readonly observationsOmitted: number
   /** Characters of raw text the inbox holds right now. */
   readonly inboxChars: number
+  /** Entries (session ids and lost-hook times) the loss markers in the inbox hold right now: bounded per marker. */
+  readonly markerEntries: number
 }
 
 export interface TracePipeline {
@@ -219,6 +221,12 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
   const attributeOptions = options.identity === undefined ? {} : {identity: options.identity}
   /** Observations waiting for the model, each with the raw text it holds against `maxInboxChars`. */
   const inbox: {readonly observation: Observation; readonly chars: number}[] = []
+  /**
+   * Loss markers in `inbox`. They are not counted against `maxInbox` (the room for ordinary observations): a marker has a
+   * reserved slot and can never be dropped. Markers merge when adjacent, so there are never more than one more than the
+   * ordinary observations: the inbox stays bounded.
+   */
+  let markers = 0
   let inboxChars = 0
   let observationsOmitted = 0
   const records: SpanRecord[] = []
@@ -227,6 +235,89 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
   let observationsDropped = 0
   let recordsFailed = 0
   let tick: NodeJS.Timeout | undefined
+
+  /** The most sessions one marker names; past it the marker names none, which means every session. */
+  const MAX_MARKER_SESSIONS = 32
+
+  const atOf = (observation: Observation): number => {
+    try {
+      return isPlainRecord(observation) && typeof observation.at === 'number' ? observation.at : now()
+    } catch {
+      return now()
+    }
+  }
+  const sessionOf = (observation: Observation): string | undefined => {
+    try {
+      return isPlainRecord(observation) && typeof observation.sessionId === 'string' ? observation.sessionId : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /** The receive time of a primary request hook, when `observation` is one: the loss of a hook is told with its time. */
+  const hookTimeOf = (observation: Observation): number | undefined => {
+    try {
+      return isPlainRecord(observation) && observation.kind === 'request' && observation.requestKind === 'primary'
+        ? atOf(observation)
+        : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  /**
+   * A marker's lost-hook times with `time` for `session` folded in (the newest per session); nothing for a drop with no session.
+   * At most MAX_MARKER_SESSIONS sessions: a time that does not fit is not kept, and the marker is then a broadcast (it names every
+   * session), which the model treats as evidence it cannot complete. A burst of drops cannot grow the marker.
+   */
+  const hookTimes = (
+    known: ReadonlyMap<string, number> | undefined,
+    session: string | undefined,
+    time: number | undefined,
+  ): {hookAt?: ReadonlyMap<string, number>} => {
+    const merged = new Map(known)
+    if (session !== undefined && time !== undefined && (merged.has(session) || merged.size < MAX_MARKER_SESSIONS)) {
+      merged.set(session, Math.max(time, merged.get(session) ?? time))
+    }
+    return merged.size === 0 ? {} : {hookAt: merged}
+  }
+
+  /**
+   * Tells the model, in order, that `observation` never reached it: a marker at the tail (it happened after everything queued)
+   * or, for one the model just failed on, at the front. A marker next to another one joins it. A drop with no known session
+   * makes a marker that names none: every session.
+   */
+  function lose(observation: Observation, reason: string, position: 'tail' | 'front' = 'tail'): void {
+    // A session id that size is malformed (it is not stored): the loss counts for every session.
+    const named = sessionOf(observation)
+    const session = named !== undefined && named.length <= MAX_IDENTIFIER_CHARS ? named : undefined
+    const edge = position === 'tail' ? inbox.at(-1) : inbox[0]
+    const merged = edge?.observation
+    if (isPlainRecord(merged) && merged.kind === 'loss') {
+      const sessionIds =
+        merged.sessionIds === undefined || session === undefined
+          ? undefined
+          : merged.sessionIds.includes(session)
+            ? merged.sessionIds
+            : merged.sessionIds.length >= MAX_MARKER_SESSIONS
+              ? undefined
+              : [...merged.sessionIds, session]
+      const joined: Observation = {...merged, sessionIds, ...hookTimes(merged.hookAt, session, hookTimeOf(observation))}
+      if (position === 'tail') inbox[inbox.length - 1] = {observation: joined, chars: 0}
+      else inbox[0] = {observation: joined, chars: 0}
+      return
+    }
+    const marker: Observation = {
+      kind: 'loss',
+      at: atOf(observation),
+      sessionIds: session === undefined ? undefined : [session],
+      reason,
+      ...hookTimes(undefined, session, hookTimeOf(observation)),
+    }
+    if (position === 'tail') inbox.push({observation: marker, chars: 0})
+    else inbox.unshift({observation: marker, chars: 0})
+    markers += 1
+  }
 
   /** Every snapshot a record holds: the request, the prompts, a tool's arguments and its result. */
   function release(record: SpanRecord): void {
@@ -270,16 +361,26 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
   /** Tells the sink about spans the model refused, once each: the model keeps a running total, this sends the difference. */
   function forwardDrops(): void {
     const total = model.stats().droppedSpans
-    if (total > forwardedDrops) {
-      options.sink.drop(total - forwardedDrops)
-      forwardedDrops = total
+    if (total <= forwardedDrops) return
+    const owed = total - forwardedDrops
+    // Counted as told before the sink hears it: a sink that throws loses these counts, it never makes them repeat.
+    forwardedDrops = total
+    tellSink(owed)
+  }
+
+  /** The sink's `drop`, which may throw: its failure is its own, and never a reason to treat the model's work as lost. */
+  function tellSink(count: number): void {
+    try {
+      options.sink.drop(count)
+    } catch {
+      // Nothing more can be done with a count the sink will not take.
     }
   }
 
   function enqueue(spans: readonly SpanRecord[]): void {
     for (const record of spans) {
       if (records.length >= limits.maxRecords) {
-        options.sink.drop(1)
+        tellSink(1)
         release(record)
         continue
       }
@@ -292,7 +393,7 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
       options.sink.export(toExportSpan(record, attributeOptions, options.scrubber))
     } catch {
       recordsFailed += 1
-      options.sink.drop(1)
+      tellSink(1)
     } finally {
       release(record)
     }
@@ -303,15 +404,25 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
     if (queued !== undefined) {
       inboxChars -= queued.chars
       const next = queued.observation
+      if (isPlainRecord(next) && next.kind === 'loss') markers -= 1
+      let produced: SpanRecord[] | undefined
       try {
-        enqueue(model.observe(next))
-        retainShared()
-        releaseDiscarded()
-        forwardDrops()
+        produced = model.observe(next)
       } catch {
-        // A model failure loses this observation, never the session.
+        // A model failure loses this observation, never the session; the model hears of it before it sees anything else.
         observationsDropped += 1
         releaseObservation(next)
+        lose(next, 'model-failed', 'front')
+      }
+      if (produced !== undefined) {
+        try {
+          enqueue(produced)
+          retainShared()
+          releaseDiscarded()
+          forwardDrops()
+        } catch {
+          // What the model did is done; a failure handing it on is not a failure of the observation.
+        }
       }
       return true
     }
@@ -345,9 +456,10 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
   return {
     observe: observation => {
       if (stopped) return
-      if (inbox.length >= limits.maxInbox) {
+      if (inbox.length - markers >= limits.maxInbox) {
         observationsDropped += 1
         releaseObservation(observation)
+        lose(observation, 'inbox-full')
         return
       }
       const measured = measure(observation)
@@ -355,6 +467,7 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
         // An identifier that size is not real: malformed, dropped, and anything it holds is freed.
         observationsDropped += 1
         releaseObservation(observation)
+        lose(observation, 'identifier-too-long')
         return
       }
       // Raw text over the remaining budget is replaced by its structure with the text omitted and marked. The replacement
@@ -378,11 +491,14 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
       const timeLeft = (): boolean => performance.now() < deadline
       // Observations first, so the model sees everything that happened; each step may be a slow one.
       while (inbox.length > 0 && timeLeft()) step()
-      // Out of time: what was never processed is lost, and says so. Its snapshots go back to the ledger.
+      // Out of time: what was never processed is lost, and its snapshots go back to the ledger. The model flushes next and closes
+      // every span as incomplete, so it needs no marker: nothing more will arrive for it to pair wrongly.
       for (const unprocessed of inbox.splice(0)) {
+        if (isPlainRecord(unprocessed.observation) && unprocessed.observation.kind === 'loss') continue
         observationsDropped += 1
         releaseObservation(unprocessed.observation)
       }
+      markers = 0
       inboxChars = 0
       try {
         enqueue(model.flush(now()))
@@ -396,10 +512,22 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
       while (records.length > 0 && timeLeft()) step()
       // Whatever is left is counted as dropped spans and released.
       for (const left of records.splice(0)) {
-        options.sink.drop(1)
+        tellSink(1)
         release(left)
       }
     },
-    stats: () => ({observationsDropped, recordsFailed, observationsOmitted, inboxChars}),
+    stats: () => ({
+      observationsDropped,
+      recordsFailed,
+      observationsOmitted,
+      inboxChars,
+      markerEntries: inbox.reduce(
+        (sum, queued) =>
+          queued.observation.kind === 'loss'
+            ? sum + (queued.observation.sessionIds?.length ?? 0) + (queued.observation.hookAt?.size ?? 0)
+            : sum,
+        0,
+      ),
+    }),
   }
 }

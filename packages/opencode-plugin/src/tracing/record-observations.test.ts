@@ -82,6 +82,22 @@ describe('observeEvent', () => {
     expect(observeEvent(event('session.usage.updated', {tokens: {input: 1, output: 1}}))).toMatchObject({kind: 'usage'})
   })
 
+  it('carries the step’s own start time, the number the join reads, and nothing for a value that is not a finite number', () => {
+    // #given step starts with a start time, with none, and with values that are not numbers
+    const data = {sessionID: 's', assistantMessageID: 'a', agent: 'build', model: {id: 'm', providerID: 'p'}}
+
+    // #then only a finite number is kept
+    expect(observeEvent(event('session.step.started', {...data, started: 1_700_000_000_123}))).toMatchObject({
+      kind: 'step.started',
+      started: 1_700_000_000_123,
+    })
+    for (const started of [undefined, 'soon', Number.NaN, Number.POSITIVE_INFINITY, null, {}]) {
+      const observed = observeEvent(event('session.step.started', {...data, started}))
+      expect(observed).toMatchObject({kind: 'step.started', messageId: 'a'})
+      expect((observed as {started?: unknown}).started).toBeUndefined()
+    }
+  })
+
   it('reads a subagent report from the item, with the header state, and the child id from metadata', () => {
     // #given an interim report item
     const raw = event('session.inbox.enqueued', {

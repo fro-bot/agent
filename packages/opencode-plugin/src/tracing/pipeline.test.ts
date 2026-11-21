@@ -354,7 +354,7 @@ describe('spans the model refuses at its open-span limit', () => {
       provider: 'p',
       content: {},
     })
-    add({kind: 'step.started', sessionId: 'a', messageId: 's1', agent: 'build', model: 'm', provider: 'p'})
+    add({kind: 'step.started', sessionId: 'a', messageId: 's1', started: at, agent: 'build', model: 'm', provider: 'p'})
     for (let index = 0; index < calls; index += 1) {
       add({kind: 'tool.named', sessionId: 'a', callId: `c${index}`, tool: 'read'})
       add({kind: 'tool.called', sessionId: 'a', callId: `c${index}`, executed: false, input: {}})
@@ -446,6 +446,7 @@ describe('a snapshot shared by a model span and a tool span', () => {
     pipeline.observe({
       kind: 'step.started',
       at: at(6),
+      started: at(6),
       sessionId: 'a',
       messageId: 's1',
       agent: 'build',
@@ -562,6 +563,7 @@ describe('stop against a deadline', () => {
       pipeline.observe({
         kind: 'step.started',
         at: at + 6,
+        started: at + 6,
         sessionId: session,
         messageId: 's',
         agent: 'build',
@@ -684,6 +686,7 @@ describe('the inbox holds a bounded amount of raw text', () => {
     pipeline.observe({
       kind: 'step.started',
       at: 6,
+      started: 6,
       sessionId: session,
       messageId: 's1',
       agent: 'build',
@@ -850,6 +853,7 @@ describe('every raw string an observation carries is counted at ingress', () => 
     pipeline.observe({
       kind: 'step.started',
       at: 6,
+      started: 6,
       sessionId: session,
       messageId: 's1',
       agent: 'build',
@@ -1082,6 +1086,7 @@ describe('every raw string an observation carries is counted at ingress', () => 
     pipeline.observe({
       kind: 'step.started',
       at: 1,
+      started: 1,
       sessionId: 's'.repeat(60),
       messageId: 'm'.repeat(60),
       agent: 'a',
@@ -1093,5 +1098,501 @@ describe('every raw string an observation carries is counted at ingress', () => 
     expect(pipeline.stats().observationsOmitted).toBe(0)
     expect(pipeline.stats().inboxChars).toBeGreaterThanOrEqual(120)
     pipeline.stop()
+  })
+})
+
+describe('an observation the pipeline drops is told to the model, in order, by a marker that cannot be dropped', () => {
+  const USAGE = {input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0}
+  const session = 'p'
+  const base = (): Observation[] => [
+    {kind: 'execution.started', at: 1, sessionId: session},
+    {
+      kind: 'request',
+      at: 2,
+      sessionId: session,
+      requestKind: 'primary',
+      agent: 'build',
+      model: 'm',
+      provider: 'p',
+      content: {},
+    },
+  ]
+  const turn = (): Observation[] => [
+    {
+      kind: 'step.started',
+      at: 3,
+      started: 3,
+      sessionId: session,
+      messageId: 's1',
+      agent: 'build',
+      model: 'm',
+      provider: 'p',
+    },
+    {kind: 'output', at: 4, sessionId: session, messageId: 's1', part: 'text', text: 'the step text'},
+    {
+      kind: 'step.ended',
+      at: 5,
+      sessionId: session,
+      messageId: 's1',
+      finish: 'stop',
+      rawFinish: 'stop',
+      usage: USAGE,
+      cost: 0,
+    },
+    {kind: 'execution.ended', at: 6, sessionId: session, outcome: 'succeeded'},
+  ]
+  const chatSpan = (spans: readonly ScrubbedSpan[]) => spans.find(span => span.name.startsWith('chat'))
+
+  it('lets a full inbox lose an observation and still reach the model with a marker, so the session’s binding is uncertain', async () => {
+    // #given an inbox of three, filled by the setup and one more observation (the step's start), which does not fit
+    const {sink, spans} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber, limits: {maxInbox: 3}})
+    for (const observation of [...base(), {kind: 'usage', at: 2, sessionId: session} as Observation])
+      pipeline.observe(observation)
+
+    // #when the rest of the turn is handed over while it is still full, then everything drains
+    for (const observation of turn()) pipeline.observe(observation)
+    await flush()
+    pipeline.stop()
+
+    // #then the lost step.started told the model, so the span carries none of the step's text, and says why
+    expect(pipeline.stats().observationsDropped).toBeGreaterThan(0)
+    const chat = chatSpan(spans)
+    expect(chat?.attributes['fro_bot.span.gaps']).toContain('step-binding-uncertain')
+    expect(JSON.stringify(spans)).not.toContain('the step text')
+  })
+
+  it('keeps the marker in its place in the sequence: what was queued before the loss is seen before it, and what arrives after it, after', async () => {
+    // #given a turn whose first step complete, then a loss, then a second step
+    const {sink, spans} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber, limits: {maxInbox: 6}})
+    for (const observation of [...base(), ...turn().slice(0, 3)]) pipeline.observe(observation)
+    for (let index = 0; index < 7; index += 1) pipeline.observe({kind: 'usage', at: 7 + index, sessionId: 'other'})
+    pipeline.observe({kind: 'execution.ended', at: 30, sessionId: session, outcome: 'succeeded'})
+    await flush()
+    pipeline.stop()
+
+    // #then the first request's own step was queued before any loss, so it keeps its data
+    expect(JSON.stringify(spans)).toContain('the step text')
+  })
+
+  it('never drops the marker itself: a stream of losses under a full inbox leaves the model told, and the inbox stays bounded', async () => {
+    // #given an inbox of two and a hundred observations for the same session handed over before the loop runs
+    const {sink, spans} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber, limits: {maxInbox: 2}})
+    for (const observation of base()) pipeline.observe(observation)
+    for (let index = 0; index < 100; index += 1) pipeline.observe({kind: 'usage', at: 3 + index, sessionId: session})
+    const dropped = pipeline.stats().observationsDropped
+    await flush()
+    for (const observation of turn()) pipeline.observe(observation)
+    await flush()
+    pipeline.stop()
+
+    // #then they were dropped, the model was told once, in a marker, and the later step bound nothing
+    expect(dropped).toBeGreaterThanOrEqual(98)
+    expect(chatSpan(spans)?.attributes['fro_bot.span.gaps']).toContain('step-binding-uncertain')
+    expect(JSON.stringify(spans)).not.toContain('the step text')
+  })
+
+  it('tells the model about an observation dropped for an oversized identifier', async () => {
+    // #given a request waiting for its step, then an observation of the same session whose tool name is not a real identifier
+    const {sink, spans} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber})
+    for (const observation of base()) pipeline.observe(observation)
+    pipeline.observe({kind: 'tool.named', at: 2, sessionId: session, callId: 'c', tool: 't'.repeat(5000)})
+    for (const observation of turn()) pipeline.observe(observation)
+    await flush()
+    pipeline.stop()
+
+    // #then the lost observation means the request waiting for its step may have lost that step's start
+    expect(pipeline.stats().observationsDropped).toBe(1)
+    expect(JSON.stringify(spans)).not.toContain('the step text')
+    expect(spans.some(span => String(span.attributes['fro_bot.span.gaps']).includes('step-binding-uncertain'))).toBe(
+      true,
+    )
+  })
+
+  it('never shows a prefix as the whole: a dropped suffix of a bound request’s text withholds the request’s step data (the review’s case)', async () => {
+    // #given a bound request with a text prefix, an inbox that fills so the suffix is dropped, and then the step ending as stop
+    const {sink, spans} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber, limits: {maxInbox: 1}})
+    const send = async (observation: Observation): Promise<void> => {
+      pipeline.observe(observation)
+      await new Promise<void>(resolve => setTimeout(resolve, 3))
+    }
+    await send({kind: 'execution.started', at: 1, sessionId: session})
+    await send(base()[1] as Observation)
+    await send({
+      kind: 'step.started',
+      at: 3,
+      started: 2,
+      sessionId: session,
+      messageId: 's1',
+      agent: 'build',
+      model: 'm',
+      provider: 'p',
+    })
+    await send({kind: 'output', at: 4, sessionId: session, messageId: 's1', part: 'text', text: 'prefix'})
+    pipeline.observe({kind: 'usage', at: 5, sessionId: session})
+    pipeline.observe({kind: 'output', at: 6, sessionId: session, messageId: 's1', part: 'text', text: 'suffix'})
+    await flush()
+    await send({
+      kind: 'step.ended',
+      at: 7,
+      sessionId: session,
+      messageId: 's1',
+      finish: 'stop',
+      rawFinish: 'stop',
+      usage: USAGE,
+      cost: 0,
+    })
+    await send({kind: 'execution.ended', at: 8, sessionId: session, outcome: 'succeeded'})
+    pipeline.stop()
+
+    // #then the suffix really was dropped, and the span carries neither the prefix nor a finish reason
+    expect(pipeline.stats().observationsDropped).toBeGreaterThan(0)
+    const chat = chatSpan(spans)
+    expect(JSON.stringify(spans)).not.toContain('prefix')
+    expect(chat?.attributes['gen_ai.response.finish_reasons']).toBeUndefined()
+    expect(chat?.attributes['fro_bot.span.gaps']).toContain('step-binding-uncertain')
+  })
+
+  it('tells the model about an observation it failed on, before anything else it sees', async () => {
+    // #given a request waiting for its step, and a step.started that reads fine at the door and throws inside the model
+    const {sink, spans} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber})
+    for (const observation of base()) pipeline.observe(observation)
+    let reads = 0
+    const hostile = {
+      kind: 'step.started',
+      at: 3,
+      started: 3,
+      sessionId: session,
+      get messageId(): string {
+        reads += 1
+        if (reads > 1) throw new Error('hostile')
+        return 's1'
+      },
+      agent: 'build',
+      model: 'm',
+      provider: 'p',
+    } as unknown as Observation
+    pipeline.observe(hostile)
+    await flush()
+
+    // #when the rest of the turn arrives
+    for (const observation of turn().slice(1)) pipeline.observe(observation)
+    await flush()
+    pipeline.stop()
+
+    // #then the session is uncertain from the failure on: the step's text is on no span
+    expect(pipeline.stats().observationsDropped).toBe(1)
+    expect(JSON.stringify(spans)).not.toContain('the step text')
+    expect(spans.some(span => String(span.attributes['fro_bot.span.gaps']).includes('step-binding-uncertain'))).toBe(
+      true,
+    )
+  })
+
+  it('names every session for a drop it cannot attribute (an observation with no session id)', async () => {
+    // #given two sessions each waiting for a step, with the inbox exactly full, and an observation with no session that does not fit
+    const {sink, spans} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber, limits: {maxInbox: 4}})
+    for (const observation of base()) pipeline.observe(observation)
+    pipeline.observe({kind: 'execution.started', at: 1, sessionId: 'q'})
+    pipeline.observe({
+      kind: 'request',
+      at: 2,
+      sessionId: 'q',
+      requestKind: 'primary',
+      agent: 'build',
+      model: 'm',
+      provider: 'p',
+      content: {},
+    })
+    pipeline.observe({kind: 'tick', at: 3})
+    expect(pipeline.stats().observationsDropped).toBe(1)
+    await flush()
+
+    // #when both sessions then deliver a complete step
+    for (const sessionId of [session, 'q']) {
+      pipeline.observe({
+        kind: 'step.started',
+        at: 4,
+        started: 4,
+        sessionId,
+        messageId: `s-${sessionId}`,
+        agent: 'build',
+        model: 'm',
+        provider: 'p',
+      })
+      pipeline.observe({
+        kind: 'output',
+        at: 5,
+        sessionId,
+        messageId: `s-${sessionId}`,
+        part: 'text',
+        text: `text of ${sessionId}`,
+      })
+      pipeline.observe({
+        kind: 'step.ended',
+        at: 6,
+        sessionId,
+        messageId: `s-${sessionId}`,
+        finish: 'stop',
+        rawFinish: 'stop',
+        usage: USAGE,
+        cost: 0,
+      })
+      pipeline.observe({kind: 'execution.ended', at: 7, sessionId, outcome: 'succeeded'})
+    }
+    await flush()
+    pipeline.stop()
+
+    // #then neither is trusted
+    expect(JSON.stringify(spans)).not.toContain('text of')
+    expect(
+      spans.filter(span => String(span.attributes['fro_bot.span.gaps']).includes('step-binding-uncertain')),
+    ).toHaveLength(2)
+  })
+})
+
+describe('a lost primary hook merged with an unattributed drop (the review’s case)', () => {
+  const USAGE = {input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0}
+  const session = 'p'
+  const primary = (at: number): Observation => ({
+    kind: 'request',
+    at,
+    sessionId: session,
+    requestKind: 'primary',
+    agent: 'build',
+    model: 'm',
+    provider: 'p',
+    content: {},
+  })
+  const chats = (spans: readonly ScrubbedSpan[]) => spans.filter(span => span.name.startsWith('chat'))
+  /** Lets the loop drain what it has, so a one-slot inbox holds one observation at a time. */
+  const settle = async (): Promise<void> => new Promise<void>(resolve => setTimeout(resolve, 3))
+
+  it('keeps the lost hook’s time in the marker, so the next hook cannot claim the lost request’s delayed step', async () => {
+    // #given a full inbox that drops a primary hook (at 20) and then an observation with no session, which merge into one marker
+    const {sink, spans} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber, limits: {maxInbox: 1}})
+    pipeline.observe({kind: 'execution.started', at: 1, sessionId: session})
+    pipeline.observe(primary(20))
+    pipeline.observe({kind: 'usage', at: 21} as unknown as Observation)
+    expect(pipeline.stats().observationsDropped).toBe(2)
+    await flush()
+
+    // #when the next request is hooked in the same millisecond, and the lost request's delayed step arrives
+    for (const observation of [
+      primary(20),
+      {
+        kind: 'step.started',
+        at: 21,
+        started: 20,
+        sessionId: session,
+        messageId: 'lost',
+        agent: 'build',
+        model: 'm',
+        provider: 'p',
+      },
+      {kind: 'output', at: 22, sessionId: session, messageId: 'lost', part: 'text', text: 'LOST REQUESTS TEXT'},
+      {
+        kind: 'step.ended',
+        at: 23,
+        sessionId: session,
+        messageId: 'lost',
+        finish: 'stop',
+        rawFinish: 'stop',
+        usage: USAGE,
+        cost: 0,
+      },
+      {kind: 'execution.ended', at: 24, sessionId: session, outcome: 'succeeded'},
+    ] as Observation[]) {
+      pipeline.observe(observation)
+      await settle()
+    }
+    await flush()
+    pipeline.stop()
+
+    // #then the text is on no span
+    expect(JSON.stringify(spans)).not.toContain('LOST REQUESTS TEXT')
+    expect(chats(spans).length).toBeGreaterThan(0)
+  })
+
+  it('keeps each session’s lost-hook time when markers for different sessions merge', async () => {
+    // #given a full inbox that drops a primary hook of session q (at 212) and an event of session r, which merge into one marker
+    const {sink, spans} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber, limits: {maxInbox: 1}})
+    pipeline.observe({kind: 'execution.started', at: 1, sessionId: 'r'})
+    pipeline.observe({...primary(212), sessionId: 'q'} as Observation)
+    pipeline.observe({kind: 'usage', at: 213, sessionId: 'r'})
+    expect(pipeline.stats().observationsDropped).toBe(2)
+    expect(pipeline.stats().markerEntries).toBeLessThanOrEqual(4)
+    await flush()
+
+    // #when session q then shows a hook that is EARLIER than the lost one (the clock went back) and the lost request's step
+    for (const observation of [
+      {kind: 'execution.started', at: 2, sessionId: 'q'},
+      {...primary(148), sessionId: 'q'},
+      {
+        kind: 'step.started',
+        at: 150,
+        started: 166,
+        sessionId: 'q',
+        messageId: 'x',
+        agent: 'build',
+        model: 'm',
+        provider: 'p',
+      },
+      {kind: 'output', at: 151, sessionId: 'q', messageId: 'x', part: 'text', text: 'MERGED MARKER TEXT'},
+      {
+        kind: 'step.ended',
+        at: 152,
+        sessionId: 'q',
+        messageId: 'x',
+        finish: 'stop',
+        rawFinish: 'stop',
+        usage: USAGE,
+        cost: 0,
+      },
+      {kind: 'execution.ended', at: 153, sessionId: 'q', outcome: 'succeeded'},
+    ] as Observation[]) {
+      pipeline.observe(observation)
+      await settle()
+    }
+    await flush()
+    pipeline.stop()
+
+    // #then the rollback was seen: q's request is exported, withheld, and the text is on no span
+    expect(JSON.stringify(spans)).not.toContain('MERGED MARKER TEXT')
+    const chat = spans.find(span => span.name.startsWith('chat'))
+    expect(chat?.attributes['fro_bot.span.gaps']).toContain('step-binding-uncertain')
+  })
+
+  it('bounds the marker under a burst of more than 32 distinct dropped primary hooks, and attribution stays safe', async () => {
+    // #given a full inbox and 200 primary hooks of 200 distinct sessions dropped in a burst
+    const {sink, spans} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber, limits: {maxInbox: 1}})
+    pipeline.observe({kind: 'execution.started', at: 1, sessionId: session})
+    for (let index = 0; index < 200; index += 1) {
+      pipeline.observe({...primary(20), sessionId: `burst-${String(index)}`} as Observation)
+    }
+    const markerSize = pipeline.stats().markerEntries
+
+    // #then the marker holds at most the bound however many were dropped, and says its evidence is incomplete
+    expect(markerSize).toBeLessThanOrEqual(64)
+    await flush()
+
+    // #when the burst's session `p` then has a hook and a delayed step of a request that was dropped with the burst
+    for (const observation of [
+      primary(20),
+      {
+        kind: 'step.started',
+        at: 21,
+        started: 20,
+        sessionId: session,
+        messageId: 'x',
+        agent: 'build',
+        model: 'm',
+        provider: 'p',
+      },
+      {kind: 'output', at: 22, sessionId: session, messageId: 'x', part: 'text', text: 'BURST TEXT'},
+      {
+        kind: 'step.ended',
+        at: 23,
+        sessionId: session,
+        messageId: 'x',
+        finish: 'stop',
+        rawFinish: 'stop',
+        usage: USAGE,
+        cost: 0,
+      },
+      {kind: 'execution.ended', at: 24, sessionId: session, outcome: 'succeeded'},
+    ] as Observation[]) {
+      pipeline.observe(observation)
+      await settle()
+    }
+    await flush()
+    pipeline.stop()
+
+    // #then nothing of the step is exported
+    expect(JSON.stringify(spans)).not.toContain('BURST TEXT')
+  })
+})
+
+describe('a sink that throws while the pipeline reports a drop', () => {
+  it('does not turn the sink’s failure into a loss marker per pass: the queue drains and stop() finishes', async () => {
+    // #given a sink whose `drop` throws, and a model that refuses its second span so a drop must be reported
+    const spans: ScrubbedSpan[] = []
+    let calls = 0
+    const sink: SpanSink = {
+      export: span => {
+        spans.push(span)
+      },
+      drop: () => {
+        calls += 1
+        throw new Error('sink is down')
+      },
+    }
+    const pipeline = createTracePipeline({sink, scrubber, modelLimits: {maxOpenSpansPerTrace: 1}})
+    const session = 'p'
+    const observations: Observation[] = [
+      {kind: 'execution.started', at: 1, sessionId: session},
+      {
+        kind: 'request',
+        at: 2,
+        sessionId: session,
+        requestKind: 'primary',
+        agent: 'build',
+        model: 'm',
+        provider: 'p',
+        content: {},
+      },
+      {
+        kind: 'request',
+        at: 3,
+        sessionId: session,
+        requestKind: 'primary',
+        agent: 'build',
+        model: 'm',
+        provider: 'p',
+        content: {},
+      },
+      {
+        kind: 'step.started',
+        at: 4,
+        started: 2,
+        sessionId: session,
+        messageId: 's1',
+        agent: 'build',
+        model: 'm',
+        provider: 'p',
+      },
+      {kind: 'output', at: 5, sessionId: session, messageId: 's1', part: 'text', text: 'first answer'},
+      {
+        kind: 'step.ended',
+        at: 6,
+        sessionId: session,
+        messageId: 's1',
+        finish: 'stop',
+        rawFinish: 'stop',
+        usage: {input: 1, output: 1, reasoning: 0, cacheRead: 0, cacheWrite: 0},
+        cost: 0,
+      },
+      {kind: 'execution.ended', at: 7, sessionId: session, outcome: 'succeeded'},
+    ]
+
+    // #when everything is observed and the pipeline runs and stops (bounded, so a loop shows as a failure, not a hang)
+    for (const observation of observations) pipeline.observe(observation)
+    await flush()
+    const started = performance.now()
+    pipeline.stop(2_000)
+
+    // #then it finished well inside the bound, lost nothing to the sink's failure, and the first request kept its own answer
+    expect(performance.now() - started).toBeLessThan(1_500)
+    expect(pipeline.stats().observationsDropped).toBe(0)
+    expect(calls).toBeGreaterThan(0)
+    expect(JSON.stringify(spans)).toContain('first answer')
   })
 })
