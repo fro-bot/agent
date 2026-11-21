@@ -241,6 +241,50 @@ describe('the snapshot ledger in the pipeline', () => {
     expect(ledger.stats()).toMatchObject({pending: 0, pendingChars: 0})
   })
 
+  it('holds no request snapshot after 64 requests of one running execution have closed', async () => {
+    // #given an execution that stays open, with 64 requests in a row, each with a snapshot of its own and its step
+    const ledger = createSnapshotLedger()
+    const {sink, spans} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber, ledger})
+    const context = {ledger}
+    const sessionId = 'ses_loop'
+    pipeline.observe({
+      kind: 'prompt',
+      at: 1,
+      sessionId,
+      messageId: 'm1',
+      content: snapshotPrompt({text: 'go'}, context),
+    })
+    pipeline.observe({kind: 'inbox.enqueued', at: 2, sessionId, inboxId: 'm1', item: 'user'})
+    pipeline.observe({kind: 'execution.started', at: 3, sessionId})
+    pipeline.observe({kind: 'inbox.delivered', at: 4, sessionId, inboxId: 'm1'})
+    for (let index = 0; index < 64; index += 1) {
+      const at = 10 + index * 10
+      const messageId = `s${String(index)}`
+      const content = snapshotRequest({system: [{text: 's'}], messages: [{role: 'user', content: 'hi'}]}, context)
+      pipeline.observe({kind: 'request', at, sessionId, requestKind: 'primary', agent: 'build', model: 'm', content})
+      pipeline.observe({
+        kind: 'step.started',
+        at: at + 1,
+        sessionId,
+        messageId,
+        started: at,
+        agent: 'build',
+        model: 'm',
+      })
+      pipeline.observe({kind: 'step.ended', at: at + 2, sessionId, messageId, finish: 'stop', rawFinish: 'stop'})
+    }
+
+    // #when the records have been exported
+    await flush()
+
+    // #then every request's snapshot is released; only the prompt, held by the open root span, is left
+    expect(spans.filter(span => span.name.startsWith('chat'))).toHaveLength(64)
+    expect(ledger.stats().pending).toBe(1)
+    pipeline.stop()
+    expect(ledger.stats().pending).toBe(0)
+  })
+
   it('frees the snapshot of an observation it discards for lack of inbox room', () => {
     // #given an inbox of one
     const ledger = createSnapshotLedger()

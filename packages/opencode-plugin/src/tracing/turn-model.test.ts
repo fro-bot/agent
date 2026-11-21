@@ -3467,6 +3467,149 @@ describe('a step belongs to the latest primary hook at or before its own start t
     expect(JSON.stringify(records)).not.toContain('kid text')
     expect(primaries(records, 'kid').some(chat => chat.gaps.includes('step-binding-uncertain'))).toBe(true)
   })
+
+  describe('a closed request leaves only its time and state in the hook record', () => {
+    it('references a request while it is open and lets go of it when its step ends', () => {
+      // #given a request hook, then its step
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      const waiting = replay(s.out, {flush: false}).model.stats()
+      s.stepStarted('p', 'm1', 100)
+      s.text('p', 'm1', 'a'.repeat(40))
+      const running = replay(s.out, {flush: false}).model.stats()
+      s.stepEnded('p', 'm1')
+
+      // #when the step ends, with the execution still running
+      const {model} = replay(s.out, {flush: false})
+
+      // #then the entry keeps its time, and no request, text or snapshot is reachable through it
+      expect([waiting.historyRequestsHeld, running.historyRequestsHeld]).toEqual([1, 1])
+      expect(model.stats()).toMatchObject({hookTimes: 1, historyRequestsHeld: 0, heldOutputChars: 0})
+    })
+
+    it('lets go of a request that a retry hook closed before its step', () => {
+      // #given a request waiting for its step, and the retry hook that follows its failure
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      retry(s, 'p')
+
+      // #when
+      const {model} = replay(s.out, {flush: false})
+
+      // #then
+      expect(model.stats()).toMatchObject({hookTimes: 1, historyRequestsHeld: 0})
+    })
+
+    it('holds no payload outside the output budget after a full record of requests has closed', () => {
+      // #given more requests in one execution than the record keeps, each with output, every one closed
+      const count = DEFAULT_LIMITS.maxHookTimes + 6
+      const s = script()
+      s.started('p')
+      for (let index = 0; index < count; index += 1) {
+        const at = 100 + index * 10
+        hook(s, 'p', at)
+        step(s, 'p', `m${String(index)}`, at, 'x'.repeat(50))
+      }
+
+      // #when
+      const {model, records} = replay(s.out, {flush: false})
+
+      // #then every span exported, the record holds exactly its bound of times and none of the requests, and nothing is withheld
+      expect(primaries(records)).toHaveLength(count)
+      expect(model.stats()).toMatchObject({
+        hookTimes: DEFAULT_LIMITS.maxHookTimes,
+        historyRequestsHeld: 0,
+        heldOutputChars: 0,
+        openSteps: 0,
+        withholds: 0,
+      })
+    })
+
+    it('binds nothing for a step that arrives after its request closed, and binds the next request normally', () => {
+      // #given a request closed by a retry hook, its late step, then a new request with its step
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      retry(s, 'p')
+      step(s, 'p', 'late', 100, 'LATE STEP')
+      hook(s, 'p', 200)
+      step(s, 'p', 'm2', 200, 'NEXT')
+      s.ended('p')
+
+      // #when
+      const {records} = replay(s.out, {flush: false})
+
+      // #then
+      expect(JSON.stringify(records)).not.toContain('LATE STEP')
+      expect(chatWith(records, 'NEXT')?.messageId).toBe('m2')
+      expect(chats(records).some(chat => chat.gaps.includes('step-binding-uncertain'))).toBe(false)
+    })
+
+    it.each([
+      ['the trace closes', (_s: ReturnType<typeof script>) => undefined],
+      ['a loss made it uncertain and the execution ends', (s: ReturnType<typeof script>) => s.lost(['a'])],
+    ])(
+      'holds no bound request in a session that outlives a trace that closed while its step ran: %s',
+      (_name, extra) => {
+        // #given a session with a prompt still queued behind the running one, a request bound to a step that never ends
+        const s = script()
+        s.prompt('a', 'm1')
+        s.prompt('a', 'm2')
+        s.enqueued('a', 'm1', 'user')
+        s.enqueued('a', 'm2', 'user')
+        s.started('a')
+        s.delivered('a', 'm1')
+        s.request('a')
+        s.stepStarted('a', 's-1')
+        s.text('a', 's-1', 'x'.repeat(30))
+        extra(s)
+        s.ended('a')
+
+        // #when
+        const {model, records} = replay(s.out, {flush: false})
+
+        // #then the request's span is out, and nothing of it is left in the session that remains
+        expect(chats(records)).toHaveLength(1)
+        expect(model.stats()).toMatchObject({sessions: 1, openSteps: 0, historyRequestsHeld: 0, heldOutputChars: 0})
+      },
+    )
+
+    it('still counts a closed hook that never had its step as unconsumed: an equal-time step withholds', () => {
+      // #given a hook closed by a retry with no step, and a step that starts in the millisecond of the hook after it
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 150)
+      retry(s, 'p')
+      hook(s, 'p', 151)
+      step(s, 'p', 'm1', 151, 'AMBIGUOUS')
+      s.ended('p')
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then
+      expect(model.stats().withholds).toBe(1)
+      expect(JSON.stringify(records)).not.toContain('AMBIGUOUS')
+    })
+
+    it('still withholds when a closed hook that never had its step is evicted', () => {
+      // #given a hook closed by a retry with no step, and two more hooks past a record of two
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 110)
+      retry(s, 'p')
+      hook(s, 'p', 120)
+      hook(s, 'p', 130)
+
+      // #when
+      const {model} = replay(s.out, {limits: {maxHookTimes: 2}, flush: false})
+
+      // #then
+      expect(model.stats().withholds).toBe(1)
+    })
+  })
 })
 
 describe('the join against every recorded scenario, with the scripted provider’s own account of whose each step was', () => {

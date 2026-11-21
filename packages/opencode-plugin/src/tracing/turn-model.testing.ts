@@ -27,7 +27,12 @@ export interface Replay {
 /** Feeds `observations` to a fresh model in order, then flushes at the last time, and returns every record. */
 export function replay(
   observations: readonly Observation[],
-  options: {readonly limits?: Partial<TurnModelLimits>; readonly flush?: boolean} = {},
+  options: {
+    readonly limits?: Partial<TurnModelLimits>
+    readonly flush?: boolean
+    /** Called after each observation with the records it finished. */
+    readonly afterEach?: (model: TurnModel, finished: readonly SpanRecord[], observation: Observation) => void
+  } = {},
 ): Replay {
   const model = createTurnModel({
     ids: sequentialIds(),
@@ -37,7 +42,9 @@ export function replay(
   let last = 0
   for (const observation of observations) {
     last = Math.max(last, observation.at)
-    records.push(...model.observe(observation))
+    const finished = model.observe(observation)
+    records.push(...finished)
+    options.afterEach?.(model, finished, observation)
   }
   if (options.flush !== false) records.push(...model.flush(last))
   return {records, model}
