@@ -87,6 +87,8 @@ function planSession(random: Random, config: Config, session: string, count: num
   const plans: HookPlan[] = []
   let t = start
   let reuse: string | undefined
+  // Adversarial runs of zero-length steps: two to four steps in a row that start, run and end in the millisecond the next hook arrives.
+  let zeroRun = 0
   for (let index = 0; index < count; index += 1) {
     const last = index === count - 1
     const fate: Fate =
@@ -99,12 +101,17 @@ function planSession(random: Random, config: Config, session: string, count: num
             ['postfail', last ? 0 : 2],
           ])
     const message = reuse ?? `${session}-m${String(index)}`
-    // The step starts at its hook's time or a millisecond after (the usual case is the same millisecond).
-    const tStart = t + (random() < 0.7 ? 0 : 1)
+    if (!clean && zeroRun === 0 && random() < 0.15) zeroRun = int(random, 2, 4)
+    const zero = zeroRun > 0
+    if (zero) zeroRun -= 1
+    // The step starts at its hook's time or a millisecond after (the usual case is the same millisecond). Adversarial: sometimes
+    // long after, as when another plugin's hook ran in between, and the next hook can still arrive in the millisecond it ends.
+    const slowStart = !clean && !zero && random() < 0.2
+    const tStart = zero ? t : slowStart ? t + int(random, 2, 60) : t + (random() < 0.7 ? 0 : 1)
     const tag = `${session}#${String(index)}`
     const parts = Array.from({length: int(random, 1, 3)}, (_, part) => `text ${tag} p${String(part)}`)
     // Clean steps take a millisecond per event; an adversarial one may take none at all.
-    const inc = clean || random() < 0.5 ? 1 : 0
+    const inc = zero ? 0 : clean || random() < 0.5 ? 1 : 0
     const plan: HookPlan = {session, index, fate, t, tStart, inc, message, tag, parts}
     plans.push(plan)
     reuse = fate === 'preout' ? message : undefined
@@ -116,7 +123,9 @@ function planSession(random: Random, config: Config, session: string, count: num
         ? done + int(random, 30, 2000)
         : clean
           ? Math.max(done, tStart + 12) + int(random, 0, 48)
-          : done + int(random, 0, 60)
+          : zero || slowStart
+            ? done
+            : done + int(random, 0, 60)
   }
   return plans
 }
@@ -441,7 +450,12 @@ function build(seed: number, config: Config): Case {
     for (const [, plan] of plans) {
       for (const hook of plan.slice(1)) {
         const previous = plan[hook.index - 1]
-        if (previous !== undefined && random() < 0.12) {
+        // Only between steps, of every session (the clock is shared): a rollback that falls between a hook and its own step's
+        // events is the documented undetectable residual (turn-model.ts), not generated.
+        const straddles = [...plans.values()].some(other =>
+          other.some(candidate => candidate.t <= hook.t - 1 && eventTimes(candidate).last > hook.t - 1),
+        )
+        if (previous !== undefined && !straddles && random() < 0.12) {
           rollbackAt.set(hook.t - 1, hook.t - previous.t + int(random, 0, 40))
           rollbacks += 1
         }
@@ -544,9 +558,11 @@ describe('the step join over generated sessions', () => {
     let exact = 0
     for (let seed = 1; seed <= SEEDS; seed += 1) {
       const {plans, observations, limits} = build(seed, {mode: 'clean'})
-      const {records} = replay(observations, {limits})
+      const {records, model} = replay(observations, {limits})
       const byTag = chatsByTag(records.filter((record): record is ChatRecord => record.kind === 'chat'))
       const problems: unknown[] = []
+      // A run whose steps and hooks the join can place never withholds.
+      if (model.stats().withholds !== 0) problems.push({withholds: model.stats().withholds})
       for (const [session, plan] of plans) {
         for (const hook of plan) {
           const spans = byTag.get(hook.tag) ?? []
@@ -586,6 +602,8 @@ describe('the step join over generated sessions', () => {
     let sameMs = 0
     let bigRecord = 0
     let children = 0
+    let zeroRuns = 0
+    let slowStarts = 0
     for (let seed = 1; seed <= SEEDS; seed += 1) {
       const generated = build(seed, {mode: 'adversarial'})
       const {plans, observations, limits} = generated
@@ -599,6 +617,8 @@ describe('the step join over generated sessions', () => {
         bigRecord += plan.length > 64 ? 1 : 0
         for (const hook of plan) {
           sameMs += plan[hook.index + 1]?.t === hook.tStart ? 1 : 0
+          zeroRuns += hook.inc === 0 && plan[hook.index + 1]?.t === hook.t && plan[hook.index + 2]?.t === hook.t ? 1 : 0
+          slowStarts += hook.tStart - hook.t >= 2 && plan[hook.index + 1]?.t === hook.tStart ? 1 : 0
           for (const chat of byTag.get(hook.tag) ?? []) {
             checked += 1
             const other = wrong(chat, hook)
@@ -624,7 +644,7 @@ describe('the step join over generated sessions', () => {
     }
     if (process.env.FRO_BOT_JOIN_STATS === '1') {
       process.stdout.write(
-        `join stats: ${JSON.stringify({checked, uncertain, kept, dropped, rollbacks, sameMs, bigRecord, children})}\n`,
+        `join stats: ${JSON.stringify({checked, uncertain, kept, dropped, rollbacks, sameMs, bigRecord, children, zeroRuns, slowStarts})}\n`,
       )
     }
     // The generator exercises what it claims to.
@@ -636,5 +656,7 @@ describe('the step join over generated sessions', () => {
     expect(sameMs).toBeGreaterThan(SEEDS / 8)
     expect(bigRecord).toBeGreaterThan(SEEDS / 200)
     expect(children).toBeGreaterThan(SEEDS / 10)
+    expect(zeroRuns).toBeGreaterThan(SEEDS / 40)
+    expect(slowStarts).toBeGreaterThan(SEEDS / 20)
   }, 120_000)
 })
