@@ -33,6 +33,11 @@ function collectingSink() {
 const fixture = (name: string): readonly Observation[] => recordedFixtures[name]?.observations ?? []
 const scrubber = createScrubber()
 const flush = async (): Promise<void> => new Promise(resolve => setTimeout(resolve, 30))
+/** Waits for `done` to hold, up to a deadline, so a loaded machine slows the test and does not fail it. */
+async function until(done: () => boolean, deadlineMs = 10_000): Promise<void> {
+  const stop = Date.now() + deadlineMs
+  while (!done() && Date.now() < stop) await new Promise(resolve => setTimeout(resolve, 5))
+}
 
 describe('the pipeline', () => {
   it('does no work in observe: the sink hears nothing until the loop has run', async () => {
@@ -276,7 +281,7 @@ describe('the snapshot ledger in the pipeline', () => {
     }
 
     // #when the records have been exported
-    await flush()
+    await until(() => spans.filter(span => span.name.startsWith('chat')).length >= 64)
 
     // #then every request's snapshot is released; only the prompt, held by the open root span, is left
     expect(spans.filter(span => span.name.startsWith('chat'))).toHaveLength(64)
