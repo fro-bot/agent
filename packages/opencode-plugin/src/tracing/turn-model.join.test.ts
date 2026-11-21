@@ -23,8 +23,9 @@ import {replay} from './turn-model.testing.js'
 //     step included), each replaced by the loss marker the pipeline would send. Invariants: no span ever carries another
 //     request's content, and a span that shows a finish reason and output has ALL of its request's text.
 //
-// Rollbacks are generated at least as large as the gap since the previous hook, so the hook lands at or before it: a smaller one,
-// that leaves the next hook later than a delayed step's start, is the documented residual (turn-model.ts) and not generated.
+// Two kinds of rollback are generated. One is at least as large as the gap since the previous hook, so the hook lands at or before
+// it. The other steps back after a slow step's start and before the next hook, so the next hook reads after the previous hook
+// and before that step's start, and the step, delivered after the hook, is the earlier hook's but resolves to the later one.
 //
 // Every case is reproducible from its seed, which is in the failure message.
 
@@ -283,6 +284,7 @@ interface Case {
   readonly limits: Partial<TurnModelLimits>
   readonly dropped: number
   readonly rollbacks: number
+  readonly stepBacks: number
 }
 
 function build(seed: number, config: Config): Case {
@@ -462,6 +464,20 @@ function build(seed: number, config: Config): Case {
       }
     }
   }
+  // The second kind: a step-back between a slow step's start and the next hook, small enough that the hook still reads after the
+  // previous hook, large enough that it reads before the step's start.
+  let stepBacks = 0
+  if (adversarial && random() < 0.7) {
+    for (const [, plan] of plans) {
+      for (const hook of plan.slice(1)) {
+        const previous = plan[hook.index - 1]
+        if (previous === undefined || previous.fate === 'orphan' || rollbackAt.has(hook.t - 1)) continue
+        if (previous.tStart - previous.t < 2 || eventTimes(previous).last >= hook.t || random() >= 0.6) continue
+        rollbackAt.set(hook.t - 1, int(random, hook.t - previous.tStart + 1, hook.t - previous.t - 1))
+        stepBacks += 1
+      }
+    }
+  }
   const points = [...rollbackAt.entries()].sort((a, b) => a[0] - b[0])
   const wall = (t: number): number => {
     let offset = 0
@@ -516,7 +532,7 @@ function build(seed: number, config: Config): Case {
       })
     } else observations.push(observation)
   }
-  return {seed, plans, observations, limits, dropped, rollbacks}
+  return {seed, plans, observations, limits, dropped, rollbacks, stepBacks}
 }
 
 const SEEDS = 20_000
@@ -599,6 +615,8 @@ describe('the step join over generated sessions', () => {
     let kept = 0
     let dropped = 0
     let rollbacks = 0
+    let stepBacks = 0
+    let withheld = 0
     let sameMs = 0
     let bigRecord = 0
     let children = 0
@@ -609,6 +627,7 @@ describe('the step join over generated sessions', () => {
       const {plans, observations, limits} = generated
       dropped += generated.dropped
       rollbacks += generated.rollbacks
+      stepBacks += generated.stepBacks
       const problems: unknown[] = []
       let hooked = 0
       let finishedPrimaries = 0
@@ -657,13 +676,14 @@ describe('the step join over generated sessions', () => {
           }
         }
       }
+      withheld += model.stats().withholds > 0 ? 1 : 0
       const held = model.stats().hookTimes
       if (held > (limits.maxHookTimes ?? 64) * 5) problems.push({hookTimes: held})
       expect({seed, limits, problems}).toEqual({seed, limits, problems: []})
     }
     if (process.env.FRO_BOT_JOIN_STATS === '1') {
       process.stdout.write(
-        `join stats: ${JSON.stringify({checked, uncertain, kept, dropped, rollbacks, sameMs, bigRecord, children, zeroRuns, slowStarts})}\n`,
+        `join stats: ${JSON.stringify({checked, uncertain, kept, dropped, rollbacks, stepBacks, withheld, sameMs, bigRecord, children, zeroRuns, slowStarts})}\n`,
       )
     }
     // The generator exercises what it claims to.
@@ -672,6 +692,7 @@ describe('the step join over generated sessions', () => {
     expect(kept).toBeGreaterThan(SEEDS)
     expect(dropped).toBeGreaterThan(SEEDS / 8)
     expect(rollbacks).toBeGreaterThan(SEEDS / 20)
+    expect(stepBacks).toBeGreaterThan(SEEDS / 20)
     expect(sameMs).toBeGreaterThan(SEEDS / 8)
     expect(bigRecord).toBeGreaterThan(SEEDS / 200)
     expect(children).toBeGreaterThan(SEEDS / 10)

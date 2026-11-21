@@ -382,7 +382,7 @@ interface ToolNote {
 interface HookRecord {
   readonly at: number
   request: RequestState | undefined
-  /** A step has been bound at this hook or a later one: its own step is done with, or will never come (steps run in order). */
+  /** A step has resolved to this hook (bound or not), or its execution ended: its own step is done with, or will never come. */
   consumed: boolean
 }
 
@@ -1218,10 +1218,11 @@ export function createTurnModel(options: {
   // joined to its request by TIME, never by arrival order. A `step.started` carries `started`, the server's clock at the start of
   // its attempt, taken after the request hook returned and before the provider was called: hook(n) <= started(n) <= hook(n+1) in
   // real time, as integers of the same clock. So a step belongs to the session's LATEST primary hook whose receive time is at or
-  // before `started`, and the one way that is wrong is `started(n) == hook(n+1)`, a step that starts, runs and ends in the very
-  // millisecond the next hook arrives (the gap between hook(n) and `started(n)` can be anything, another plugin's hook may sit in
-  // it). Arrival order cannot be used: the hook is a direct call and the events come through a pull loop, so hook(n+1) is often
-  // seen before step.started(n).
+  // before `started`, provided every earlier hook already has its step. It is wrong only when an earlier hook's step is the one in
+  // hand: `started(n) == hook(n+1)` (a step that starts, runs and ends in the very millisecond the next hook arrives; the gap
+  // between hook(n) and `started(n)` can be anything, another plugin's hook may sit in it), or a wall clock that stepped back
+  // between hook(n) and `started(n)`, so that hook(n+1) reads earlier than `started(n)`. Arrival order cannot be used: the hook is
+  // a direct call and the events come through a pull loop, so hook(n+1) is often seen before step.started(n).
   //
   // A step binds the request of that hook if it is still open and has no step, and the session is not withheld. Otherwise it binds
   // nothing and its later events (by message id) are ignored. A step older than every recorded hook binds nothing, and nothing
@@ -1231,20 +1232,20 @@ export function createTurnModel(options: {
   // not finished (waiting or bound) and every later one exports no step data: only the hook's own agent, model, provider and
   // request, an incomplete outcome and the gap `step-binding-uncertain`, with no synthesized finish reason. It clears only on an
   // observed `execution.ended` for the session, and then the hook record restarts empty. It is set by exactly these triggers:
-  //   1. An ambiguous step: `started` equals the time of the latest hook at or before it AND an earlier hook is still unconsumed.
-  //      That earlier hook may own the step (it started, ran and ended in the millisecond the later hook arrived). A hook is
-  //      consumed when a step is bound at it or at a later hook; steps of a session arrive in publish order, so ordinarily every
-  //      earlier hook has had its step and nothing is ever withheld. `hook(n+1) - hook(n) <= 1` needs no rule of its own: the step
-  //      that could be mistaken for it arrives with `started` equal to the later hook's time, which this trigger catches, whether
-  //      or not hook(n)'s step event was ever seen. Over-withholding (an orphan hook that never gets a step, as after a recovery,
-  //      then a step in its successor's millisecond) is accepted; under-withholding is not.
+  //   1. An ambiguous step: it resolves to a hook and an EARLIER hook is still unconsumed. That earlier hook may own the step
+  //      (equal-millisecond start, or a clock step-back between its hook and its start). A hook is consumed when a step has
+  //      resolved to it, bound or not (a refused or lost hook's time-only entry too), or when its execution ended. Steps of a
+  //      session arrive in publish order, so ordinarily every earlier hook has had its step and nothing is ever withheld; a hook
+  //      observed AHEAD of earlier step events is not an earlier hook of any step before it. Over-withholding is accepted: an
+  //      abandoned request (a hook that never gets a step, as after a recovery) withholds the session at its next step, until the
+  //      execution ends. Under-withholding is not.
   //   2. The clock went backwards: a primary hook earlier than the previous one. Old-epoch steps may still be in flight and no
-  //      time can be trusted. (Residual, undetectable: a rollback between a hook and its own step's `started` while an older orphan
-  //      hook waits, and one smaller than the gap between a step's start and the next hook with that step delayed past the hook.)
+  //      time can be trusted. (A step-back that leaves the later hook later than the previous one is trigger 1's: the step in flight
+  //      finds its own hook still waiting.)
   //   3. A loss without complete evidence: a loss marker that is a broadcast (it names no session: an unattributed drop, or more
   //      sessions than a marker can hold), or whose lost-hook times no longer fit. A marker that names its session and carries the
   //      time of every primary hook it stands for does not withhold: the hook is recorded like a refused one (it holds no request,
-  //      so a step that resolves to it binds nothing, and it counts for trigger 1 and 2), and the session's unfinished requests are
+  //      so a step that resolves to it binds nothing, and it counts for trigger 1 and 2: its own step is awaited), and the session's unfinished requests are
   //      marked uncertain (the loss may have been a request's `step.started` or part of its output, which would show as the whole).
   //   4. A step whose `started` is missing or not a finite number: an event the join cannot place.
   //   Also: the hook record is bounded (`maxHookTimes`); evicting a hook that was never consumed withholds (its step could still
@@ -1297,12 +1298,12 @@ export function createTurnModel(options: {
     while (index >= 0 && (node.hooks[index]?.at ?? Number.POSITIVE_INFINITY) > started) index -= 1
     const found = node.hooks[index]
     if (found === undefined) return undefined
-    if (found.at === started && node.hooks.slice(0, index).some(hook => !hook.consumed)) {
+    const waiting = node.hooks.findIndex(hook => !hook.consumed)
+    if (waiting !== -1 && waiting < index) {
       withhold(node)
       return undefined
     }
-    // Steps run in order: whatever precedes this hook has had its step, or never will.
-    for (const hook of node.hooks.slice(0, index + 1)) hook.consumed = true
+    found.consumed = true
     return found
   }
 
@@ -1355,6 +1356,8 @@ export function createTurnModel(options: {
   function closeUncertain(node: SessionNode, at: number): void {
     node.nextAttempt = 1
     node.withheld = false
+    // A step is published before its execution's end: a hook still without one never gets it.
+    for (const hook of node.hooks) hook.consumed = true
     for (const request of [...node.requests]) {
       if (!request.bindUncertain || request.closed) continue
       request.gaps.add('output')
