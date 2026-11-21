@@ -1420,6 +1420,56 @@ describe('a lost primary hook merged with an unattributed drop (the review’s c
     expect(chats(spans).length).toBeGreaterThan(0)
   })
 
+  it('keeps each session’s lost-hook time when markers for different sessions merge', async () => {
+    // #given a full inbox that drops a primary hook of session q (at 212) and an event of session r, which merge into one marker
+    const {sink, spans} = collectingSink()
+    const pipeline = createTracePipeline({sink, scrubber, limits: {maxInbox: 1}})
+    pipeline.observe({kind: 'execution.started', at: 1, sessionId: 'r'})
+    pipeline.observe({...primary(212), sessionId: 'q'} as Observation)
+    pipeline.observe({kind: 'usage', at: 213, sessionId: 'r'})
+    expect(pipeline.stats().observationsDropped).toBe(2)
+    expect(pipeline.stats().markerEntries).toBeLessThanOrEqual(4)
+    await flush()
+
+    // #when session q then shows a hook that is EARLIER than the lost one (the clock went back) and the lost request's step
+    for (const observation of [
+      {kind: 'execution.started', at: 2, sessionId: 'q'},
+      {...primary(148), sessionId: 'q'},
+      {
+        kind: 'step.started',
+        at: 150,
+        started: 166,
+        sessionId: 'q',
+        messageId: 'x',
+        agent: 'build',
+        model: 'm',
+        provider: 'p',
+      },
+      {kind: 'output', at: 151, sessionId: 'q', messageId: 'x', part: 'text', text: 'MERGED MARKER TEXT'},
+      {
+        kind: 'step.ended',
+        at: 152,
+        sessionId: 'q',
+        messageId: 'x',
+        finish: 'stop',
+        rawFinish: 'stop',
+        usage: USAGE,
+        cost: 0,
+      },
+      {kind: 'execution.ended', at: 153, sessionId: 'q', outcome: 'succeeded'},
+    ] as Observation[]) {
+      pipeline.observe(observation)
+      await settle()
+    }
+    await flush()
+    pipeline.stop()
+
+    // #then the rollback was seen: q's request is exported, withheld, and the text is on no span
+    expect(JSON.stringify(spans)).not.toContain('MERGED MARKER TEXT')
+    const chat = spans.find(span => span.name.startsWith('chat'))
+    expect(chat?.attributes['fro_bot.span.gaps']).toContain('step-binding-uncertain')
+  })
+
   it('bounds the marker under a burst of more than 32 distinct dropped primary hooks, and attribution stays safe', async () => {
     // #given a full inbox and 200 primary hooks of 200 distinct sessions dropped in a burst
     const {sink, spans} = collectingSink()

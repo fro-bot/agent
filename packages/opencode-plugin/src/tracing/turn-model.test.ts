@@ -3202,11 +3202,12 @@ describe('a step belongs to the latest primary hook at or before its own start t
   })
 
   describe('the withhold state: set by exactly four triggers, cleared only by the session’s own execution.ended', () => {
-    /** An execution whose first hook is already past, then the trigger, then a request that follows it, then the end. */
+    /** An ordinary request with its step, then the trigger, then a request that follows it with its own step, then the end. */
     const withTrigger = (trigger: (s: ReturnType<typeof script>) => void) => {
       const s = script()
       s.started('p')
       hook(s, 'p', 100)
+      step(s, 'p', 'm0', 100, 'BEFORE THE TRIGGER')
       trigger(s)
       hook(s, 'p', 400)
       step(s, 'p', 'm2', 400, 'AFTER THE TRIGGER')
@@ -3217,7 +3218,8 @@ describe('a step belongs to the latest primary hook at or before its own start t
         'an ambiguous step',
         s => {
           hook(s, 'p', 150)
-          step(s, 'p', 'm1', 150, 'AMBIGUOUS')
+          hook(s, 'p', 151)
+          step(s, 'p', 'm1', 151, 'AMBIGUOUS')
         },
         {},
       ],
@@ -3238,6 +3240,7 @@ describe('a step belongs to the latest primary hook at or before its own start t
         s => {
           hook(s, 'p', 110)
           hook(s, 'p', 120)
+          hook(s, 'p', 130)
         },
         {maxHookTimes: 2},
       ],
@@ -3251,10 +3254,12 @@ describe('a step belongs to the latest primary hook at or before its own start t
       // #when
       const {records, model} = replay(s.out, {limits, flush: false})
 
-      // #then the session was withheld, nothing after the trigger carries a step, and the record is empty after the end
+      // #then the session was withheld, the request before the trigger kept its step, nothing after it carries one, and the record
+      // is empty after the end
       expect(model.stats().withholds).toBeGreaterThan(0)
+      expect(chatWith(records, 'BEFORE THE TRIGGER')?.messageId).toBe('m0')
       expect(JSON.stringify(records)).not.toMatch(/AFTER THE TRIGGER|AMBIGUOUS/)
-      for (const chat of primaries(records)) expectNoStepData(chat)
+      for (const chat of primaries(records).filter(candidate => candidate.start !== 100)) expectNoStepData(chat)
       expect(model.stats().hookTimes).toBe(0)
     })
 
@@ -3417,6 +3422,29 @@ describe('a step belongs to the latest primary hook at or before its own start t
     expect(JSON.stringify(records)).not.toContain('lost hook text')
     expect(chatWith(records, 'first kid text')?.messageId).toBe('k1')
     expect(chatWith(records, 'third kid text')?.messageId).toBe('k3')
+  })
+
+  it('withholds a buffered child for good when a broadcast marker reaches it: a request after the marker carries no step data', () => {
+    // #given a buffered child with a finished request, a broadcast marker, and a later request with its own step
+    const s = bufferedChild()
+    s.prompt('kid', 'mk')
+    s.enqueued('kid', 'mk', 'user')
+    s.started('kid')
+    s.delivered('kid', 'mk')
+    hook(s, 'kid', 150)
+    step(s, 'kid', 'k1', 150, 'before the marker')
+    s.lost(undefined, 'identifier-too-long')
+    hook(s, 'kid', 300)
+    step(s, 'kid', 'k2', 300, 'AFTER THE MARKER')
+    s.ended('kid')
+    link(s)
+
+    // #when
+    const {records} = replay(s.out, {flush: false})
+
+    // #then
+    expect(chatWith(records, 'before the marker')?.messageId).toBe('k1')
+    expect(JSON.stringify(records)).not.toContain('AFTER THE MARKER')
   })
 
   it('tells every buffered child about a loss that names no session', () => {

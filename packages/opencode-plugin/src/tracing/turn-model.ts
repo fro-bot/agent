@@ -1346,10 +1346,7 @@ export function createTurnModel(options: {
   /** The execution ended: what waited for a step that cannot be trusted is closed, as incomplete, and the withhold is over. */
   function closeUncertain(node: SessionNode, at: number): void {
     node.nextAttempt = 1
-    if (node.withheld) {
-      node.withheld = false
-      node.hooks.length = 0
-    }
+    node.withheld = false
     for (const request of [...node.requests]) {
       if (!request.bindUncertain || request.closed) continue
       request.gaps.add('output')
@@ -1388,7 +1385,7 @@ export function createTurnModel(options: {
       withhold(node)
       return
     }
-    if (node.withheld) return
+    // A withheld session records no hooks, so a step finds none and binds nothing.
     const request = resolveStep(node, o.started)?.request
     if (request === undefined || request.closed || request.messageId !== undefined || request.bindUncertain) return
     request.messageId = o.messageId
