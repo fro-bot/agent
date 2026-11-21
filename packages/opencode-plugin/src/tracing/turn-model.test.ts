@@ -4048,24 +4048,22 @@ describe('a step belongs to the latest primary hook at or before its own start t
       expect(['B1 RESPONSE', 'B2 RESPONSE'].map(text => chatWith(records, text)?.messageId)).toEqual(['mB1', 'mB2'])
     })
 
-    it('keeps no more kept sessions than the idle limit allows when their traces close', () => {
-      // #given an idle limit of one and two sessions whose traces close at an end event that the next hook overtook
+    it('lets the session that opens a trace at the trace limit bind its own step and close its trace', () => {
+      // #given a trace limit of one, an idle limit of one, and session a running with a hook that has no step
       const s = script()
-      for (const session of ['a', 'b']) s.started(session)
-      for (const session of ['a', 'b']) {
-        s.request(session, 'primary', {at: 100})
-        s.stepStarted(session, `m-${session}`, 100)
-        s.stepEnded(session, `m-${session}`)
-        s.request(session, 'primary', {at: 210})
-      }
+      s.started('a')
+      hook(s, 'a', 100)
 
-      // #when both end at 200
-      for (const session of ['a', 'b'])
-        s.out.push({kind: 'execution.ended', sessionId: session, outcome: 'succeeded', at: 200})
-      const {model} = replay(s.out, {limits: {maxIdleSessions: 1}, flush: false})
+      // #when session b starts, which closes a's trace, and runs one request with its step to its end
+      s.started('b')
+      hook(s, 'b', 300)
+      step(s, 'b', 'mB', 300, 'B TEXT')
+      s.ended('b')
+      const {records, model} = replay(s.out, {limits: {maxOpenTraces: 1, maxIdleSessions: 1}, flush: false})
 
-      // #then one idle record remains
-      expect(model.stats()).toMatchObject({sessions: 1, openTraces: 0})
+      // #then b's step bound its own request, its trace closed, and only a's kept record is left
+      expect(chatWith(records, 'B TEXT')?.messageId).toBe('mB')
+      expect(model.stats()).toMatchObject({openTraces: 0, sessions: 1, hookTimes: 1, openSteps: 0})
     })
 
     it('never gives a step to the request of a hook the execution boundary settled', () => {

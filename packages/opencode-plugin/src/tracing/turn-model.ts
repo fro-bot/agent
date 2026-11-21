@@ -586,6 +586,7 @@ export function createTurnModel(options: {
       earlyLostHooks.delete(sessionId)
       recordHook(node, lost, undefined, true)
     }
+    // The idle limit applies when a node is created; a node left idle later stays until it expires.
     enforceIdleBound(node)
     return node
   }
@@ -826,8 +827,6 @@ export function createTurnModel(options: {
       }
     }
     traces.delete(trace)
-    // A session kept above for its record is idle now: the idle limit holds at this point too, not only at allocation.
-    for (const node of trace.nodes.values()) if (sessions.get(node.id) === node && isIdle(node)) enforceIdleBound(node)
   }
 
   function rememberTombstone(childId: string, traceId: string): void {
