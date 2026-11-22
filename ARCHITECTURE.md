@@ -9,10 +9,10 @@ This document describes the system design, invariants, and data flows for the fr
 This monorepo ships its deployable surfaces from one codebase:
 
 - **GitHub Action** — a CI harness that runs OpenCode agents in response to GitHub webhook events (issues, PRs, comments, reviews, scheduled runs, workflow dispatches). The Action entry points are `src/main.ts` and `src/post.ts`; the real logic lives in the 4-layer `src/` tree and `packages/runtime/`. Sessions persist across CI runs via GitHub Actions cache when the trigger permits cache writes, and via an S3-compatible object store; `issue_comment` and `issues` runs cannot write the cache and depend on the object store for continuity.
-- **`@fro-bot/gateway`** (`packages/gateway/`) — a Discord-first daemon that listens for `@fro-bot` mentions in bound guild channels and runs OpenCode inside a sandboxed workspace container. Includes an operator web surface (Hono, gateway-net only), an inbound announce webhook, and an S3-backed coordination layer. The `/fro-bot dispatch` slash command is a separate, simpler path: it asks the bound repo's `fro-bot.yaml` workflow to run via the GitHub Actions API and returns the run URL — it never touches the gateway's queue, concurrency cap, or run-state.
+- **`@fro-bot/gateway`** (`packages/gateway/`) — a Discord-first daemon that listens for `@fro-bot` mentions in bound guild channels and runs OpenCode inside a sandboxed workspace container. Includes an operator web surface (Hono, gateway-net only), an inbound announce webhook, and an S3-backed coordination layer. The `/fro-bot dispatch` slash command is separate: it asks the bound repo's `fro-bot.yaml` workflow to run through the GitHub Actions API and returns the run URL, never touching the gateway's queue, cap or run-state.
 - **`@fro.bot/harness`** (`packages/harness/`) — the patched OpenCode build package, retired from every runtime path: the Action and the gateway run stock OpenCode V2 only. Its release workflows are removed; the final build (`1.19.5+harness.bf7f7dfe`) and the published packages stay available, and the package source remains until its removal.
 
-Supporting packages: `@fro-bot/runtime` (`packages/runtime/`) owns shared runtime primitives and version-pin constants; `@fro-bot/action` (`apps/action/`) is a thin workspace wrapper whose build produces the committed root `dist/`; `@fro-bot/workspace-agent` (`apps/workspace-agent/`) is the Hono HTTP sidecar inside the workspace container. `@fro.bot/opencode-plugin` (`packages/opencode-plugin/`) is the OpenCode V2 plugin published to npm: the `session_*` tools plus a guard that rejects `subagent` calls resuming a session. V2 skips a plugin that fails to load and keeps serving, so its id (`fro-bot.opencode-plugin`) is fixed and the surfaces confirm it by id; no surface loads it yet.
+Supporting packages: `@fro-bot/runtime` (`packages/runtime/`) owns shared runtime primitives and version-pin constants; `@fro-bot/action` (`apps/action/`) is a thin wrapper whose build produces the committed root `dist/`; `@fro-bot/workspace-agent` (`apps/workspace-agent/`) is the Hono sidecar inside the workspace container. `@fro.bot/opencode-plugin` (`packages/opencode-plugin/`) is the OpenCode V2 plugin published to npm: the `session_*` tools, a guard that rejects `subagent` calls resuming a session, and opt-in run tracing. V2 skips a plugin that fails to load and keeps serving, so its id (`fro-bot.opencode-plugin`) is fixed and the surfaces confirm it by id. The Action and the workspace image load it; the gateway does not.
 
 ## Codemap
 
@@ -106,11 +106,11 @@ These are CI-enforced constraints. Violating any of them breaks the build or the
 2. **Committed `dist/` must stay in sync.** CI runs `bun run build` and fails if `git diff dist/` shows changes. The pre-push hook enforces the same check locally. Never edit `dist/` by hand.
 3. **Strict booleans.** No implicit falsy checks (`!value`). Use explicit comparisons (`=== null`, `=== undefined`, `.length === 0`). Enforced by ESLint.
 4. **Functions only — no classes for stateful patterns.** Closures, not ES6 classes, carry state across the codebase (the only classes are a handful of `Error` subclasses in the gateway). Enforced by convention and code review.
-5. **Exactly one comment or review per invocation (Response Protocol).** Exactly one GitHub comment or PR review is delivered per Action run. For every trigger except `workflow_dispatch`/`schedule` this is **action-enforced**: the model writes its response to a run-scoped file and the harness posts it once via the Octokit writers, binding the target and surface to the trusted event (the response file cannot select its own). For `workflow_dispatch`/`schedule` the model still self-posts via `gh`, and the one-response rule remains prompt-enforced in `buildHarnessRulesSection()`.
+5. **Exactly one comment or review per invocation (Response Protocol).** Exactly one GitHub comment or PR review is delivered per Action run. For every trigger except `workflow_dispatch`/`schedule` this is **action-enforced**: the model writes its response to a run-scoped file and the harness posts it once via the Octokit writers, binding the target and surface to the trusted event. For `workflow_dispatch`/`schedule` the model still self-posts via `gh`, prompt-enforced in `buildHarnessRulesSection()`.
 6. **`NormalizedEvent` is never bypassed.** All webhook payloads must pass through `normalizeEvent()` before routing. The router never reads `context.payload` directly. Raw event access is an anti-pattern caught in code review.
 7. **No type suppression.** `as any`, `@ts-ignore`, and `@ts-expect-error` are forbidden project-wide.
-8. **Redaction-before-query (gateway operator surface).** On operator-web routes, the denylist check runs after the server-owned binding lookup (the predicate consumes the binding's deny keys) and before any run-state read or GitHub API call. Repo access is bindings-only: a repo is reachable when it is bound and not denylisted, with no GitHub-rights check. A repo redacted in `metadata/repos.yaml` is never queried and never reaches the audit stream. Cold-start failure → deny all (fail-closed). Discord surfaces do not currently consult the denylist post-binding.
-9. **Client identity is never guessed, and derived accounting keys never stand in for exact identity (gateway ingress).** The client behind every public operator-surface request is a `ResolvedClientAddress` returned by `resolveClient()` (`packages/gateway/src/web/ingress/resolve-client.ts`) against the configured `OperatorIngressPolicy`. Trust and binding decisions (configured-peer equality, the OAuth `boundAddress`) use only its exact canonical identity (`.canonical`); the derived `.accountingKey` (IPv6 → /64, IPv4 → /32) only counts or buckets traffic (rate-limit buckets, the OAuth outstanding-attempt slot), and aggregation happens after `resolveClient`, never in `canonical-address.ts`. An unresolvable request rejects before any bucket or state entry is allocated — it is never collapsed onto a shared fallback key. `GATEWAY_OPERATOR_TRUSTED_PROXIES` is required whenever the operator surface is enabled (see Operator Ingress Trust Policy below).
+8. **Redaction-before-query (gateway operator surface).** On operator-web routes, the denylist check runs after the server-owned binding lookup (the predicate consumes the binding's deny keys) and before any run-state read or GitHub API call. Repo access is bindings-only (bound and not denylisted, no GitHub-rights check). A repo redacted in `metadata/repos.yaml` is never queried and never reaches the audit stream. Cold-start failure → deny all (fail-closed). Discord surfaces do not currently consult the denylist post-binding.
+9. **Client identity is never guessed, and derived accounting keys never stand in for exact identity (gateway ingress).** The client behind every public operator-surface request is a `ResolvedClientAddress` from `resolveClient()` (`packages/gateway/src/web/ingress/resolve-client.ts`) against the configured `OperatorIngressPolicy`. Trust and binding decisions use only its exact canonical identity (`.canonical`); the derived `.accountingKey` (IPv6 → /64, IPv4 → /32) only buckets traffic, after `resolveClient`. An unresolvable request rejects before any bucket or state entry is allocated, never collapsed onto a shared fallback key. `GATEWAY_OPERATOR_TRUSTED_PROXIES` is required whenever the operator surface is enabled (see Operator Ingress Trust Policy below).
 
 > See also: [Conventions and Patterns](docs/wiki/Conventions%20and%20Patterns.md)
 
@@ -222,13 +222,13 @@ All GitHub webhook payloads are normalized through `normalizeEvent()` (`src/serv
 
 ### XML-Tagged Prompt Architecture
 
-Agent prompts are assembled from named XML-tagged sections with an explicit authority hierarchy. Section order follows Anthropic's recommended pattern: reference data first (`<harness_rules>`, `<identity>`, `<environment>`, `<issue>`/`<pull_request>`, `<session_context>`), task and instructions last (`<task>`, `<user_supplied_instructions>`, `<output_contract>`, `<agent_context>`). `<harness_rules>` takes precedence over `<user_supplied_instructions>`. The canonical builder is `buildAgentPrompt` in `packages/runtime/src/agent/prompt.ts`.
+Agent prompts are assembled from named XML-tagged sections with an explicit authority hierarchy. Reference data comes first (`<harness_rules>`, `<identity>`, `<environment>`, `<issue>`/`<pull_request>`, `<session_context>`), task and instructions last (`<task>`, `<user_supplied_instructions>`, `<output_contract>`, `<agent_context>`). `<harness_rules>` takes precedence over `<user_supplied_instructions>`. The canonical builder is `buildAgentPrompt` in `packages/runtime/src/agent/prompt.ts`.
 
 > See also: [Prompt Architecture](docs/wiki/Prompt%20Architecture.md)
 
 ### Two-Layer Session Management
 
-Session persistence spans two distinct layers that are easy to conflate. During execution, the **agent-side** layer is a set of always-on native OpenCode file tools that let the model query prior sessions directly. Around execution, the **action-side** layer is a set of runtime utilities that summarize, prune, and write session state. Both layers share the same SDK-backed persisted session store, but neither calls the other directly.
+Session persistence spans two layers that are easy to conflate. The **agent-side** layer is a set of always-on native OpenCode file tools that let the model query prior sessions during execution. The **action-side** layer is a set of runtime utilities that summarize, prune and write session state around it. Both share the same SDK-backed session store; neither calls the other directly.
 
 > See also: [Session Persistence](docs/wiki/Session%20Persistence.md) — canonical reference for the native tool inventory, config-dir registration, fallback behavior, and detailed session lifecycle.
 
@@ -268,7 +268,7 @@ Per-repo S3 conditional-write locks (`If-None-Match` / `If-Match`) built by `get
 - With S3 configured, a lock error fails the Action closed; a contended Action exits 0 as `skipped`; a run without the lock never persists session state.
 - Ordinary renewal and release are guarded by the lock's ETag (`If-Match`). Adopting a renewal whose result was lost, and ownership-based cleanup (the gateway's release retry, the post hook's delete), check the acquisition instead: holder id, job or run id and the per-acquisition `acquisition_token`. A record without a token is never adopted.
 - The Action holder id stays `action:<runId>:<attempt>`; older agent versions match exactly that shape. The job identity rides in `holder_job`.
-- The gateway corroborates every expired lease before replacing it (`ConfirmExpiredHolder` `clear`, via `packages/gateway/src/execute/repo-quiescence.ts`). Only the Action reclaims an expired lease directly, and only from an Action holder (`reclaimableWithoutConfirmation`). This is snapshot corroboration, not fencing.
+- The gateway corroborates every expired lease before replacing it (`ConfirmExpiredHolder` `clear`, via `packages/gateway/src/execute/repo-quiescence-v2.ts`). Only the Action reclaims an expired lease directly, and only from an Action holder (`reclaimableWithoutConfirmation`). This is snapshot corroboration, not fencing.
 
 > See also: [Execution Lifecycle](docs/wiki/Execution%20Lifecycle.md#s3-conditional-write-locks-gateway-repojson-action-actionjson)
 
@@ -305,7 +305,7 @@ The root's turn ends on the V2 terminal event (`observeRootTerminal`, `src/featu
 
 ### Approval Denial on Undeliverable Discord Notification
 
-`createDiscordApprovalOnPending` (`packages/gateway/src/approvals/discord-transport.ts`) posts the approval embed. A TERMINAL Discord failure (`UnknownChannel` / `MissingAccess`, matched on `DiscordAPIError.code`, never message text) makes `handleUndeliverable` deny server-side via `approvalRegistry.rejectUndeliverable`, rather than wait out the budget. The registry rejects only if the entry is still the same registration and still `open`; a request whose operator decision is already in flight (`claimed`), already settled, or replaced by a re-ask is left to settle on its own path and no denial is announced. Retryable failures leave the entry open. The denial is deliberately visible: logged at `error` with a distinct thread note.
+`createDiscordApprovalOnPending` (`packages/gateway/src/approvals/discord-transport.ts`) posts the approval embed. A TERMINAL Discord failure (`UnknownChannel` / `MissingAccess`, matched on `DiscordAPIError.code`, never message text) denies server-side via `approvalRegistry.rejectUndeliverable` rather than waiting out the budget, but only if the entry is still the same registration and still `open`. Retryable failures leave the entry open. The denial is logged at `error` with a distinct thread note.
 
 > See also: [Operator Web Control Surface](docs/wiki/Operator%20Web%20Control%20Surface.md#approval-denial-on-undeliverable-discord-notification)
 
@@ -331,7 +331,7 @@ Gateway runs share one checkout per repository and record what they started from
 
 ### OpenCode File Watcher Disabled By Default
 
-The Action and the workspace do not consume file-change events, so `bootstrapOpenCodeServer` (`packages/runtime/src/agent/server.ts`) sets `OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER=true` before spawn, only when the value is unset or empty, so an explicit operator value (including `false`) wins. The workspace's V2 server keeps V2's default: probe P3 found no difference with the watcher on or off, and the child environment is an allowlist that does not forward the flag. Accepted tradeoff: OpenCode's cached VCS branch can go stale after a checkout.
+The Action and the workspace do not consume file-change events, so `bootstrapOpenCodeServer` (`packages/runtime/src/agent/server.ts`) sets `OPENCODE_EXPERIMENTAL_DISABLE_FILEWATCHER=true` before spawn, only when the value is unset or empty, so an explicit operator value (including `false`) wins. The workspace's V2 server keeps V2's default (probe P3: no difference, and its allowlisted environment does not forward the flag). Accepted tradeoff: OpenCode's cached VCS branch can go stale after a checkout.
 
 > See also: [Background Subagents and Ownership](docs/wiki/Background%20Subagents%20and%20Ownership.md#opencode-file-watcher-disabled-by-default)
 
@@ -343,7 +343,7 @@ Nobody can answer an interactive `question` in CI, so `bootstrapOpenCodeServer` 
 
 ### Mitmproxy Egress Topology (Workspace)
 
-The workspace container runs inside a sandboxed Docker Compose network. All outbound traffic from the workspace is routed through a `mitmproxy` instance on `egress-net`; the workspace itself is on `sandbox-net` with no direct internet access. The mitmproxy enforces an allowlist of permitted outbound hosts. The gateway reaches the workspace via Docker Compose service DNS (`workspace:9100` for the workspace agent, `workspace:9200` for the OpenCode reverse proxy).
+The workspace container runs inside a sandboxed Docker Compose network. All outbound traffic from the workspace is routed through a `mitmproxy` instance on `egress-net`; the workspace itself is on `sandbox-net` with no direct internet access. The proxy enforces an allowlist of outbound hosts. The gateway reaches the workspace via Docker Compose service DNS (`workspace:9100` for the workspace agent, `workspace:9200` for the OpenCode reverse proxy).
 
 ```
 workspace container (sandbox-net)
@@ -380,6 +380,16 @@ With `isolate-agent`, the Action creates a per-run local user, hands it only the
 - Runner-side git runs through `src/features/delegated/trusted-git.ts` against metadata restored from a pre-agent copy; reads of sandbox-writable paths refuse symlinks and special files (`packages/runtime/src/shared/safe-read.ts`).
 
 > See also: [Setup and Configuration](docs/wiki/Setup%20and%20Configuration.md#withholding-is-not-an-os-boundary), [key proxy](docs/wiki/Setup%20and%20Configuration.md#isolate-agent-the-key-proxy)
+
+### Run Tracing (Action + Plugin)
+
+Opt-in OpenTelemetry tracing of a run. `@fro.bot/opencode-plugin` (`packages/opencode-plugin/src/tracing/`) turns hook calls and session events into GenAI spans and exports them over OTLP/HTTP. In the Action, a relay child (`dist/trace-relay.js`, supervised by `src/harness/phases/trace-relay-process.ts`) holds the collector URL and credential from `trace-endpoint` and `trace-headers`.
+
+- Only the operator turns tracing on or picks the destination: Action inputs, or a user-owned settings file for a local session. Plugin options, project config and repository content never do.
+- The server gets only the relay's loopback address and the run identity (`packages/runtime/src/agent/tracing-launcher.ts`), never the credential or collector host.
+- Fail-soft: the relay never joins the abort signal, the sandbox outcome or the persistence decision.
+
+> See also: [Setup and Configuration](docs/wiki/Setup%20and%20Configuration.md#tracing-a-run)
 
 ### Operator Ingress Trust Policy (Gateway)
 
