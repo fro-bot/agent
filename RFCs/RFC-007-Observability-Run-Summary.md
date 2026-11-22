@@ -1250,7 +1250,7 @@ inputs:
 ### Acceptance Criteria (F83)
 
 - [ ] Default telemetry config disables external aggregation
-- [ ] Raw content (code, comments, prompts) never logged to external systems
+- [ ] Raw content (code, comments, prompts) never logged to external systems, except by operator-enabled run tracing
 - [ ] Metrics derived from run summaries and structured JSON logs only
 - [ ] User can opt-in to external aggregation via input
 - [ ] Telemetry level documented in README and action.yaml

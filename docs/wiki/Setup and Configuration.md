@@ -346,7 +346,7 @@ The Action can send an OpenTelemetry trace of each run to a collector you operat
 
 ### What a trace contains
 
-Each turn of the session is one trace. It has a span for the agent, one for each model request and one for each tool call. A subagent's spans sit under the tool call that started it. Span names and attributes follow the OpenTelemetry GenAI conventions. The agent's span carries the prompt and, when the turn finished normally, the final answer.
+Each turn of the session is one trace. It has a span for the agent, one for each model request and one for each tool call. A subagent's spans sit under the tool call that started it. Span names and attributes follow the OpenTelemetry GenAI conventions. The agent's span carries the prompt.
 
 The spans carry content:
 
