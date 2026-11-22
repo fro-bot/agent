@@ -256,6 +256,14 @@
       },
     },
     {
+      // Systematic's reusable connect workflow runs with our credentials: review each pin bump, never automerge.
+      // groupName null keeps it out of the "GitHub Actions" group, whose PR would otherwise lose automerge for every member.
+      matchManagers: ['github-actions'],
+      matchPackageNames: ['marcusrbrown/systematic'],
+      groupName: null,
+      automerge: false,
+    },
+    {
       // The @aws-sdk changelog fetch walks the whole aws-sdk-js-v3 repo tree (~165s per run).
       matchPackageNames: ['@aws-sdk/**'],
       fetchChangeLogs: 'off',

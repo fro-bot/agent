@@ -1,0 +1,29 @@
+---
+# Daily ce:connect sweep across the projects in vars.FRO_BOT_CONNECT_PROJECTS, run by Systematic's reusable workflow.
+name: Connect
+
+on:
+  schedule:
+    - cron: '23 6 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  connect:
+    name: Connect
+    # Ceiling for the called workflow's jobs: read for prepare and run, issues for the report.
+    permissions:
+      contents: read
+      issues: write
+    uses: marcusrbrown/systematic/.github/workflows/connect.yaml@41ceb8e341bda946d5d583821f8359d67753fc05 # v3.38.0
+    with:
+      projects: ${{ vars.FRO_BOT_CONNECT_PROJECTS }}
+      parent-model: ${{ vars.FRO_BOT_MODEL }}
+      researcher-model: ${{ vars.FRO_BOT_CONNECT_MODEL }}
+      variant: ${{ vars.FRO_BOT_CONNECT_VARIANT }}
+      step-timeout-minutes: ${{ vars.FRO_BOT_CONNECT_STEP_TIMEOUT }}
+    # Named one by one: `secrets: inherit` does not cross owners.
+    secrets:
+      OPENCODE_AUTH_JSON: ${{ secrets.OPENCODE_AUTH_JSON }}
+      OPENCODE_CONFIG: ${{ secrets.OPENCODE_CONFIG }}
