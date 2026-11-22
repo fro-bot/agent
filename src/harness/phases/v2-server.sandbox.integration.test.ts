@@ -109,6 +109,12 @@ import {
   type ScanSpec,
 } from './v2-server.sandbox.canary.js'
 import {
+  fallbackHosts,
+  startRecordingHttpSink,
+  tracingFallbackDocument,
+  type RecordingHttpSink,
+} from './v2-server.sandbox.fallback.js'
+import {
   aclLines,
   aclText,
   changedFilesSince,
@@ -257,7 +263,10 @@ interface IsolatedRunOptions {
   /** Called with the lifecycle as soon as it exists, so a suite's `afterAll` can release it if the run throws. */
   readonly onLifecycle?: (lifecycle: SandboxLifecycle) => void
   /** Called with the launch the lifecycle prepared (the account's uid is the one the handoff named). */
-  readonly onPrepared?: (launch: {readonly account: {readonly uid: number}}) => void
+  readonly onPrepared?: (launch: {
+    readonly account: {readonly uid: number; readonly gid: number}
+    readonly xdg: {readonly config: string}
+  }) => Promise<void> | void
   /** A plugin for the server to load and what the launcher says about tracing. Absent: no plugin, tracing off. */
   readonly tracing?: ScriptedTracing
   /** Awaited after the scripted turn and before the server is stopped. */
@@ -292,7 +301,7 @@ async function runIsolated(options: IsolatedRunOptions): Promise<IsolatedRunResu
       repoSkills: options.repoSkills ?? null,
     })
     if (!prepared.success) throw new Error(prepared.error)
-    options.onPrepared?.(prepared.data)
+    await options.onPrepared?.(prepared.data)
     const handle = await startScriptedSession({
       binary: BINARY ?? '',
       workspace: options.workspace,
@@ -3146,6 +3155,45 @@ function tracingOffEnvProbe(expectedLauncherLine: string, collectorAddress: stri
   }
 }
 
+/**
+ * That the fallback is really in place, as the plugin would find it: at `$XDG_CONFIG_HOME/fro-bot/opencode-plugin/tracing.json`,
+ * a regular file the sandbox user owns, mode 0600, naming the sink. Without this a silent sink could mean a file that was
+ * never there.
+ */
+function tracingFallbackPlantedProbe(sinkAddress: string, machine: string): Probe {
+  return {
+    id: 'tracing_fallback_planted',
+    category: 'works',
+    cmd:
+      `f="$XDG_CONFIG_HOME/fro-bot/opencode-plugin/tracing.json"; ` +
+      `[ -f "$f" ] || { R tracing_fallback_planted FAILED "no file at the plugin's path"; exit 0; }; ` +
+      `m=$(stat -c %a "$f"); own=0; [ -O "$f" ] && own=1; s=$(grep -cF -- ${q(sinkAddress)} "$f"); h=$(grep -cF -- ${q(machine)} "$f"); ` +
+      `[ "$m" = 600 ] && [ $own = 1 ] && [ "$s" = 1 ] && [ "$h" = 1 ] && st=WORKS || st=FAILED; ` +
+      `R tracing_fallback_planted $st "mode=$m owned=$own sink=$s machine=$h"`,
+  }
+}
+
+/** Installs `content` at `dest` for the sandbox user, mode 0600, with the directories above it (below `base`) owned by it. */
+function plantForAccount(account: {uid: number; gid: number}, base: string, dest: string, content: string): void {
+  const owner = ['-o', String(account.uid), '-g', String(account.gid)]
+  const sudo = (args: string[]): void => {
+    const result = spawnSync('sudo', ['-n', 'install', ...args], {encoding: 'utf8'})
+    if (result.status !== 0) throw new Error(`install ${args.at(-1)}: ${result.stderr}`)
+  }
+  let dir = base
+  for (const part of path.relative(base, path.dirname(dest)).split(path.sep)) {
+    dir = path.join(dir, part)
+    sudo(['-d', '-m', '0700', ...owner, dir])
+  }
+  const source = path.join(os.tmpdir(), `fallback-${process.pid}-${randomBytes(4).toString('hex')}`)
+  fs.writeFileSync(source, content, {mode: 0o600})
+  try {
+    sudo(['-m', '0600', ...owner, source, dest])
+  } finally {
+    fs.rmSync(source, {force: true})
+  }
+}
+
 /** The names of the spans a stand-in collector received. A body that is not OTLP JSON adds none. */
 function exportedSpanNames(requests: readonly RecordedRequest[]): string[] {
   return exportedSpans(requests.map(request => request.body)).map(span => span.name)
@@ -3164,6 +3212,8 @@ interface TracedTurn {
   readonly relayStop: TraceRelayStopResult | null
   /** What `pgrep` finds of the relay's bundle after the run. */
   readonly relayLeft: string
+  /** What the plain-`http` fallback sink received. Empty for a run with no fallback planted. */
+  readonly sinkRequests: readonly string[]
 }
 
 describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not isolated, and off', () => {
@@ -3250,6 +3300,11 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
     const workspace = path.join(scratch, `ws-${name}`)
     initWorkspace(workspace)
     const collector = await startCollector()
+    // A usable fallback a wrongly-on plugin would export through, for the off run only: see the row for what it proves.
+    const sink: RecordingHttpSink | null =
+      options.tracing === 'off' && options.isolation === 'on' ? await startRecordingHttpSink() : null
+    if (sink !== null) cleanups.push(async () => sink.close())
+    const machine = fallbackHosts(os.hostname())[0] ?? ''
     const relay = options.tracing === 'on' ? await startRelay(collector, name) : null
     const identity = unwrapOk(
       buildTracingRunIdentity({
@@ -3272,6 +3327,7 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
         ? [{id: 'canary_scan', category: 'blocked', cmd: `: ${TOOL_ARGUMENT_MARKER}\n${scanCommand(scanSpec)}`}]
         : [
             noRelayProcessProbe(),
+            ...(sink === null ? [] : [tracingFallbackPlantedProbe(sink.address, machine)]),
             tracingOffEnvProbe(
               `OPENCODE_FROBOT_TRACING=${buildTracingLauncherValue(offHost)}`,
               new URL(collector.origin).host,
@@ -3303,6 +3359,20 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
         logger,
         tracing,
         beforeShutdown,
+        // After the account exists and before the server starts: the file must be there when the plugin loads.
+        ...(sink === null
+          ? {}
+          : {
+              onPrepared: launch => {
+                const dest = path.join(launch.xdg.config, 'fro-bot', 'opencode-plugin', 'tracing.json')
+                plantForAccount(
+                  launch.account,
+                  launch.xdg.config,
+                  dest,
+                  tracingFallbackDocument({endpoint: `${sink.origin}/v1/traces`, hosts: fallbackHosts(os.hostname())}),
+                )
+              },
+            }),
       })
       rows = result.rows
       released = result.released
@@ -3336,6 +3406,7 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
       released,
       relayStop,
       relayLeft: pgrepOutput(['-f', relayBundle]),
+      sinkRequests: [...(sink?.requests ?? [])],
     }
   }
 
@@ -3463,6 +3534,14 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
     // server and runner export when the launcher says on. So the agent reads the server's own environment: the launcher line
     // is exactly the "off" document, the only one, no OTEL_* variable is set and the stand-in's address appears nowhere in it.
     expect(failuresFor(off?.rows ?? new Map(), 'tracing_off_env', 'BLOCKED')).toEqual([])
+
+    // #and a usable fallback was in place and nothing used it: a valid user-scope settings file (the sandbox user's own, mode
+    // 0600, naming this machine, pointing at a plain-http loopback sink) that the plugin would accept if no launcher variable
+    // were set (the unit control in v2-server.sandbox.fallback.test.ts shows exactly that, against the plugin's own resolver).
+    // The Action's server also carries the headless markers, which would refuse the file on their own; so this row shows the
+    // published plugin, given the "off" launcher, sends nothing even with a fallback present and a sink to receive it.
+    expect(failuresFor(off?.rows ?? new Map(), 'tracing_fallback_planted', 'WORKS')).toEqual([])
+    expect(off?.sinkRequests).toEqual([])
     expect(off?.rows.get('tracing_off_env')?.[0]?.evidence).toBe('launcher_off=1 launcher_vars=1 otel=0 endpoint=0')
 
     // #then no relay process runs (after a control showed the search could see one), the stand-in heard nothing, and no relay

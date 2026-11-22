@@ -13,7 +13,8 @@
     "src/**/*.json",
     "../../src/**/*.ts",
     "../opencode-plugin/src/integration.fixture.ts",
-    "../opencode-plugin/src/tracing/tracing.integration.fixture.ts"
+    "../opencode-plugin/src/tracing/tracing.integration.fixture.ts",
+    "../opencode-plugin/src/tracing/settings.ts"
   ],
   "exclude": ["dist", "node_modules"]
 }
