@@ -1096,153 +1096,174 @@ describe('a collector that keeps the socket active past the watchdog', () => {
   it('sends the batches queued behind it once the watchdog cancels it, and counts every span exactly once', async () => {
     // #given the first batch's response trickles forever and nine more spans queue behind it
     const target = await trickler(index => index === 0)
-    const exporter = exporterFor({url: target.url, limits: WATCHDOG_LIMITS})
-    const total = 11
-    const started = Date.now()
+    try {
+      const exporter = exporterFor({url: target.url, limits: WATCHDOG_LIMITS})
+      const total = 11
+      const started = Date.now()
 
-    // #when
-    for (let index = 0; index < total; index += 1) exporter.export(span())
-    await vi.waitFor(
-      () => {
-        const {exported, dropped} = exporter.counts()
-        expect(exported + dropped).toBe(total)
-      },
-      {timeout: WATCHDOG_MS + 5_000, interval: 25},
-    )
+      // #when
+      for (let index = 0; index < total; index += 1) exporter.export(span())
+      await vi.waitFor(
+        () => {
+          const {exported, dropped} = exporter.counts()
+          expect(exported + dropped).toBe(total)
+        },
+        {timeout: WATCHDOG_MS + 5_000, interval: 25},
+      )
 
-    // #then the stalled batch (two spans) is the only loss, every later batch was delivered, and it took the watchdog plus a little
-    expect(exporter.counts()).toEqual({exported: total - 2, dropped: 2})
-    expect(Date.now() - started).toBeLessThan(WATCHDOG_MS + 3_000)
-    expect(target.requests()).toBe(1 + Math.ceil((total - 2) / 2))
-    const closing = Date.now()
-    expect(await exporter.close(2_000)).toEqual({exported: total - 2, dropped: 2})
-    expect(Date.now() - closing).toBeLessThan(1_000)
-    await target.stop()
+      // #then the stalled batch (two spans) is the only loss, every later batch was delivered, and it took the watchdog plus a little
+      expect(exporter.counts()).toEqual({exported: total - 2, dropped: 2})
+      expect(Date.now() - started).toBeLessThan(WATCHDOG_MS + 3_000)
+      expect(target.requests()).toBe(1 + Math.ceil((total - 2) / 2))
+      const closing = Date.now()
+      expect(await exporter.close(2_000)).toEqual({exported: total - 2, dropped: 2})
+      expect(Date.now() - closing).toBeLessThan(1_000)
+    } finally {
+      await target.stop()
+    }
   }, 30_000)
 
   it('stops within its bound, with every span counted once, when shutdown arrives mid-stall', async () => {
     // #given a first batch that trickles forever, with more spans queued behind it
     const target = await trickler(() => true)
-    const exporter = exporterFor({url: target.url, limits: WATCHDOG_LIMITS})
-    const total = 7
-    for (let index = 0; index < total; index += 1) exporter.export(span())
-    await vi.waitFor(() => expect(target.requests()).toBe(1), {timeout: 3_000, interval: 10})
-    await sleep(100)
+    try {
+      const exporter = exporterFor({url: target.url, limits: WATCHDOG_LIMITS})
+      const total = 7
+      for (let index = 0; index < total; index += 1) exporter.export(span())
+      await vi.waitFor(() => expect(target.requests()).toBe(1), {timeout: 3_000, interval: 10})
+      await sleep(100)
 
-    // #when shutdown arrives while the request is active, well before the watchdog
-    const closing = Date.now()
-    const counts = await exporter.close(600)
+      // #when shutdown arrives while the request is active, well before the watchdog
+      const closing = Date.now()
+      const counts = await exporter.close(600)
 
-    // #then it returns in its bound, and nothing is counted twice or lost
-    expect(Date.now() - closing).toBeLessThan(1_500)
-    expect(counts.exported + counts.dropped).toBe(total)
-    expect(counts).toEqual({exported: 0, dropped: total})
-    await target.stop()
+      // #then it returns in its bound, and nothing is counted twice or lost
+      expect(Date.now() - closing).toBeLessThan(1_500)
+      expect(counts.exported + counts.dropped).toBe(total)
+      expect(counts).toEqual({exported: 0, dropped: total})
+    } finally {
+      await target.stop()
+    }
   }, 30_000)
 
   it('trips the breaker and counts everything queued when every request stalls, without waiting on any of them', async () => {
     // #given a collector that stalls every request
     const target = await trickler(() => true)
-    const stopped = vi.fn()
-    const exporter = exporterFor({url: target.url, limits: WATCHDOG_LIMITS, onStopped: stopped})
-    const total = 20
-    const started = Date.now()
+    try {
+      const stopped = vi.fn()
+      const exporter = exporterFor({url: target.url, limits: WATCHDOG_LIMITS, onStopped: stopped})
+      const total = 20
+      const started = Date.now()
 
-    // #when
-    for (let index = 0; index < total; index += 1) exporter.export(span())
-    await vi.waitFor(() => expect(stopped).toHaveBeenCalledTimes(1), {timeout: 3 * WATCHDOG_MS + 8_000, interval: 50})
+      // #when
+      for (let index = 0; index < total; index += 1) exporter.export(span())
+      await vi.waitFor(() => expect(stopped).toHaveBeenCalledTimes(1), {timeout: 3 * WATCHDOG_MS + 8_000, interval: 50})
 
-    // #then three watchdogs and three cancels (bounded), and the rest counted dropped in one go: every span counted once
-    expect(Date.now() - started).toBeLessThan(3 * WATCHDOG_MS + 6_000)
-    expect(exporter.counts()).toEqual({exported: 0, dropped: total})
-    expect(target.requests()).toBe(3)
-    expect(await exporter.close(500)).toEqual({exported: 0, dropped: total})
-    await target.stop()
+      // #then three watchdogs and three cancels (bounded), and the rest counted dropped in one go: every span counted once
+      expect(Date.now() - started).toBeLessThan(3 * WATCHDOG_MS + 6_000)
+      expect(exporter.counts()).toEqual({exported: 0, dropped: total})
+      expect(target.requests()).toBe(3)
+      expect(await exporter.close(500)).toEqual({exported: 0, dropped: total})
+    } finally {
+      await target.stop()
+    }
   }, 60_000)
 
   it('gives up on a transport that will not let go: trips the breaker, counts the queue, and never counts a span twice', async () => {
     // #given a request that cannot be cancelled (its socket survives the cancel) and spans queued behind it
     const target = await trickler(() => true)
-    const stopped = vi.fn()
-    const exporter = exporterFor({
-      url: target.url,
-      limits: {...WATCHDOG_LIMITS, maxConsecutiveFailures: 50},
-      onStopped: stopped,
-      testing: {ignoreAgentDestroy: true},
-    })
-    const total = 9
-    const started = Date.now()
-    for (let index = 0; index < total; index += 1) exporter.export(span())
+    try {
+      const stopped = vi.fn()
+      const exporter = exporterFor({
+        url: target.url,
+        limits: {...WATCHDOG_LIMITS, maxConsecutiveFailures: 50},
+        onStopped: stopped,
+        testing: {ignoreAgentDestroy: true},
+      })
+      const total = 9
+      const started = Date.now()
+      for (let index = 0; index < total; index += 1) exporter.export(span())
 
-    // #when the watchdog fires, then the drain grace (one second) passes
-    await vi.waitFor(() => expect(stopped).toHaveBeenCalledTimes(1), {timeout: WATCHDOG_MS + 4_000, interval: 25})
+      // #when the watchdog fires, then the drain grace (one second) passes
+      await vi.waitFor(() => expect(stopped).toHaveBeenCalledTimes(1), {timeout: WATCHDOG_MS + 4_000, interval: 25})
 
-    // #then it stopped in the watchdog plus the grace, everything is counted dropped once, and only one request was ever made
-    expect(Date.now() - started).toBeLessThan(WATCHDOG_MS + 3_500)
-    expect(exporter.counts()).toEqual({exported: 0, dropped: total})
-    expect(target.requests()).toBe(1)
-    expect(await exporter.close(500)).toEqual({exported: 0, dropped: total})
-    await target.stop()
+      // #then it stopped in the watchdog plus the grace, everything is counted dropped once, and only one request was ever made
+      expect(Date.now() - started).toBeLessThan(WATCHDOG_MS + 3_500)
+      expect(exporter.counts()).toEqual({exported: 0, dropped: total})
+      expect(target.requests()).toBe(1)
+      expect(await exporter.close(500)).toEqual({exported: 0, dropped: total})
+    } finally {
+      await target.stop()
+    }
   }, 30_000)
 
   it('does not count the stalled batch again when shutdown arrives while the delegate has not yet let go of it', async () => {
     // #given a request that cannot be cancelled, so after the watchdog its batch is counted but its slot is still held
     const target = await trickler(() => true)
-    const exporter = exporterFor({
-      url: target.url,
-      limits: {...WATCHDOG_LIMITS, maxConsecutiveFailures: 50},
-      testing: {ignoreAgentDestroy: true},
-    })
-    const total = 6
-    for (let index = 0; index < total; index += 1) exporter.export(span())
-    await vi.waitFor(() => expect(exporter.counts().dropped).toBe(2), {timeout: WATCHDOG_MS + 3_000, interval: 10})
+    try {
+      const exporter = exporterFor({
+        url: target.url,
+        limits: {...WATCHDOG_LIMITS, maxConsecutiveFailures: 50},
+        testing: {ignoreAgentDestroy: true},
+      })
+      const total = 6
+      for (let index = 0; index < total; index += 1) exporter.export(span())
+      await vi.waitFor(() => expect(exporter.counts().dropped).toBe(2), {timeout: WATCHDOG_MS + 3_000, interval: 10})
 
-    // #when shutdown arrives in that window
-    const counts = await exporter.close(500)
+      // #when shutdown arrives in that window
+      const counts = await exporter.close(500)
 
-    // #then the stalled batch (two spans) is counted once and the four queued behind it once: six in all, not eight
-    expect(counts).toEqual({exported: 0, dropped: total})
-    await target.stop()
+      // #then the stalled batch (two spans) is counted once and the four queued behind it once: six in all, not eight
+      expect(counts).toEqual({exported: 0, dropped: total})
+    } finally {
+      await target.stop()
+    }
   }, 30_000)
 
   it('does not announce a stop after shutdown has finished, when the grace period for an uncancellable request ends later', async () => {
     // #given a request that cannot be cancelled, whose watchdog has fired (its batch counted, the grace period running)
     const target = await trickler(() => true)
-    const stopped = vi.fn()
-    const exporter = exporterFor({
-      url: target.url,
-      limits: {...WATCHDOG_LIMITS, maxConsecutiveFailures: 50},
-      onStopped: stopped,
-      testing: {ignoreAgentDestroy: true},
-    })
-    const total = 4
-    for (let index = 0; index < total; index += 1) exporter.export(span())
-    await vi.waitFor(() => expect(exporter.counts().dropped).toBe(2), {timeout: WATCHDOG_MS + 3_000, interval: 10})
+    try {
+      const stopped = vi.fn()
+      const exporter = exporterFor({
+        url: target.url,
+        limits: {...WATCHDOG_LIMITS, maxConsecutiveFailures: 50},
+        onStopped: stopped,
+        testing: {ignoreAgentDestroy: true},
+      })
+      const total = 4
+      for (let index = 0; index < total; index += 1) exporter.export(span())
+      await vi.waitFor(() => expect(exporter.counts().dropped).toBe(2), {timeout: WATCHDOG_MS + 3_000, interval: 10})
 
-    // #when shutdown finishes inside the grace period, and the grace period then runs out
-    const counts = await exporter.close(300)
-    await sleep(1_500)
+      // #when shutdown finishes inside the grace period, and the grace period then runs out
+      const counts = await exporter.close(300)
+      await sleep(1_500)
 
-    // #then shutdown's own cancellation stands: no stop is announced after close() has returned, and no count moved
-    expect(counts).toEqual({exported: 0, dropped: total})
-    expect(stopped).not.toHaveBeenCalled()
-    expect(exporter.counts()).toEqual({exported: 0, dropped: total})
-    await target.stop()
+      // #then shutdown's own cancellation stands: no stop is announced after close() has returned, and no count moved
+      expect(counts).toEqual({exported: 0, dropped: total})
+      expect(stopped).not.toHaveBeenCalled()
+      expect(exporter.counts()).toEqual({exported: 0, dropped: total})
+    } finally {
+      await target.stop()
+    }
   }, 30_000)
 
   it('counts a span dropped once when shutdown arrives after the watchdog already counted its batch', async () => {
     // #given the first batch stalls past the watchdog while later ones succeed
     const target = await trickler(index => index === 0)
-    const exporter = exporterFor({url: target.url, limits: WATCHDOG_LIMITS})
-    for (let index = 0; index < 4; index += 1) exporter.export(span())
-    await vi.waitFor(() => expect(exporter.counts().dropped).toBe(2), {timeout: WATCHDOG_MS + 3_000, interval: 25})
+    try {
+      const exporter = exporterFor({url: target.url, limits: WATCHDOG_LIMITS})
+      for (let index = 0; index < 4; index += 1) exporter.export(span())
+      await vi.waitFor(() => expect(exporter.counts().dropped).toBe(2), {timeout: WATCHDOG_MS + 3_000, interval: 25})
 
-    // #when shutdown comes straight after, with the rest possibly in flight
-    const counts = await exporter.close(2_000)
+      // #when shutdown comes straight after, with the rest possibly in flight
+      const counts = await exporter.close(2_000)
 
-    // #then the stalled batch is not counted again
-    expect(counts.exported + counts.dropped).toBe(4)
-    expect(counts.dropped).toBe(2)
-    await target.stop()
+      // #then the stalled batch is not counted again
+      expect(counts.exported + counts.dropped).toBe(4)
+      expect(counts.dropped).toBe(2)
+    } finally {
+      await target.stop()
+    }
   }, 30_000)
 })
