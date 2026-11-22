@@ -166,10 +166,11 @@ jobs:
           TARBALL="$(ls "${STAGE}/out")"
           mkdir -p dist-tarball
           cp "${STAGE}/out/${TARBALL}" "dist-tarball/${TARBALL}"
+          CONTENTS="$(tar -tzf "dist-tarball/${TARBALL}")"
           echo "Packed contents:"
-          tar -tzf "dist-tarball/${TARBALL}"
-          # The notices travel with the inlined third-party code.
-          tar -tzf "dist-tarball/${TARBALL}" | grep -qx 'package/THIRD_PARTY_NOTICES.md' \
+          echo "${CONTENTS}"
+          # The notices travel with the inlined third-party code. Matched on the saved listing: `tar | grep -q` can fail under pipefail.
+          grep -qx 'package/THIRD_PARTY_NOTICES.md' <<<"${CONTENTS}" \
             || { echo "::error::the tarball is missing THIRD_PARTY_NOTICES.md"; exit 1; }
           echo "tarball=${TARBALL}" >> "${GITHUB_OUTPUT}"
 
