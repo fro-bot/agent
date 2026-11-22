@@ -3556,6 +3556,101 @@ describe('a step belongs to the latest primary hook at or before its own start t
       })
     })
 
+    it('lets go of a request, and its step, when its step fails and the execution stays open, keeping its time for the join', () => {
+      // #given a request with a step that failed while the execution goes on
+      const s = script()
+      s.started('p')
+      hook(s, 'p', 100)
+      s.stepStarted('p', 'm1', 100)
+      s.text('p', 'm1', 'partial')
+      s.out.push({
+        kind: 'step.failed',
+        sessionId: 'p',
+        messageId: 'm1',
+        error: {type: 'provider.internal', message: 'boom'},
+        at: lastAt(s.out) + 1,
+      })
+
+      // #when
+      const {records, model} = replay(s.out, {flush: false})
+
+      // #then its span is out as an error, it holds no request or step, and its hook time is still the record's one entry
+      expect(primaries(records)).toMatchObject([{status: 'error', texts: ['partial']}])
+      expect(model.stats()).toMatchObject({hookTimes: 1, historyRequestsHeld: 0, openSteps: 0})
+
+      // #when a step that started at that time arrives again, and then the next request with its own step
+      s.stepStarted('p', 'm1-again', 100)
+      s.text('p', 'm1-again', 'stray')
+      hook(s, 'p', 200)
+      step(s, 'p', 'm2', 200, 'next')
+      const after = replay(s.out, {flush: false})
+
+      // #then the stray step found its time but no request and bound nothing; the next step bound to its own request
+      expect(JSON.stringify(after.records)).not.toContain('stray')
+      expect(primaries(after.records).map(chat => [chat.messageId, chat.texts])).toEqual([
+        ['m1', ['partial']],
+        ['m2', ['next']],
+      ])
+    })
+
+    describe('a session that outlives its trace', () => {
+      /** A turn that ends with one more prompt still queued: the session stays, holding it, once the trace is closed. */
+      const surviving = () => {
+        const s = script()
+        s.prompt('p', 'u1')
+        s.enqueued('p', 'u1', 'user')
+        s.started('p')
+        s.delivered('p', 'u1')
+        hook(s, 'p', 100)
+        step(s, 'p', 'm1', 100, 'one')
+        s.prompt('p', 'u2')
+        s.enqueued('p', 'u2', 'user')
+        s.ended('p')
+        return s
+      }
+
+      it('expires after the idle timeout, with no closed request left in its request list', () => {
+        // #given the trace is closed and the session holds only the queued prompt
+        const s = surviving()
+        const kept = replay(s.out, {flush: false}).model.stats()
+        expect(kept).toMatchObject({openTraces: 0, sessions: 1})
+
+        // #when the idle timeout passes
+        s.tick(lastAt(s.out) + DEFAULT_LIMITS.sessionIdleMs + 1)
+        const {model} = replay(s.out, {flush: false})
+
+        // #then the session is forgotten: a closed request left in its list would have kept it from ever being idle
+        expect(model.stats()).toMatchObject({sessions: 0, hookTimes: 0})
+      })
+
+      it('attaches a late tool call to no chat span and holds no extra reference, and binds the next step to its own request', () => {
+        // #given the surviving session starts its next execution
+        const s = surviving()
+        s.started('p')
+        s.delivered('p', 'u2')
+
+        // #when a tool call for the first turn's message arrives late, then the next request runs
+        s.toolBefore('p', 'late', 'read', 'm1')
+        s.toolEnded('p', 'late')
+        hook(s, 'p', 300)
+        step(s, 'p', 'm2', 300, 'two')
+        s.ended('p')
+        const {records, model} = replay(s.out, {flush: false})
+
+        // #then no chat span carries the call, no second owner of its arguments was taken, and the step bound its own request
+        expect(primaries(records).map(chat => [chat.messageId, chat.toolCalls.length])).toEqual([
+          ['m1', 0],
+          ['m2', 0],
+        ])
+        expect(model.takeRetained()).toEqual([])
+        expect(primaries(records).at(-1)?.texts).toEqual(['two'])
+        // #and the call is not dropped: it is one tool span under the second execution's root
+        const late = tools(records).filter(tool => tool.callId === 'late')
+        expect(late).toHaveLength(1)
+        expect(late[0]?.parentSpanId).toBe(roots(records).at(-1)?.spanId)
+      })
+    })
+
     it('binds nothing for a step that arrives after its request closed, and binds the next request normally', () => {
       // #given a request closed by a retry hook, its late step, then a new request with its step
       const s = script()
@@ -3830,12 +3925,29 @@ describe('a step belongs to the latest primary hook at or before its own start t
       s.ended('p')
 
       // #when
-      const {records, model} = replay(s.out, {flush: false})
+      const emissions: (readonly [number, string])[] = []
+      const {records, model} = replay(s.out, {
+        flush: false,
+        afterEach: (_live, finished, observation) => {
+          for (const record of finished) {
+            if (record.kind === 'chat' && record.requestKind === 'primary') {
+              emissions.push([record.start, `${observation.kind}@${String(observation.at)}`])
+            }
+          }
+        },
+      })
 
       // #then the second execution carries no step data, and the response is on no span
       expect(JSON.stringify(records)).not.toContain('B2 RESPONSE')
       for (const chat of primaries(records).filter(candidate => candidate.start >= 210)) expectNoStepData(chat)
       expect(model.stats().withholds).toBe(1)
+
+      // #and its spans are not emitted when the previous execution ends (200): both come out at their own execution's end, the last
+      const lastEnd = s.out.at(-1)
+      expect(lastEnd?.kind).toBe('execution.ended')
+      const atLastEnd = `execution.ended@${String(lastEnd?.at)}`
+      expect(emissions.filter(([start]) => start === 210)).toEqual([[210, atLastEnd]])
+      expect(emissions.filter(([start]) => start === 220)).toEqual([[220, atLastEnd]])
     })
 
     /** A first execution with one step, then the next execution's first hook observed before the first execution's end event. */

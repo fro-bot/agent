@@ -166,7 +166,10 @@ export interface TurnModelLimits {
    * has no trace to close it.
    */
   readonly sessionIdleMs: number
-  /** Idle sessions kept at once; past it the least recently active is forgotten. A running session never counts. */
+  /**
+   * Idle sessions kept, a limit applied when a session record is created: past it the least recently active is forgotten. A running
+   * session never counts. Records that go idle later can exceed it until the next allocation or their idle expiry.
+   */
   readonly maxIdleSessions: number
   /**
    * Finished call ids remembered per session, so a repeated terminal event (or a late hook) for a call that already ended
