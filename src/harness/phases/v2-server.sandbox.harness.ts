@@ -247,8 +247,26 @@ function scriptedServerOptions(input: ScriptedServerInput) {
   } satisfies Parameters<typeof startOpenCodeV2Server>[0]
 }
 
-/** Opens a session on a started server, sends one prompt and waits until the provider's script has run to the end. */
+/**
+ * Opens a session on a started server, sends one prompt and waits until the provider's script has run to the end. A failure
+ * stops the server before it is rethrown: the caller never received the handle, so nothing else could.
+ */
 async function driveScriptedTurn(
+  handle: OpenCodeV2ServerHandle,
+  workspace: string,
+  provider: ScriptedProvider,
+  turnTimeoutMs: number | undefined,
+): Promise<void> {
+  try {
+    await promptAndWait(handle, workspace, provider, turnTimeoutMs)
+  } catch (error) {
+    // The turn's error is the one that matters; a shutdown that also fails adds nothing the caller can use.
+    await handle.shutdown().catch(() => undefined)
+    throw error
+  }
+}
+
+async function promptAndWait(
   handle: OpenCodeV2ServerHandle,
   workspace: string,
   provider: ScriptedProvider,
@@ -305,11 +323,15 @@ export async function startScriptedSession(options: ScriptedSessionOptions): Pro
   return handle
 }
 
-export type PlainScriptedSessionOptions = Omit<ScriptedSessionOptions, 'lifecycle'>
+export interface PlainScriptedSessionOptions extends Omit<ScriptedSessionOptions, 'lifecycle'> {
+  /** The server start. Left out, the real one; a test passes its own. */
+  readonly deps?: {readonly start?: typeof startOpenCodeV2Server}
+}
 
 /** The same server and turn as `startScriptedSession`, as the runner's own user and with no sandbox: `isolate-agent` off. */
 export async function startPlainScriptedSession(options: PlainScriptedSessionOptions): Promise<OpenCodeV2ServerHandle> {
-  const started = await startOpenCodeV2Server(scriptedServerOptions(options), options.logger)
+  const start = options.deps?.start ?? startOpenCodeV2Server
+  const started = await start(scriptedServerOptions(options), options.logger)
   if (!started.success) throw new Error(`server start failed: ${started.error.message}`)
   await driveScriptedTurn(started.data, options.workspace, options.provider, options.turnTimeoutMs)
   return started.data

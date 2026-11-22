@@ -3,7 +3,8 @@ import * as fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import {fileURLToPath} from 'node:url'
-import {afterEach, describe, expect, it} from 'vitest'
+import {afterEach, describe, expect, it, vi} from 'vitest'
+import {createMockLogger} from '../../shared/test-helpers.js'
 import {
   aclLines,
   aclText,
@@ -22,6 +23,7 @@ import {
   PRELUDE,
   runInspection,
   runnerFirstLine,
+  startPlainScriptedSession,
   writeMatrixProbe,
   writeWorksProbe,
   type InspectionResult,
@@ -583,5 +585,66 @@ describe('inspections that feed an absence assertion', () => {
       // #then
       expect(inspectOutput('sh', ['-c', 'echo fine'], 'real command')).toBe('fine\n')
     })
+  })
+})
+
+describe('startPlainScriptedSession', () => {
+  const provider = {port: 1, state: {results: [] as string[], done: true}, close: async () => undefined}
+  const handleWith = (fetch: () => Promise<Response>) => ({
+    fetch: vi.fn(fetch),
+    registerOwnedSession: vi.fn(),
+    shutdown: vi.fn(async () => ({exit: {outcome: 'graceful'}})),
+  })
+  const optionsFor = (handle: ReturnType<typeof handleWith>) => ({
+    binary: '/bin/opencode',
+    workspace: '/ws',
+    env: {},
+    provider,
+    logger: createMockLogger(),
+    deps: {start: vi.fn(async () => ({success: true as const, data: handle}))},
+  })
+
+  it('shuts the server down before it rethrows when the session cannot be created', async () => {
+    // #given a started server whose session request fails
+    const handle = handleWith(async () => Promise.reject(new Error('connection reset')))
+
+    // #when the helper drives the turn
+    // #then it rejects, and the caller never held the handle, so the helper stopped the server itself
+    await expect(startPlainScriptedSession(optionsFor(handle) as never)).rejects.toThrow('connection reset')
+    expect(handle.shutdown).toHaveBeenCalledTimes(1)
+  })
+
+  it('shuts the server down when the prompt request fails after the session was created', async () => {
+    // #given a session that is created, then a prompt that fails
+    let calls = 0
+    const handle = handleWith(async () => {
+      calls += 1
+      if (calls === 1) return new Response(JSON.stringify({data: {id: 'ses_1'}}))
+      throw new Error('prompt refused')
+    })
+
+    // #then the helper stops the server and the original error still reaches the caller
+    await expect(startPlainScriptedSession(optionsFor(handle) as never)).rejects.toThrow('prompt refused')
+    expect(handle.registerOwnedSession).toHaveBeenCalledWith('ses_1')
+    expect(handle.shutdown).toHaveBeenCalledTimes(1)
+  })
+
+  it('returns the running handle, and leaves the shutdown to the caller, when the turn completes', async () => {
+    // #given a server that takes the session and the prompt
+    let calls = 0
+    const handle = handleWith(async () => new Response(JSON.stringify(++calls === 1 ? {data: {id: 'ses_1'}} : {})))
+
+    // #then the helper hands it back still running
+    await expect(startPlainScriptedSession(optionsFor(handle) as never)).resolves.toBe(handle)
+    expect(handle.shutdown).not.toHaveBeenCalled()
+  })
+
+  it('keeps the turn error when the shutdown itself fails', async () => {
+    // #given a failing turn and a failing shutdown
+    const handle = handleWith(async () => Promise.reject(new Error('turn failed')))
+    handle.shutdown.mockRejectedValueOnce(new Error('shutdown failed'))
+
+    // #then the caller sees the turn's error
+    await expect(startPlainScriptedSession(optionsFor(handle) as never)).rejects.toThrow('turn failed')
   })
 })
