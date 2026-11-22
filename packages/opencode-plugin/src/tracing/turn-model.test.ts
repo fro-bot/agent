@@ -3921,12 +3921,28 @@ describe('a step belongs to the latest primary hook at or before its own start t
       s.ended('p')
 
       // #when
-      const {records, model} = replay(s.out, {flush: false})
+      const emittedBy = new Map<number, string>()
+      const {records, model} = replay(s.out, {
+        flush: false,
+        afterEach: (_live, finished, observation) => {
+          for (const record of finished) {
+            if (record.kind === 'chat' && record.requestKind === 'primary') {
+              emittedBy.set(record.start, `${observation.kind}@${String(observation.at)}`)
+            }
+          }
+        },
+      })
 
       // #then the second execution carries no step data, and the response is on no span
       expect(JSON.stringify(records)).not.toContain('B2 RESPONSE')
       for (const chat of primaries(records).filter(candidate => candidate.start >= 210)) expectNoStepData(chat)
       expect(model.stats().withholds).toBe(1)
+
+      // #and its spans are not emitted when the previous execution ends (200): both come out at their own execution's end, the last
+      const lastEnd = s.out.at(-1)
+      expect(lastEnd?.kind).toBe('execution.ended')
+      expect(emittedBy.get(210)).toBe(`execution.ended@${String(lastEnd?.at)}`)
+      expect(emittedBy.get(220)).toBe(`execution.ended@${String(lastEnd?.at)}`)
     })
 
     /** A first execution with one step, then the next execution's first hook observed before the first execution's end event. */
