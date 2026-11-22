@@ -3102,6 +3102,8 @@ const SCAN_CONTROLS = {
   liveControl: canaryShapedValue('sk-trace-live-', randomBytes(18).toString('hex')),
   xdgTextControl: canaryShapedValue('sk-trace-xdgt-', randomBytes(18).toString('hex')),
   xdgBinaryControl: canaryShapedValue('sk-trace-xdgb-', randomBytes(18).toString('hex')),
+  longControl: canaryShapedValue('sk-trace-long-', randomBytes(18).toString('hex')),
+  boundaryControl: canaryShapedValue('sk-trace-edge-', randomBytes(18).toString('hex')),
 } as const
 
 /** Counts processes whose command line names the relay's bundle, after showing the search a process that does. */
@@ -3185,6 +3187,10 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
   const scanSpecFor = (workspace: string): ScanSpec => ({
     canary: TRACE_CANARY,
     ...SCAN_CONTROLS,
+    // 1 MiB chunks, so the planted boundary control needs a 2 MiB file. Over 128 MiB a file is counted as skipped: the runner
+    // temp holds the OpenCode binary (about 225 MiB), which the sandbox is not meant to read and which would only spend time.
+    chunkBytes: 1024 * 1024,
+    maxFileBytes: 128 * 1024 * 1024,
     runnerTemp,
     checkout: [workspace, responseDir],
   })

@@ -90,7 +90,7 @@ export interface Row {
 
 export function parseRows(text: string): Map<string, Row[]> {
   const rows = new Map<string, Row[]>()
-  for (const match of text.matchAll(/RESULT ([a-z0-9_]+) (BLOCKED|OPEN|WORKS|FAILED|INFO) ([^\n"]*)/g)) {
+  for (const match of text.matchAll(/RESULT ([a-z0-9_]+) (BLOCKED|OPEN|WORKS|FAILED|INFO|INCOMPLETE) ([^\n"]*)/g)) {
     const [, id, status, evidence] = match
     if (id === undefined || status === undefined) continue
     rows.set(id, [...(rows.get(id) ?? []), {status, evidence: (evidence ?? '').trim()}])

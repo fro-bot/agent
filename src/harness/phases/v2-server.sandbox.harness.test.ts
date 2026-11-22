@@ -648,3 +648,13 @@ describe('startPlainScriptedSession', () => {
     await expect(startPlainScriptedSession(optionsFor(handle) as never)).rejects.toThrow('turn failed')
   })
 })
+
+describe('parseRows verdicts', () => {
+  it('reads an INCOMPLETE row, so a scan that left data unexamined is not mistaken for a missing one', () => {
+    // #given a scan result that skipped a file
+    const rows = parseRows('RESULT canary_scan INCOMPLETE canary.xdg=0 skip.xdg=1\n')
+
+    // #then the status is kept
+    expect(rows.get('canary_scan')).toEqual([{status: 'INCOMPLETE', evidence: 'canary.xdg=0 skip.xdg=1'}])
+  })
+})

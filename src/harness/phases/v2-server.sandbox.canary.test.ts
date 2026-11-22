@@ -21,6 +21,11 @@ const spec: ScanSpec = {
   liveControl: canaryShapedValue('sk-trace-live-', '0123456789abcdef0123456789abcdef0123'),
   xdgTextControl: canaryShapedValue('sk-trace-xdgt-', 'fedcba9876543210fedcba9876543210fedc'),
   xdgBinaryControl: canaryShapedValue('sk-trace-xdgb-', '1357924680acebdf1357924680acebdf1357'),
+  longControl: canaryShapedValue('sk-trace-long-', '2468013579bdface2468013579bdface2468'),
+  boundaryControl: canaryShapedValue('sk-trace-edge-', '9876543210fedcba9876543210fedcba9876'),
+  chunkBytes: 4096,
+  // The verdict tests run where there is no /proc too; the container run requires the process controls.
+  requireProcControls: false,
   runnerTemp: '/nonexistent-runner-temp',
   checkout: [],
 }
@@ -52,12 +57,13 @@ function runScan(overrides: Partial<ScanSpec>, xdgRoot: string, extraDir: string
   expect(result.status).toBe(0)
   const line = result.stdout.split('\n').find(text => text.startsWith('RESULT canary_scan '))
   expect(line).toBeDefined()
-  return new Map(
-    (line ?? '')
+  return new Map([
+    ['status', (line ?? '').split(' ')[2] ?? ''],
+    ...(line ?? '')
       .split(' ')
       .filter(part => part.includes('='))
       .map(part => part.split('=') as [string, string]),
-  )
+  ])
 }
 
 /** The agent's layout: each XDG root holds an `opencode` link to the runner's directory. */
@@ -73,6 +79,8 @@ function layout(): {xdgRoot: string; runner: string; extra: string} {
   fs.mkdirSync(path.join(agent, 'home'))
   const extra = path.join(base, 'extra')
   fs.mkdirSync(extra)
+  // What the command's own `mktemp` directory holds for the scanner to find.
+  fs.writeFileSync(path.join(extra, 'notes.txt'), spec.liveControl)
   return {xdgRoot: agent, runner, extra}
 }
 
@@ -171,6 +179,123 @@ describe.skipIf(!python)('the scanner', () => {
 
     // #then the verdict is FAILED, so an empty result is never read as a pass
     expect(result.stdout).toMatch(/^RESULT canary_scan FAILED a detector control was not seen: .*xdgtext\.xdg/)
+  })
+})
+
+describe.skipIf(!python)('the scanner on large files and long runs', () => {
+  const canary = spec.canary
+  const scanCheckout = (files: Record<string, Buffer>, overrides: Partial<ScanSpec> = {}): Map<string, string> => {
+    const {xdgRoot, runner, extra} = layout()
+    plantScanControls(runner, {...spec, ...overrides})
+    const checkout = tempDir()
+    for (const [name, content] of Object.entries(files)) fs.writeFileSync(path.join(checkout, name), content)
+    return runScan({...overrides, checkout: [checkout]}, xdgRoot, extra)
+  }
+
+  it('finds the canary inside a token run longer than 4,096 bytes', () => {
+    // #given the canary in the middle of a 12,000-character run of token characters
+    const run = Buffer.from(`${'a'.repeat(6000)}${canary}${'b'.repeat(6000)}`)
+
+    // #then it is found, not skipped for its length
+    const counts = scanCheckout({'run.txt': run})
+    expect(counts.get('canary.checkout')).toBe('1')
+    expect(counts.get('skip.checkout')).toBe('0')
+  })
+
+  it('finds the canary across a chunk boundary, wherever the boundary falls inside it', () => {
+    // #given a file per offset, with the canary straddling the 4,096-byte chunk boundary at every position but the ends
+    const files: Record<string, Buffer> = {}
+    const first = 4096 - canary.length + 1
+    for (let offset = first; offset < 4096; offset += 1) {
+      files[`edge-${offset}.bin`] = Buffer.concat([Buffer.alloc(offset), Buffer.from(canary), Buffer.alloc(9000, 1)])
+    }
+
+    // #then every file's canary is found
+    expect(scanCheckout(files).get('canary.checkout')).toBe(String(Object.keys(files).length))
+  })
+
+  it('finds the canary in the last chunk of a file many chunks long, and a run that crosses several', () => {
+    // #given a 40,000-byte binary file with the canary near its end, and a 20,000-character run with it in the second half
+    const counts = scanCheckout({
+      'big.bin': Buffer.concat([Buffer.alloc(39_000), Buffer.from(canary), Buffer.alloc(900, 2)]),
+      'long.txt': Buffer.from(`${'q'.repeat(12_000)}${canary}${'r'.repeat(8000)}`),
+    })
+
+    // #then both are found
+    expect(counts.get('canary.checkout')).toBe('2')
+  })
+
+  it('finds the long-run control and the chunk-boundary control the runner plants', () => {
+    // #given the controls planted behind the links
+    const {xdgRoot, runner, extra} = layout()
+    plantScanControls(runner, spec)
+
+    // #when
+    const counts = runScan({}, xdgRoot, extra)
+
+    // #then both are found, and the planted boundary file is larger than a chunk
+    expect(counts.get('ctl.long.xdg')).toBe('1')
+    expect(counts.get('ctl.boundary.xdg')).toBe('1')
+    expect(fs.statSync(path.join(runner, 'cache', 'opencode', 'it-control-boundary.bin')).size).toBeGreaterThan(4096)
+  })
+
+  it('reports INCOMPLETE, with a count, when a file in the checkout cannot be read', () => {
+    // #given a file the scanner may not open
+    const {xdgRoot, runner, extra} = layout()
+    plantScanControls(runner, spec)
+    const checkout = tempDir()
+    fs.writeFileSync(path.join(checkout, 'sealed.txt'), 'nothing here')
+    fs.chmodSync(path.join(checkout, 'sealed.txt'), 0o000)
+
+    // #when
+    const counts = runScan({checkout: [checkout]}, xdgRoot, extra)
+
+    // #then the verdict is not BLOCKED
+    expect(counts.get('skip.checkout')).toBe('1')
+    expect(counts.get('status')).toBe('INCOMPLETE')
+  })
+
+  it('reports INCOMPLETE when a file is over the size bound, and when the time budget is spent', () => {
+    // #given a file over a bound that the planted controls are under
+    const big = {'big.bin': Buffer.alloc(30_000)}
+    const bounded = scanCheckout(big, {maxFileBytes: 25_000})
+    expect(bounded.get('skip.checkout')).toBe('1')
+    expect(bounded.get('status')).toBe('INCOMPLETE')
+
+    // #and a budget of zero seconds, which leaves every file unread: counted, and never a pass
+    const spent = scanCheckout(big, {budgetSeconds: 0})
+    expect(Number(spent.get('skip.checkout'))).toBeGreaterThanOrEqual(1)
+    expect(Number(spent.get('skip.xdg'))).toBeGreaterThanOrEqual(1)
+    expect(spent.get('status')).not.toBe('BLOCKED')
+  })
+
+  it('does not call the scan incomplete for a skipped file in the runner temp, which the sandbox is not meant to read', () => {
+    // #given an unreadable file in the temp root and nothing skipped elsewhere
+    const {xdgRoot, runner, extra} = layout()
+    plantScanControls(runner, spec)
+    const temp = tempDir()
+    fs.writeFileSync(path.join(temp, 'step.txt'), 'private')
+    fs.chmodSync(path.join(temp, 'step.txt'), 0o000)
+
+    // #when
+    const counts = runScan({runnerTemp: temp}, xdgRoot, extra)
+
+    // #then it is counted and the verdict stands
+    expect(counts.get('skip.temp')).toBe('1')
+    expect(counts.get('status')).toBe('BLOCKED')
+  })
+
+  it('reports OPEN, not INCOMPLETE, when the canary was found and something else was skipped', () => {
+    // #given a hit and an unreadable file
+    const {xdgRoot, runner, extra} = layout()
+    plantScanControls(runner, spec)
+    const checkout = tempDir()
+    fs.writeFileSync(path.join(checkout, 'hit.txt'), canary)
+    fs.writeFileSync(path.join(checkout, 'sealed.txt'), 'x')
+    fs.chmodSync(path.join(checkout, 'sealed.txt'), 0o000)
+
+    // #then
+    expect(runScan({checkout: [checkout]}, xdgRoot, extra).get('status')).toBe('OPEN')
   })
 })
 

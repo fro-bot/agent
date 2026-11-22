@@ -34,10 +34,26 @@ export interface ScanSpec {
   readonly xdgTextControl: string
   /** Planted by the runner in a binary file in another `opencode` directory. */
   readonly xdgBinaryControl: string
+  /** Planted by the runner inside a token run longer than any single read of the scanner. */
+  readonly longControl: string
+  /** Planted by the runner across the boundary between two chunks of a file larger than a chunk. */
+  readonly boundaryControl: string
   readonly runnerTemp: string
   /** The checkout and the response directory. */
   readonly checkout: readonly string[]
+  /** Bytes read at a time. Default `DEFAULT_CHUNK_BYTES`. */
+  readonly chunkBytes?: number
+  /** A file larger than this is skipped and counted. Default `DEFAULT_MAX_FILE_BYTES`. */
+  readonly maxFileBytes?: number
+  /** After this many seconds the scanner stops reading and counts what is left as skipped. Default `DEFAULT_BUDGET_SECONDS`. */
+  readonly budgetSeconds?: number
+  /** Whether the live controls in a process environment and a command line are required. Off only for a host with no `/proc`. */
+  readonly requireProcControls?: boolean
 }
+
+export const DEFAULT_CHUNK_BYTES = 4 * 1024 * 1024
+export const DEFAULT_MAX_FILE_BYTES = 1024 * 1024 * 1024
+export const DEFAULT_BUDGET_SECONDS = 300
 
 /** The hashes the scanner looks for, by name. Names are what it reports. */
 function targets(spec: ScanSpec): Record<string, string> {
@@ -46,100 +62,163 @@ function targets(spec: ScanSpec): Record<string, string> {
     [sha256Hex(spec.liveControl)]: 'live',
     [sha256Hex(spec.xdgTextControl)]: 'xdgtext',
     [sha256Hex(spec.xdgBinaryControl)]: 'xdgbin',
+    [sha256Hex(spec.longControl)]: 'long',
+    [sha256Hex(spec.boundaryControl)]: 'boundary',
   }
 }
 
-/** The scanner's one argument: hashes, a length and paths. It holds no canary and no control value. */
+/** The scanner's one argument: hashes, a length, bounds and paths. It holds no canary and no control value. */
 export function scanConfig(spec: ScanSpec): string {
-  return JSON.stringify({len: CANARY_LENGTH, targets: targets(spec), temp: spec.runnerTemp, checkout: spec.checkout})
+  return JSON.stringify({
+    len: CANARY_LENGTH,
+    targets: targets(spec),
+    temp: spec.runnerTemp,
+    checkout: spec.checkout,
+    chunk: spec.chunkBytes ?? DEFAULT_CHUNK_BYTES,
+    max: spec.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES,
+    budget: spec.budgetSeconds ?? DEFAULT_BUDGET_SECONDS,
+    proc: spec.requireProcControls ?? true,
+  })
 }
 
 /**
  * Reads every file under the named roots (binary files too, the session database and its WAL among them) and every
- * process's environment and command line; hashes each run of `[A-Za-z0-9_-]` bytes (and each window of that length inside a
- * longer run) and counts the files whose hash is a target. A root that is a link is followed; a link met inside a walk is not.
- * A file over 64 MiB is skipped and counted. Prints one `RESULT` line, counts only.
+ * process's environment and command line, in chunks that overlap by one less than the canary's length, so a match across a
+ * chunk boundary lies whole in the next chunk. Hashes every window of that length inside each run of `[A-Za-z0-9_-]` bytes,
+ * however long the run, and counts the files whose hash is a target. A root that is a link is followed; a link met inside a
+ * walk is not.
+ *
+ * Nothing is skipped silently: a file that cannot be opened or read, one over the size bound, and every file left when the
+ * time budget is spent is counted per group. A skip in the checkout, the agent's home or OpenCode's storage makes the verdict
+ * INCOMPLETE (unless the canary was found: that stays OPEN). Skips in the runner temp are counted only, since the sandbox is
+ * not meant to read it. Prints one `RESULT` line, counts only.
  */
-export const SCAN_PROGRAM = `import glob, hashlib, json, os, re, sys
+export const SCAN_PROGRAM = `import glob, hashlib, json, os, re, sys, time
 
 cfg = json.loads(sys.argv[1])
 extra = sys.argv[2]
 LEN = cfg['len']
 TARGETS = cfg['targets']
-MAX_BYTES = 64 * 1024 * 1024
+CHUNK = max(cfg['chunk'], LEN)
+MAX_BYTES = cfg['max']
+DEADLINE = time.monotonic() + cfg['budget']
 TOKEN = re.compile(rb'[A-Za-z0-9_-]+')
 GROUPS = ['environ', 'cmdline', 'file', 'temp', 'checkout', 'home', 'xdg']
+COVERED = ('checkout', 'home', 'xdg')
 env = os.environ
 bases = [env.get(n, '') for n in ('XDG_DATA_HOME', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME')]
 bases = [b for b in bases if b]
+# The places that decide the verdict come before the runner temp, so a spent budget never starves them.
 roots = {
     'file': [extra],
-    'temp': [cfg['temp']],
+    'xdg': [os.path.join(b, 'opencode') for b in bases],
     'checkout': cfg['checkout'],
     'home': [r for r in [env.get('HOME', '')] + bases if r],
-    'xdg': [os.path.join(b, 'opencode') for b in bases],
+    'temp': [cfg['temp']],
 }
 read = {g: 0 for g in GROUPS}
+skip = {g: 0 for g in GROUPS}
 hits = {g: {} for g in GROUPS}
-skipped = 0
 
 
-def found_in(data):
-    found = set()
+def found_in(data, found):
     for m in TOKEN.finditer(data):
         tok = m.group()
         n = len(tok)
-        if n < LEN or n > 4096:
+        if n < LEN:
             continue
         for i in range(n - LEN + 1):
             name = TARGETS.get(hashlib.sha256(tok[i:i + LEN]).hexdigest())
             if name is not None:
                 found.add(name)
-    return found
 
 
-def count(group, data):
+def scan_stream(f):
+    """The set of target names in a stream, read in chunks that overlap by LEN - 1 bytes. None when the budget runs out."""
+    found = set()
+    carry = b''
+    while True:
+        block = f.read(CHUNK)
+        if not block:
+            return found
+        buf = carry + block
+        found_in(buf, found)
+        carry = buf[-(LEN - 1):]
+        if time.monotonic() > DEADLINE:
+            return None
+
+
+def count(group, found):
     read[group] += 1
-    for name in found_in(data):
+    for name in found:
         hits[group][name] = hits[group].get(name, 0) + 1
 
 
 for group in ('environ', 'cmdline'):
     for p in glob.glob('/proc/[0-9]*/' + group):
+        # Another user's process is meant to be unreadable here: not counted as a skip.
         try:
             with open(p, 'rb') as f:
-                count(group, f.read())
+                found = scan_stream(f)
+            if found is not None:
+                count(group, found)
         except OSError:
             pass
 
+
+def scan_file(group, p):
+    if time.monotonic() > DEADLINE:
+        skip[group] += 1
+        return
+    try:
+        if os.path.islink(p):
+            return
+        if os.stat(p).st_size > MAX_BYTES:
+            skip[group] += 1
+            return
+        with open(p, 'rb') as f:
+            found = scan_stream(f)
+        if found is None:
+            skip[group] += 1
+        else:
+            count(group, found)
+    except OSError:
+        skip[group] += 1
+
+
+def walk_error(group):
+    def on_error(_error):
+        skip[group] += 1
+    return on_error
+
+
 for group, group_roots in roots.items():
     for root in group_roots:
-        walk = [(os.path.dirname(root), [], [os.path.basename(root)])] if os.path.isfile(root) else os.walk(root, followlinks=False)
-        for top, _dirs, files in walk:
+        if os.path.isfile(root):
+            scan_file(group, root)
+            continue
+        for top, _dirs, files in os.walk(root, followlinks=False, onerror=walk_error(group)):
             for name in files:
-                p = os.path.join(top, name)
-                try:
-                    if os.path.islink(p):
-                        continue
-                    if os.stat(p).st_size > MAX_BYTES:
-                        skipped += 1
-                        continue
-                    with open(p, 'rb') as f:
-                        count(group, f.read())
-                except OSError:
-                    pass
+                scan_file(group, os.path.join(top, name))
 
 canary = {g: hits[g].get('canary', 0) for g in GROUPS}
-need = [('live', 'environ'), ('live', 'cmdline'), ('live', 'file'), ('xdgtext', 'xdg'), ('xdgbin', 'xdg')]
+need = [('live', 'file'), ('xdgtext', 'xdg'), ('xdgbin', 'xdg'), ('long', 'xdg'), ('boundary', 'xdg')]
+if cfg['proc']:
+    need = [('live', 'environ'), ('live', 'cmdline')] + need
 missing = [n + '.' + g for n, g in need if hits[g].get(n, 0) < 1]
-parts = ['canary.' + g + '=' + str(canary[g]) for g in GROUPS if g not in ('file',)]
+incomplete = sum(skip[g] for g in COVERED) > 0
+parts = ['canary.' + g + '=' + str(canary[g]) for g in GROUPS if g != 'file']
 parts += ['ctl.' + n + '.' + g + '=' + str(hits[g].get(n, 0)) for n, g in need]
 parts += ['read.' + g + '=' + str(read[g]) for g in ('checkout', 'home', 'xdg')]
-parts.append('skipped=' + str(skipped))
+parts += ['skip.' + g + '=' + str(skip[g]) for g in ('checkout', 'home', 'xdg', 'temp')]
 if missing:
     print('RESULT canary_scan FAILED a detector control was not seen: ' + ','.join(missing) + ' ' + ' '.join(parts))
+elif sum(canary.values()) > 0:
+    print('RESULT canary_scan OPEN ' + ' '.join(parts))
+elif incomplete:
+    print('RESULT canary_scan INCOMPLETE ' + ' '.join(parts))
 else:
-    print('RESULT canary_scan ' + ('OPEN' if sum(canary.values()) > 0 else 'BLOCKED') + ' ' + ' '.join(parts))
+    print('RESULT canary_scan BLOCKED ' + ' '.join(parts))
 `
 
 /**
@@ -165,23 +244,39 @@ export function scanCommand(spec: ScanSpec): string {
 }
 
 /**
- * Plants the runner's controls where the sandbox reaches OpenCode's storage: a text file in the data `opencode` directory
- * (the sandbox's link points here) and a binary file, with the value at an odd offset between NULs, in the state one.
+ * Plants the runner's controls where the sandbox reaches OpenCode's storage:
+ * - a text file in the data `opencode` directory (the sandbox's link points here);
+ * - a binary file, with the value at an odd offset between NULs, in the state one;
+ * - a file in the config one holding the value inside a token run longer than any read;
+ * - a file in the cache one of two chunks, with the value straddling the boundary between them.
  */
 export function plantScanControls(xdgRoot: string, spec: ScanSpec): void {
-  const text = path.join(xdgRoot, 'data', 'opencode')
-  const binary = path.join(xdgRoot, 'state', 'opencode')
-  fs.mkdirSync(text, {recursive: true})
-  fs.mkdirSync(binary, {recursive: true})
-  fs.writeFileSync(path.join(text, 'it-control.txt'), `scan control ${spec.xdgTextControl}\n`)
+  const dirs = {
+    data: path.join(xdgRoot, 'data', 'opencode'),
+    state: path.join(xdgRoot, 'state', 'opencode'),
+    config: path.join(xdgRoot, 'config', 'opencode'),
+    cache: path.join(xdgRoot, 'cache', 'opencode'),
+  }
+  for (const dir of Object.values(dirs)) fs.mkdirSync(dir, {recursive: true})
+  fs.writeFileSync(path.join(dirs.data, 'it-control.txt'), `scan control ${spec.xdgTextControl}\n`)
   fs.writeFileSync(
-    path.join(binary, 'it-control.bin'),
+    path.join(dirs.state, 'it-control.bin'),
     Buffer.concat([
       Buffer.from([0, 1, 2, 0xff, 0xfe, 0, 7]),
       Buffer.from(spec.xdgBinaryControl),
       Buffer.from([0, 0x80, 0x81, 0, 3]),
     ]),
   )
+  const chunk = spec.chunkBytes ?? DEFAULT_CHUNK_BYTES
+  const long = Math.max(chunk, 8192) + 1000
+  fs.writeFileSync(
+    path.join(dirs.config, 'it-control-long.txt'),
+    `${'k'.repeat(long)}${spec.longControl}${'m'.repeat(long)}`,
+  )
+  // Starts 17 bytes before the end of the first chunk, so it ends inside the second.
+  const edge = Buffer.alloc(chunk * 2, 1)
+  Buffer.from(spec.boundaryControl).copy(edge, chunk - 17)
+  fs.writeFileSync(path.join(dirs.cache, 'it-control-boundary.bin'), edge)
 }
 
 /** Every string a JSON body holds, as parsed (so every escape is already undone). Empty for a body that is not JSON. */
