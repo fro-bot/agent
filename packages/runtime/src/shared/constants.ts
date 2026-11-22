@@ -75,7 +75,7 @@ export const SYSTEMATIC_V2_PLUGIN_ID = 'systematic'
 // equal it.
 export const FRO_BOT_PLUGIN_PACKAGE = '@fro.bot/opencode-plugin'
 export const FRO_BOT_PLUGIN_ID = 'fro-bot.opencode-plugin'
-export const FRO_BOT_PLUGIN_VERSION = '0.1.0'
+export const FRO_BOT_PLUGIN_VERSION = '0.2.0'
 
 // The variable a launcher (the Action, the workspace) uses to tell the plugin its host and whether tracing is on. The
 // plugin duplicates the name (`TRACING_LAUNCHER_ENV`) and a test keeps them equal. `OPENCODE_`-prefixed so `filterAgentEnv`
