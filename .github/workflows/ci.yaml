@@ -182,6 +182,15 @@ jobs:
           # A dummy value, never a real secret: the suite checks the model shell cannot read it from /proc.
           PROBE_DUMMY_TOKEN: dummy-probe-token-not-a-secret
         run: bunx vitest run src/harness/phases/v2-server.sandbox.integration.test.ts
+      # The plugin's real-binary suites load the built bundle into the pinned binary this job has already verified. The
+      # fixture recorder in the same package stays off (it needs FRO_BOT_RECORD_FIXTURES), so only these two files run.
+      - name: Run the OpenCode plugin's real-binary tests
+        if: ${{ !cancelled() }}
+        env:
+          FRO_BOT_OPENCODE_V2_BIN: ${{ steps.opencode.outputs.binary }}
+        run: |
+          bun run --filter @fro.bot/opencode-plugin build
+          bunx vitest run packages/opencode-plugin/src/integration.test.ts packages/opencode-plugin/src/tracing/tracing.integration.test.ts
 
   test-action:
     if: >-
