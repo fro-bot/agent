@@ -407,7 +407,7 @@ An acknowledged batch is the collector's HTTP answer. It is not proof that every
 
 - With tracing on, the Fro Bot plugin is listed after your own `opencode-config` plugins, so it sees the prompt after they have changed it. With tracing off the order is unchanged.
 - OpenCode has its own OpenTelemetry exporter, which carries no prompt or tool content. It is separate from this feature and stays off in the Action, which removes `OTEL_*` variables from the agent's environment.
-- A fork pull request has no access to your secrets. With `trace-endpoint` set and `trace-headers` empty, the Action logs a notice and sends spans with no credential, which a collector that needs one will refuse.
+- Whether a credential is available depends on the workflow's trigger and settings. A workflow that handles a fork pull request through `issue_comment` or `pull_request_target` runs in the base repository and can pass `trace-headers`. The Action does not look at fork status: it uses whatever `trace-headers` it is given, and without `isolate-agent` the agent can read any credential supplied. Decide per trigger whether to pass one. With `trace-endpoint` set and `trace-headers` empty, the Action logs a notice and sends spans with no credential, which a collector that needs one will refuse.
 - Tracing a local OpenCode session uses a settings file instead of these inputs. See the [plugin README](../../packages/opencode-plugin/README.md).
 
 ## Action Inputs
