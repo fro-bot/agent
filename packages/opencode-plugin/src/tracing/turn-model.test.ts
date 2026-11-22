@@ -3644,6 +3644,10 @@ describe('a step belongs to the latest primary hook at or before its own start t
         ])
         expect(model.takeRetained()).toEqual([])
         expect(primaries(records).at(-1)?.texts).toEqual(['two'])
+        // #and the call is not dropped: it is one tool span under the second execution's root
+        const late = tools(records).filter(tool => tool.callId === 'late')
+        expect(late).toHaveLength(1)
+        expect(late[0]?.parentSpanId).toBe(roots(records).at(-1)?.spanId)
       })
     })
 
@@ -3921,13 +3925,13 @@ describe('a step belongs to the latest primary hook at or before its own start t
       s.ended('p')
 
       // #when
-      const emittedBy = new Map<number, string>()
+      const emissions: (readonly [number, string])[] = []
       const {records, model} = replay(s.out, {
         flush: false,
         afterEach: (_live, finished, observation) => {
           for (const record of finished) {
             if (record.kind === 'chat' && record.requestKind === 'primary') {
-              emittedBy.set(record.start, `${observation.kind}@${String(observation.at)}`)
+              emissions.push([record.start, `${observation.kind}@${String(observation.at)}`])
             }
           }
         },
@@ -3941,8 +3945,9 @@ describe('a step belongs to the latest primary hook at or before its own start t
       // #and its spans are not emitted when the previous execution ends (200): both come out at their own execution's end, the last
       const lastEnd = s.out.at(-1)
       expect(lastEnd?.kind).toBe('execution.ended')
-      expect(emittedBy.get(210)).toBe(`execution.ended@${String(lastEnd?.at)}`)
-      expect(emittedBy.get(220)).toBe(`execution.ended@${String(lastEnd?.at)}`)
+      const atLastEnd = `execution.ended@${String(lastEnd?.at)}`
+      expect(emissions.filter(([start]) => start === 210)).toEqual([[210, atLastEnd]])
+      expect(emissions.filter(([start]) => start === 220)).toEqual([[220, atLastEnd]])
     })
 
     /** A first execution with one step, then the next execution's first hook observed before the first execution's end event. */
