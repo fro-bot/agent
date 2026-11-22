@@ -352,6 +352,11 @@ async function runTurn(options: TurnOptions): Promise<TurnResult> {
       timeouts: {readyMs: 15_000, exitGraceMs: 4_000, killConfirmMs: 2_000},
     })
     relay = relayStart.success ? relayStart.data : null
+    // Registered as soon as the relay is up, so an assertion that fails later still stops it. Cleanups run in reverse: the
+    // server's (pushed later) goes first and the relay second, the order `run.ts` uses.
+    cleanups.push(async () => {
+      await relay?.stop()
+    })
     expect(relayStart.success).toBe(true)
   }
   const identity = unwrapOk(
@@ -477,10 +482,6 @@ async function runTurn(options: TurnOptions): Promise<TurnResult> {
     relayProcessText = relay === null ? null : liveProcessText(relay.pid)
     const stopped = await handle.shutdown()
     shutdown = stopped.exit.outcome
-    // The relay goes after the server has exited, as `run.ts` does.
-    cleanups.push(async () => {
-      await relay?.stop()
-    })
   }
   const relayStop = relay === null ? null : await relay.stop({serverKilled: shutdown !== 'graceful'})
   const requests = toSinkRequests(upstream?.requests ?? [])
