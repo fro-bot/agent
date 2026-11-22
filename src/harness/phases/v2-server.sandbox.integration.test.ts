@@ -44,6 +44,7 @@ import type {SandboxToolPaths} from '../../services/setup/sandbox-preflight.js'
 import type {Logger} from '../../shared/logger.js'
 import type {SandboxLifecycle, SandboxLifecycleDeps, SandboxReleaseResult} from './sandbox-lifecycle.js'
 import type {LaunchNamespaces, Probe, Row, ScriptedProvider, ScriptedTracing} from './v2-server.sandbox.harness.js'
+import {Buffer} from 'node:buffer'
 import {spawn, spawnSync} from 'node:child_process'
 import {createHash, randomBytes} from 'node:crypto'
 import * as fs from 'node:fs'
@@ -57,6 +58,7 @@ import {fileURLToPath} from 'node:url'
 import {
   admitLaunch,
   buildSandboxLaunch,
+  buildTracingLauncherValue,
   createSandboxAccount,
   FRO_BOT_PLUGIN_ID,
   FRO_BOT_PLUGIN_PACKAGE,
@@ -97,6 +99,14 @@ import {startKeyProxyProcess, type KeyProxyProcess} from './key-proxy-process.js
 import {snapshotLogDirectory} from './log-snapshot.js'
 import {createSandboxLifecycle} from './sandbox-lifecycle.js'
 import {startTraceRelayProcess, type TraceRelayProcess, type TraceRelayStopResult} from './trace-relay-process.js'
+import {
+  bodyStrings,
+  canaryForms,
+  canaryShapedValue,
+  plantScanControls,
+  scanCommand,
+  type ScanSpec,
+} from './v2-server.sandbox.canary.js'
 import {
   aclLines,
   aclText,
@@ -3082,33 +3092,17 @@ function pinTraces(version: string): boolean {
 // pin names a version with tracing.
 const tracingGated = gated && pinTraces(FRO_BOT_PLUGIN_VERSION)
 
-/** Unique per process, so any copy of it anywhere is this run's. */
-const TRACE_CANARY = `sk-trace-canary-${randomBytes(9).toString('hex')}`
+/**
+ * Unique per process, so any copy of it anywhere is this run's. The sandbox is never given it: the search it runs gets the
+ * canary's SHA-256 and length (see `v2-server.sandbox.canary.ts`), and its detector controls are other values of the same shape.
+ */
+const TRACE_CANARY = canaryShapedValue('sk-trace-canary-', randomBytes(18).toString('hex'))
 const TRACE_HEADERS = `Authorization: Bearer ${TRACE_CANARY}`
-
-/** What a canary search counts in the places an agent could look. The whole key is only ever assembled at run time. */
-function canaryScanProbe(workspace: string, responseDir: string): Probe {
-  const procs = String.raw`procs(){ n=0; for f in /proc/[0-9]*/"$1"; do { tr '\0' '\n' < "$f"; } 2>/dev/null | grep -qF -- "$2" && n=$((n+1)); done; echo $n; }; `
-  const files = `files(){ grep -rIlF -- "$KEY" "$@" 2>/dev/null </dev/null | wc -l | tr -d ' '; }; `
-  return {
-    id: 'canary_scan',
-    category: 'blocked',
-    cmd:
-      `KEY=${q(TRACE_CANARY.slice(0, 9))}${q(TRACE_CANARY.slice(9))}; ${procs}${files}` +
-      // Every detector is shown a copy before it is trusted to find none: a file under an ordinary name, a process that holds
-      // the key in its environment, and one that holds it in its argument vector (`exec -a` puts it there without a child).
-      `ctl=$(mktemp -d) && printf %s "$KEY" > "$ctl/notes.txt" || { R canary_scan FAILED "control setup"; exit 0; }; ` +
-      `CTLENV="$KEY" sleep 30 & p1=$!; bash -c 'exec -a "$0" sleep 30' "$KEY" & p2=$!; sleep 1; ` +
-      `ok=0; [ "$(files "$ctl")" = 1 ] && [ "$(procs environ "$KEY")" -ge 1 ] && [ "$(procs cmdline "$KEY")" -ge 1 ] && ok=1; ` +
-      `kill $p1 $p2 2>/dev/null; wait $p1 $p2 2>/dev/null; rm -rf "$ctl"; ` +
-      `[ $ok = 1 ] || { R canary_scan FAILED "a detector control did not see its copy"; exit 0; }; ` +
-      `e=$(procs environ "$KEY"); c=$(procs cmdline "$KEY"); ` +
-      `t=$(files ${q(runnerTemp)}); k=$(files ${q(workspace)} ${q(responseDir)}); ` +
-      // An unset root is skipped: an empty operand would make some grep builds scan the current directory.
-      `set --; for d in "$HOME" "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME"; do [ -n "$d" ] && set -- "$@" "$d"; done; h=$(files "$@"); ` +
-      `[ $((e+c+t+k+h)) -eq 0 ] && s=BLOCKED || s=OPEN; R canary_scan $s "environ=$e cmdline=$c temp=$t checkout=$k home=$h"`,
-  }
-}
+const SCAN_CONTROLS = {
+  liveControl: canaryShapedValue('sk-trace-live-', randomBytes(18).toString('hex')),
+  xdgTextControl: canaryShapedValue('sk-trace-xdgt-', randomBytes(18).toString('hex')),
+  xdgBinaryControl: canaryShapedValue('sk-trace-xdgb-', randomBytes(18).toString('hex')),
+} as const
 
 /** Counts processes whose command line names the relay's bundle, after showing the search a process that does. */
 function noRelayProcessProbe(): Probe {
@@ -3122,6 +3116,25 @@ function noRelayProcessProbe(): Probe {
       `kill $p 2>/dev/null; wait $p 2>/dev/null; ` +
       `[ $ok = 1 ] || { R no_relay_process FAILED "the search did not see a process that names the relay"; exit 0; }; ` +
       `n=$(count); [ "$n" = 0 ] && R no_relay_process BLOCKED "no relay process" || R no_relay_process OPEN "relay_processes=$n"`,
+  }
+}
+
+/**
+ * What the server was told, read from its own environment (the tool shell's parent): the launcher variable is exactly the
+ * Action's "off" document, there is exactly one such variable, no `OTEL_*` variable is set, and nothing names the address of the
+ * collector stand-in. Together with a relay that never ran, "no request arrived" then means tracing was off, not that spans
+ * went somewhere else.
+ */
+function tracingOffEnvProbe(expectedLauncherLine: string, collectorAddress: string): Probe {
+  return {
+    id: 'tracing_off_env',
+    category: 'blocked',
+    cmd:
+      `${String.raw`exp=${q(expectedLauncherLine)}; env=$(tr '\0' '\n' < /proc/$PPID/environ 2>/dev/null); `}[ -n "$env" ] || { R tracing_off_env FAILED "the server environment could not be read"; exit 0; }; ` +
+      `l=$(printf %s "$env" | grep -cxF -- "$exp"); v=$(printf %s "$env" | grep -c '^OPENCODE_FROBOT_TRACING='); ` +
+      `o=$(printf %s "$env" | grep -c '^OTEL_'); e=$(printf %s "$env" | grep -cF -- ${q(collectorAddress)}); ` +
+      `[ "$l" = 1 ] && [ "$v" = 1 ] && [ "$o" = 0 ] && [ "$e" = 0 ] && s=BLOCKED || s=OPEN; ` +
+      `R tracing_off_env $s "launcher_off=$l launcher_vars=$v otel=$o endpoint=$e"`,
   }
 }
 
@@ -3169,6 +3182,12 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
   const relayBundle = path.join(realDist, 'trace-relay.js')
   const pluginSpec = `${FRO_BOT_PLUGIN_PACKAGE}@${FRO_BOT_PLUGIN_VERSION}`
   const cleanups: (() => Promise<void> | void)[] = []
+  const scanSpecFor = (workspace: string): ScanSpec => ({
+    canary: TRACE_CANARY,
+    ...SCAN_CONTROLS,
+    runnerTemp,
+    checkout: [workspace, responseDir],
+  })
   let isolated: TracedTurn | undefined
   let plain: TracedTurn | undefined
   let off: TracedTurn | undefined
@@ -3249,7 +3268,18 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
       expectedPluginIds: [FRO_BOT_PLUGIN_ID],
       host: buildActionTracingHost(relay?.port ?? null, identity),
     }
-    const steps = [options.tracing === 'on' ? canaryScanProbe(workspace, responseDir) : noRelayProcessProbe()]
+    const scanSpec = scanSpecFor(workspace)
+    const offHost = buildActionTracingHost(null, identity)
+    const steps: Probe[] =
+      options.tracing === 'on'
+        ? [{id: 'canary_scan', category: 'blocked', cmd: scanCommand(scanSpec)}]
+        : [
+            noRelayProcessProbe(),
+            tracingOffEnvProbe(
+              `OPENCODE_FROBOT_TRACING=${buildTracingLauncherValue(offHost)}`,
+              new URL(collector.origin).host,
+            ),
+          ]
     // A turn is over when its root span is at the collector; stopping the server before that would race the last flush.
     const beforeShutdown = async (): Promise<void> => {
       if (options.tracing === 'off') return
@@ -3321,6 +3351,8 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
     fs.mkdirSync(stepDir, {recursive: true, mode: 0o700})
     fs.writeFileSync(path.join(stepDir, 'file_commands.txt'), `INPUT_TRACE-HEADERS=${TRACE_HEADERS}\n`, {mode: 0o600})
     await startStepStandIn()
+    // The runner's detector controls, in the directories the sandbox reaches OpenCode's storage through links to.
+    plantScanControls(xdgRoot, scanSpecFor(path.join(scratch, 'ws-isolated')))
 
     // The pinned plugin, installed as setup installs it, into the cache the server reads (the lifecycle hands the agent a link
     // to it).
@@ -3345,6 +3377,15 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
     for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
   }, 120_000)
 
+  /** The `key=value` counts of the canary search's result line. */
+  const scanCounts = (turn: TracedTurn | undefined): Map<string, string> =>
+    new Map(
+      (turn?.rows.get('canary_scan')?.[0]?.evidence ?? '')
+        .split(' ')
+        .filter(part => part.includes('='))
+        .map(part => part.split('=') as [string, string]),
+    )
+
   const credentialSeen = (turn: TracedTurn | undefined): boolean[] =>
     (turn?.requests ?? []).map(request => request.headers.authorization === `Bearer ${TRACE_CANARY}`)
 
@@ -3355,10 +3396,19 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
     expect(credentialSeen(isolated).length).toBeGreaterThan(0)
     expect(credentialSeen(isolated).every(Boolean)).toBe(true)
 
-    // #then the sandbox user's search of process environments and command lines, the runner's temp and step files, the checkout
-    // and the agent's home found no copy, with every detector shown a copy first
+    // #then the sandbox user's search (by fingerprint: it was never given the canary) of process environments and command lines,
+    // the runner's temp and step files, the checkout, the agent's home and OpenCode's storage behind the links found no copy
     expect(failuresFor(isolated?.rows ?? new Map(), 'canary_scan', 'BLOCKED')).toEqual([])
-    expect(isolated?.rows.get('canary_scan')?.[0]?.evidence).toContain('environ=0 cmdline=0 temp=0 checkout=0 home=0')
+    const counts = scanCounts(isolated)
+    for (const group of ['environ', 'cmdline', 'temp', 'checkout', 'home', 'xdg']) {
+      expect(counts.get(`canary.${group}`)).toBe('0')
+    }
+
+    // #and the search is shown to look where it counts: its own controls were found in a file, a process environment and a
+    // command line, the runner's controls in a text file and in a binary file behind the links, and it read files there and in
+    // the checkout
+    expect(Number(counts.get('read.xdg'))).toBeGreaterThanOrEqual(2)
+    expect(Number(counts.get('read.checkout'))).toBeGreaterThanOrEqual(1)
   })
 
   it('not isolated: the same turn is traced, and the same search finds the canary', () => {
@@ -3372,20 +3422,29 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
     // neither the checkout nor the agent's home does. The exposure warning that goes with this is run.ts's, covered in
     // run-tracing.test.ts: this suite drives the server, not the Action.
     expect(failuresFor(plain?.rows ?? new Map(), 'canary_scan', 'OPEN')).toEqual([])
-    const evidence = plain?.rows.get('canary_scan')?.[0]?.evidence ?? ''
-    expect(evidence).toMatch(/environ=[1-9]/)
-    expect(evidence).toMatch(/temp=[1-9]/)
-    expect(evidence).toContain('cmdline=0 ')
-    expect(evidence).toContain('checkout=0 ')
-    expect(evidence).toMatch(/home=0$/)
+    const counts = scanCounts(plain)
+    expect(Number(counts.get('canary.environ'))).toBeGreaterThanOrEqual(1)
+    expect(Number(counts.get('canary.temp'))).toBeGreaterThanOrEqual(1)
+    for (const group of ['cmdline', 'checkout', 'home', 'xdg']) expect(counts.get(`canary.${group}`)).toBe('0')
   })
 
-  it('exports no span that holds the canary', () => {
-    // #given everything each collector stand-in received
-    // #then no request body holds it, isolated or not
+  it('exports no span that holds the canary, in any form a span could carry it', () => {
+    // #given the checker is shown able to see the credential header it will be asked about
+    expect(canaryForms(Buffer.from(JSON.stringify({header: TRACE_HEADERS})), TRACE_CANARY)).toContain('contiguous')
+
     for (const turn of [isolated, plain]) {
-      expect((turn?.requests ?? []).length).toBeGreaterThan(0)
-      for (const request of turn?.requests ?? []) expect(request.body.includes(TRACE_CANARY)).toBe(false)
+      const requests = turn?.requests ?? []
+
+      // #given spans that really carry content: a tool span arrived, and the tool call's own arguments are in what was
+      // exported, so an absent canary is absence from content that was there to hold it
+      expect(exportedSpanNames(requests).some(name => name.startsWith('execute_tool'))).toBe(true)
+      expect(requests.flatMap(request => bodyStrings(request.body)).some(text => text.includes('canary_scan'))).toBe(
+        true,
+      )
+
+      // #then no request body holds the canary as written (raw or in any parsed string), as \uXXXX escapes, as both halves, as
+      // base64 or base64url at any of the three alignments, or as hex
+      for (const request of requests) expect(canaryForms(request.body, TRACE_CANARY)).toEqual([])
     }
   })
 
@@ -3401,9 +3460,15 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
     }
   })
 
-  it('with tracing off on the same runner: no relay process runs, nothing is sent, and the plugin still loads', () => {
-    // #given the turn with the plugin installed and the launcher saying off
-    // #then the agent saw no relay process (after a control showed it could), the collector stand-in heard nothing, and no relay
+  it('with tracing off on the same runner: the server was told off, no relay runs, and nothing is sent', () => {
+    // #given the turn with the plugin installed and the launcher saying off. Zero requests proves tracing was off only if the
+    // server was told so and nothing pointed its export elsewhere; the traced rows are the control, since the same plugin,
+    // server and runner export when the launcher says on. So the agent reads the server's own environment: the launcher line
+    // is exactly the "off" document, the only one, no OTEL_* variable is set and the stand-in's address appears nowhere in it.
+    expect(failuresFor(off?.rows ?? new Map(), 'tracing_off_env', 'BLOCKED')).toEqual([])
+    expect(off?.rows.get('tracing_off_env')?.[0]?.evidence).toBe('launcher_off=1 launcher_vars=1 otel=0 endpoint=0')
+
+    // #then no relay process runs (after a control showed the search could see one), the stand-in heard nothing, and no relay
     // was started or left
     expect(failuresFor(off?.rows ?? new Map(), 'no_relay_process', 'BLOCKED')).toEqual([])
     expect(off?.requests).toEqual([])
