@@ -3234,6 +3234,8 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
     maxFileBytes: 128 * 1024 * 1024,
     runnerTemp,
     checkout: [workspace, responseDir],
+    // Opened by exact path as well as walked for: a directory can refuse listing and still allow access to a known child.
+    knownPaths: [path.join(scratch, 'step', 'file_commands.txt')],
   })
   let isolated: TracedTurn | undefined
   let plain: TracedTurn | undefined
@@ -3468,9 +3470,13 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
     // the runner's temp and step files, the checkout, the agent's home and OpenCode's storage behind the links found no copy
     expect(failuresFor(isolated?.rows ?? new Map(), 'canary_scan', 'BLOCKED')).toEqual([])
     const counts = scanCounts(isolated)
-    for (const group of ['environ', 'cmdline', 'temp', 'checkout', 'home', 'xdg']) {
+    for (const group of ['environ', 'cmdline', 'temp', 'checkout', 'home', 'xdg', 'known']) {
       expect(counts.get(`canary.${group}`)).toBe('0')
     }
+    // #and the step file, opened by its exact path, was refused (not absent, which would be a skip) and not read
+    expect(counts.get('denied.known')).toBe('1')
+    expect(counts.get('read.known')).toBe('0')
+    expect(counts.get('skip.known')).toBe('0')
 
     // #and the search is shown to look where it counts: its own controls were found in a file, a process environment and a
     // command line, the runner's controls in a text file and in a binary file behind the links, and it read files there and in
@@ -3493,6 +3499,9 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
     const counts = scanCounts(plain)
     expect(Number(counts.get('canary.environ'))).toBeGreaterThanOrEqual(1)
     expect(Number(counts.get('canary.temp'))).toBeGreaterThanOrEqual(1)
+    // #and the step file, opened by its exact path, was read and held it
+    expect(counts.get('read.known')).toBe('1')
+    expect(counts.get('canary.known')).toBe('1')
     for (const group of ['cmdline', 'checkout', 'home', 'xdg']) expect(counts.get(`canary.${group}`)).toBe('0')
   })
 

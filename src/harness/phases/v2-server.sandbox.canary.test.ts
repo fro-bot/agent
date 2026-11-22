@@ -44,18 +44,22 @@ const tempDir = (): string => {
 const python = spawnSync('python3', ['--version']).status === 0
 
 /** Runs the scanner as the sandbox would: the config and a scratch directory, with the XDG roots of the given directory. */
-function runScan(overrides: Partial<ScanSpec>, xdgRoot: string, extraDir: string): Map<string, string> {
-  const result = spawnSync('python3', ['-c', SCAN_PROGRAM, scanConfig({...spec, ...overrides}), extraDir], {
-    encoding: 'utf8',
-    env: {
-      PATH: process.env.PATH ?? '',
-      HOME: path.join(xdgRoot, 'home'),
-      XDG_DATA_HOME: path.join(xdgRoot, 'data'),
-      XDG_CONFIG_HOME: path.join(xdgRoot, 'config'),
-      XDG_CACHE_HOME: path.join(xdgRoot, 'cache'),
-      XDG_STATE_HOME: path.join(xdgRoot, 'state'),
+function runScan(overrides: Partial<ScanSpec>, xdgRoot: string, extraDir: string, preamble = ''): Map<string, string> {
+  const result = spawnSync(
+    'python3',
+    ['-c', `${preamble}\n${SCAN_PROGRAM}`, scanConfig({...spec, ...overrides}), extraDir],
+    {
+      encoding: 'utf8',
+      env: {
+        PATH: process.env.PATH ?? '',
+        HOME: path.join(xdgRoot, 'home'),
+        XDG_DATA_HOME: path.join(xdgRoot, 'data'),
+        XDG_CONFIG_HOME: path.join(xdgRoot, 'config'),
+        XDG_CACHE_HOME: path.join(xdgRoot, 'cache'),
+        XDG_STATE_HOME: path.join(xdgRoot, 'state'),
+      },
     },
-  })
+  )
   expect(result.status).toBe(0)
   const line = result.stdout.split('\n').find(text => text.startsWith('RESULT canary_scan '))
   expect(line).toBeDefined()
@@ -298,6 +302,168 @@ describe.skipIf(!python)('the scanner on large files and long runs', () => {
 
     // #then
     expect(runScan({checkout: [checkout]}, xdgRoot, extra).get('status')).toBe('OPEN')
+  })
+})
+
+/**
+ * Python run before the scanner, so a clock and a read error can be injected without a hook in the scanner: `open` is wrapped,
+ * and what the wrapper does is decided by the file's name.
+ */
+const FAULTS = `import builtins, time
+_open = builtins.open
+_late = [False]
+_reads = {}
+
+
+class _File:
+    def __init__(self, f, name):
+        self.f, self.name = f, name
+
+    def read(self, n=-1):
+        _reads[self.name] = _reads.get(self.name, 0) + 1
+        if self.name.endswith('fails.txt') and _reads[self.name] == 2:
+            raise OSError(5, 'injected read error')
+        data = self.f.read(n)
+        if self.name.endswith('late.txt') and data:
+            _late[0] = True
+        return data
+
+    def __enter__(self):
+        self.f.__enter__()
+        return self
+
+    def __exit__(self, *args):
+        return self.f.__exit__(*args)
+
+
+builtins.open = lambda p, *a, **k: _File(_open(p, *a, **k), str(p))
+_mono = time.monotonic
+time.monotonic = lambda: 1e9 if _late[0] else _mono()
+`
+
+describe.skipIf(!python)('a hit is never dropped by an early exit', () => {
+  const canary = spec.canary
+  /** A temp root with one multi-chunk file that starts with the canary, then runs on. */
+  const tempWith = (name: string, size = 20_000): string => {
+    const temp = tempDir()
+    fs.writeFileSync(path.join(temp, name), Buffer.concat([Buffer.from(canary), Buffer.alloc(size, 1)]))
+    return temp
+  }
+  const scanTemp = (temp: string, overrides: Partial<ScanSpec> = {}, preamble = ''): Map<string, string> => {
+    const {xdgRoot, runner, extra} = layout()
+    plantScanControls(runner, {...spec, ...overrides})
+    return runScan({...overrides, runnerTemp: temp}, xdgRoot, extra, preamble)
+  }
+
+  it('keeps the hit when the deadline passes after it in the same runner-temp file', () => {
+    // #given the canary in the first chunk of a file, and a clock that runs out as soon as that file has been read once
+    const counts = scanTemp(tempWith('late.txt'), {}, FAULTS)
+
+    // #then the hit is counted and the verdict is OPEN, with the file recorded as skipped
+    expect(counts.get('canary.temp')).toBe('1')
+    expect(counts.get('skip.temp')).toBe('1')
+    expect(counts.get('status')).toBe('OPEN')
+  })
+
+  it('keeps the hit when a read fails after it in the same file', () => {
+    // #given the canary in the first chunk, and an I/O error on the second read of the file
+    const counts = scanTemp(tempWith('fails.txt'), {}, FAULTS)
+
+    // #then
+    expect(counts.get('canary.temp')).toBe('1')
+    expect(counts.get('skip.temp')).toBe('1')
+    expect(counts.get('status')).toBe('OPEN')
+  })
+
+  it('keeps the hit in the part of a file under the size bound, and records the file as skipped', () => {
+    // #given a file over the bound with the canary at its start (the bound is above every planted control)
+    const counts = scanTemp(tempWith('over.bin', 30_000), {maxFileBytes: 25_000})
+
+    // #then the part that was read is examined
+    expect(counts.get('canary.temp')).toBe('1')
+    expect(counts.get('skip.temp')).toBe('1')
+    expect(counts.get('status')).toBe('OPEN')
+  })
+
+  it('keeps a hit in the checkout and in OpenCode storage the same way', () => {
+    // #given the canary at the start of a file with a failing read in the checkout
+    const {xdgRoot, runner, extra} = layout()
+    plantScanControls(runner, spec)
+    const checkout = tempDir()
+    fs.writeFileSync(path.join(checkout, 'fails.txt'), Buffer.concat([Buffer.from(canary), Buffer.alloc(20_000, 1)]))
+
+    // #then
+    const counts = runScan({checkout: [checkout]}, xdgRoot, extra, FAULTS)
+    expect(counts.get('canary.checkout')).toBe('1')
+    expect(counts.get('skip.checkout')).toBe('1')
+    expect(counts.get('status')).toBe('OPEN')
+  })
+
+  it('keeps a control hit when the stream that held it ended early, so a missing control means it was not seen', () => {
+    // #given the live control in a file whose second read fails
+    const {xdgRoot, runner, extra} = layout()
+    plantScanControls(runner, spec)
+    fs.rmSync(path.join(extra, 'notes.txt'))
+    fs.writeFileSync(
+      path.join(extra, 'fails.txt'),
+      Buffer.concat([Buffer.from(spec.liveControl), Buffer.alloc(20_000, 1)]),
+    )
+
+    // #then the control still counts: the verdict is not FAILED for it
+    const counts = runScan({}, xdgRoot, extra, FAULTS)
+    expect(counts.get('ctl.live.file')).toBe('1')
+    expect(counts.get('status')).not.toBe('FAILED')
+  })
+})
+
+describe.skipIf(!python)('the known credential-bearing paths', () => {
+  it('opens a known file in a directory that cannot be listed, which a walk cannot reach', () => {
+    // #given the canary in a child of a directory with search permission only (no listing)
+    const {xdgRoot, runner, extra} = layout()
+    plantScanControls(runner, spec)
+    const temp = tempDir()
+    const step = path.join(temp, 'step')
+    fs.mkdirSync(step)
+    fs.writeFileSync(path.join(step, 'file_commands.txt'), `INPUT_TRACE-HEADERS=Authorization: Bearer ${spec.canary}\n`)
+    fs.chmodSync(step, 0o100)
+
+    try {
+      // #when the walk alone runs, it cannot list the directory, and finds nothing
+      const walked = runScan({runnerTemp: temp}, xdgRoot, extra)
+      expect(walked.get('canary.temp')).toBe('0')
+      expect(walked.get('skip.temp')).toBe('1')
+
+      // #and the known path is opened directly
+      const direct = runScan({runnerTemp: temp, knownPaths: [path.join(step, 'file_commands.txt')]}, xdgRoot, extra)
+
+      // #then the hit counts and the verdict is OPEN
+      expect(direct.get('canary.known')).toBe('1')
+      expect(direct.get('read.known')).toBe('1')
+      expect(direct.get('status')).toBe('OPEN')
+    } finally {
+      fs.chmodSync(step, 0o700)
+    }
+  })
+
+  it('counts a permission error as a refusal, not a skip, and any other error as a skip', () => {
+    // #given a known file that cannot be read, and one that does not exist
+    const {xdgRoot, runner, extra} = layout()
+    plantScanControls(runner, spec)
+    const dir = tempDir()
+    const sealed = path.join(dir, 'sealed.txt')
+    fs.writeFileSync(sealed, spec.canary)
+    fs.chmodSync(sealed, 0o000)
+
+    // #then a refusal is counted and the verdict stands
+    const refused = runScan({knownPaths: [sealed]}, xdgRoot, extra)
+    expect(refused.get('denied.known')).toBe('1')
+    expect(refused.get('skip.known')).toBe('0')
+    expect(refused.get('status')).toBe('BLOCKED')
+
+    // #but a path that is not there is an incomplete scan
+    const missing = runScan({knownPaths: [path.join(dir, 'gone.txt')]}, xdgRoot, extra)
+    expect(missing.get('skip.known')).toBe('1')
+    expect(missing.get('status')).toBe('INCOMPLETE')
   })
 })
 

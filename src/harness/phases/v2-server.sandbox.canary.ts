@@ -47,6 +47,11 @@ export interface ScanSpec {
   readonly maxFileBytes?: number
   /** After this many seconds the scanner stops reading and counts what is left as skipped. Default `DEFAULT_BUDGET_SECONDS`. */
   readonly budgetSeconds?: number
+  /**
+   * Files opened by their exact path, as well as walked for: a directory can refuse listing and still allow access to a known
+   * child. A permission error is a refusal (counted, fine); any other error is a skip.
+   */
+  readonly knownPaths?: readonly string[]
   /** Whether the live controls in a process environment and a command line are required. Off only for a host with no `/proc`. */
   readonly requireProcControls?: boolean
 }
@@ -78,6 +83,7 @@ export function scanConfig(spec: ScanSpec): string {
     max: spec.maxFileBytes ?? DEFAULT_MAX_FILE_BYTES,
     budget: spec.budgetSeconds ?? DEFAULT_BUDGET_SECONDS,
     proc: spec.requireProcControls ?? true,
+    known: spec.knownPaths ?? [],
   })
 }
 
@@ -88,12 +94,15 @@ export function scanConfig(spec: ScanSpec): string {
  * however long the run, and counts the files whose hash is a target. A root that is a link is followed; a link met inside a
  * walk is not.
  *
- * Nothing is skipped silently: a file that cannot be opened or read, one over the size bound, and every file left when the
- * time budget is spent is counted per group. A skip in the checkout, the agent's home or OpenCode's storage makes the verdict
- * INCOMPLETE (unless the canary was found: that stays OPEN). Skips in the runner temp are counted only, since the sandbox is
- * not meant to read it. Prints one `RESULT` line, counts only.
+ * Nothing is skipped silently and no match is dropped. Matches go into the caller's set as they are confirmed, so every hit
+ * counts toward OPEN however the scan of that file ended (the time budget, the size bound, a read error). A file that cannot be
+ * opened or read, one over the size bound (its first bytes are still examined), and every file left when the time budget is
+ * spent is counted per group. A skip in the checkout, the agent's home, OpenCode's storage or the known paths makes the
+ * verdict INCOMPLETE (a hit stays OPEN). Skips in the runner temp are counted only, since the sandbox is not meant to read it.
+ * The known paths are opened by exact path too: a permission error there is a refusal and counted as one, any other error is a
+ * skip. Prints one `RESULT` line, counts only.
  */
-export const SCAN_PROGRAM = `import glob, hashlib, json, os, re, sys, time
+export const SCAN_PROGRAM = `import errno, glob, hashlib, json, os, re, sys, time
 
 cfg = json.loads(sys.argv[1])
 extra = sys.argv[2]
@@ -103,8 +112,10 @@ CHUNK = max(cfg['chunk'], LEN)
 MAX_BYTES = cfg['max']
 DEADLINE = time.monotonic() + cfg['budget']
 TOKEN = re.compile(rb'[A-Za-z0-9_-]+')
-GROUPS = ['environ', 'cmdline', 'file', 'temp', 'checkout', 'home', 'xdg']
-COVERED = ('checkout', 'home', 'xdg')
+GROUPS = ['environ', 'cmdline', 'file', 'temp', 'checkout', 'home', 'xdg', 'known']
+# A skip in one of these makes the verdict INCOMPLETE. The process groups count only a budget that ran out: another user's
+# process is meant to be unreadable.
+COVERED = ('checkout', 'home', 'xdg', 'known', 'environ', 'cmdline')
 env = os.environ
 bases = [env.get(n, '') for n in ('XDG_DATA_HOME', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME')]
 bases = [b for b in bases if b]
@@ -118,7 +129,12 @@ roots = {
 }
 read = {g: 0 for g in GROUPS}
 skip = {g: 0 for g in GROUPS}
+denied = {g: 0 for g in GROUPS}
 hits = {g: {} for g in GROUPS}
+
+
+def expired():
+    return time.monotonic() > DEADLINE
 
 
 def found_in(data, found):
@@ -133,19 +149,28 @@ def found_in(data, found):
                 found.add(name)
 
 
-def scan_stream(f):
-    """The set of target names in a stream, read in chunks that overlap by LEN - 1 bytes. None when the budget runs out."""
-    found = set()
+def scan_stream(f, found, limit=None):
+    """Adds the target names in a stream to found, reading chunks that overlap by LEN - 1 bytes.
+
+    Matches go into the caller's set as they are confirmed, so they survive however the stream ends: True means the whole
+    stream was read; False means it stopped early (the time budget, or limit bytes). A read error propagates with found
+    already holding what was confirmed before it.
+    """
     carry = b''
+    total = 0
     while True:
-        block = f.read(CHUNK)
+        want = CHUNK if limit is None else min(CHUNK, limit - total)
+        if want <= 0:
+            return False
+        block = f.read(want)
         if not block:
-            return found
+            return True
+        total += len(block)
         buf = carry + block
         found_in(buf, found)
         carry = buf[-(LEN - 1):]
-        if time.monotonic() > DEADLINE:
-            return None
+        if expired():
+            return False
 
 
 def count(group, found):
@@ -154,36 +179,48 @@ def count(group, found):
         hits[group][name] = hits[group].get(name, 0) + 1
 
 
-for group in ('environ', 'cmdline'):
-    for p in glob.glob('/proc/[0-9]*/' + group):
-        # Another user's process is meant to be unreadable here: not counted as a skip.
-        try:
-            with open(p, 'rb') as f:
-                found = scan_stream(f)
-            if found is not None:
-                count(group, found)
-        except OSError:
-            pass
-
-
-def scan_file(group, p):
-    if time.monotonic() > DEADLINE:
+def scan_path(group, p, known=False):
+    """Examines one file. Every match found is counted, whatever stopped the scan of it; only then is a skip recorded."""
+    if expired():
         skip[group] += 1
         return
+    found = set()
+    opened = False
+    complete = False
+    error = None
     try:
-        if os.path.islink(p):
+        if not known and os.path.islink(p):
             return
-        if os.stat(p).st_size > MAX_BYTES:
-            skip[group] += 1
-            return
+        limit = MAX_BYTES if os.stat(p).st_size > MAX_BYTES else None
         with open(p, 'rb') as f:
-            found = scan_stream(f)
-        if found is None:
-            skip[group] += 1
-        else:
-            count(group, found)
-    except OSError:
+            opened = True
+            complete = scan_stream(f, found, limit)
+    except OSError as e:
+        error = e
+    if opened:
+        count(group, found)
+    if error is not None and known and error.errno in (errno.EACCES, errno.EPERM):
+        denied[group] += 1
+    elif error is not None or not complete:
         skip[group] += 1
+
+
+for group in ('environ', 'cmdline'):
+    for p in glob.glob('/proc/[0-9]*/' + group):
+        found = set()
+        opened = False
+        complete = False
+        # Another user's process is meant to be unreadable here: an error is not a skip.
+        try:
+            with open(p, 'rb') as f:
+                opened = True
+                complete = scan_stream(f, found)
+        except OSError:
+            complete = True
+        if opened:
+            count(group, found)
+        if not complete:
+            skip[group] += 1
 
 
 def walk_error(group):
@@ -195,11 +232,14 @@ def walk_error(group):
 for group, group_roots in roots.items():
     for root in group_roots:
         if os.path.isfile(root):
-            scan_file(group, root)
+            scan_path(group, root)
             continue
         for top, _dirs, files in os.walk(root, followlinks=False, onerror=walk_error(group)):
             for name in files:
-                scan_file(group, os.path.join(top, name))
+                scan_path(group, os.path.join(top, name))
+
+for p in cfg['known']:
+    scan_path('known', p, known=True)
 
 canary = {g: hits[g].get('canary', 0) for g in GROUPS}
 need = [('live', 'file'), ('xdgtext', 'xdg'), ('xdgbin', 'xdg'), ('long', 'xdg'), ('boundary', 'xdg')]
@@ -209,8 +249,9 @@ missing = [n + '.' + g for n, g in need if hits[g].get(n, 0) < 1]
 incomplete = sum(skip[g] for g in COVERED) > 0
 parts = ['canary.' + g + '=' + str(canary[g]) for g in GROUPS if g != 'file']
 parts += ['ctl.' + n + '.' + g + '=' + str(hits[g].get(n, 0)) for n, g in need]
-parts += ['read.' + g + '=' + str(read[g]) for g in ('checkout', 'home', 'xdg')]
-parts += ['skip.' + g + '=' + str(skip[g]) for g in ('checkout', 'home', 'xdg', 'temp')]
+parts += ['read.' + g + '=' + str(read[g]) for g in ('checkout', 'home', 'xdg', 'known')]
+parts += ['denied.known=' + str(denied['known'])]
+parts += ['skip.' + g + '=' + str(skip[g]) for g in ('checkout', 'home', 'xdg', 'known', 'temp')]
 if missing:
     print('RESULT canary_scan FAILED a detector control was not seen: ' + ','.join(missing) + ' ' + ' '.join(parts))
 elif sum(canary.values()) > 0:
