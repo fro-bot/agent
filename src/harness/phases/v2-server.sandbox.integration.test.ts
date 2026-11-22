@@ -100,11 +100,12 @@ import {snapshotLogDirectory} from './log-snapshot.js'
 import {createSandboxLifecycle} from './sandbox-lifecycle.js'
 import {startTraceRelayProcess, type TraceRelayProcess, type TraceRelayStopResult} from './trace-relay-process.js'
 import {
-  bodyStrings,
   canaryForms,
   canaryShapedValue,
+  exportedSpans,
   plantScanControls,
   scanCommand,
+  toolSpanHoldsArgument,
   type ScanSpec,
 } from './v2-server.sandbox.canary.js'
 import {
@@ -3098,6 +3099,11 @@ const tracingGated = gated && pinTraces(FRO_BOT_PLUGIN_VERSION)
  */
 const TRACE_CANARY = canaryShapedValue('sk-trace-canary-', randomBytes(18).toString('hex'))
 const TRACE_HEADERS = `Authorization: Bearer ${TRACE_CANARY}`
+/**
+ * A command-only marker: the scripted tool command starts with it as a no-op (`: marker`), so it is in the tool call's
+ * arguments and in no output the command prints. It is what ties an exported tool span to this call.
+ */
+const TOOL_ARGUMENT_MARKER = `toolarg-marker-${randomBytes(8).toString('hex')}`
 const SCAN_CONTROLS = {
   liveControl: canaryShapedValue('sk-trace-live-', randomBytes(18).toString('hex')),
   xdgTextControl: canaryShapedValue('sk-trace-xdgt-', randomBytes(18).toString('hex')),
@@ -3142,22 +3148,7 @@ function tracingOffEnvProbe(expectedLauncherLine: string, collectorAddress: stri
 
 /** The names of the spans a stand-in collector received. A body that is not OTLP JSON adds none. */
 function exportedSpanNames(requests: readonly RecordedRequest[]): string[] {
-  const names: string[] = []
-  for (const request of requests) {
-    let body: unknown
-    try {
-      body = JSON.parse(request.body.toString('utf8'))
-    } catch {
-      continue
-    }
-    const resources = (body as {resourceSpans?: {scopeSpans?: {spans?: {name?: unknown}[]}[]}[]} | null)?.resourceSpans
-    for (const resource of resources ?? []) {
-      for (const scope of resource.scopeSpans ?? []) {
-        for (const span of scope.spans ?? []) if (typeof span.name === 'string') names.push(span.name)
-      }
-    }
-  }
-  return names
+  return exportedSpans(requests.map(request => request.body)).map(span => span.name)
 }
 
 const hasRootSpan = (requests: readonly RecordedRequest[]): boolean =>
@@ -3278,7 +3269,7 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
     const offHost = buildActionTracingHost(null, identity)
     const steps: Probe[] =
       options.tracing === 'on'
-        ? [{id: 'canary_scan', category: 'blocked', cmd: scanCommand(scanSpec)}]
+        ? [{id: 'canary_scan', category: 'blocked', cmd: `: ${TOOL_ARGUMENT_MARKER}\n${scanCommand(scanSpec)}`}]
         : [
             noRelayProcessProbe(),
             tracingOffEnvProbe(
@@ -3441,10 +3432,10 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
     for (const turn of [isolated, plain]) {
       const requests = turn?.requests ?? []
 
-      // #given spans that really carry content: a tool span arrived, and the tool call's own arguments are in what was
-      // exported, so an absent canary is absence from content that was there to hold it
-      expect(exportedSpanNames(requests).some(name => name.startsWith('execute_tool'))).toBe(true)
-      expect(requests.flatMap(request => bodyStrings(request.body)).some(text => text.includes('canary_scan'))).toBe(
+      // #given spans that really carry content: the tool span for this call arrived with the command-only marker in its own
+      // `gen_ai.tool.call.arguments` attribute (the marker is in no tool output, so the result span alone cannot supply it), so
+      // an absent canary is absence from content that was there to hold it
+      expect(toolSpanHoldsArgument(exportedSpans(requests.map(request => request.body)), TOOL_ARGUMENT_MARKER)).toBe(
         true,
       )
 

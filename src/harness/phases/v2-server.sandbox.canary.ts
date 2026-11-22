@@ -335,3 +335,55 @@ export function canaryForms(body: Buffer, canary: string): string[] {
   if (anywhere(Buffer.from(canary).toString('hex'))) found.add('hex')
   return [...found]
 }
+
+export interface ExportedSpan {
+  readonly name: string
+  /** The span's string-valued attributes. */
+  readonly attributes: Readonly<Record<string, string>>
+}
+
+interface OtlpSpan {
+  readonly name?: unknown
+  readonly attributes?: readonly {readonly key?: unknown; readonly value?: {readonly stringValue?: unknown}}[]
+}
+
+/** Every span in OTLP JSON request bodies, in order. A body that is not OTLP JSON adds none. */
+export function exportedSpans(bodies: readonly Buffer[]): ExportedSpan[] {
+  const spans: ExportedSpan[] = []
+  for (const body of bodies) {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(body.toString('utf8'))
+    } catch {
+      continue
+    }
+    const resources = (parsed as {resourceSpans?: {scopeSpans?: {spans?: OtlpSpan[]}[]}[] | null} | null)?.resourceSpans
+    for (const resource of resources ?? []) {
+      for (const scope of resource.scopeSpans ?? []) {
+        for (const span of scope.spans ?? []) {
+          if (typeof span.name !== 'string') continue
+          const attributes: Record<string, string> = {}
+          for (const attribute of span.attributes ?? []) {
+            if (typeof attribute.key === 'string' && typeof attribute.value?.stringValue === 'string') {
+              attributes[attribute.key] = attribute.value.stringValue
+            }
+          }
+          spans.push({name: span.name, attributes})
+        }
+      }
+    }
+  }
+  return spans
+}
+
+/**
+ * Whether a tool span's own `gen_ai.tool.call.arguments` attribute holds `marker`. The marker may also be in the tool's
+ * result or in a later model request that quotes the call; only the attribute on an `execute_tool` span shows that the tool
+ * call's arguments were exported.
+ */
+export function toolSpanHoldsArgument(spans: readonly ExportedSpan[], marker: string): boolean {
+  return spans.some(
+    span =>
+      span.name.startsWith('execute_tool') && (span.attributes['gen_ai.tool.call.arguments'] ?? '').includes(marker),
+  )
+}

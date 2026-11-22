@@ -8,11 +8,13 @@ import {
   bodyStrings,
   canaryForms,
   canaryShapedValue,
+  exportedSpans,
   plantScanControls,
   SCAN_PROGRAM,
   scanCommand,
   scanConfig,
   sha256Hex,
+  toolSpanHoldsArgument,
   type ScanSpec,
 } from './v2-server.sandbox.canary.js'
 
@@ -340,5 +342,60 @@ describe('canaryForms', () => {
   it('reads the strings of a body, keys included, and none of one that is not JSON', () => {
     expect(bodyStrings(Buffer.from('{"k":["v",{"n":"w"}]}'))).toEqual(['k', 'v', 'n', 'w'])
     expect(bodyStrings(Buffer.from('not json'))).toEqual([])
+  })
+})
+
+describe('the exported tool span', () => {
+  const attribute = (key: string, value: string) => ({key, value: {stringValue: value}})
+  const span = (name: string, attributes: Record<string, string>) => ({
+    name,
+    attributes: Object.entries(attributes).map(([key, value]) => attribute(key, value)),
+  })
+  const body = (...spans: ReturnType<typeof span>[]): Buffer =>
+    Buffer.from(JSON.stringify({resourceSpans: [{scopeSpans: [{spans}]}]}))
+  const marker = 'toolarg-marker-0123abcd'
+
+  it('decodes the name and the string attributes of every span in every body', () => {
+    // #given two bodies
+    const spans = exportedSpans([body(span('invoke_agent x', {a: '1'})), body(span('execute_tool bash', {b: '2'}))])
+
+    // #then
+    expect(spans).toEqual([
+      {name: 'invoke_agent x', attributes: {a: '1'}},
+      {name: 'execute_tool bash', attributes: {b: '2'}},
+    ])
+  })
+
+  it('finds the marker in the tool span arguments', () => {
+    const spans = exportedSpans([
+      body(span('execute_tool bash', {'gen_ai.tool.call.arguments': `{"command":": ${marker}; true"}`})),
+    ])
+    expect(toolSpanHoldsArgument(spans, marker)).toBe(true)
+  })
+
+  it('does not count the marker found elsewhere: in the result, in a model request, or in another attribute of the tool span', () => {
+    // #given the marker in the tool's result, in a chat span's input and in the tool span's description, never in its arguments
+    const spans = exportedSpans([
+      body(
+        span('execute_tool bash', {
+          'gen_ai.tool.call.arguments': '{"command":"true"}',
+          'gen_ai.tool.call.result': `saw ${marker}`,
+          description: marker,
+        }),
+        span('chat fixture-model', {'gen_ai.input.messages': `[{"tool_call":"${marker}"}]`}),
+      ),
+    ])
+
+    // #then it is not proof that the tool's arguments arrived
+    expect(toolSpanHoldsArgument(spans, marker)).toBe(false)
+  })
+
+  it('is false when no tool span arrived', () => {
+    expect(toolSpanHoldsArgument(exportedSpans([body(span('invoke_agent x', {}))]), marker)).toBe(false)
+    expect(toolSpanHoldsArgument([], marker)).toBe(false)
+  })
+
+  it('ignores a body that is not OTLP JSON', () => {
+    expect(exportedSpans([Buffer.from('nope'), Buffer.from('{"resourceSpans":null}')])).toEqual([])
   })
 })
