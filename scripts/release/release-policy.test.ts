@@ -86,6 +86,15 @@ const MATRIX: readonly MatrixCase[] = [
     expectedAnalyzer: null,
     expectedPreview: 'none',
   },
+  {message: 'feat(opencode-plugin): add a feature', expectedAnalyzer: null, expectedPreview: 'none'},
+  {message: 'fix(opencode-plugin): fix a bug', expectedAnalyzer: null, expectedPreview: 'none'},
+  {message: 'build(opencode-plugin): bundle a dependency', expectedAnalyzer: null, expectedPreview: 'none'},
+  {
+    message: 'feat(opencode-plugin)!: breaking plugin change\n\nBREAKING CHANGE: details',
+    expectedAnalyzer: null,
+    expectedPreview: 'none',
+  },
+  {message: 'feat(action): add a feature', expectedAnalyzer: 'minor', expectedPreview: 'minor'},
   {message: 'docs(readme): update', expectedAnalyzer: 'patch', expectedPreview: 'patch'},
   {message: 'docs(rfcs): update', expectedAnalyzer: 'patch', expectedPreview: 'patch'},
   {
@@ -145,6 +154,99 @@ describe('release policy: BREAKING CHANGE notes survive the minor-not-major poli
     // #then
     expect(notes).toContain('BREAKING CHANGES')
     expect(notes).toContain('something broke for users')
+  })
+})
+
+async function notesFor(messages: readonly string[]): Promise<string> {
+  const {preset, presetConfig} = loadReleasercPolicy()
+  return generateNotes(
+    {preset, presetConfig},
+    {
+      cwd: process.cwd(),
+      options: {repositoryUrl: 'https://github.com/example/example.git'},
+      lastRelease: {gitTag: 'v0.110.0'},
+      nextRelease: {version: '0.111.0', gitTag: 'v0.111.0'},
+      commits: messages.map((message, index) => ({hash: `abc12${index.toString().padStart(2, '0')}`, message})),
+    },
+  )
+}
+
+describe('release policy: opencode-plugin commits stay out of the Action release notes', () => {
+  const PLUGIN_TYPES = [
+    'feat',
+    'features',
+    'fix',
+    'build',
+    'docs',
+    'test',
+    'ci',
+    'style',
+    'refactor',
+    'perf',
+    'revert',
+    'chore',
+  ] as const
+
+  it.each(PLUGIN_TYPES)('hides a %s(opencode-plugin) commit', async type => {
+    // #given
+    const messages = [`${type}(opencode-plugin): plugin only change`, `${type}(action): action change`]
+
+    // #when
+    const notes = await notesFor(messages)
+
+    // #then: the plugin commit is absent and the same type under another scope is still listed
+    expect(notes).not.toContain('plugin only change')
+    expect(notes).toContain('action change')
+  })
+
+  it('lets an Action commit set the release when a breaking plugin commit is in the same batch', async () => {
+    // #given: a plugin pin update for the Action beside a breaking plugin commit
+    const messages = [
+      'feat(opencode-plugin)!: breaking plugin change\n\nBREAKING CHANGE: plugin setting renamed',
+      'build(deps): update the plugin pin',
+    ]
+    const {preset, presetConfig, releaseRules} = loadReleasercPolicy()
+
+    // #when
+    const releaseType = await analyzeCommits(
+      {preset, presetConfig, releaseRules},
+      {
+        commits: messages.map((message, index) => ({hash: `abc12${index.toString().padStart(2, '0')}`, message})),
+        cwd: process.cwd(),
+        logger: noopLogger,
+      },
+    )
+    const notes = await notesFor(messages)
+
+    // #then: the pin update alone decides the bump, and preview.ts agrees
+    expect(releaseType).toBe('patch')
+    expect(analyzeReleaseType(messages)).toBe('patch')
+    // #then: the notes generator always shows a breaking note, so the plugin's one stays visible
+    expect(notes).toContain('update the plugin pin')
+    expect(notes).toContain('plugin setting renamed')
+  })
+
+  it.each([
+    ['footer', 'feat(opencode-plugin): footer directive\n\nRelease-As: 9.9.9'],
+    ['body', 'feat(opencode-plugin): body directive\n\nA sentence in the body.\nRelease-As: 9.9.9\n\nRefs: #1'],
+  ])('lists a plugin commit with a Release-As line in its %s, without releasing', async (_where, message) => {
+    // #given/#when
+    const releaseType = await analyzeWithRealAnalyzer(message)
+    const notes = await notesFor([message, 'fix(action): action fix'])
+
+    // #then: the notes generator shows the commit, and it still triggers no Action release
+    expect(notes).toContain('directive')
+    expect(releaseType).toBeNull()
+    expect(analyzeReleaseType([message])).toBe('none')
+  })
+
+  it('still lists the same types without a scope', async () => {
+    // #given/#when
+    const notes = await notesFor(['feat: unscoped feature', 'fix: unscoped fix'])
+
+    // #then
+    expect(notes).toContain('unscoped feature')
+    expect(notes).toContain('unscoped fix')
   })
 })
 

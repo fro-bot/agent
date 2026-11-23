@@ -1633,9 +1633,10 @@ Enforce privacy-first telemetry policy across all modalities.
 **Acceptance Criteria:**
 - [ ] All metrics derived from run summaries and structured JSON logs only
 - [ ] No external telemetry aggregation unless user explicitly opts in
-- [ ] No raw content (code, comments, prompts) logged to external systems
+- [ ] No raw content (code, comments, prompts) logged to external systems, except by run tracing that the operator has turned on
 - [ ] Metrics stored locally in run artifacts and GitHub Actions logs
 - [ ] User controls what data leaves the system (transparent)
+- [ ] Run tracing is off by default, has no default destination, and sends content only to a collector the operator chooses
 
 **Technical Considerations:**
 - Aligns with PRD v1.4 telemetry policy requirements

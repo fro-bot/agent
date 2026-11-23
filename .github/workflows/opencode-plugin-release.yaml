@@ -72,17 +72,79 @@ jobs:
         working-directory: packages/opencode-plugin
         run: |
           set -euo pipefail
-          node --input-type=module -e '
-            import {readFileSync} from "node:fs"
-            const source = readFileSync("dist/index.mjs", "utf8")
-            const patterns = [/\bfrom\s*["\x27]([^"\x27]+)["\x27]/g, /\bimport\s*["\x27]([^"\x27]+)["\x27]/g, /\b(?:import|require)\(\s*["\x27]([^"\x27]+)["\x27]\s*\)/g]
-            const specifiers = patterns.flatMap(pattern => [...source.matchAll(pattern)].map(m => m[1]))
-            const allowed = (s) => s === "effect" || s.startsWith("effect/") || s === "@opencode/plugin" || s.startsWith("@opencode/plugin/") || s.startsWith("node:")
-            const bad = [...new Set(specifiers.filter(s => !allowed(s)))]
-            if (bad.length > 0) { console.error("::error::unexpected imports in dist/index.mjs: " + bad.join(", ")); process.exit(1) }
-            if (!specifiers.includes("@opencode/plugin")) { console.error("::error::dist/index.mjs no longer imports @opencode/plugin"); process.exit(1) }
-            console.log("bundle imports ok: " + [...new Set(specifiers)].join(", "))
-          '
+          # Checks every emitted file, not only the entry: the OpenTelemetry SDK is inlined into a lazily loaded chunk.
+          # A relative import is allowed only when it is a regular file inside dist.
+          node --input-type=module <<'EOF'
+          import {existsSync, lstatSync, readdirSync, readFileSync, realpathSync} from "node:fs"
+          import path from "node:path"
+
+          const dist = realpathSync("dist")
+          const entry = "index.mjs"
+          const files = readdirSync(dist).filter(name => name.endsWith(".mjs"))
+          const forbidden = ["child_process", "vm", "worker_threads"]
+          const hostProvided = s => s === "effect" || s.startsWith("effect/") || s === "@opencode/plugin" || s.startsWith("@opencode/plugin/") || s.startsWith("node:")
+          const take = (source, pattern) => [...source.matchAll(pattern)].map(m => m[1])
+          const primitives = [
+            ["a dynamic import with a non-literal argument", /\bimport\s*\((?!\s*["'][^"'\n]*["']\s*\))/],
+            ["createRequire", /\bcreateRequire\b/],
+            ["import.meta.resolve", /\bimport\s*\.\s*meta\s*\.\s*resolve\b/],
+            ["process.binding or process.dlopen", /\bprocess\s*(?:\.|\[\s*["'`])\s*(?:binding|dlopen)\b/],
+            ["eval", /\beval\b/],
+            ["the Function constructor", /\bnew\s+Function\b|(?<![\w$.])Function\s*\(|\bconstructor\s*\.\s*constructor\b/],
+          ]
+          const errors = []
+          const seen = new Set()
+
+          // Only ES module chunks, their source maps and declarations belong in dist.
+          for (const name of readdirSync(dist)) {
+            if (!/\.(?:mjs|mjs\.map|d\.mts|d\.mts\.map)$/.test(name)) errors.push(`dist/${name}: not an expected build output`)
+          }
+
+          for (const file of files) {
+            const source = readFileSync(path.join(dist, file), "utf8")
+            // Static imports and re-exports start a line in the bundler output; an unanchored `from "x"` also matches prose in strings.
+            const statics = [...take(source, /^(?:import|export)\s[^"'`;]*\sfrom\s*["']([^"']+)["']/gm), ...take(source, /^import\s*["']([^"']+)["']/gm)]
+            const dynamics = take(source, /\bimport\(\s*["']([^"']+)["']\s*\)/g)
+            const requires = take(source, /(?<![\w$.])(?:__)?require\(\s*["']([^"']+)["']\s*\)/g)
+            for (const s of requires) errors.push(`${file}: require("${s}") in an ES module bundle`)
+            for (const name of forbidden) {
+              if (new RegExp(`["'](?:node:)?${name}["']`).test(source)) errors.push(`${file}: names node:${name}`)
+            }
+            // Loading and evaluation primitives the import scan cannot see. A textual deny, not a parser: it fails closed, so a
+            // comment or string that spells one is flagged too and has to be reworded. packages/opencode-plugin/src/bundle.test.ts
+            // holds the same list and runs this script over bypass fixtures.
+            for (const [label, pattern] of primitives) if (pattern.test(source)) errors.push(`${file}: uses ${label}`)
+            for (const s of [...statics, ...dynamics]) {
+              seen.add(s)
+              if (hostProvided(s)) continue
+              if (!s.startsWith("./")) { errors.push(`${file}: unexpected import "${s}"`); continue }
+              // A relative import is allowed only when it is a regular file (not a link) inside dist that this check also scans.
+              const target = path.resolve(dist, s)
+              const inside = target.startsWith(dist + path.sep)
+              if (!inside || !existsSync(target) || !lstatSync(target).isFile() || !files.includes(path.basename(target)) || path.dirname(target) !== dist) {
+                errors.push(`${file}: relative import "${s}" is not a regular .mjs file inside dist`)
+              }
+            }
+            // The entry loads tracing code only through a dynamic import, so a tracing-off start never evaluates it.
+            if (file === entry) {
+              for (const s of statics) if (!hostProvided(s)) errors.push(`${file}: static import of "${s}" (only host-provided modules may be imported statically)`)
+              if (!statics.includes("@opencode/plugin")) errors.push(`${file}: no longer imports @opencode/plugin`)
+            }
+          }
+          if (!files.includes(entry)) errors.push(`dist/${entry} is missing`)
+
+          if (errors.length > 0) {
+            for (const message of errors) console.error("::error::" + message)
+            process.exit(1)
+          }
+          console.log(`bundle imports ok: ${files.length} files; ` + [...seen].sort().join(", "))
+          EOF
+
+      - name: Check the built bundle shape (tests)
+        working-directory: packages/opencode-plugin
+        env:
+          FRO_BOT_REQUIRE_PLUGIN_BUNDLE: '1'
+        run: bunx vitest run --config ../../vitest.config.ts src/bundle.test.ts
 
       - name: Pack
         id: pack
@@ -94,7 +156,7 @@ jobs:
           STAGE="$(mktemp -d)"
           PKG=packages/opencode-plugin
           mkdir -p "${STAGE}/pkg" "${STAGE}/out"
-          cp -R "${PKG}/dist" "${PKG}/README.md" "${PKG}/LICENSE" "${PKG}/package.json" "${STAGE}/pkg/"
+          cp -R "${PKG}/dist" "${PKG}/README.md" "${PKG}/LICENSE" "${PKG}/THIRD_PARTY_NOTICES.md" "${PKG}/package.json" "${STAGE}/pkg/"
           (
             cd "${STAGE}/pkg"
             npm pkg set "version=${VERSION}"
@@ -104,8 +166,12 @@ jobs:
           TARBALL="$(ls "${STAGE}/out")"
           mkdir -p dist-tarball
           cp "${STAGE}/out/${TARBALL}" "dist-tarball/${TARBALL}"
+          CONTENTS="$(tar -tzf "dist-tarball/${TARBALL}")"
           echo "Packed contents:"
-          tar -tzf "dist-tarball/${TARBALL}"
+          echo "${CONTENTS}"
+          # The notices travel with the inlined third-party code. Matched on the saved listing: `tar | grep -q` can fail under pipefail.
+          grep -qx 'package/THIRD_PARTY_NOTICES.md' <<<"${CONTENTS}" \
+            || { echo "::error::the tarball is missing THIRD_PARTY_NOTICES.md"; exit 1; }
           echo "tarball=${TARBALL}" >> "${GITHUB_OUTPUT}"
 
       - name: Upload tarball

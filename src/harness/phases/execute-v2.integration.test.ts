@@ -28,7 +28,7 @@ import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import {DatabaseSync} from 'node:sqlite'
-import {buildSessionTitle, evaluatePermissionV2} from '@fro-bot/runtime'
+import {ACTION_TRACING_OFF, buildSessionTitle, evaluatePermissionV2} from '@fro-bot/runtime'
 import {afterAll, beforeAll, describe, expect, it, vi} from 'vitest'
 import pin from '../../../packages/runtime/src/shared/opencode-v2-pin.json'
 import {createActionClientV2} from '../../features/agent/execution-v2.js'
@@ -335,6 +335,7 @@ async function startRealServer(
     env: box.env,
     runId: 78,
     runAttempt: 1,
+    tracing: ACTION_TRACING_OFF,
     logger: createMockLogger(),
     deps: {
       startServer: async (spawnOptions, spawnLogger) => {
@@ -605,6 +606,7 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
       env: box.env,
       runId: 77,
       runAttempt: 1,
+      tracing: ACTION_TRACING_OFF,
       logger: createMockLogger(),
       deps: {
         startServer: async (spawnOptions, spawnLogger) => {

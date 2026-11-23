@@ -60,7 +60,7 @@ export const DEFAULT_MODEL = {
 // build is no longer the default; a consumer can still select it by pinning `opencode-version` to the harness
 // build.
 export const DEFAULT_OPENCODE_VERSION: string = v2PinFile.version
-export const DEFAULT_SYSTEMATIC_VERSION = '3.35.2'
+export const DEFAULT_SYSTEMATIC_VERSION = '3.37.0'
 
 // Systematic for OpenCode V2. 3.27.x loads on both V1 and V2, so the V2 path installs DEFAULT_SYSTEMATIC_VERSION too
 // and there is no separate V2 pin. The plugin id is the `id` of the object the package's default export carries
@@ -75,7 +75,13 @@ export const SYSTEMATIC_V2_PLUGIN_ID = 'systematic'
 // equal it.
 export const FRO_BOT_PLUGIN_PACKAGE = '@fro.bot/opencode-plugin'
 export const FRO_BOT_PLUGIN_ID = 'fro-bot.opencode-plugin'
-export const FRO_BOT_PLUGIN_VERSION = '0.1.0'
+export const FRO_BOT_PLUGIN_VERSION = '0.2.0'
+
+// The variable a launcher (the Action, the workspace) uses to tell the plugin its host and whether tracing is on. The
+// plugin duplicates the name (`TRACING_LAUNCHER_ENV`) and a test keeps them equal. `OPENCODE_`-prefixed so `filterAgentEnv`
+// admits it, and not ending in a denied suffix. It carries no credential: host, on or off, a loopback relay address and run
+// identity.
+export const FRO_BOT_TRACING_LAUNCHER_ENV = 'OPENCODE_FROBOT_TRACING'
 
 // Retry configuration lives in the Action layer's src/features/agent/retry.ts,
 // colocated with the retry logic that consumes the values.

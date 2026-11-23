@@ -8,6 +8,7 @@ import * as fs from 'node:fs/promises'
 import * as os from 'node:os'
 import * as path from 'node:path'
 import {DatabaseSync} from 'node:sqlite'
+import {ACTION_TRACING_OFF} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMetricsCollector} from '../../features/observability/index.js'
 import {checkpointDatabase as realCheckpointDatabase} from '../../services/cache/checkpoint.js'
@@ -114,6 +115,7 @@ function createActionInputs(overrides: Partial<ActionInputs> = {}): ActionInputs
     repoSkills: false,
     isolateAgent: false,
     agentStateHome: null,
+    tracing: {enabled: false},
     storeConfig: {
       enabled: false,
       bucket: '',
@@ -178,7 +180,12 @@ describe('runCacheRestore database repair', () => {
     const {runCacheRestore} = await import('./cache-restore.js')
 
     // #when the cache-restore phase runs
-    const result = await runCacheRestore(createBootstrapPhaseResult(), createMetricsCollector())
+    const result = await runCacheRestore(
+      createBootstrapPhaseResult(),
+      createMetricsCollector(),
+      null,
+      ACTION_TRACING_OFF,
+    )
 
     // #then the restored database is checkpointed against the canonical DB-family paths
     // and the healed repository is logged at info level
@@ -207,7 +214,12 @@ describe('runCacheRestore database repair', () => {
     const {runCacheRestore} = await import('./cache-restore.js')
 
     // #when the cache-restore phase runs
-    const result = await runCacheRestore(createBootstrapPhaseResult(), createMetricsCollector())
+    const result = await runCacheRestore(
+      createBootstrapPhaseResult(),
+      createMetricsCollector(),
+      null,
+      ACTION_TRACING_OFF,
+    )
 
     // #then checkpointDatabase was still consulted (there was a restored database to check),
     // the usability probe ran against the same database path, and nothing was logged about
@@ -236,7 +248,12 @@ describe('runCacheRestore database repair', () => {
     const {runCacheRestore} = await import('./cache-restore.js')
 
     // #when the cache-restore phase runs
-    const result = await runCacheRestore(createBootstrapPhaseResult(), createMetricsCollector())
+    const result = await runCacheRestore(
+      createBootstrapPhaseResult(),
+      createMetricsCollector(),
+      null,
+      ACTION_TRACING_OFF,
+    )
 
     // #then the usability probe catches what the checkpoint attempt could not, storage is
     // wiped, and the run is reported as a corrupted cache instead of a hit
@@ -268,7 +285,12 @@ describe('runCacheRestore database repair', () => {
     const {runCacheRestore} = await import('./cache-restore.js')
 
     // #when the cache-restore phase runs
-    const result = await runCacheRestore(createBootstrapPhaseResult(), createMetricsCollector())
+    const result = await runCacheRestore(
+      createBootstrapPhaseResult(),
+      createMetricsCollector(),
+      null,
+      ACTION_TRACING_OFF,
+    )
 
     // #then neither checkpointDatabase nor the usability probe is ever consulted, and
     // bootstrap still proceeds
@@ -286,7 +308,12 @@ describe('runCacheRestore database repair', () => {
     const {runCacheRestore} = await import('./cache-restore.js')
 
     // #when the cache-restore phase runs
-    const result = await runCacheRestore(createBootstrapPhaseResult(), createMetricsCollector())
+    const result = await runCacheRestore(
+      createBootstrapPhaseResult(),
+      createMetricsCollector(),
+      null,
+      ACTION_TRACING_OFF,
+    )
 
     // #then the failure is logged as a warning, storage is left alone, the run is not
     // failed, and bootstrap proceeds
@@ -313,7 +340,12 @@ describe('runCacheRestore database repair', () => {
     const {runCacheRestore} = await import('./cache-restore.js')
 
     // #when the cache-restore phase runs
-    const result = await runCacheRestore(createBootstrapPhaseResult(), createMetricsCollector())
+    const result = await runCacheRestore(
+      createBootstrapPhaseResult(),
+      createMetricsCollector(),
+      null,
+      ACTION_TRACING_OFF,
+    )
 
     // #then storage is left intact, the run still reports a hit, and cacheResult agrees
     expect(result).not.toBeNull()
@@ -336,7 +368,12 @@ describe('runCacheRestore database repair', () => {
     const {runCacheRestore} = await import('./cache-restore.js')
 
     // #when the cache-restore phase runs
-    const result = await runCacheRestore(createBootstrapPhaseResult(), createMetricsCollector())
+    const result = await runCacheRestore(
+      createBootstrapPhaseResult(),
+      createMetricsCollector(),
+      null,
+      ACTION_TRACING_OFF,
+    )
 
     // #then storage is wiped, the cache status is downgraded to corrupted, and bootstrap
     // still proceeds against a clean state rather than the malformed database
@@ -377,7 +414,7 @@ describe('runCacheRestore database repair', () => {
     const {runCacheRestore} = await import('./cache-restore.js')
 
     // #when the cache-restore phase runs
-    await runCacheRestore(createBootstrapPhaseResult(), createMetricsCollector())
+    await runCacheRestore(createBootstrapPhaseResult(), createMetricsCollector(), null, ACTION_TRACING_OFF)
 
     // #then the repair happens strictly between restore and bootstrap — an ordering
     // regression here would silently move the checkpoint cost back inside the bootstrap
@@ -393,7 +430,12 @@ describe('runCacheRestore database repair', () => {
     const {runCacheRestore} = await import('./cache-restore.js')
 
     // #when
-    const result = await runCacheRestore(createBootstrapPhaseResult({sandbox}), createMetricsCollector())
+    const result = await runCacheRestore(
+      createBootstrapPhaseResult({sandbox}),
+      createMetricsCollector(),
+      null,
+      ACTION_TRACING_OFF,
+    )
 
     // #then the same object reaches the start (so its failure paths release it) and the phase result
     expect(mocks.startActionOpenCodeV2).toHaveBeenCalledWith(expect.objectContaining({sandbox}))
@@ -407,7 +449,12 @@ describe('runCacheRestore database repair', () => {
     const {runCacheRestore} = await import('./cache-restore.js')
 
     // #when
-    const result = await runCacheRestore(createBootstrapPhaseResult(), createMetricsCollector())
+    const result = await runCacheRestore(
+      createBootstrapPhaseResult(),
+      createMetricsCollector(),
+      null,
+      ACTION_TRACING_OFF,
+    )
 
     // #then
     expect(mocks.startActionOpenCodeV2).toHaveBeenCalledWith(expect.objectContaining({sandbox: null}))
@@ -486,7 +533,12 @@ describe('runCacheRestore database repair (end-to-end against a real database)',
     const {runCacheRestore} = await import('./cache-restore.js')
 
     // #when the cache-restore phase runs against the real filesystem
-    const result = await runCacheRestore(createBootstrapPhaseResult(), createMetricsCollector())
+    const result = await runCacheRestore(
+      createBootstrapPhaseResult(),
+      createMetricsCollector(),
+      null,
+      ACTION_TRACING_OFF,
+    )
 
     // #then the write-ahead log is empty afterwards — the real repair happened, not a
     // mock reporting success — and bootstrap still ran
@@ -515,7 +567,12 @@ describe('runCacheRestore database repair (end-to-end against a real database)',
     const {runCacheRestore} = await import('./cache-restore.js')
 
     // #when the cache-restore phase runs against the real filesystem
-    const result = await runCacheRestore(createBootstrapPhaseResult(), createMetricsCollector())
+    const result = await runCacheRestore(
+      createBootstrapPhaseResult(),
+      createMetricsCollector(),
+      null,
+      ACTION_TRACING_OFF,
+    )
 
     // #then the malformed database is detected (a structural SQLite error, not a busy
     // lock), storage is wiped rather than handed to bootstrap, and the run is reported as
@@ -548,7 +605,12 @@ describe('runCacheRestore database repair (end-to-end against a real database)',
     const {runCacheRestore} = await import('./cache-restore.js')
 
     // #when the cache-restore phase runs against the real filesystem
-    const result = await runCacheRestore(createBootstrapPhaseResult(), createMetricsCollector())
+    const result = await runCacheRestore(
+      createBootstrapPhaseResult(),
+      createMetricsCollector(),
+      null,
+      ACTION_TRACING_OFF,
+    )
 
     // #then the lock is reported as a retryable failure rather than structural corruption,
     // storage is left untouched, and bootstrap still runs
@@ -575,7 +637,12 @@ describe('runCacheRestore database repair (end-to-end against a real database)',
     const {runCacheRestore} = await import('./cache-restore.js')
 
     // #when the cache-restore phase runs against the real filesystem
-    const result = await runCacheRestore(createBootstrapPhaseResult(), createMetricsCollector())
+    const result = await runCacheRestore(
+      createBootstrapPhaseResult(),
+      createMetricsCollector(),
+      null,
+      ACTION_TRACING_OFF,
+    )
 
     // #then the usability probe (not the checkpoint attempt) detects the corruption,
     // storage is wiped, and the run is reported as corrupted instead of a hit
@@ -602,7 +669,12 @@ describe('runCacheRestore database repair (end-to-end against a real database)',
     const {runCacheRestore} = await import('./cache-restore.js')
 
     // #when the cache-restore phase runs against the real filesystem
-    const result = await runCacheRestore(createBootstrapPhaseResult(), createMetricsCollector())
+    const result = await runCacheRestore(
+      createBootstrapPhaseResult(),
+      createMetricsCollector(),
+      null,
+      ACTION_TRACING_OFF,
+    )
 
     // #then the usability probe passes, storage is left completely alone, and the run
     // still reports a hit — this is the common case and must stay silent and untouched
@@ -705,7 +777,7 @@ describe('runCacheRestore usability probe via the object-store restore source (e
 
     // #when the cache-restore phase runs against the real filesystem and the real
     // object-store restore code path
-    const result = await runCacheRestore(bootstrap, createMetricsCollector())
+    const result = await runCacheRestore(bootstrap, createMetricsCollector(), null, ACTION_TRACING_OFF)
 
     // #then the object store reports a hit (source: 'storage'), which the cacheStatus ===
     // 'hit' gate covers exactly like a cache-sourced hit, the usability probe (not the
@@ -757,7 +829,7 @@ describe('runCacheRestore usability probe via the object-store restore source (e
 
     // #when the cache-restore phase runs against the real filesystem and the real
     // object-store restore code path
-    const result = await runCacheRestore(bootstrap, createMetricsCollector())
+    const result = await runCacheRestore(bootstrap, createMetricsCollector(), null, ACTION_TRACING_OFF)
 
     // #then the restore is a healthy hit, not corrupted — the stale wal was deleted
     // before the restore-side checkpoint repair ever opened the database, so the

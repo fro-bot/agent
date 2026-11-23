@@ -101,6 +101,8 @@ export default defineConfig(
             'eslint.config.ts',
             'scripts/**',
             'packages/harness/scripts/**',
+            // The plugin inlines its OpenTelemetry SDK devDependencies into the lazily loaded tracing chunk at build time.
+            'packages/opencode-plugin/src/tracing/**',
           ].map(glob => join(import.meta.dirname, glob)),
           peerDependencies: true,
         },

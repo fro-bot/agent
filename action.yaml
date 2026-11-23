@@ -65,7 +65,7 @@ inputs:
     description: 'Agent to use. When unset, uses OpenCode build agent. Must be a primary agent, not subagent.'
     required: false
   model:
-    description: "Model override (format: provider/model). If not set, uses agent's configured model."
+    description: 'Model to run (format: provider/model). If not set, the run uses opencode/big-pickle, a free model that needs no credentials; set it to run on your own provider.'
     required: false
   timeout:
     description: 'Execution timeout in milliseconds for OpenCode execution only (not the whole GitHub Actions job). 0 = no Action-internal execution deadline. Default: 1800000 (30 minutes). Set the job-level timeout-minutes as the whole-job backstop, with headroom beyond this value for setup, fallback response delivery, and cleanup.'
@@ -126,6 +126,29 @@ inputs:
       run and takes it back after, so a tool that keeps state there (a run record, a ledger) leaves it in the checkout. A
       relative path, a path outside the checkout or a symlink fails the run. Ignored without `isolate-agent`.
     required: false
+  trace-endpoint:
+    description: >-
+      Sends a trace of the run to your OpenTelemetry collector. The full URL of its traces route, for example
+      `https://collector.example.com/v1/traces`. Empty (the default) means no tracing. The traces hold the prompts, tool
+      results and model output of the run, so send them only to a collector you control. The URL must be `https`, or `http`
+      to a loopback IP address such as `127.0.0.1` for a collector on the runner that needs no credential. A URL with a
+      username, password or fragment, port 0, or any other fault turns tracing off with one warning; it never fails the
+      run. This release accepts the input and starts the relay, but the pinned plugin does not send traces yet. No traces
+      are sent until a later release of this Action that includes a plugin with tracing. Do not configure a production
+      credential for it yet.
+    required: false
+    default: ''
+  trace-headers:
+    description: >-
+      The credential for the collector in `trace-endpoint`, one header per line in the form `Name: value`, for example
+      `Authorization: Basic <base64>`. Keep it in a secret, and use a credential that can only write traces to one project.
+      The headers go to the Action's relay process only. They are not passed to the OpenCode server or the plugin. With
+      `isolate-agent: true` the agent cannot read them. Without it the agent runs as the same user as the Action and can
+      read them, and every span, so set `isolate-agent: true` to keep the credential from the agent. A header the relay
+      sets itself (such as `Host` or `Content-Type`), a line that is not `Name: value`, or any header with an `http`
+      endpoint turns tracing off with one warning that names the line. Ignored when `trace-endpoint` is empty.
+    required: false
+    default: ''
   opencode-config:
     description: >-
       JSON object to merge into the OpenCode config (OPENCODE_CONFIG_CONTENT).

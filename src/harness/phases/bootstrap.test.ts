@@ -98,6 +98,7 @@ function createActionInputs(overrides: Partial<ActionInputs> = {}): ActionInputs
     repoSkills: false,
     isolateAgent: false,
     agentStateHome: null,
+    tracing: {enabled: false},
     storeConfig: {
       enabled: false,
       bucket: '',

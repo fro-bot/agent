@@ -238,7 +238,7 @@ FROM version-gate AS runtime
 WORKDIR /app
 
 # Pinned tool versions (track the runtime constants noted in the header).
-ARG SYSTEMATIC_VERSION=3.35.2
+ARG SYSTEMATIC_VERSION=3.37.0
 
 # System packages come from the base image's Alpine 3.24 branch and are not
 # pinned: the branch index drops older versions, so exact pins would break the
@@ -271,7 +271,7 @@ RUN apk add --no-cache \
 # Package managers for agent tasks: Bun (the binary `build-deps` verified) and npm 12. The base's bundled npm 11,
 # yarn and corepack are removed, because npm 11's own dependency tree carries HIGH CVEs that overrides can't reach
 # (#2117). The V2 plugin install below uses OpenCode's in-process arborist, not this npm.
-ARG NPM_VERSION=12.2.2
+ARG NPM_VERSION=12.2.3
 COPY --from=build-deps /usr/local/bin/bun /usr/local/bin/bun
 RUN set -euo pipefail \
     && case "${NPM_VERSION}" in \
@@ -352,7 +352,7 @@ RUN set -euo pipefail \
 # Systematic installs at SYSTEMATIC_VERSION (declared above), and the versions must equal DEFAULT_SYSTEMATIC_VERSION
 # and FRO_BOT_PLUGIN_VERSION in packages/runtime/src/shared/constants.ts; deploy/scripts/workspace-v2-image.test.mjs
 # keeps them in step, and the plugin gate refuses a server whose plugins differ from what the workspace expects.
-ARG FRO_BOT_PLUGIN_VERSION=0.1.0
+ARG FRO_BOT_PLUGIN_VERSION=0.2.0
 COPY deploy/scripts/install-opencode-v2-plugins.sh /usr/local/lib/workspace-scripts/install-opencode-v2-plugins.sh
 RUN sh /usr/local/lib/workspace-scripts/install-opencode-v2-plugins.sh \
       "@fro.bot/systematic@${SYSTEMATIC_VERSION}" \
