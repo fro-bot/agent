@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-11-15"
-updated-by: "962b70bc"
+last-updated: "2026-11-23"
+updated-by: "8ca1022d"
 sources:
   - src/harness/phases/sandbox-lifecycle.ts
   - packages/runtime/src/agent/sandbox-namespace.ts
@@ -16,6 +16,7 @@ sources:
   - packages/runtime/src/agent/directory-quiescence-v2.ts
   - packages/runtime/src/agent/server-v2.ts
   - src/features/agent/streaming-v2.ts
+  - src/features/agent/subagent-notice-log.ts
   - src/features/agent/drain-v2.ts
   - src/harness/phases/execute.ts
   - src/harness/phases/release-v2.ts
@@ -70,7 +71,7 @@ Inbox reads cover the root, owned sessions, and sessions updated since the run b
 
 Release requires eleven consecutive quiet readings at least 500 milliseconds apart and spanning at least five seconds. Any activity or failed reading resets the window. Root activity that invalidates the completion evidence also resets admission, including activity racing the final reading. A partial read can still identify sessions or shells to stop, but cannot authorize release.
 
-This is deliberately stronger than an empty ledger. V2 can wake a session after a shell exits or a child's completion is enqueued, through a step the event stream does not expose. The ledger describes what the harness observed; the directory gate checks the checkout that is about to be handed back.
+This is deliberately stronger than an empty ledger. V2 can wake a session after a shell exits or a child's completion is enqueued. A connected stream can show the notice and wake, but cannot prove there is no later wake still to come. The active-session list can show a running child without showing its idle owner. The ledger describes what the harness observed; the directory gate checks the checkout that is about to be handed back.
 
 The stability window is still bounded evidence, not a proof against an upstream producer paused longer than the window and waking later. Quarantine after an unconfirmed stop and the next run's workspace admission check provide additional protection.
 

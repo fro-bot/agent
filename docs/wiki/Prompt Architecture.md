@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-11-15"
-updated-by: "962b70bc"
+last-updated: "2026-11-23"
+updated-by: "8ca1022d"
 sources:
   - src/harness/phases/brokered-push-plan.ts
   - src/features/agent/prompt-sender-v2.ts
@@ -20,6 +20,7 @@ sources:
   - src/features/agent/prompt.ts
   - src/features/agent/context.ts
   - src/features/context/types.ts
+  - src/features/context/discussion.ts
   - RFCs/RFC-012-Agent-Execution-Main-Action.md
 summary: "How the multi-section XML-tagged prompt is assembled and why each section exists"
 ---
@@ -88,6 +89,8 @@ Materialization failures use the runtime's non-throwing `toErrorMessage` helper,
 
 ## Hydrated Context
 
+Discussion mentions use the trusted discussion target for a bounded GraphQL read (`src/features/context/discussion.ts`). The prompt puts the resulting metadata under `<discussion>` and attaches the body and comments as reference files. If hydration fails, the prompt keeps the event's facts; it does not look up an issue with the same number.
+
 For issue and PR events, the prompt builder can include rich context fetched via GraphQL (RFC-015). The `HydratedContext` type carries structured data about the issue or PR: metadata, file changes with diff stats, commit history, reviews, and comments, all subject to budget constraints (50 files fetched, 20 injected into prompt). For PRs, diff status information is merged from the REST diff endpoint when available, adding `added`/`modified`/`removed` status to each file row.
 
 ## Response Protocol
@@ -112,7 +115,7 @@ Keeping this branch in the prompt builder (rather than in a separate agent instr
 
 For an eligible same-repository PR comment, the file-convention protocol also explains the brokered push: the agent commits its edits locally and the Action pushes them after execution. `src/harness/phases/brokered-push-plan.ts` derives this instruction from trusted trigger, association, head-anchor, and hydrated PR facts before the prompt is built. It is absent for forks or incomplete context. The model does not report whether the push landed; the harness appends that outcome after its live checks, as described in [[Execution Lifecycle]].
 
-Delivery mode answers "how does the answer get posted." A second, orthogonal axis answers "what kind of artifact is this run allowed to produce," and it is carried by `ResponseSurface` (`packages/runtime/src/agent/response-file.ts`). Four surfaces exist: `issue-comment`, `pr-comment`, `pr-review`, and `pr-review-permitted`.
+Delivery mode answers "how does the answer get posted." A second, orthogonal axis answers "what kind of artifact is this run allowed to produce," and it is carried by `ResponseSurface` (`packages/runtime/src/agent/response-file.ts`). Five surfaces exist: `discussion-comment`, `issue-comment`, `pr-comment`, `pr-review`, and `pr-review-permitted`. In file-convention mode, a discussion reply is a top-level discussion comment; a reply to an inline PR review comment is a top-level PR comment, not a reply in the review thread.
 
 The interesting one is `pr-review-permitted`, which exists because an authorized `@fro-bot` mention on a pull request does not fit either of the two states that preceded it. A `pr-review` run must produce a verdict — that is what the trigger asked for. A `pr-comment` run must not. A mention on a PR is legitimately either: the human may be asking for a review, or may be asking a question that deserves a prose answer. The two-state surface forced a choice between rejecting every mention verdict and demanding one from every PR mention. On the permitted surface a verdict is accepted and submits a real review through the existing fork and head-SHA guards, and its absence is equally valid and posts a comment.
 

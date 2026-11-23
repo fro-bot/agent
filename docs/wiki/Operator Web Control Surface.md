@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-11-15"
-updated-by: "962b70bc"
+last-updated: "2026-11-23"
+updated-by: "8ca1022d"
 sources:
   - packages/gateway/src/execute/format-part.ts
   - packages/gateway/src/execute/permission-detail-v2.ts
@@ -275,6 +275,8 @@ Question content is not repeated in the generic tool-output stream. `packages/ga
 A quarantine hold is not cancellable. `execute/cancel.ts` checks the process's live quarantine registry before taking a cancellation path and again before a rendezvous write. The run may still read `EXECUTING` if its failed-state write did not land, but cancel cannot overwrite that uncertainty with `CANCELLED` or release its slot or lock. Failed and cancelled runs flush any partial output without adding an empty-output placeholder before their failure reply or cancellation notice (`execute/run.ts`).
 
 An operator can stop a run that is still in flight. `POST /operator/runs/:runId/cancel` (`web/operator/cancel-route.ts`) applies the same repo-access predicate as the other routes. The route resolves the run to its repository through the server-owned run index, re-runs the predicate, and (deliberately) applies the operator-keyed rate limit only _after_ it so a denied caller never consumes budget.
+
+Cancellation is a request, not proof that OpenCode stopped. In `packages/gateway/src/execute/run-core-v2.ts`, an interrupt reply is not accepted as stop confirmation: an interrupt can arrive while the first prompt is still being admitted and find nothing to stop. The gateway still requires termination and directory evidence before relinquishing the checkout (see [[Background Subagents and Ownership]]).
 
 Under the hood, cancellation rides an in-memory abort registry (`execute/abort-registry.ts`). When a run reaches the `EXECUTING` phase, the engine registers a per-run `AbortController` in the registry and composes the run's effective signal as `AbortSignal.any([timeoutSignal, cancelSignal])`; the controller is always removed in the outer `finally` regardless of how the run settles. Registration happens only after the `EXECUTING` transition commits — the earlier window is guarded instead by the run-state conditional-write rendezvous. A cancel request simply fires the registered controller.
 
