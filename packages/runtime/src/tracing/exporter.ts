@@ -115,6 +115,8 @@ export const SDK_SPAN_LIMITS = {
 export interface SpanExporterOptions {
   /** Full OTLP traces URL. */
   readonly url: string
+  /** The resource's `service.name`, and the tracer's name: which sender a span came from. Fixed text, never content. */
+  readonly serviceName: string
   readonly headers: Readonly<Record<string, string>>
   /** Action mode: send the running counts on every batch. Local mode: never. */
   readonly reportCounts: boolean
@@ -266,7 +268,7 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
   }
   const provider = new BasicTracerProvider({
     // Hand-built: no detectors, so no process arguments, host name or environment-derived attributes.
-    resource: resourceFromAttributes({'service.name': 'fro-bot-opencode-plugin'}),
+    resource: resourceFromAttributes({'service.name': options.serviceName}),
     sampler: new AlwaysOnSampler(),
     idGenerator,
     spanLimits: SDK_SPAN_LIMITS,
@@ -276,7 +278,7 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
     },
     spanProcessors: [processor],
   })
-  const tracer = provider.getTracer('fro-bot-opencode-plugin')
+  const tracer = provider.getTracer(options.serviceName)
 
   function trip(): void {
     // Shutdown's permanent cancellation (`cancelled`) already counted the queue and returned the totals: a stop announced after
@@ -426,6 +428,14 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
         kind: span.kind === 'client' ? SpanKind.CLIENT : SpanKind.INTERNAL,
         startTime: hrTime(span.startMs),
         attributes: {...span.attributes} as Record<string, string | number | boolean | string[]>,
+        ...(span.links === undefined
+          ? {}
+          : {
+              links: span.links.map(link => ({
+                context: {traceId: link.traceId, spanId: link.spanId, traceFlags: TraceFlags.SAMPLED},
+                attributes: {...link.attributes},
+              })),
+            }),
       },
       // Always explicit: an ambient context another library registered in this process must never become a parent.
       parent,

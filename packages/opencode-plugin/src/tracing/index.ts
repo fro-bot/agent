@@ -31,6 +31,9 @@ export const CLEANUP_BOUND_MS = 3_000
  */
 export const DRAIN_BOUND_MS = 1_000
 
+/** The `service.name` of every span this plugin exports. The Action's own spans carry a different one. */
+const PLUGIN_SERVICE_NAME = 'fro-bot-opencode-plugin'
+
 export type OnSettings = Extract<TracingSettings, {mode: 'on'}>
 
 export interface TracingHandle {
@@ -67,6 +70,7 @@ export async function startTracing(
     })
   const exporter = createSpanExporter({
     url: settings.endpoint,
+    serviceName: PLUGIN_SERVICE_NAME,
     headers: local ? settings.headers : {},
     // Action mode only: a local collector did not ask for the header.
     reportCounts: !local,

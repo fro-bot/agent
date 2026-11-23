@@ -57,6 +57,7 @@ interface Decoded {
   readonly attributes: {key: string; value: Record<string, unknown>}[]
   readonly status?: {code?: number; message?: string}
   readonly events?: {name: string; timeUnixNano: string; attributes?: {key: string; value: unknown}[]}[]
+  readonly links?: {traceId: string; spanId: string; attributes?: {key: string; value: Record<string, unknown>}[]}[]
 }
 
 /** Every span in a decoded OTLP JSON request. */
@@ -80,7 +81,13 @@ const sink = async (...args: Parameters<typeof startOtlpSink>): Promise<OtlpSink
   return started
 }
 function exporterFor(options: Partial<SpanExporterOptions> & Pick<SpanExporterOptions, 'url'>): SpanExporter {
-  const made = createSpanExporter({headers: {}, reportCounts: false, limits: FAST, ...options})
+  const made = createSpanExporter({
+    serviceName: 'fro-bot-opencode-plugin',
+    headers: {},
+    reportCounts: false,
+    limits: FAST,
+    ...options,
+  })
   exporters.push(made)
   return made
 }
@@ -125,6 +132,53 @@ describe('what the exporter sends', () => {
     expect(second?.status).toMatchObject({code: 2, message: 'boom'})
     expect(second?.events?.[0]).toMatchObject({name: 'exception', timeUnixNano: '1700000004999000000'})
     expect(request?.contentType).toBe('application/json')
+  })
+
+  it('serializes a span’s links with hex trace and span ids, and its attributes', async () => {
+    // #given a span that links to a span in another trace
+    const target = await sink()
+    const exporter = exporterFor({url: target.url})
+    const linked = {traceId: hex(0xdef, 32), spanId: hex(0x42, 16), attributes: {'fro_bot.link.kind': 'run'}}
+    exporter.export(span({links: [linked]}))
+    exporter.export(span())
+
+    // #when it is received
+    await exporter.close(3_000)
+
+    // #then the link carries the ids as lowercase hex, the way OTLP JSON writes them, and its attribute
+    const [request] = target.accepted()
+    const [withLink, without] = spansOf(request as SinkRequest)
+    expect(withLink?.links).toHaveLength(1)
+    const [link] = withLink?.links ?? []
+    expect(link?.traceId).toBe(hex(0xdef, 32))
+    expect(link?.spanId).toBe(hex(0x42, 16))
+    expect(link?.traceId).toMatch(/^[0-9a-f]{32}$/)
+    expect(link?.spanId).toMatch(/^[0-9a-f]{16}$/)
+    expect(link?.attributes).toEqual([{key: 'fro_bot.link.kind', value: {stringValue: 'run'}}])
+    // #and a span without links carries none
+    expect(without?.links ?? []).toEqual([])
+  })
+
+  it('names the sender with the service name it was given, on the resource and the scope', async () => {
+    // #given an exporter for another sender
+    const target = await sink()
+    const exporter = exporterFor({url: target.url, serviceName: 'fro-bot-action'})
+    exporter.export(span())
+
+    // #when it is received
+    await exporter.close(3_000)
+
+    // #then
+    const body = (target.accepted()[0] as SinkRequest).body as {
+      resourceSpans: {
+        resource: {attributes: {key: string; value: {stringValue?: string}}[]}
+        scopeSpans: {scope: {name: string}}[]
+      }[]
+    }
+    expect(body.resourceSpans[0]?.resource.attributes).toEqual([
+      {key: 'service.name', value: {stringValue: 'fro-bot-action'}},
+    ])
+    expect(body.resourceSpans[0]?.scopeSpans[0]?.scope.name).toBe('fro-bot-action')
   })
 
   it('carries a hand-built resource with no process arguments, host name or environment', async () => {

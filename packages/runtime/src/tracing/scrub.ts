@@ -854,17 +854,29 @@ const MIN_LITERAL_CHARS = 8
 const MAX_LITERAL_CHARS = 4096
 const MAX_LITERALS = 128
 
-/** The literal secrets to remove: from the environment once, raw and JSON-escaped, longest first. Never returns names. */
+/**
+ * The forms of one secret to remove: the value, and its JSON-escaped text when that differs. None for a value outside the
+ * length bounds: one shorter than `MIN_LITERAL_CHARS` would redact ordinary text, one longer than `MAX_LITERAL_CHARS` is not a
+ * secret anyone typed.
+ */
+function literalForms(value: string | undefined): readonly string[] {
+  if (value === undefined || value.length < MIN_LITERAL_CHARS || value.length > MAX_LITERAL_CHARS) return []
+  const escaped = JSON.stringify(value).slice(1, -1)
+  return escaped !== value && escaped.length <= MAX_LITERAL_CHARS * 2 ? [value, escaped] : [value]
+}
+
+/**
+ * The literal secrets to remove: from the environment once, raw and JSON-escaped, longest first and at most `MAX_LITERALS`.
+ * Never returns names. The cap bounds the cost of scanning every string for every literal; secrets added after the scrubber
+ * exists go through `Scrubber.addLiterals`, which does not apply it.
+ */
 export function collectLiterals(
   env: Readonly<Record<string, string | undefined>>,
   extra: readonly string[] = [],
 ): readonly string[] {
   const found = new Set<string>()
   const add = (value: string | undefined): void => {
-    if (value === undefined || value.length < MIN_LITERAL_CHARS || value.length > MAX_LITERAL_CHARS) return
-    found.add(value)
-    const escaped = JSON.stringify(value).slice(1, -1)
-    if (escaped !== value && escaped.length <= MAX_LITERAL_CHARS * 2) found.add(escaped)
+    for (const form of literalForms(value)) found.add(form)
   }
   for (const [name, value] of Object.entries(env)) {
     // `OPENCODE_PASSWORD`, the server's own credential, matches `PASSWORD`.
@@ -910,6 +922,15 @@ export interface Scrubber {
   readonly survived?: (text: string) => boolean
   /** How many values `survived` has reported so far. Normally 0: a non-zero count means a matcher missed a known literal. */
   readonly survivalCount?: () => number
+  /**
+   * Adds literal secrets that became known after the scrubber was created (a credential minted mid-run). Every later `scrub`
+   * and `survived` treats them like the construction-time literals: raw and JSON-escaped, with the same length bounds (a value
+   * under eight characters is not matched, so it cannot redact ordinary text). Unlike the construction-time set, which keeps
+   * only the longest `MAX_LITERALS`, none of these is dropped for want of room: dropping one would export a secret the caller
+   * said it knew. A value already known is ignored. The cost of a scrub grows with the number of literals, so a caller adds
+   * secrets, not arbitrary text.
+   */
+  readonly addLiterals?: (values: readonly string[]) => void
 }
 
 export interface ScrubberOptions {
@@ -990,10 +1011,21 @@ export function scrubWithMatchers(
 
 export function createScrubber(options: ScrubberOptions = {}): Scrubber {
   const ceiling = options.limits?.inputCeilingChars ?? DEFAULT_CONTENT_LIMITS.inputCeilingChars
-  const literals = collectLiterals(options.env ?? {}, options.extraSecrets)
+  // Mutable: `addLiterals` appends, and the literal matcher reads this same array on every scrub.
+  const literals = [...collectLiterals(options.env ?? {}, options.extraSecrets)]
+  const known = new Set(literals)
   const matchers = [...(options.patterns ?? SCRUB_PATTERNS), literalMatcher(literals)]
   let survivals = 0
   return {
+    addLiterals: values => {
+      for (const value of values) {
+        for (const form of literalForms(value)) {
+          if (known.has(form)) continue
+          known.add(form)
+          literals.push(form)
+        }
+      }
+    },
     inputCeilingChars: ceiling,
     survived: text => {
       for (const literal of literals) {
@@ -1139,6 +1171,14 @@ const isContentAttribute = (value: unknown): value is ContentAttribute =>
 export type PlainAttributeValue = string | number | boolean | readonly string[]
 export type PendingAttributeValue = PlainAttributeValue | ContentAttribute
 
+/** A link from a span to another span, in this trace or another. The ids are hex, as the producer chose them. */
+export interface SpanLink {
+  readonly traceId: string
+  readonly spanId: string
+  /** Text attributes of the link. Scrubbed like an event's. */
+  readonly attributes: Readonly<Record<string, string>>
+}
+
 export interface PendingSpan {
   readonly traceId: string
   readonly spanId: string
@@ -1155,6 +1195,8 @@ export interface PendingSpan {
     readonly timeMs: number
     readonly attributes: Readonly<Record<string, string>>
   }[]
+  /** Links to other spans. Absent for a span with none. */
+  readonly links?: readonly SpanLink[]
   /** Content the hook-time snapshot could not take, as `attribute:reason`. Carried into the span's omission marker. */
   readonly omitted?: readonly string[]
   /** Items already left out before this point (oldest history over the snapshot's ceiling), per attribute. */
@@ -1180,6 +1222,8 @@ export interface ScrubbedSpan {
     readonly timeMs: number
     readonly attributes: Readonly<Record<string, string>>
   }[]
+  /** Present only when the span had links. */
+  readonly links?: readonly SpanLink[]
 }
 
 /** Marker attribute names. Fixed vocabulary: none reflects content. */
@@ -1450,6 +1494,17 @@ export function scrubSpan(
     ),
   }))
 
+  const links = span.links?.map(link => ({
+    traceId: link.traceId,
+    spanId: link.spanId,
+    attributes: Object.fromEntries(
+      Object.entries(link.attributes).map(([key, text]) => [
+        key,
+        scrubPlain(text, `link.${key}`, scrubber, limits, tally),
+      ]),
+    ),
+  }))
+
   if (tally.redactions > 0) attributes[MARKER.redactions] = tally.redactions
   if (tally.truncated.length > 0) attributes[MARKER.truncated] = tally.truncated
   if (tally.omitted.length > 0) attributes[MARKER.omitted] = tally.omitted
@@ -1467,5 +1522,6 @@ export function scrubSpan(
     attributes,
     status: statusMessage === undefined ? {code: span.status.code} : {code: span.status.code, message: statusMessage},
     events,
+    ...(links === undefined ? {} : {links}),
   }
 }
