@@ -383,7 +383,7 @@ With `isolate-agent`, the Action creates a per-run local user, hands it only the
 
 ### Run Tracing (Action + Plugin)
 
-Opt-in OpenTelemetry tracing of a run. `@fro.bot/opencode-plugin` (`packages/opencode-plugin/src/tracing/`) turns hook calls and session events into GenAI spans and exports them over OTLP/HTTP. In the Action, a relay child (`dist/trace-relay.js`, supervised by `src/harness/phases/trace-relay-process.ts`) holds the collector URL and credential from `trace-endpoint` and `trace-headers`.
+Opt-in OpenTelemetry tracing of a run. `@fro.bot/opencode-plugin` (`packages/opencode-plugin/src/tracing/`) turns hook calls and session events into GenAI spans and exports them over OTLP/HTTP through the shared scrubber and exporter in `packages/runtime/src/tracing/`, which the plugin bundles inline (its built output imports only `effect`, `@opencode/plugin` and `node:` modules). In the Action, a relay child (`dist/trace-relay.js`, supervised by `src/harness/phases/trace-relay-process.ts`) holds the collector URL and credential from `trace-endpoint` and `trace-headers`.
 
 - Only the operator turns tracing on or picks the destination: Action inputs, or a user-owned settings file for a local session. Plugin options, project config and repository content never do.
 - The server gets only the relay's loopback address and the run identity (`packages/runtime/src/agent/tracing-launcher.ts`), never the credential or collector host.
