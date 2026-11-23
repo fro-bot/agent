@@ -26,6 +26,8 @@ export interface RestoreCacheOptions {
   readonly storeConfig?: ObjectStoreConfig
   readonly storeAdapter?: ObjectStoreAdapter
   readonly cacheAdapter?: CacheAdapter
+  /** The `skip-cache` input. Skips the restore entirely, like the `SKIP_CACHE=true` environment variable. */
+  readonly skipCache?: boolean
 }
 
 /**
@@ -53,4 +55,6 @@ export interface SaveCacheOptions {
   readonly storeAdapter?: ObjectStoreAdapter
   readonly objectStorePublish?: ObjectStorePublish
   readonly cacheAdapter?: CacheAdapter
+  /** The `skip-cache` input. Skips the save entirely, like the `SKIP_CACHE=true` environment variable. */
+  readonly skipCache?: boolean
 }

@@ -170,6 +170,8 @@ export async function run(): Promise<number> {
   let liveObservation: ExecutePhaseResult['liveObservation']
   let requestedOutputModeState: OutputModeRequestState = 'omitted'
   let finalizationStarted = false
+  // Hoisted for cleanup, which runs from the `finally` block; stays false until bootstrap resolves inputs.
+  let skipCache = false
   let storeConfig: ObjectStoreConfig = {
     enabled: false,
     bucket: '',
@@ -301,6 +303,7 @@ export async function run(): Promise<number> {
     // Owned from here on: every exit path below releases it, including a V2 start that fails or throws.
     sandboxLifecycle = bootstrap.sandbox ?? null
     storeConfig = bootstrap.inputs.storeConfig
+    skipCache = bootstrap.inputs.skipCache
     sessionRetention = bootstrap.inputs.sessionRetention
     responseMode = bootstrap.inputs.responseMode
 
@@ -695,6 +698,7 @@ export async function run(): Promise<number> {
       attachmentResult,
       ...(serverHandleV2 === null ? {} : {serverHandleV2}),
       storeConfig,
+      skipCache,
       metrics,
       agentIdentity: 'github',
       repo,

@@ -91,6 +91,7 @@ describe('restoreCache', () => {
   })
 
   afterEach(async () => {
+    vi.unstubAllEnvs()
     await fs.rm(tempDir, {recursive: true, force: true})
   })
 
@@ -113,6 +114,70 @@ describe('restoreCache', () => {
     expect(result.key).toBeNull()
     expect(result.corrupted).toBe(false)
     expect(result.source).toBeNull()
+  })
+
+  it.each([
+    {label: 'skipCache: true', options: {skipCache: true}, adapterCalls: 0},
+    {label: 'skipCache: false', options: {skipCache: false}, adapterCalls: 1},
+    {label: 'skipCache unset', options: {}, adapterCalls: 1},
+  ])('honors the skipCache option ($label)', async ({options: skipOptions, adapterCalls}) => {
+    // #given a cache adapter that would hit, and no SKIP_CACHE in the environment
+    vi.stubEnv('SKIP_CACHE', '')
+    const adapter = createMockCacheAdapter({restoreResult: 'opencode-storage-github-owner-repo-main-Linux'})
+    const restoreSpy = vi.spyOn(adapter, 'restoreCache')
+
+    // #when restoring with the option
+    await restoreCache({
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      cacheAdapter: adapter,
+      ...skipOptions,
+    })
+
+    // #then the adapter is reached only when the restore is not skipped
+    expect(restoreSpy).toHaveBeenCalledTimes(adapterCalls)
+  })
+
+  it('returns a miss without restoring when skipCache is true', async () => {
+    // #given a cache adapter that would hit
+    vi.stubEnv('SKIP_CACHE', '')
+    const adapter = createMockCacheAdapter({restoreResult: 'opencode-storage-github-owner-repo-main-Linux'})
+
+    // #when restoring with skipCache: true
+    const result = await restoreCache({
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      cacheAdapter: adapter,
+      skipCache: true,
+    })
+
+    // #then the result is a plain miss and the storage directory exists for the run
+    expect(result).toEqual({hit: false, key: null, restoredPath: null, corrupted: false, source: null})
+    await expect(fs.stat(storagePath)).resolves.toBeDefined()
+  })
+
+  it('still skips the restore when SKIP_CACHE=true and the option is unset', async () => {
+    // #given the environment variable callers set today
+    vi.stubEnv('SKIP_CACHE', 'true')
+    const adapter = createMockCacheAdapter({restoreResult: 'opencode-storage-github-owner-repo-main-Linux'})
+    const restoreSpy = vi.spyOn(adapter, 'restoreCache')
+
+    // #when restoring
+    const result = await restoreCache({
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      cacheAdapter: adapter,
+    })
+
+    // #then the adapter is never called
+    expect(result.hit).toBe(false)
+    expect(restoreSpy).not.toHaveBeenCalled()
   })
 
   it('returns hit: true with key on cache hit', async () => {
@@ -1439,6 +1504,47 @@ describe('saveCache', () => {
       } else {
         process.env.SKIP_CACHE = previousSkipCache
       }
+    }
+  })
+
+  it('skips both backends when the skipCache option is true, and not when it is false or unset', async () => {
+    // #given storage with content, no SKIP_CACHE in the environment, and an object store configured
+    vi.stubEnv('SKIP_CACHE', '')
+    await fs.mkdir(storagePath, {recursive: true})
+    await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
+
+    const run = async (skipOptions: {readonly skipCache?: boolean}) => {
+      const upload = vi.fn<ObjectStoreAdapter['upload']>(async () => ok(undefined))
+      const saveCacheSpy = vi.fn(async () => 1)
+      const result = await saveCache({
+        components: testComponents,
+        runId: 98765,
+        logger: createTestLogger(),
+        storagePath,
+        authPath,
+        cacheAdapter: {restoreCache: async () => undefined, saveCache: saveCacheSpy},
+        storeConfig: testStoreConfig,
+        storeAdapter: createMockStoreAdapter({upload}),
+        ...skipOptions,
+      })
+      return {result, upload, saveCacheSpy}
+    }
+
+    // #when saving with skipCache: true
+    const skipped = await run({skipCache: true})
+
+    // #then neither backend is attempted
+    expect(skipped.result).toEqual({cachePersisted: false, storePersisted: false, outcome: 'skipped-by-configuration'})
+    expect(skipped.saveCacheSpy).not.toHaveBeenCalled()
+    expect(skipped.upload).not.toHaveBeenCalled()
+
+    // #when saving with skipCache: false or unset
+    for (const skipOptions of [{skipCache: false}, {}]) {
+      const attempted = await run(skipOptions)
+
+      // #then the save is attempted
+      expect(attempted.result.outcome).not.toBe('skipped-by-configuration')
+      expect(attempted.saveCacheSpy).toHaveBeenCalled()
     }
   })
 

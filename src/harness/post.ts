@@ -160,6 +160,8 @@ async function persistRunState(logger: Logger): Promise<void> {
   // state) as 'not-persisted' -- fail toward retrying the save, never toward skipping it,
   // since this post hook is the last chance to persist state for the run.
   const cacheSaved = parseCacheSaveStateValue(core.getState(STATE_KEYS.CACHE_SAVED))
+  // Written by the main step's bootstrap from the `skip-cache` input; the post hook reads state, not inputs.
+  const skipCache = core.getState(STATE_KEYS.SKIP_CACHE) === 'true'
   const sessionId = core.getState(STATE_KEYS.SESSION_ID) || null
   const storeConfig = reconstructStoreConfigFromState()
   // On an isolated run the log directory is sandbox-writable until the main step confirms the teardown. Only an explicit
@@ -188,7 +190,11 @@ async function persistRunState(logger: Logger): Promise<void> {
     return
   }
 
-  if (cacheSaved === 'durable' || cacheSaved === 'store-only' || cacheSaved === 'skipped') {
+  if (skipCache) {
+    // The run was told to skip the cache, so a retry would only repeat the no-op, whatever the main step recorded
+    // (including nothing, when it died before cleanup).
+    logger.info('Skipping post-action: skip-cache was set', {cacheSaved})
+  } else if (cacheSaved === 'durable' || cacheSaved === 'store-only' || cacheSaved === 'skipped') {
     // durable: the cache write itself already persisted -- nothing left to do.
     // store-only: the database is durable in the object store independently of the cache
     //   write -- only opencode.db travels through the store (DB_TRANSPORTABLE_BASENAMES),
@@ -200,7 +206,7 @@ async function persistRunState(logger: Logger): Promise<void> {
     //   doc on cache-rejected). The retry below never publishes to the object store, so
     //   repeating the save here would only re-attempt the Actions cache write, which the
     //   store already makes redundant for the database.
-    // skipped: SKIP_CACHE=true -- a deliberate no-op; retrying would just repeat it.
+    // skipped: `skip-cache` is `true` or `SKIP_CACHE` is set -- a deliberate no-op; retrying would just repeat it.
     const skipReason =
       cacheSaved === 'durable'
         ? 'cache saved by main action'

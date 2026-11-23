@@ -648,6 +648,22 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
     expect(saveCache).toHaveBeenCalledTimes(1)
   })
 
+  it.each([
+    {label: 'true', options: {skipCache: true}, expected: true},
+    {label: 'false', options: {skipCache: false}, expected: false},
+    {label: 'omitted', options: {}, expected: false},
+  ])('hands skip-cache ($label) to the cache save', async ({options, expected}) => {
+    // #given cleanup options with or without skip-cache
+    const {saveCache} = await import('../../services/cache/index.js')
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs
+    await runCleanup(baseOptions(options))
+
+    // #then the save receives it as an explicit option
+    expect(saveCache).toHaveBeenCalledWith(expect.objectContaining({skipCache: expected}))
+  })
+
   it('declines cache persistence when server shutdown could not confirm quiescence', async () => {
     // #given shutdown() reports quiesced: false
     const {saveCache} = await import('../../services/cache/index.js')

@@ -32,6 +32,10 @@ describe('state-keys', () => {
       expect(STATE_KEYS.LOCK_ACQUISITION_TOKEN).toBe('lockAcquisitionToken')
     })
 
+    it('contains skipCache key', () => {
+      expect(STATE_KEYS.SKIP_CACHE).toBe('skipCache')
+    })
+
     it('contains lockHolderJob key', () => {
       expect(STATE_KEYS.LOCK_HOLDER_JOB).toBe('lockHolderJob')
     })
@@ -50,7 +54,7 @@ describe('state-keys', () => {
     })
 
     it('has correct number of keys', () => {
-      expect(Object.keys(STATE_KEYS)).toHaveLength(21)
+      expect(Object.keys(STATE_KEYS)).toHaveLength(22)
     })
 
     it('values are string type compatible', () => {

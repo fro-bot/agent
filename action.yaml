@@ -92,7 +92,7 @@ inputs:
     description: Systematic plugin version to register with OpenCode. Defaults to version pinned in source code if not set.
     required: false
   skip-cache:
-    description: Skip session cache restore (default false)
+    description: Skip session cache restore and save (default false)
     required: false
     default: 'false'
   repo-skills:
@@ -216,8 +216,8 @@ outputs:
     description: >-
       Session persistence outcome for this run: durable (the Actions cache write
       persisted), store-only (the object store persisted the state but the Actions
-      cache write did not), skipped (SKIP_CACHE was set), declined-for-safety (the
-      save was deliberately refused because persistence safety could not be
+      cache write did not), skipped (`skip-cache` is `true` or SKIP_CACHE is set),
+      declined-for-safety (the save was deliberately refused because persistence safety could not be
       confirmed -- a live writer may still exist; this run will not retry it), or
       not-persisted (nothing durable happened -- a rejected write, a declined
       checkpoint, or no cacheable content found; the job summary names which --
