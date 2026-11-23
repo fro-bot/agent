@@ -2,6 +2,22 @@ import {describe, expect, it} from 'vitest'
 import {filterAgentEnv} from './filter-env.js'
 
 describe('filterAgentEnv', () => {
+  it('admits the tracing launcher variable by name, so the spawn must replace an inherited value', () => {
+    // #given the launcher variable the plugin reads, beside OpenTelemetry settings the agent must never see
+    const env = {
+      OPENCODE_FROBOT_TRACING: '{"version":1,"host":"action","tracing":"off"}',
+      OTEL_EXPORTER_OTLP_ENDPOINT: 'https://collector.example.test',
+      OTEL_EXPORTER_OTLP_HEADERS: 'authorization=Basic abc',
+      OTEL_RESOURCE_ATTRIBUTES: 'a=b',
+    }
+
+    // #when
+    const result = filterAgentEnv(env)
+
+    // #then the OPENCODE_ prefix admits it (the spawn sets its own over it), and no OTEL_ name gets through
+    expect(result).toEqual({OPENCODE_FROBOT_TRACING: env.OPENCODE_FROBOT_TRACING})
+  })
+
   it('retains allowlisted keys unchanged', () => {
     // #given
     const env = {

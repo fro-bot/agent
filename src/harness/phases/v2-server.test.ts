@@ -1,4 +1,10 @@
-import type {OpenCodeV2ServerHandle, OpenCodeV2ShutdownResult} from '@fro-bot/runtime'
+import type {
+  OpenCodeV2ActionTracingHost,
+  OpenCodeV2ServerHandle,
+  OpenCodeV2ShutdownResult,
+  OpenCodeV2TracingDecision,
+} from '@fro-bot/runtime'
+import type {ActionTracingSource} from '../../services/setup/tracing.js'
 import type {KeyProxyProbeResult} from './key-proxy-probe.js'
 import type {KeyProxyProcess} from './key-proxy-process.js'
 import type {SandboxLifecycle} from './sandbox-lifecycle.js'
@@ -8,7 +14,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import {DatabaseSync} from 'node:sqlite'
 import {err} from '@bfra.me/es/result'
-import {clearHeldClaims} from '@fro-bot/runtime'
+import {ACTION_TRACING_OFF, clearHeldClaims} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi, type Mock} from 'vitest'
 import {pluginCacheDir, resolvePluginSpecsV2} from '../../services/setup/plugin-install-v2.js'
 import {createRepoSkillsStagingRoot} from '../../services/setup/repo-skills.js'
@@ -30,7 +36,9 @@ interface FakeServer {
   readonly loadConfig: (config: Readonly<Record<string, unknown>> | undefined) => void
 }
 
-function fakeServer(options: {agents?: unknown; integration?: unknown; agentStatus?: number} = {}): FakeServer {
+function fakeServer(
+  options: {agents?: unknown; integration?: unknown; agentStatus?: number; providers?: readonly string[]} = {},
+): FakeServer {
   let loaded: unknown[] = []
   const shutdown = vi.fn(async (): Promise<OpenCodeV2ShutdownResult> => ({
     interrupts: {stopped: [], notRunning: [], unconfirmed: []},
@@ -43,6 +51,9 @@ function fakeServer(options: {agents?: unknown; integration?: unknown; agentStat
     }
     if (pathname.startsWith('/api/integration/')) {
       return new Response(JSON.stringify(options.integration ?? {data: {connections: []}}), {status: 200})
+    }
+    if (pathname === '/api/provider' && options.providers !== undefined) {
+      return new Response(JSON.stringify({data: options.providers.map(id => ({id}))}), {status: 200})
     }
     return new Response('{}', {status: 404})
   })
@@ -97,8 +108,35 @@ function spawnedConfig(deps: Partial<StartActionOpenCodeV2Deps>): {mcp?: unknown
   return config as {mcp?: unknown}
 }
 
+/** What the spawn would be given at the moment it is made: the resolver of a late setting is called, as the server start does. */
+function decisionOf(deps: Partial<StartActionOpenCodeV2Deps>): OpenCodeV2TracingDecision {
+  const setting = vi.mocked(deps.startServer as StartServer).mock.calls[0]?.[0].tracingHost
+  if (typeof setting !== 'function') throw new Error('expected a late tracing setting')
+  return setting()
+}
+
+/** A binary that writes the launcher variable and the config it was started with, then leaves. */
+function recordingBinary(root: string): {binaryPath: string; launcher: () => string; config: () => string} {
+  const launcherFile = path.join(root, 'child-launcher.txt')
+  const configFile = path.join(root, 'child-config.txt')
+  const binaryPath = path.join(root, 'recording-opencode')
+  fs.writeFileSync(
+    binaryPath,
+    `#!/bin/sh\nprintf '%s' "$OPENCODE_FROBOT_TRACING" > '${launcherFile}'\nprintf '%s' "$OPENCODE_CONFIG_CONTENT" > '${configFile}'\nexit 0\n`,
+    {mode: 0o755},
+  )
+  return {
+    binaryPath,
+    launcher: () => fs.readFileSync(launcherFile, 'utf8'),
+    config: () => fs.readFileSync(configFile, 'utf8'),
+  }
+}
+
+/** The config the child would receive: the late decision's when it has one, else the start's own. */
 function spawnedContent(deps: Partial<StartActionOpenCodeV2Deps>): Record<string, unknown> {
-  return vi.mocked(deps.startServer as StartServer).mock.calls[0]?.[0].config as Record<string, unknown>
+  const spawn = vi.mocked(deps.startServer as StartServer).mock.calls[0]?.[0]
+  const decided = typeof spawn?.tracingHost === 'function' ? spawn.tracingHost().config : undefined
+  return (decided ?? spawn?.config) as Record<string, unknown>
 }
 
 describe('startActionOpenCodeV2', () => {
@@ -143,6 +181,7 @@ describe('startActionOpenCodeV2', () => {
       env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
       runId: 42,
       runAttempt: 1,
+      tracing: ACTION_TRACING_OFF,
       logger: createMockLogger(),
       ...overrides,
     }
@@ -208,6 +247,184 @@ describe('startActionOpenCodeV2', () => {
     expect(JSON.stringify(startArgs?.config)).not.toContain(CANARY)
   })
 
+  describe('tracing', () => {
+    const TRACING_ON: OpenCodeV2ActionTracingHost = {
+      host: 'action',
+      tracing: 'on',
+      relayPort: 43_210,
+      identity: {repository: 'owner/repo', runId: '42', attempt: '1', job: 'review', trigger: 'pull_request'},
+    }
+
+    it('hands the spawn a late setting that resolves to the host it was given, off or on', async () => {
+      // #given
+      const offDeps = recordingDeps(fakeServer())
+      const onDeps = recordingDeps(fakeServer())
+
+      // #when
+      await startActionOpenCodeV2(options({deps: offDeps, tracing: ACTION_TRACING_OFF}))
+      await startActionOpenCodeV2(options({deps: onDeps, tracing: TRACING_ON}))
+
+      // #then
+      expect(decisionOf(offDeps).host).toEqual(ACTION_TRACING_OFF)
+      expect(decisionOf(onDeps).host).toEqual(TRACING_ON)
+    })
+
+    it('says off, with no config of its own, when the source goes off between preparation and the spawn', async () => {
+      // #given a source that says on while the start is prepared and off when the spawn asks
+      const reads: OpenCodeV2ActionTracingHost[] = [TRACING_ON, ACTION_TRACING_OFF]
+      const source = vi.fn(() => reads.shift() ?? ACTION_TRACING_OFF)
+      const deps = recordingDeps(fakeServer())
+
+      // #when
+      const started = await startActionOpenCodeV2(options({deps, tracing: source}))
+
+      // #then the run went on, and the decision is the plain off one: the start's own (tracing-off) config stands
+      expect(started.success).toBe(true)
+      expect(decisionOf(deps)).toEqual({host: ACTION_TRACING_OFF})
+      expect(source).toHaveBeenCalledTimes(2)
+    })
+
+    it('reads the source again for every spawn, never caching the first answer', async () => {
+      // #given a source that is on for two reads (preparation, the first spawn) and off afterwards
+      let reads = 0
+      const source = vi.fn((): OpenCodeV2ActionTracingHost => {
+        reads += 1
+        return reads <= 2 ? TRACING_ON : ACTION_TRACING_OFF
+      })
+      const firstDeps = recordingDeps(fakeServer())
+      const secondDeps = recordingDeps(fakeServer())
+      const opts = options({deps: firstDeps, tracing: source})
+
+      // #when two servers are started from the same options, as a restart would
+      await startActionOpenCodeV2(opts)
+      // (the mocked server start does not call the resolver, so the test is the spawn and reads it in order)
+      const first = decisionOf(firstDeps).host
+      await startActionOpenCodeV2({...opts, deps: secondDeps})
+      const second = decisionOf(secondDeps).host
+
+      // #then each spawn saw the answer at its own moment
+      expect(first).toEqual(TRACING_ON)
+      expect(second).toEqual(ACTION_TRACING_OFF)
+    })
+
+    it('lists the Fro Bot plugin after the operator plugins only when tracing is on', async () => {
+      // #given two operator plugins
+      const opencodeConfig = JSON.stringify({plugins: ['op-one', 'op-two']})
+      const offDeps = recordingDeps(fakeServer())
+      const onDeps = recordingDeps(fakeServer())
+
+      // #when
+      await startActionOpenCodeV2(options({deps: offDeps, opencodeConfig}))
+      await startActionOpenCodeV2(options({deps: onDeps, opencodeConfig, tracing: TRACING_ON}))
+
+      // #then tracing off is the order it has always had, and tracing on moves only this plugin
+      const [systematic, froBot] = PLUGIN_SPECS
+      expect(spawnedContent(offDeps).plugins).toEqual([systematic, froBot, 'op-one', 'op-two'])
+      expect(spawnedContent(onDeps).plugins).toEqual([systematic, 'op-one', 'op-two', froBot])
+    })
+
+    describe('what the child is actually given (a real spawn of a recording binary)', () => {
+      const OPERATOR_PLUGINS = ['op-one', '@fro.bot/opencode-plugin', 'op-two']
+      const OPERATOR_CONFIG = JSON.stringify({plugins: OPERATOR_PLUGINS})
+      const OFF_LAUNCHER = '{"version":1,"host":"action","tracing":"off"}'
+
+      /**
+       * Starts the Action's server start against the recording binary with the REAL runtime start. `relayDownDuringPort` makes the
+       * source go off while the runtime is picking the port: a microtask queued by the password registration (the first thing the
+       * start does, before its port allocation yields) runs at that yield.
+       */
+      async function spawnChild(spec: {
+        readonly tracing: (relay: {down: boolean}) => ActionTracingSource
+        readonly relayDownDuringPort?: boolean
+        readonly relayDownBeforeStart?: boolean
+      }) {
+        const binary = recordingBinary(root)
+        const relay = {down: spec.relayDownBeforeStart === true}
+        let spawning = false
+        const {startOpenCodeV2Server} = await import('@fro-bot/runtime')
+        const deps = recordingDeps(fakeServer(), {
+          startServer: async (spawnOptions, spawnLogger) => {
+            spawning = true
+            return startOpenCodeV2Server({...spawnOptions, timeouts: {agentReadyTimeoutMs: 2000}}, spawnLogger)
+          },
+        })
+        const outcome = await startActionOpenCodeV2(
+          options({
+            deps,
+            binaryPath: binary.binaryPath,
+            workspacePath: root,
+            opencodeConfig: OPERATOR_CONFIG,
+            tracing: spec.tracing(relay),
+            maskSecret: () => {
+              if (spawning && spec.relayDownDuringPort === true) {
+                queueMicrotask(() => {
+                  relay.down = true
+                })
+              }
+            },
+          }),
+        )
+        if (!fs.existsSync(path.join(root, 'child-launcher.txt')))
+          throw new Error(`the child was never spawned: ${JSON.stringify(outcome)}`)
+        // Each start writes its credential files into a directory with a random name; the rest of the config is its own.
+        return {
+          launcher: binary.launcher(),
+          config: binary.config().replaceAll(/fro-bot-credentials-[A-Za-z0-9]+/g, 'fro-bot-credentials-X'),
+        }
+      }
+
+      const liveSource = (relay: {down: boolean}) => (): OpenCodeV2ActionTracingHost =>
+        relay.down ? ACTION_TRACING_OFF : TRACING_ON
+
+      it('gives the child the on document and the plugin-last list when the relay is alive at the spawn', async () => {
+        // #given a relay that stays up
+        const child = await spawnChild({tracing: liveSource})
+
+        // #then the launcher says on, with the relay port and identity
+        expect(JSON.parse(child.launcher)).toMatchObject({tracing: 'on', relay: 'http://127.0.0.1:43210/v1/traces'})
+        // and the config has this plugin last, with the operator's own entry for it dropped (listed once, at the end)
+        const [systematic, froBot] = PLUGIN_SPECS
+        expect((JSON.parse(child.config) as {plugins: string[]}).plugins).toEqual([
+          systematic,
+          'op-one',
+          'op-two',
+          froBot,
+        ])
+      })
+
+      it('gives the child the tracing-off document AND the tracing-off plugin list when the relay goes down while the port is being allocated', async () => {
+        // #given the child a run with tracing off gets, as the baseline
+        const baseline = await spawnChild({tracing: () => ACTION_TRACING_OFF})
+
+        // #when the relay is up while the start is prepared and goes down while the runtime picks the port
+        const child = await spawnChild({tracing: liveSource, relayDownDuringPort: true})
+
+        // #then the child holds exactly what a tracing-off run gives it: the off document and the off config, byte for byte
+        expect(child.launcher).toBe(OFF_LAUNCHER)
+        expect(child.launcher).toBe(baseline.launcher)
+        expect(child.config).toBe(baseline.config)
+        // and that is the order of today: this plugin before the operator's, the operator's own entry for it kept
+        const [systematic, froBot] = PLUGIN_SPECS
+        expect((JSON.parse(child.config) as {plugins: string[]}).plugins).toEqual([
+          systematic,
+          froBot,
+          'op-one',
+          '@fro.bot/opencode-plugin',
+          'op-two',
+        ])
+      })
+
+      it('gives the child the tracing-off document and list when the relay was already down when the start began', async () => {
+        const baseline = await spawnChild({tracing: () => ACTION_TRACING_OFF})
+
+        const child = await spawnChild({tracing: liveSource, relayDownBeforeStart: true})
+
+        expect(child.launcher).toBe(baseline.launcher)
+        expect(child.config).toBe(baseline.config)
+      })
+    })
+  })
+
   it('produces the config and credential files it always did, and starts no proxy, when isolation is off', async () => {
     // #given two API keys and an operator config that sets a base URL, a timeout and a key reference
     const server = fakeServer()
@@ -239,6 +456,7 @@ describe('startActionOpenCodeV2', () => {
       'directory',
       'env',
       'expectedPluginIds',
+      'tracingHost',
     ])
 
     // #then each provider keeps its operator settings and gains only a {file:} key reference; no baseURL is rewritten
@@ -540,6 +758,29 @@ describe('startActionOpenCodeV2', () => {
     expect(unwrapErr(result).message).toContain('google')
   })
 
+  it('names the disabled default model before the credential gate asks for the config model provider', async () => {
+    // #given no model input, no key, and a config whose top-level model (never the session's model) names a provider
+    // with no credential while the config removes the default model's provider
+    const server = fakeServer({providers: ['anthropic']})
+    const probeKeyProxy = vi.fn()
+    const deps = recordingDeps(server, {probeKeyProxy})
+    const opencodeConfig = JSON.stringify({model: 'anthropic/claude-sonnet-4-6', disabled_providers: ['opencode']})
+
+    // #when
+    const result = await startActionOpenCodeV2(options({deps, model: null, authJson: '{}', opencodeConfig}))
+
+    // #then the start fails at the config stage, naming the default model and the model input
+    expect(result).toMatchObject({success: false, error: {stage: 'config'}})
+    const message = unwrapErr(result).message
+    expect(message).toContain('opencode/big-pickle')
+    expect(message).toContain('`model` input')
+    expect(message).not.toContain('credential')
+    // #and neither later gate was reached
+    expect(server.fetch.mock.calls.map(call => call[0])).not.toContain('/api/integration/anthropic')
+    expect(probeKeyProxy).not.toHaveBeenCalled()
+    expect(server.shutdown).toHaveBeenCalledTimes(1)
+  })
+
   it('checks the provider of every written key when no model is named at all', async () => {
     const server = fakeServer()
 
@@ -554,6 +795,121 @@ describe('startActionOpenCodeV2', () => {
     const result = await startActionOpenCodeV2(options({deps: recordingDeps(server), model: null, authJson: '{}'}))
 
     expect(result.success).toBe(true)
+  })
+
+  describe('the default model', () => {
+    const warnings = (logger: ReturnType<typeof createMockLogger>): string[] =>
+      vi.mocked(logger.warning).mock.calls.map(call => String(call[0]))
+    const defaultModelLines = (lines: string[]): string[] => lines.filter(line => line.includes('opencode/big-pickle'))
+
+    it('warns once, naming the model and the unused provider, when credentials are supplied and no model is set', async () => {
+      // #given an auth-json key and no model input
+      const logger = createMockLogger()
+
+      // #when
+      const result = await startActionOpenCodeV2(options({deps: recordingDeps(fakeServer()), model: null, logger}))
+
+      // #then the run starts, and the one warning says which model runs and that the key is not used by it
+      expect(result.success).toBe(true)
+      const lines = defaultModelLines(warnings(logger))
+      expect(lines).toHaveLength(1)
+      expect(lines[0]).toContain('anthropic')
+      expect(lines[0]).toContain('not used')
+      expect(lines[0]).toContain('`model` input')
+      expect(serializeLoggerCalls(logger)).not.toContain(CANARY)
+    })
+
+    it('warns when only opencode-config declares a provider', async () => {
+      // #given no key, a provider block in opencode-config, and no model input
+      const logger = createMockLogger()
+      const opencodeConfig = JSON.stringify({provider: {gateway: {npm: '@ai-sdk/openai-compatible', options: {}}}})
+
+      // #when
+      const result = await startActionOpenCodeV2(
+        options({deps: recordingDeps(fakeServer()), model: null, authJson: '{}', opencodeConfig, logger}),
+      )
+
+      // #then
+      expect(result.success).toBe(true)
+      const lines = defaultModelLines(warnings(logger))
+      expect(lines).toHaveLength(1)
+      expect(lines[0]).toContain('gateway')
+    })
+
+    it('logs one info line, and no warning, when no credentials are supplied', async () => {
+      // #given
+      const logger = createMockLogger()
+
+      // #when
+      const result = await startActionOpenCodeV2(
+        options({deps: recordingDeps(fakeServer()), model: null, authJson: '{}', logger}),
+      )
+
+      // #then
+      expect(result.success).toBe(true)
+      expect(defaultModelLines(warnings(logger))).toEqual([])
+      const info = vi
+        .mocked(logger.info)
+        .mock.calls.map(call => String(call[0]))
+        .filter(line => line.includes('opencode/big-pickle'))
+      expect(info).toHaveLength(1)
+      expect(info[0]).toContain('free')
+    })
+
+    it('says nothing about the default model when the model input is set', async () => {
+      // #given a model input and a key
+      const logger = createMockLogger()
+      const server = fakeServer({providers: ['anthropic']})
+
+      // #when
+      const result = await startActionOpenCodeV2(options({deps: recordingDeps(server), logger}))
+
+      // #then no default-model line at any level, and the provider list was never read
+      expect(result.success).toBe(true)
+      expect(serializeLoggerCalls(logger)).not.toContain('opencode/big-pickle')
+      expect(server.fetch.mock.calls.map(call => call[0])).not.toContain('/api/provider')
+    })
+
+    it('fails at start, naming the cause, when no model is set and the server has no opencode provider', async () => {
+      // #given a caller config that enables only their provider, and no model input
+      const server = fakeServer({providers: ['anthropic']})
+      const deps = recordingDeps(server)
+      const opencodeConfig = JSON.stringify({enabled_providers: ['anthropic']})
+
+      // #when
+      const result = await startActionOpenCodeV2(options({deps, model: null, opencodeConfig}))
+
+      // #then the start fails with the default model, its provider and the remedy, and the server is stopped
+      expect(result).toMatchObject({success: false, error: {stage: 'config'}})
+      const message = unwrapErr(result).message
+      expect(message).toContain('opencode/big-pickle')
+      expect(message).toContain('`model` input')
+      expect(server.shutdown).toHaveBeenCalledTimes(1)
+      expect(calls).not.toContain('import-wait')
+    })
+
+    it('starts when no model is set and the server lists the opencode provider', async () => {
+      // #given
+      const server = fakeServer({providers: ['opencode', 'anthropic']})
+
+      // #when
+      const result = await startActionOpenCodeV2(options({deps: recordingDeps(server), model: null}))
+
+      // #then
+      expect(result.success).toBe(true)
+    })
+
+    it("does not fail a model-input run for a restricted provider list: the named model is the caller's choice", async () => {
+      // #given a model input on the caller's provider and a server that has only that provider
+      const server = fakeServer({providers: ['anthropic']})
+      const opencodeConfig = JSON.stringify({enabled_providers: ['anthropic']})
+
+      // #when
+      const result = await startActionOpenCodeV2(options({deps: recordingDeps(server), opencodeConfig}))
+
+      // #then
+      expect(result.success).toBe(true)
+    })
   })
 
   it('fails the permission gate, and stops the server, when an agent lacks the deny', async () => {
@@ -1351,6 +1707,7 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
       env,
       runId: 42,
       runAttempt: 1,
+      tracing: ACTION_TRACING_OFF,
       logger: createMockLogger(),
       sandbox,
       deps,
@@ -1575,6 +1932,7 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
         env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
         runId: 42,
         runAttempt: 1,
+        tracing: ACTION_TRACING_OFF,
         logger,
         sandbox: sandbox.sandbox,
         deps,
@@ -1637,6 +1995,7 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
         env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
         runId: 42,
         runAttempt: 1,
+        tracing: ACTION_TRACING_OFF,
         logger: createMockLogger(),
         sandbox: sandbox.sandbox,
         maskSecret: value => masked.push(value),
@@ -1806,6 +2165,7 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
         env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
         runId: 42,
         runAttempt: 1,
+        tracing: ACTION_TRACING_OFF,
         logger: createMockLogger(),
         sandbox: sandbox.sandbox,
         deps,
@@ -1840,6 +2200,7 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
         env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
         runId: 42,
         runAttempt: 1,
+        tracing: ACTION_TRACING_OFF,
         logger: createMockLogger(),
         sandbox: sandbox.sandbox,
         deps,
@@ -1874,6 +2235,7 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
         env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
         runId: 42,
         runAttempt: 1,
+        tracing: ACTION_TRACING_OFF,
         logger: createMockLogger(),
         sandbox: sandbox.sandbox,
         deps,
@@ -1913,6 +2275,7 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
         env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
         runId: 42,
         runAttempt: 1,
+        tracing: ACTION_TRACING_OFF,
         logger: overrides.logger ?? createMockLogger(),
         sandbox,
         deps,
@@ -1940,6 +2303,7 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
         env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
         runId: 42,
         runAttempt: 1,
+        tracing: ACTION_TRACING_OFF,
         logger,
         sandbox: sandbox.sandbox,
         deps,

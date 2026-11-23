@@ -9,9 +9,17 @@ import type {
 import {Buffer} from 'node:buffer'
 import {getEventListeners} from 'node:events'
 import process from 'node:process'
-import {afterEach, describe, expect, it, vi} from 'vitest'
+import {afterEach, describe, expect, expectTypeOf, it, vi} from 'vitest'
 import {createFixture} from './server-v2-test-kit.js'
 import {DEFAULT_OPENCODE_V2_TIMEOUTS, startOpenCodeV2Server} from './server-v2.js'
+import {
+  ACTION_TRACING_OFF,
+  buildTracingLauncherValue,
+  WORKSPACE_TRACING_HOST,
+  type OpenCodeV2TracingDecision,
+  type OpenCodeV2TracingHost,
+  type OpenCodeV2TracingSetting,
+} from './tracing-launcher.js'
 
 const FAST: Partial<OpenCodeV2Timeouts> = {
   listenTimeoutMs: 3000,
@@ -82,6 +90,7 @@ describe('startOpenCodeV2Server', () => {
       directory: created.dir,
       expectedPluginIds: [],
       timeouts: FAST,
+      tracingHost: ACTION_TRACING_OFF,
       ...overrides,
     }
   }
@@ -251,6 +260,173 @@ describe('startOpenCodeV2Server', () => {
       expect(JSON.parse(childEnv.OPENCODE_CONFIG_CONTENT ?? '')).toEqual({plugins: ['@fro.bot/systematic@3.26.4']})
       // A self-update would replace the digest-verified binary mid-run.
       expect(childEnv.OPENCODE_DISABLE_AUTOUPDATE).toBe('1')
+    })
+
+    describe('the tracing launcher variable', () => {
+      const ACTION_ON: OpenCodeV2TracingHost = {
+        host: 'action',
+        tracing: 'on',
+        relayPort: 43_210,
+        identity: {
+          repository: 'fro-bot/agent',
+          runId: '42',
+          attempt: '3',
+          job: 'review',
+          trigger: 'pull_request',
+        },
+      }
+      const LAUNCHER = 'OPENCODE_FROBOT_TRACING'
+
+      it.each([
+        ['Action off', ACTION_TRACING_OFF],
+        ['Action on', ACTION_ON],
+        ['the workspace', WORKSPACE_TRACING_HOST],
+      ])('writes the document for %s into the child environment', async (_name, tracingHost) => {
+        // #given a spawn that declares its host
+        const created = fixture()
+
+        // #when started
+        const result = await start(created, {tracingHost})
+
+        // #then the child holds exactly the launcher document for that host
+        expect(result.success).toBe(true)
+        expect(created.readRecord().env[LAUNCHER]).toBe(buildTracingLauncherValue(tracingHost))
+      })
+
+      it('replaces a value inherited from the job environment, whatever the host says', async () => {
+        // #given a job environment that tries to turn tracing on for a host that says off
+        const created = fixture()
+        const inherited = '{"version":1,"host":"action","tracing":"on","relay":"http://127.0.0.1:1/v1/traces"}'
+        const env = {PATH: process.env.PATH, [LAUNCHER]: inherited}
+
+        // #when started with the Action's off host and with the workspace host
+        const off = await start(created, {env, tracingHost: ACTION_TRACING_OFF})
+
+        // #then the inherited value is gone and the spawn's own is there
+        expect(off.success).toBe(true)
+        expect(created.readRecord().env[LAUNCHER]).toBe('{"version":1,"host":"action","tracing":"off"}')
+        expect(created.readRecord().env[LAUNCHER]).not.toContain('127.0.0.1')
+      })
+
+      it('replaces an inherited value for the workspace host too', async () => {
+        const created = fixture()
+        const env = {PATH: process.env.PATH, [LAUNCHER]: '{"version":1,"host":"action","tracing":"on"}'}
+
+        const result = await start(created, {env, tracingHost: WORKSPACE_TRACING_HOST})
+
+        expect(result.success).toBe(true)
+        expect(created.readRecord().env[LAUNCHER]).toBe('{"version":1,"host":"workspace","tracing":"off"}')
+      })
+
+      it('never hands the server an OTEL_ variable from the job environment', async () => {
+        // #given a job that points OpenCode's own exporter at a collector
+        const created = fixture()
+        const env = {
+          PATH: process.env.PATH,
+          OTEL_EXPORTER_OTLP_ENDPOINT: 'https://collector.example.test',
+          OTEL_EXPORTER_OTLP_HEADERS: 'authorization=Basic abc',
+          OTEL_RESOURCE_ATTRIBUTES: 'a=b',
+          OTEL_SDK_DISABLED: 'false',
+        }
+
+        // #when started with tracing on
+        const result = await start(created, {env, tracingHost: ACTION_ON})
+
+        // #then no OTEL_ name reaches the child
+        expect(result.success).toBe(true)
+        expect(Object.keys(created.readRecord().env).filter(name => name.startsWith('OTEL_'))).toEqual([])
+      })
+
+      it('puts no credential, header or collector host in the document, only the host declaration', async () => {
+        // #given a launcher that knows nothing but a port and an identity
+        const value = buildTracingLauncherValue(ACTION_ON)
+
+        // #then
+        expect(Object.keys(JSON.parse(value) as object).sort()).toEqual([
+          'host',
+          'identity',
+          'relay',
+          'tracing',
+          'version',
+        ])
+        expect(value).toContain('http://127.0.0.1:43210/v1/traces')
+      })
+
+      it('requires a host setting: options without one are not assignable', () => {
+        // #given the options a caller must supply
+        type Required = StartOpenCodeV2ServerOptions
+        type WithoutHost = Omit<Required, 'tracingHost'>
+
+        // #then a call that leaves the host out does not compile (checked by the type checker, not at run time)
+        expectTypeOf<WithoutHost>().not.toExtend<Required>()
+        expectTypeOf<Required['tracingHost']>().toEqualTypeOf<OpenCodeV2TracingSetting>()
+        // the plain host the workspace passes is one of the two forms, and so is a late resolver
+        expectTypeOf<OpenCodeV2TracingHost>().toExtend<OpenCodeV2TracingSetting>()
+        expectTypeOf<() => OpenCodeV2TracingDecision>().toExtend<OpenCodeV2TracingSetting>()
+      })
+
+      describe('a late decision', () => {
+        const BASE_CONFIG = {plugins: ['systematic', 'fro-bot', 'op-one']}
+        const ON_CONFIG = {plugins: ['systematic', 'op-one', 'fro-bot']}
+
+        it('is taken after the port is allocated and once, so a relay that went down while the port was picked is not advertised', async () => {
+          // #given a relay that goes down while the start is allocating its port: a microtask queued by the first call the
+          // start makes (registering the password) runs when the start yields to the port allocation
+          const created = fixture()
+          const relay = {down: false}
+          const decide = vi.fn((): OpenCodeV2TracingDecision =>
+            relay.down ? {host: ACTION_TRACING_OFF} : {host: ACTION_ON, config: ON_CONFIG},
+          )
+
+          // #when
+          const result = await start(created, {
+            config: BASE_CONFIG,
+            tracingHost: decide,
+            maskSecret: () => {
+              queueMicrotask(() => {
+                relay.down = true
+              })
+            },
+          })
+
+          // #then the child was given the off document and the base config, byte for byte what an off start gives
+          expect(result.success).toBe(true)
+          expect(decide).toHaveBeenCalledTimes(1)
+          expect(created.readRecord().env[LAUNCHER]).toBe(buildTracingLauncherValue(ACTION_TRACING_OFF))
+          expect(created.readRecord().env.OPENCODE_CONFIG_CONTENT).toBe(JSON.stringify(BASE_CONFIG))
+        })
+
+        it('gives the child the decision’s document and config when the relay is still up at the spawn', async () => {
+          // #given a relay that stays up
+          const created = fixture()
+
+          // #when
+          const result = await start(created, {
+            config: BASE_CONFIG,
+            tracingHost: () => ({host: ACTION_ON, config: ON_CONFIG}),
+          })
+
+          // #then
+          expect(result.success).toBe(true)
+          expect(created.readRecord().env[LAUNCHER]).toBe(buildTracingLauncherValue(ACTION_ON))
+          expect(created.readRecord().env.OPENCODE_CONFIG_CONTENT).toBe(JSON.stringify(ON_CONFIG))
+        })
+
+        it('keeps the base config when the decision carries none, and replaces an inherited launcher value', async () => {
+          const created = fixture()
+          const env = {PATH: process.env.PATH, [LAUNCHER]: '{"version":1,"host":"action","tracing":"on"}'}
+
+          const result = await start(created, {
+            config: BASE_CONFIG,
+            env,
+            tracingHost: () => ({host: ACTION_TRACING_OFF}),
+          })
+
+          expect(result.success).toBe(true)
+          expect(created.readRecord().env[LAUNCHER]).toBe(buildTracingLauncherValue(ACTION_TRACING_OFF))
+          expect(created.readRecord().env.OPENCODE_CONFIG_CONTENT).toBe(JSON.stringify(BASE_CONFIG))
+        })
+      })
     })
 
     it('gives the server gh auth only through GH_CONFIG_DIR, never a GH_TOKEN (#2156)', async () => {

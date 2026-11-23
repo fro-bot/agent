@@ -5,7 +5,7 @@ import type {Server} from 'node:http'
  * starts the server as the sandbox user and drives one turn. Nothing here is product code and nothing here runs outside
  * that suite.
  */
-import type {OpenCodeV2ServerHandle} from '@fro-bot/runtime'
+import type {OpenCodeV2ServerHandle, OpenCodeV2TracingSetting} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
 import type {SandboxLifecycle} from './sandbox-lifecycle.js'
 import {Buffer} from 'node:buffer'
@@ -14,7 +14,7 @@ import * as fs from 'node:fs'
 import http from 'node:http'
 import path from 'node:path'
 import {DatabaseSync} from 'node:sqlite'
-import {startOpenCodeV2Server} from '@fro-bot/runtime'
+import {ACTION_TRACING_OFF, startOpenCodeV2Server} from '@fro-bot/runtime'
 
 export const PRELUDE = String.raw`R(){ echo "RESULT $1 $2 $3"; }; ev(){ head -c 240 | tr '\n\r\t' '   '; }; `
 export const q = (value: string): string => `'${value.replaceAll("'", String.raw`'\''`)}'`
@@ -90,7 +90,7 @@ export interface Row {
 
 export function parseRows(text: string): Map<string, Row[]> {
   const rows = new Map<string, Row[]>()
-  for (const match of text.matchAll(/RESULT ([a-z0-9_]+) (BLOCKED|OPEN|WORKS|FAILED|INFO) ([^\n"]*)/g)) {
+  for (const match of text.matchAll(/RESULT ([a-z0-9_]+) (BLOCKED|OPEN|WORKS|FAILED|INFO|INCOMPLETE) ([^\n"]*)/g)) {
     const [, id, status, evidence] = match
     if (id === undefined || status === undefined) continue
     rows.set(id, [...(rows.get(id) ?? []), {status, evidence: (evidence ?? '').trim()}])
@@ -196,16 +196,101 @@ export async function startScriptedProvider(steps: () => readonly Probe[]): Prom
   }
 }
 
-export interface ScriptedSessionOptions {
+/** A plugin the server loads for a traced turn, and what the launcher tells it. Without one: no plugin, tracing off. */
+export interface ScriptedTracing {
+  /** Exact plugin specs for the config, already installed in the cache the server reads. */
+  readonly specs: readonly string[]
+  /** Plugin ids the server must list as active before it counts as started. */
+  readonly expectedPluginIds: readonly string[]
+  readonly host: OpenCodeV2TracingSetting
+}
+
+interface ScriptedServerInput {
   readonly binary: string
   readonly workspace: string
   readonly env: NodeJS.ProcessEnv
-  readonly lifecycle: SandboxLifecycle
   /** The provider key file, referenced from the config. Omit it when `proxy` supplies the base URL and credential. */
   readonly keyFile?: string
   /** A key proxy's base URL and placeholder for the provider, in place of the direct URL and the key file. */
   readonly proxy?: {readonly baseURL: string; readonly apiKey: string}
   readonly provider: ScriptedProvider
+  readonly tracing?: ScriptedTracing
+}
+
+/** The server start both launchers share: the config and the plugin and tracing declarations. The caller adds the sandbox. */
+function scriptedServerOptions(input: ScriptedServerInput) {
+  return {
+    binaryPath: input.binary,
+    directory: input.workspace,
+    expectedPluginIds: input.tracing?.expectedPluginIds ?? [],
+    tracingHost: input.tracing?.host ?? ACTION_TRACING_OFF,
+    env: input.env,
+    config: {
+      share: 'disabled',
+      model: 'fake/fixture-model',
+      plugins: input.tracing?.specs ?? [],
+      provider: {
+        fake: {
+          npm: '@ai-sdk/openai-compatible',
+          name: 'Fake',
+          options: input.proxy ?? {
+            baseURL: `http://127.0.0.1:${input.provider.port}/v1`,
+            apiKey: `{file:${input.keyFile ?? ''}}`,
+          },
+          models: {'fixture-model': {name: 'Fixture', tool_call: true, limit: {context: 100_000, output: 8000}}},
+        },
+      },
+      // This suite tests the OS boundary, not OpenCode's permission layer.
+      permission: {bash: 'allow', edit: 'allow', external_directory: 'allow', question: 'deny'},
+    },
+    timeouts: {agentReadyTimeoutMs: 90_000},
+  } satisfies Parameters<typeof startOpenCodeV2Server>[0]
+}
+
+/**
+ * Opens a session on a started server, sends one prompt and waits until the provider's script has run to the end. A failure
+ * stops the server before it is rethrown: the caller never received the handle, so nothing else could.
+ */
+async function driveScriptedTurn(
+  handle: OpenCodeV2ServerHandle,
+  workspace: string,
+  provider: ScriptedProvider,
+  turnTimeoutMs: number | undefined,
+): Promise<void> {
+  try {
+    await promptAndWait(handle, workspace, provider, turnTimeoutMs)
+  } catch (error) {
+    // The turn's error is the one that matters; a shutdown that also fails adds nothing the caller can use.
+    await handle.shutdown().catch(() => undefined)
+    throw error
+  }
+}
+
+async function promptAndWait(
+  handle: OpenCodeV2ServerHandle,
+  workspace: string,
+  provider: ScriptedProvider,
+  turnTimeoutMs: number | undefined,
+): Promise<void> {
+  const created = (await (
+    await handle.fetch('/api/session', {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+      body: JSON.stringify({location: {directory: workspace}}),
+    })
+  ).json()) as {data: {id: string}}
+  handle.registerOwnedSession(created.data.id)
+  await handle.fetch(`/api/session/${created.data.id}/prompt`, {
+    method: 'POST',
+    headers: {'content-type': 'application/json'},
+    body: JSON.stringify({text: 'run the probes'}),
+  })
+  const deadline = Date.now() + (turnTimeoutMs ?? 240_000)
+  while (!provider.state.done && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 500))
+}
+
+export interface ScriptedSessionOptions extends ScriptedServerInput {
+  readonly lifecycle: SandboxLifecycle
   readonly logger: Logger
   readonly turnTimeoutMs?: number
 }
@@ -221,32 +306,10 @@ export async function startScriptedSession(options: ScriptedSessionOptions): Pro
   const launched = await options.lifecycle.launch(async context => {
     const result = await startOpenCodeV2Server(
       {
-        binaryPath: options.binary,
-        directory: workspace,
-        expectedPluginIds: [],
-        env: options.env,
+        ...scriptedServerOptions(options),
         sandbox: context.spec,
         signal: context.signal,
         onSpawn: context.noteSpawn,
-        config: {
-          share: 'disabled',
-          model: 'fake/fixture-model',
-          plugins: [],
-          provider: {
-            fake: {
-              npm: '@ai-sdk/openai-compatible',
-              name: 'Fake',
-              options: options.proxy ?? {
-                baseURL: `http://127.0.0.1:${provider.port}/v1`,
-                apiKey: `{file:${options.keyFile ?? ''}}`,
-              },
-              models: {'fixture-model': {name: 'Fixture', tool_call: true, limit: {context: 100_000, output: 8000}}},
-            },
-          },
-          // This suite tests the OS boundary, not OpenCode's permission layer.
-          permission: {bash: 'allow', edit: 'allow', external_directory: 'allow', question: 'deny'},
-        },
-        timeouts: {agentReadyTimeoutMs: 90_000},
       },
       options.logger,
     )
@@ -256,23 +319,22 @@ export async function startScriptedSession(options: ScriptedSessionOptions): Pro
   const started = launched.data
   if (!started.success) throw new Error(`server start failed: ${started.error.message}`)
   const handle = started.data
-
-  const created = (await (
-    await handle.fetch('/api/session', {
-      method: 'POST',
-      headers: {'content-type': 'application/json'},
-      body: JSON.stringify({location: {directory: workspace}}),
-    })
-  ).json()) as {data: {id: string}}
-  handle.registerOwnedSession(created.data.id)
-  await handle.fetch(`/api/session/${created.data.id}/prompt`, {
-    method: 'POST',
-    headers: {'content-type': 'application/json'},
-    body: JSON.stringify({text: 'run the probes'}),
-  })
-  const deadline = Date.now() + (options.turnTimeoutMs ?? 240_000)
-  while (!provider.state.done && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 500))
+  await driveScriptedTurn(handle, workspace, provider, options.turnTimeoutMs)
   return handle
+}
+
+export interface PlainScriptedSessionOptions extends Omit<ScriptedSessionOptions, 'lifecycle'> {
+  /** The server start. Left out, the real one; a test passes its own. */
+  readonly deps?: {readonly start?: typeof startOpenCodeV2Server}
+}
+
+/** The same server and turn as `startScriptedSession`, as the runner's own user and with no sandbox: `isolate-agent` off. */
+export async function startPlainScriptedSession(options: PlainScriptedSessionOptions): Promise<OpenCodeV2ServerHandle> {
+  const start = options.deps?.start ?? startOpenCodeV2Server
+  const started = await start(scriptedServerOptions(options), options.logger)
+  if (!started.success) throw new Error(`server start failed: ${started.error.message}`)
+  await driveScriptedTurn(started.data, options.workspace, options.provider, options.turnTimeoutMs)
+  return started.data
 }
 
 // --- The read-only view suite ------------------------------------------------------------------------------------------

@@ -31,7 +31,13 @@ import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
-import {createOwnershipLedger, createRemoteOpenCodeV2Client, mapV2Event, startOpenCodeV2Server} from '@fro-bot/runtime'
+import {
+  createOwnershipLedger,
+  createRemoteOpenCodeV2Client,
+  mapV2Event,
+  startOpenCodeV2Server,
+  WORKSPACE_TRACING_HOST,
+} from '@fro-bot/runtime'
 import {SUBAGENT_NOTICE_ENQUEUED_FRAME} from '@fro-bot/runtime/event-v2-fixtures'
 import {afterAll, beforeAll, describe, expect, it, vi} from 'vitest'
 
@@ -224,6 +230,8 @@ async function startStockServer(
       binaryPath: BINARY as string,
       directory: repo,
       expectedPluginIds: [],
+      // Stands in for the workspace service, which is the one launcher of a gateway-facing server.
+      tracingHost: WORKSPACE_TRACING_HOST,
       env: createEnv(root),
       timeouts: {agentReadyTimeoutMs: 60_000, pluginGateTimeoutMs: 1500, exitTimeoutMs: 10_000},
       config: {

@@ -164,6 +164,17 @@ export interface SandboxLifecycle {
   readonly startKeyProxy: <T extends OwnedKeyProxy>(
     start: (context: {readonly signal: AbortSignal}) => Promise<KeyProxyStartReport<T>>,
   ) => Promise<Result<T | null, string>>
+  /**
+   * Registers a stop the signal teardown runs beside the sandbox's own, inside the same budget (`SIGNAL_TEARDOWN_BUDGET_MS`),
+   * for a process the run owns that the lifecycle does not: the trace relay. A cancellation ends the process without running
+   * `run.ts`'s `finally`, so without this the relay would be left to notice its stdin closing. It is a bounded extra, not part
+   * of the teardown's outcome: it never changes what the sandbox reports, a throw or a rejection is swallowed, and one that
+   * outlasts the budget is cut off with the rest. A normal `release` does not call it (the run stops the process itself), and
+   * it takes no part in the key proxy's slot. Registered after a signal began, it runs at once. Registering installs the signal
+   * handlers (like `startKeyProxy`) unless the teardown has begun, so a stop can be registered before the process it owns is
+   * spawned and still be reached by a signal.
+   */
+  readonly registerSignalStop: (stop: () => Promise<unknown>) => void
 }
 
 /** Longest `release` waits for an in-flight launch to settle after aborting it, before it fails closed as unconfirmed. */
@@ -552,6 +563,27 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   }
   // Bound once `release` is defined below; the handlers only run after `prepare`, so it is always set by then.
   let releaseRef: () => Promise<SandboxReleaseResult> = async () => ({stop: 'never-started', restore: 'not-needed'})
+  // Extra stops the signal teardown runs beside the sandbox's (the trace relay's). Not part of the teardown's outcome.
+  const signalStops: (() => Promise<unknown>)[] = []
+  // The running extra stops of an active signal teardown, those started late included. Never rejects.
+  const signalStopRuns: Promise<void>[] = []
+  /** Resolves once every stop run so far has settled, including any added while it waits. */
+  const settleSignalStops = async (): Promise<void> => {
+    let waited = 0
+    while (waited < signalStopRuns.length) {
+      const batch = signalStopRuns.slice(waited)
+      waited += batch.length
+      await Promise.all(batch)
+    }
+  }
+  /** Runs one extra stop. Never rejects and never throws: a failing extra stop must not touch the sandbox teardown. */
+  const runSignalStop = async (stop: () => Promise<unknown>): Promise<void> => {
+    try {
+      await stop()
+    } catch {
+      // The sandbox's own teardown decides the outcome; an extra stop that failed has nothing to add.
+    }
+  }
   const onSignal = async (signal: 'SIGINT' | 'SIGTERM'): Promise<void> => {
     if (signalled) return
     signalled = true
@@ -562,7 +594,12 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     const timedOut = new Promise<'timeout'>(resolve => {
       timer = setTimeout(() => resolve('timeout'), options.signalTeardownBudgetMs ?? SIGNAL_TEARDOWN_BUDGET_MS)
     })
+    // The extra stops start now, beside the sandbox teardown, so both fit the one budget.
+    signalStopRuns.push(...signalStops.map(runSignalStop))
     const outcome = await Promise.race([releaseRef().catch(() => 'failed' as const), timedOut])
+    // Whatever budget is left is theirs too, those registered while the teardown ran included; the sandbox's outcome above
+    // is decided without them. With none registered there is nothing to wait for and nothing new on this path.
+    if (signalStopRuns.length > 0) await Promise.race([settleSignalStops(), timedOut])
     if (timer !== undefined) clearTimeout(timer)
     if (outcome === 'timeout' || outcome === 'failed') {
       logger.error('The sandbox was not confirmed stopped and restored before exiting on a signal')
@@ -1328,5 +1365,18 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   }
 
   // False from the moment a signal begins the teardown (not when it ends), so a caller about to spawn the server sees it.
-  return {prepare, launch, release, startKeyProxy}
+  const registerSignalStop = (stop: () => Promise<unknown>): void => {
+    if (signalled) {
+      // The teardown is running or over: start it now, and let a teardown still waiting count it against its budget.
+      signalStopRuns.push(runSignalStop(stop))
+      return
+    }
+    // Signal ownership before the caller spawns anything, the same rule `startKeyProxy` follows: the trace relay starts before
+    // the server, the key proxy and the account, so without this a signal in that window reaches no handler of ours and the
+    // process ends with a child still starting. Not once the teardown has begun or finished: nothing would remove them.
+    if (!admissionClosed && !cancelled && released === undefined) installSignalHandlers()
+    signalStops.push(stop)
+  }
+
+  return {prepare, launch, release, startKeyProxy, registerSignalStop}
 }

@@ -9,7 +9,7 @@
  * tool shell as the sandbox user. Each "blocked" probe has a positive control: the same command run as the runner must
  * succeed (be OPEN), otherwise a BLOCKED result proves nothing.
  *
- * Thirteen suites run one after another (the sandbox account name is fixed, so two never overlap):
+ * Fourteen suites run one after another (the sandbox account name is fixed, so two never overlap):
  *   1. the boundary: blocked and works rows, identity, quiescence, take-back;
  *   2. a provisioned `gh` config and an admitted repo skill;
  *   3. the persistence round trip (restore, isolated run, checkpoint and save, restore, isolated run);
@@ -30,6 +30,11 @@
  *      runner-owned, its `opencode` entry is a link that is removed afterwards, and a clone under the checkout is trusted;
  *  13. the same, in connect's layout: the runner's `XDG_STATE_HOME` is the state home, so its real `opencode` directory is
  *      nested inside the handed-over state home, and the take-back still ends `restored` with the session database readable.
+ *  14. run tracing, once the Action's pinned plugin is 0.2.0 or later (it is installed from the registry, as setup installs it):
+ *      a loopback HTTPS collector stand-in and a unique canary in `trace-headers`. Isolated, the spans arrive with the canary
+ *      header and the sandbox user's search of process environments and command lines, the runner's temp and step files, the
+ *      checkout and the agent's home finds none; not isolated, the same search finds it (the control); no exported span holds
+ *      it; no relay process is left and the sandbox restores; with tracing off no relay runs and nothing is sent.
  *
  * Every suite runs through the read-only view, as the Action does: the launch has no other form.
  *
@@ -38,9 +43,10 @@
 import type {SandboxToolPaths} from '../../services/setup/sandbox-preflight.js'
 import type {Logger} from '../../shared/logger.js'
 import type {SandboxLifecycle, SandboxLifecycleDeps, SandboxReleaseResult} from './sandbox-lifecycle.js'
-import type {LaunchNamespaces, Probe, Row, ScriptedProvider} from './v2-server.sandbox.harness.js'
+import type {LaunchNamespaces, Probe, Row, ScriptedProvider, ScriptedTracing} from './v2-server.sandbox.harness.js'
+import {Buffer} from 'node:buffer'
 import {spawn, spawnSync} from 'node:child_process'
-import {createHash} from 'node:crypto'
+import {createHash, randomBytes} from 'node:crypto'
 import * as fs from 'node:fs'
 import http from 'node:http'
 import net from 'node:net'
@@ -49,9 +55,23 @@ import path from 'node:path'
 import process from 'node:process'
 import {DatabaseSync} from 'node:sqlite'
 import {fileURLToPath} from 'node:url'
-import {admitLaunch, buildSandboxLaunch, createSandboxAccount, getSessionDbBasenames} from '@fro-bot/runtime'
+import {
+  admitLaunch,
+  buildSandboxLaunch,
+  buildTracingLauncherValue,
+  createSandboxAccount,
+  FRO_BOT_PLUGIN_ID,
+  FRO_BOT_PLUGIN_PACKAGE,
+  FRO_BOT_PLUGIN_VERSION,
+  getSessionDbBasenames,
+} from '@fro-bot/runtime'
 import {afterAll, beforeAll, describe, expect, it} from 'vitest'
-import {startTlsUpstream, type TlsUpstream} from '../../../packages/runtime/src/agent/key-proxy-test-kit.js'
+import {waitUntil} from '../../../packages/opencode-plugin/src/tracing/tracing.integration.fixture.js'
+import {
+  startTlsUpstream,
+  type RecordedRequest,
+  type TlsUpstream,
+} from '../../../packages/runtime/src/agent/key-proxy-test-kit.js'
 import {resolveBrokeredPushCommitMessage} from '../../features/delegated/commit-message.js'
 import {reconstructChanges} from '../../features/delegated/reconstruct-changes.js'
 import {
@@ -65,15 +85,35 @@ import {
 } from '../../services/cache/index.js'
 import {buildCachePathsV2} from '../../services/cache/paths.js'
 import {createExecAdapter} from '../../services/setup/adapters.js'
+import {installPluginsV2} from '../../services/setup/plugin-install-v2.js'
 import {admitRepoSkills, createRepoSkillsStagingRoot} from '../../services/setup/repo-skills.js'
 import {createSandboxPreflightDeps, runSandboxPreflight} from '../../services/setup/sandbox-preflight.js'
 import {createViewProbe} from '../../services/setup/sandbox-view-probe.js'
+import {buildActionTracingHost, buildTracingRunIdentity, relayRequestFromInputs} from '../../services/setup/tracing.js'
 import {STORAGE_VERSION} from '../../shared/constants.js'
 import {getGitHubRunAttempt, getInvocationIdentity} from '../../shared/env.js'
 import {createLogger} from '../../shared/logger.js'
+import {unwrapOk} from '../../shared/test-helpers.js'
+import {parseTraceInputs} from '../config/trace-inputs.js'
 import {startKeyProxyProcess, type KeyProxyProcess} from './key-proxy-process.js'
 import {snapshotLogDirectory} from './log-snapshot.js'
 import {createSandboxLifecycle} from './sandbox-lifecycle.js'
+import {startTraceRelayProcess, type TraceRelayProcess, type TraceRelayStopResult} from './trace-relay-process.js'
+import {
+  canaryForms,
+  canaryShapedValue,
+  exportedSpans,
+  plantScanControls,
+  scanCommand,
+  toolSpanHoldsArgument,
+  type ScanSpec,
+} from './v2-server.sandbox.canary.js'
+import {
+  fallbackHosts,
+  startRecordingHttpSink,
+  tracingFallbackDocument,
+  type RecordingHttpSink,
+} from './v2-server.sandbox.fallback.js'
 import {
   aclLines,
   aclText,
@@ -97,6 +137,7 @@ import {
   runnerFirstLine,
   safeEnvPath,
   safeEnvToken,
+  startPlainScriptedSession,
   startScriptedProvider,
   startScriptedSession,
   VIEW_IT_PREFIX,
@@ -222,7 +263,14 @@ interface IsolatedRunOptions {
   /** Called with the lifecycle as soon as it exists, so a suite's `afterAll` can release it if the run throws. */
   readonly onLifecycle?: (lifecycle: SandboxLifecycle) => void
   /** Called with the launch the lifecycle prepared (the account's uid is the one the handoff named). */
-  readonly onPrepared?: (launch: {readonly account: {readonly uid: number}}) => void
+  readonly onPrepared?: (launch: {
+    readonly account: {readonly uid: number; readonly gid: number}
+    readonly xdg: {readonly config: string}
+  }) => Promise<void> | void
+  /** A plugin for the server to load and what the launcher says about tracing. Absent: no plugin, tracing off. */
+  readonly tracing?: ScriptedTracing
+  /** Awaited after the scripted turn and before the server is stopped. */
+  readonly beforeShutdown?: () => Promise<void>
 }
 
 interface IsolatedRunResult {
@@ -253,7 +301,7 @@ async function runIsolated(options: IsolatedRunOptions): Promise<IsolatedRunResu
       repoSkills: options.repoSkills ?? null,
     })
     if (!prepared.success) throw new Error(prepared.error)
-    options.onPrepared?.(prepared.data)
+    await options.onPrepared?.(prepared.data)
     const handle = await startScriptedSession({
       binary: BINARY ?? '',
       workspace: options.workspace,
@@ -262,8 +310,10 @@ async function runIsolated(options: IsolatedRunOptions): Promise<IsolatedRunResu
       keyFile: options.keyFile,
       provider,
       logger: options.logger,
+      ...(options.tracing === undefined ? {} : {tracing: options.tracing}),
     })
     const rows = parseRows(provider.state.results.join('\n'))
+    await options.beforeShutdown?.()
     await handle.shutdown()
     const released = await lifecycle.release()
     return {rows, released}
@@ -3030,5 +3080,484 @@ describe.skipIf(!gated)('isolate-agent runs bun and pnpm from their install root
     expect(places).toMatch(/\/\.bun\/install\/cache/)
     expect(places).toMatch(/\/\.cache\/uv/)
     expect(places).not.toContain('/fixtures/')
+  })
+})
+
+// --- 14. Run tracing ---------------------------------------------------------------------------------------------------
+
+/** The first plugin version that traces. */
+const TRACING_PLUGIN_MIN_VERSION = [0, 2, 0] as const
+
+function pinTraces(version: string): boolean {
+  const parts = version.split('.').map(Number)
+  for (const [index, least] of TRACING_PLUGIN_MIN_VERSION.entries()) {
+    const part = parts[index] ?? 0
+    if (part !== least) return part > least
+  }
+  return true
+}
+
+// These rows load the plugin the Action pins, installed from the registry as setup installs it. The suite has no local-build
+// path (the real-binary tracing test in tracing.integration.test.ts has one, outside the sandbox), so the rows run once the
+// pin names a version with tracing.
+const tracingGated = gated && pinTraces(FRO_BOT_PLUGIN_VERSION)
+
+/**
+ * Unique per process, so any copy of it anywhere is this run's. The sandbox is never given it: the search it runs gets the
+ * canary's SHA-256 and length (see `v2-server.sandbox.canary.ts`), and its detector controls are other values of the same shape.
+ */
+const TRACE_CANARY = canaryShapedValue('sk-trace-canary-', randomBytes(18).toString('hex'))
+const TRACE_HEADERS = `Authorization: Bearer ${TRACE_CANARY}`
+/**
+ * A command-only marker: the scripted tool command starts with it as a no-op (`: marker`), so it is in the tool call's
+ * arguments and in no output the command prints. It is what ties an exported tool span to this call.
+ */
+const TOOL_ARGUMENT_MARKER = `toolarg-marker-${randomBytes(8).toString('hex')}`
+const SCAN_CONTROLS = {
+  liveControl: canaryShapedValue('sk-trace-live-', randomBytes(18).toString('hex')),
+  xdgTextControl: canaryShapedValue('sk-trace-xdgt-', randomBytes(18).toString('hex')),
+  xdgBinaryControl: canaryShapedValue('sk-trace-xdgb-', randomBytes(18).toString('hex')),
+  longControl: canaryShapedValue('sk-trace-long-', randomBytes(18).toString('hex')),
+  boundaryControl: canaryShapedValue('sk-trace-edge-', randomBytes(18).toString('hex')),
+} as const
+
+/** Counts processes whose command line names the relay's bundle, after showing the search a process that does. */
+function noRelayProcessProbe(): Probe {
+  const count = String.raw`count(){ n=0; for f in /proc/[0-9]*/cmdline; do { tr '\0' ' ' < "$f"; } 2>/dev/null | grep -qF -- "$M" && n=$((n+1)); done; echo $n; }; `
+  return {
+    id: 'no_relay_process',
+    category: 'blocked',
+    cmd:
+      `M=${q('trace-rel')}${q('ay.js')}; ${count}` +
+      `bash -c 'exec -a "$0" sleep 30' "$M" & p=$!; sleep 1; ok=0; [ "$(count)" -ge 1 ] && ok=1; ` +
+      `kill $p 2>/dev/null; wait $p 2>/dev/null; ` +
+      `[ $ok = 1 ] || { R no_relay_process FAILED "the search did not see a process that names the relay"; exit 0; }; ` +
+      `n=$(count); [ "$n" = 0 ] && R no_relay_process BLOCKED "no relay process" || R no_relay_process OPEN "relay_processes=$n"`,
+  }
+}
+
+/**
+ * What the server was told, read from its own environment (the tool shell's parent): the launcher variable is exactly the
+ * Action's "off" document, there is exactly one such variable, no `OTEL_*` variable is set, and nothing names the address of the
+ * collector stand-in. Together with a relay that never ran, "no request arrived" then means tracing was off, not that spans
+ * went somewhere else.
+ */
+function tracingOffEnvProbe(expectedLauncherLine: string, collectorAddress: string): Probe {
+  return {
+    id: 'tracing_off_env',
+    category: 'blocked',
+    cmd:
+      `${String.raw`exp=${q(expectedLauncherLine)}; env=$(tr '\0' '\n' < /proc/$PPID/environ 2>/dev/null); `}[ -n "$env" ] || { R tracing_off_env FAILED "the server environment could not be read"; exit 0; }; ` +
+      `l=$(printf %s "$env" | grep -cxF -- "$exp"); v=$(printf %s "$env" | grep -c '^OPENCODE_FROBOT_TRACING='); ` +
+      `o=$(printf %s "$env" | grep -c '^OTEL_'); e=$(printf %s "$env" | grep -cF -- ${q(collectorAddress)}); ` +
+      `[ "$l" = 1 ] && [ "$v" = 1 ] && [ "$o" = 0 ] && [ "$e" = 0 ] && s=BLOCKED || s=OPEN; ` +
+      `R tracing_off_env $s "launcher_off=$l launcher_vars=$v otel=$o endpoint=$e"`,
+  }
+}
+
+/**
+ * That the fallback is really in place, as the plugin would find it: at `$XDG_CONFIG_HOME/fro-bot/opencode-plugin/tracing.json`,
+ * a regular file the sandbox user owns, mode 0600, naming the sink. Without this a silent sink could mean a file that was
+ * never there.
+ */
+function tracingFallbackPlantedProbe(sinkAddress: string, machine: string): Probe {
+  return {
+    id: 'tracing_fallback_planted',
+    category: 'works',
+    cmd:
+      `f="$XDG_CONFIG_HOME/fro-bot/opencode-plugin/tracing.json"; ` +
+      `[ -f "$f" ] || { R tracing_fallback_planted FAILED "no file at the plugin's path"; exit 0; }; ` +
+      `m=$(stat -c %a "$f"); own=0; [ -O "$f" ] && own=1; s=$(grep -cF -- ${q(sinkAddress)} "$f"); h=$(grep -cF -- ${q(machine)} "$f"); ` +
+      `[ "$m" = 600 ] && [ $own = 1 ] && [ "$s" = 1 ] && [ "$h" = 1 ] && st=WORKS || st=FAILED; ` +
+      `R tracing_fallback_planted $st "mode=$m owned=$own sink=$s machine=$h"`,
+  }
+}
+
+/** Installs `content` at `dest` for the sandbox user, mode 0600, with the directories above it (below `base`) owned by it. */
+function plantForAccount(account: {uid: number; gid: number}, base: string, dest: string, content: string): void {
+  const owner = ['-o', String(account.uid), '-g', String(account.gid)]
+  const sudo = (args: string[]): void => {
+    const result = spawnSync('sudo', ['-n', 'install', ...args], {encoding: 'utf8'})
+    if (result.status !== 0) throw new Error(`install ${args.at(-1)}: ${result.stderr}`)
+  }
+  let dir = base
+  for (const part of path.relative(base, path.dirname(dest)).split(path.sep)) {
+    dir = path.join(dir, part)
+    sudo(['-d', '-m', '0700', ...owner, dir])
+  }
+  const source = path.join(os.tmpdir(), `fallback-${process.pid}-${randomBytes(4).toString('hex')}`)
+  fs.writeFileSync(source, content, {mode: 0o600})
+  try {
+    sudo(['-m', '0600', ...owner, source, dest])
+  } finally {
+    fs.rmSync(source, {force: true})
+  }
+}
+
+/** The names of the spans a stand-in collector received. A body that is not OTLP JSON adds none. */
+function exportedSpanNames(requests: readonly RecordedRequest[]): string[] {
+  return exportedSpans(requests.map(request => request.body)).map(span => span.name)
+}
+
+const hasRootSpan = (requests: readonly RecordedRequest[]): boolean =>
+  exportedSpanNames(requests).some(name => name.startsWith('invoke_agent'))
+
+interface TracedTurn {
+  readonly rows: ReadonlyMap<string, readonly Row[]>
+  /** Everything the collector stand-in received. */
+  readonly requests: readonly RecordedRequest[]
+  /** Set for an isolated run. */
+  readonly released: SandboxReleaseResult | undefined
+  /** Null when no relay was started. */
+  readonly relayStop: TraceRelayStopResult | null
+  /** What `pgrep` finds of the relay's bundle after the run. */
+  readonly relayLeft: string
+  /** What the plain-`http` fallback sink received. Empty for a run with no fallback planted. */
+  readonly sinkRequests: readonly string[]
+}
+
+describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not isolated, and off', () => {
+  const logger = createLogger({phase: 'sandbox-integration-tracing'})
+  const scratch = path.join(runnerTemp, `sandbox-it-tracing-${process.pid}`)
+  const responseDir = path.join(scratch, 'response')
+  // Its own XDG roots, shared by the runs: the plugin is installed once into the cache the server reads.
+  const xdgRoot = path.join(scratch, 'xdg')
+  const relayBundle = path.join(realDist, 'trace-relay.js')
+  const pluginSpec = `${FRO_BOT_PLUGIN_PACKAGE}@${FRO_BOT_PLUGIN_VERSION}`
+  const cleanups: (() => Promise<void> | void)[] = []
+  const scanSpecFor = (workspace: string): ScanSpec => ({
+    canary: TRACE_CANARY,
+    ...SCAN_CONTROLS,
+    // 1 MiB chunks, so the planted boundary control needs a 2 MiB file. Over 128 MiB a file is counted as skipped: the runner
+    // temp holds the OpenCode binary (about 225 MiB), which the sandbox is not meant to read and which would only spend time.
+    chunkBytes: 1024 * 1024,
+    maxFileBytes: 128 * 1024 * 1024,
+    runnerTemp,
+    checkout: [workspace, responseDir],
+    // Opened by exact path as well as walked for: a directory can refuse listing and still allow access to a known child.
+    knownPaths: [path.join(scratch, 'step', 'file_commands.txt')],
+  })
+  let isolated: TracedTurn | undefined
+  let plain: TracedTurn | undefined
+  let off: TracedTurn | undefined
+
+  /** The collector stand-in: an HTTPS server on loopback that records every request and accepts it. */
+  async function startCollector(): Promise<TlsUpstream> {
+    const collector = await startTlsUpstream((_request, res) => {
+      res.writeHead(200, {'content-type': 'application/json'})
+      res.end('{}')
+    })
+    cleanups.push(async () => collector.close())
+    return collector
+  }
+
+  /**
+   * What a real step's process holds: the action's inputs sit in its environment, readable by the runner's own user. This
+   * stand-in carries them, so the not-isolated row has a place where the search must find the canary.
+   */
+  async function startStepStandIn(): Promise<void> {
+    const child = spawn(builderNode, ['-e', 'setInterval(() => {}, 1000)'], {
+      env: {PATH: process.env.PATH ?? '', 'INPUT_TRACE-HEADERS': TRACE_HEADERS},
+      stdio: 'ignore',
+    })
+    cleanups.push(async () => {
+      child.kill('SIGKILL')
+      await new Promise<void>(resolve => (child.exitCode === null ? child.once('exit', () => resolve()) : resolve()))
+    })
+  }
+
+  async function startRelay(collector: TlsUpstream, name: string): Promise<TraceRelayProcess> {
+    // The inputs, through the real parser, as a workflow's two inputs would reach it.
+    const parsed = parseTraceInputs(
+      {endpoint: `${collector.origin}/v1/traces`, headers: TRACE_HEADERS},
+      {warning: () => undefined, notice: () => undefined, info: () => undefined, mask: () => undefined},
+    )
+    const request = relayRequestFromInputs(parsed)
+    if (request === null) throw new Error('the trace inputs were not accepted')
+    const caFile = path.join(scratch, `collector-ca-${name}.pem`)
+    fs.writeFileSync(caFile, collector.ca)
+    // `env` gives the relay's own empty environment the stand-in's CA and nothing else; the credential still reaches it only
+    // on its stdin.
+    const started = await startTraceRelayProcess({
+      config: request,
+      logger,
+      launcher: {command: '/usr/bin/env', args: [`NODE_EXTRA_CA_CERTS=${caFile}`, builderNode, relayBundle]},
+      timeouts: {readyMs: 15_000, exitGraceMs: 4_000, killConfirmMs: 2_000},
+    })
+    const relay = unwrapOk(started)
+    // Registered as soon as the relay is up, so a failure later in the run still stops it.
+    cleanups.push(async () => {
+      await relay.stop()
+    })
+    return relay
+  }
+
+  async function runTurn(options: {
+    readonly name: string
+    readonly isolation: 'on' | 'off'
+    readonly tracing: 'on' | 'off'
+    readonly tools: SandboxToolPaths
+  }): Promise<TracedTurn> {
+    const {name, tools} = options
+    const workspace = path.join(scratch, `ws-${name}`)
+    initWorkspace(workspace)
+    const collector = await startCollector()
+    // A usable fallback a wrongly-on plugin would export through, for the off run only: see the row for what it proves.
+    const sink: RecordingHttpSink | null =
+      options.tracing === 'off' && options.isolation === 'on' ? await startRecordingHttpSink() : null
+    if (sink !== null) cleanups.push(async () => sink.close())
+    const machine = fallbackHosts(os.hostname())[0] ?? ''
+    const relay = options.tracing === 'on' ? await startRelay(collector, name) : null
+    const identity = unwrapOk(
+      buildTracingRunIdentity({
+        repository: 'owner/repo',
+        runId: '4242',
+        attempt: 1,
+        job: 'sandbox-it',
+        trigger: 'workflow_dispatch',
+      }),
+    )
+    const tracing: ScriptedTracing = {
+      specs: [pluginSpec],
+      expectedPluginIds: [FRO_BOT_PLUGIN_ID],
+      host: buildActionTracingHost(relay?.port ?? null, identity),
+    }
+    const scanSpec = scanSpecFor(workspace)
+    const offHost = buildActionTracingHost(null, identity)
+    const steps: Probe[] =
+      options.tracing === 'on'
+        ? [{id: 'canary_scan', category: 'blocked', cmd: `: ${TOOL_ARGUMENT_MARKER}\n${scanCommand(scanSpec)}`}]
+        : [
+            noRelayProcessProbe(),
+            ...(sink === null ? [] : [tracingFallbackPlantedProbe(sink.address, machine)]),
+            tracingOffEnvProbe(
+              `OPENCODE_FROBOT_TRACING=${buildTracingLauncherValue(offHost)}`,
+              new URL(collector.origin).host,
+            ),
+          ]
+    // A turn is over when its root span is at the collector; stopping the server before that would race the last flush.
+    const beforeShutdown = async (): Promise<void> => {
+      if (options.tracing === 'off') return
+      await waitUntil(
+        'the turn’s root span at the collector stand-in',
+        () => hasRootSpan(collector.requests),
+        90_000,
+        () =>
+          `received ${collector.requests.length} requests; spans: ${exportedSpanNames(collector.requests).join(', ')}`,
+      )
+    }
+    const keyFile = writeKeyFile(path.join(scratch, `key-${name}`))
+
+    let rows: ReadonlyMap<string, readonly Row[]>
+    let released: SandboxReleaseResult | undefined
+    if (options.isolation === 'on') {
+      const result = await runIsolated({
+        tools,
+        env: hostedEnv(workspace, xdgRoot),
+        workspace,
+        responseDir,
+        keyFile,
+        steps,
+        logger,
+        tracing,
+        beforeShutdown,
+        // After the account exists and before the server starts: the file must be there when the plugin loads.
+        ...(sink === null
+          ? {}
+          : {
+              onPrepared: launch => {
+                const dest = path.join(launch.xdg.config, 'fro-bot', 'opencode-plugin', 'tracing.json')
+                plantForAccount(
+                  launch.account,
+                  launch.xdg.config,
+                  dest,
+                  tracingFallbackDocument({endpoint: `${sink.origin}/v1/traces`, hosts: fallbackHosts(os.hostname())}),
+                )
+              },
+            }),
+      })
+      rows = result.rows
+      released = result.released
+    } else {
+      // The agent's home is a directory of its own, so the search of "the agent's home" does not walk the runner's.
+      const home = path.join(scratch, 'home-plain')
+      fs.mkdirSync(home, {recursive: true})
+      const provider = await startScriptedProvider(() => steps)
+      cleanups.push(async () => provider.close())
+      const handle = await startPlainScriptedSession({
+        binary: BINARY ?? '',
+        workspace,
+        env: {...hostedEnv(workspace, xdgRoot), HOME: home},
+        keyFile,
+        provider,
+        logger,
+        tracing,
+      })
+      cleanups.push(async () => {
+        await handle.shutdown()
+      })
+      rows = parseRows(provider.state.results.join('\n'))
+      await beforeShutdown()
+      await handle.shutdown()
+    }
+    // The relay goes after the server and the sandbox, as the Action stops it.
+    const relayStop = relay === null ? null : await relay.stop()
+    return {
+      rows,
+      requests: [...collector.requests],
+      released,
+      relayStop,
+      relayLeft: pgrepOutput(['-f', relayBundle]),
+      sinkRequests: [...(sink?.requests ?? [])],
+    }
+  }
+
+  beforeAll(async () => {
+    const tools = await preflightTools(logger)
+    fs.mkdirSync(responseDir, {recursive: true})
+    cleanups.push(() => fs.rmSync(scratch, {recursive: true, force: true}))
+    // Where a runner's step files would hold the action's inputs: a private file, readable by the runner's user and by no one else.
+    const stepDir = path.join(scratch, 'step')
+    fs.mkdirSync(stepDir, {recursive: true, mode: 0o700})
+    fs.writeFileSync(path.join(stepDir, 'file_commands.txt'), `INPUT_TRACE-HEADERS=${TRACE_HEADERS}\n`, {mode: 0o600})
+    await startStepStandIn()
+    // The runner's detector controls, in the directories the sandbox reaches OpenCode's storage through links to.
+    plantScanControls(xdgRoot, scanSpecFor(path.join(scratch, 'ws-isolated')))
+
+    // The pinned plugin, installed as setup installs it, into the cache the server reads (the lifecycle hands the agent a link
+    // to it).
+    const installed = await installPluginsV2({
+      logger,
+      execAdapter: createExecAdapter(),
+      opencodeBinaryPath: BINARY ?? '',
+      specs: [pluginSpec],
+      cacheHome: path.join(xdgRoot, 'cache'),
+      env: hostedEnv(path.join(scratch, 'ws-install'), xdgRoot),
+    })
+    if (!installed.success) throw new Error(`plugin install failed: ${installed.error.message}`)
+
+    // One after another: the sandbox account's name is fixed. The not-isolated run is last, so it can leave nothing in a place a
+    // sandbox run reads.
+    isolated = await runTurn({name: 'isolated', isolation: 'on', tracing: 'on', tools})
+    off = await runTurn({name: 'off', isolation: 'on', tracing: 'off', tools})
+    plain = await runTurn({name: 'plain', isolation: 'off', tracing: 'on', tools})
+  }, 1_200_000)
+
+  afterAll(async () => {
+    for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
+  }, 120_000)
+
+  /** The `key=value` counts of the canary search's result line. */
+  const scanCounts = (turn: TracedTurn | undefined): Map<string, string> =>
+    new Map(
+      (turn?.rows.get('canary_scan')?.[0]?.evidence ?? '')
+        .split(' ')
+        .filter(part => part.includes('='))
+        .map(part => part.split('=') as [string, string]),
+    )
+
+  const credentialSeen = (turn: TracedTurn | undefined): boolean[] =>
+    (turn?.requests ?? []).map(request => request.headers.authorization === `Bearer ${TRACE_CANARY}`)
+
+  it('isolated: the spans reach the collector with the canary credential, and the sandbox user finds it nowhere', () => {
+    // #given a traced turn in the sandbox, with the credential held by the relay alone
+    // #then the root span arrived, and every request carried the canary
+    expect(hasRootSpan(isolated?.requests ?? [])).toBe(true)
+    expect(credentialSeen(isolated).length).toBeGreaterThan(0)
+    expect(credentialSeen(isolated).every(Boolean)).toBe(true)
+
+    // #then the sandbox user's search (by fingerprint: it was never given the canary) of process environments and command lines,
+    // the runner's temp and step files, the checkout, the agent's home and OpenCode's storage behind the links found no copy
+    expect(failuresFor(isolated?.rows ?? new Map(), 'canary_scan', 'BLOCKED')).toEqual([])
+    const counts = scanCounts(isolated)
+    for (const group of ['environ', 'cmdline', 'temp', 'checkout', 'home', 'xdg', 'known']) {
+      expect(counts.get(`canary.${group}`)).toBe('0')
+    }
+    // #and the step file, opened by its exact path, was refused (not absent, which would be a skip) and not read
+    expect(counts.get('denied.known')).toBe('1')
+    expect(counts.get('read.known')).toBe('0')
+    expect(counts.get('skip.known')).toBe('0')
+
+    // #and the search is shown to look where it counts: its own controls were found in a file, a process environment and a
+    // command line, the runner's controls in a text file and in a binary file behind the links, and it read files there and in
+    // the checkout
+    expect(Number(counts.get('read.xdg'))).toBeGreaterThanOrEqual(2)
+    expect(Number(counts.get('read.checkout'))).toBeGreaterThanOrEqual(1)
+  })
+
+  it('not isolated: the same turn is traced, and the same search finds the canary', () => {
+    // #given the same turn with the agent running as the runner's user
+    // #then it is traced the same way
+    expect(hasRootSpan(plain?.requests ?? [])).toBe(true)
+    expect(credentialSeen(plain).every(Boolean)).toBe(true)
+
+    // #then the search finds the canary where the runner's user can read it (the step's environment and the step file): the
+    // negative control that shows the isolated row's empty result means something. The relay's own command line holds none, and
+    // neither the checkout nor the agent's home does. The exposure warning that goes with this is run.ts's, covered in
+    // run-tracing.test.ts: this suite drives the server, not the Action.
+    expect(failuresFor(plain?.rows ?? new Map(), 'canary_scan', 'OPEN')).toEqual([])
+    const counts = scanCounts(plain)
+    expect(Number(counts.get('canary.environ'))).toBeGreaterThanOrEqual(1)
+    expect(Number(counts.get('canary.temp'))).toBeGreaterThanOrEqual(1)
+    // #and the step file, opened by its exact path, was read and held it
+    expect(counts.get('read.known')).toBe('1')
+    expect(counts.get('canary.known')).toBe('1')
+    for (const group of ['cmdline', 'checkout', 'home', 'xdg']) expect(counts.get(`canary.${group}`)).toBe('0')
+  })
+
+  it('exports no span that holds the canary, in any form a span could carry it', () => {
+    // #given the checker is shown able to see the credential header it will be asked about
+    expect(canaryForms(Buffer.from(JSON.stringify({header: TRACE_HEADERS})), TRACE_CANARY)).toContain('contiguous')
+
+    for (const turn of [isolated, plain]) {
+      const requests = turn?.requests ?? []
+
+      // #given spans that really carry content: the tool span for this call arrived with the command-only marker in its own
+      // `gen_ai.tool.call.arguments` attribute (the marker is in no tool output, so the result span alone cannot supply it), so
+      // an absent canary is absence from content that was there to hold it
+      expect(toolSpanHoldsArgument(exportedSpans(requests.map(request => request.body)), TOOL_ARGUMENT_MARKER)).toBe(
+        true,
+      )
+
+      // #then no request body holds the canary as written (raw or in any parsed string), as \uXXXX escapes, as both halves, as
+      // base64 or base64url at any of the three alignments, or as hex
+      for (const request of requests) expect(canaryForms(request.body, TRACE_CANARY)).toEqual([])
+    }
+  })
+
+  it('leaves no relay process after any run, and the sandbox restores cleanly', () => {
+    // #then each traced run stopped its relay and none is left, and each isolated run was taken back
+    for (const turn of [isolated, plain]) {
+      expect(['stopped', 'already-exited']).toContain(turn?.relayStop?.outcome)
+      expect(turn?.relayLeft).toBe('')
+    }
+    for (const turn of [isolated, off]) {
+      expect(turn?.released?.restore).toBe('restored')
+      expect(turn?.released?.stop).not.toBe('never-started')
+    }
+  })
+
+  it('with tracing off on the same runner: the server was told off, no relay runs, and nothing is sent', () => {
+    // #given the turn with the plugin installed and the launcher saying off. Zero requests proves tracing was off only if the
+    // server was told so and nothing pointed its export elsewhere; the traced rows are the control, since the same plugin,
+    // server and runner export when the launcher says on. So the agent reads the server's own environment: the launcher line
+    // is exactly the "off" document, the only one, no OTEL_* variable is set and the stand-in's address appears nowhere in it.
+    expect(failuresFor(off?.rows ?? new Map(), 'tracing_off_env', 'BLOCKED')).toEqual([])
+
+    // #and a usable fallback was in place and nothing used it: a valid user-scope settings file (the sandbox user's own, mode
+    // 0600, naming this machine, pointing at a plain-http loopback sink) that the plugin would accept if no launcher variable
+    // were set (the unit control in v2-server.sandbox.fallback.test.ts shows exactly that, against the plugin's own resolver).
+    // The Action's server also carries the headless markers, which would refuse the file on their own; so this row shows the
+    // published plugin, given the "off" launcher, sends nothing even with a fallback present and a sink to receive it.
+    expect(failuresFor(off?.rows ?? new Map(), 'tracing_fallback_planted', 'WORKS')).toEqual([])
+    expect(off?.sinkRequests).toEqual([])
+    expect(off?.rows.get('tracing_off_env')?.[0]?.evidence).toBe('launcher_off=1 launcher_vars=1 otel=0 endpoint=0')
+
+    // #then no relay process runs (after a control showed the search could see one), the stand-in heard nothing, and no relay
+    // was started or left
+    expect(failuresFor(off?.rows ?? new Map(), 'no_relay_process', 'BLOCKED')).toEqual([])
+    expect(off?.requests).toEqual([])
+    expect(off?.relayStop).toBeNull()
+    expect(off?.relayLeft).toBe('')
   })
 })

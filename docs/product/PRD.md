@@ -100,7 +100,7 @@ Fro Bot addresses this by:
 
 - All metrics derived from run summaries and structured JSON logs.
 - No external telemetry aggregation unless user explicitly opts in.
-- No raw content (code, comments, prompts) logged to external systems.
+- No raw content (code, comments, prompts) logged to external systems, with one exception: run tracing, which the operator turns on and which sends prompt and tool content to a collector the operator chooses.
 - Metrics stored locally in run artifacts and GitHub Actions logs.
 
 ---
@@ -147,7 +147,7 @@ These requirements apply to **all modalities** (GitHub, Discord, future):
 - Structured JSON logs for machine parsing
 - Run summaries with metadata (event type, cache status, session IDs, duration, token usage)
 - Opt-in external aggregation only
-- No raw content in telemetry
+- No raw content in telemetry, except operator-enabled run tracing
 
 ### Modality-Specific Scope
 
@@ -462,6 +462,7 @@ Run summary format is platform-specific (see RFC-007).
 - **Local-first**: Metrics derived from run summaries and JSON logs
 - **No raw content**: Never log code, comments, or prompts to external systems
 - **Transparent**: User controls what data leaves the system
+- **Run tracing is the one exception to "no raw content"**: it is off by default, has no default destination, and only the operator can turn it on. It sends OpenTelemetry traces with prompt and tool content to the operator's own collector. The project never receives them.
 
 ### G. Error Handling & Reliability
 

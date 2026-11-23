@@ -221,6 +221,76 @@ describe('buildCIConfigV2', () => {
     })
   })
 
+  describe('plugin order and tracing', () => {
+    const SYSTEMATIC = '@fro.bot/systematic@9.9.9'
+    const FRO_BOT = '@fro.bot/opencode-plugin@9.9.8'
+    const plugins = [SYSTEMATIC, FRO_BOT]
+    const operator = (...entries: unknown[]) => JSON.stringify({plugins: entries})
+
+    it('lists the Fro Bot plugin after operator plugins when tracing is on', () => {
+      // #given two operator plugins
+      // #when
+      const {content} = build({plugins, opencodeConfig: operator('op-one', 'op-two'), tracing: true})
+
+      // #then a plugin sees only the edits of plugins listed before it, so this one is last
+      expect(content.plugins).toEqual([SYSTEMATIC, 'op-one', 'op-two', FRO_BOT])
+    })
+
+    it('keeps the order it has today when tracing is off', () => {
+      // #given the same inputs, with tracing omitted and with tracing false
+      const opencodeConfig = operator('op-one', 'op-two')
+      const omitted = build({plugins, opencodeConfig})
+      const off = build({plugins, opencodeConfig, tracing: false})
+
+      // #then Systematic, this plugin, then the operator's, exactly as before
+      expect(omitted.content.plugins).toEqual([SYSTEMATIC, FRO_BOT, 'op-one', 'op-two'])
+      expect(JSON.stringify(off.content)).toBe(JSON.stringify(omitted.content))
+    })
+
+    it('changes nothing but the plugin list when tracing is on', () => {
+      // #given
+      const opencodeConfig = operator('op-one')
+      const off = build({plugins, opencodeConfig}).content
+      const on = build({plugins, opencodeConfig, tracing: true}).content
+
+      // #then
+      expect({...on, plugins: undefined}).toEqual({...off, plugins: undefined})
+    })
+
+    it.each([
+      ['the same spec', FRO_BOT],
+      ['the bare package name', '@fro.bot/opencode-plugin'],
+      ['another version of it', '@fro.bot/opencode-plugin@0.0.1'],
+    ])('does not list the Fro Bot plugin twice when the operator lists it as %s and tracing is on', (_name, entry) => {
+      // #given the operator names the plugin, before another of theirs
+      const {content} = build({plugins, opencodeConfig: operator(entry, 'op-one'), tracing: true})
+
+      // #then exactly one entry names it, and it is last
+      const named = (content.plugins as string[]).filter(plugin => plugin.startsWith('@fro.bot/opencode-plugin'))
+      expect(named).toEqual([FRO_BOT])
+      expect(content.plugins).toEqual([SYSTEMATIC, 'op-one', FRO_BOT])
+    })
+
+    it('still de-duplicates an exact repeat when tracing is off, as before', () => {
+      const {content} = build({plugins, opencodeConfig: operator(FRO_BOT, 'op-one')})
+
+      expect(content.plugins).toEqual([SYSTEMATIC, FRO_BOT, 'op-one'])
+    })
+
+    it('leaves object-form operator entries dropped, with tracing on and off', () => {
+      // #given an object-form entry for this plugin and a tuple for another
+      const opencodeConfig = operator({name: '@fro.bot/opencode-plugin', tracing: 'on'}, ['other', {a: 1}], 'op-one')
+
+      // #when
+      const on = build({plugins, opencodeConfig, tracing: true}).content.plugins
+      const off = build({plugins, opencodeConfig}).content.plugins
+
+      // #then only string entries survive, as today
+      expect(on).toEqual([SYSTEMATIC, 'op-one', FRO_BOT])
+      expect(off).toEqual([SYSTEMATIC, FRO_BOT, 'op-one'])
+    })
+  })
+
   describe('operator config', () => {
     it('merges operator keys and de-duplicates plugins', () => {
       // #given

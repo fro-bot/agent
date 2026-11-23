@@ -160,6 +160,7 @@ function createBootstrap(): BootstrapPhaseResult {
       repoSkills: false,
       isolateAgent: false,
       agentStateHome: null,
+      tracing: {enabled: false},
     },
     logger: createLogger({phase: 'test'}),
     opencodeResult: {path: 'opencode', version: '2.2.6'},

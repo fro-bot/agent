@@ -266,7 +266,7 @@ RFC-001 (Foundation)
 | F64: Session Sharing                   | Public session share links       | Future RFC                       |
 | F65: Automatic Branch Management       | Branch creation workflows        | Future RFC                       |
 | F66: Event Streaming and Progress Logs | Real-time agent progress logging | Future RFC                       |
-| F83: Telemetry Policy Enforcement      | Privacy-first telemetry          | **Amended in RFC-007**           |
+| F83: Telemetry Policy Enforcement      | Privacy-first; opt-in tracing    | **Amended in RFC-007**           |
 
 ### P2 Features (Nice-to-Have) - Future RFCs
 

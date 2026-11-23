@@ -5,6 +5,7 @@ import {describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {
   discoverActionLocation,
+  isInstalledEntryScriptUsable,
   runSandboxPreflight,
   SANDBOX_TOOL_NAMES,
   TRUSTED_TOOL_DIRS,
@@ -478,6 +479,21 @@ describe('runSandboxPreflight', () => {
       await expectRefused(deps, getExecOutput, /key-proxy\.js is not a regular file/)
     })
 
+    it.each([
+      ['is missing', undefined],
+      ['is a symlink', 'symlink'],
+      ['is a directory', 'directory'],
+    ] as const)('does not look at dist/trace-relay.js: the preflight passes when it %s', async (_label, kind) => {
+      // #given an install whose relay bundle is in some state, with tracing not part of the preflight at all
+      const entries = publishedEntries(PUBLISHED_ROOT)
+      entries.delete(`${PUBLISHED_ROOT}/dist/trace-relay.js`)
+      if (kind !== undefined) entries.set(`${PUBLISHED_ROOT}/dist/trace-relay.js`, kind)
+      const {deps} = withInstall(PUBLISHED_ROOT, {entries})
+
+      // #when / #then an isolated run behaves exactly as it did before the relay existed
+      expect((await runSandboxPreflight(deps)).ok).toBe(true)
+    })
+
     it('refuses an install that has no sandbox-view.js, because root runs the view builder before the agent starts', async () => {
       // #given an install without the view builder
       const entries = publishedEntries(PUBLISHED_ROOT)
@@ -656,5 +672,89 @@ describe('runSandboxPreflight', () => {
         expect(found.bundleDir).toBeNull()
       })
     })
+  })
+})
+
+function installDeps(entries: Map<string, EntryKind>, overrides: Partial<SandboxPreflightDeps> = {}) {
+  const {deps} = createDeps({entries})
+  return {...deps, ...overrides}
+}
+
+describe('isInstalledEntryScriptUsable', () => {
+  const RELAY = ['dist/trace-relay.js'] as const
+
+  it('is true for a regular file in the published install, under the same rules the preflight applies', async () => {
+    const entries = publishedEntries(PUBLISHED_ROOT)
+    entries.set(`${PUBLISHED_ROOT}/dist/trace-relay.js`, 'file')
+
+    expect(await isInstalledEntryScriptUsable(installDeps(entries), RELAY)).toBe(true)
+  })
+
+  it.each([
+    ['missing', undefined],
+    ['a symlink', 'symlink'],
+    ['a directory', 'directory'],
+    ['a device or FIFO', 'other'],
+  ] as const)('is false when the script is %s', async (_label, kind) => {
+    const entries = publishedEntries(PUBLISHED_ROOT)
+    entries.delete(`${PUBLISHED_ROOT}/dist/trace-relay.js`)
+    if (kind !== undefined) entries.set(`${PUBLISHED_ROOT}/dist/trace-relay.js`, kind)
+
+    expect(await isInstalledEntryScriptUsable(installDeps(entries), RELAY)).toBe(false)
+  })
+
+  it.each([
+    ['dist is a symlink', `${PUBLISHED_ROOT}/dist`, 'symlink'],
+    ['the install root is a symlink', PUBLISHED_ROOT, 'symlink'],
+    ['the action manifest is a symlink', `${PUBLISHED_ROOT}/action.yaml`, 'symlink'],
+    ['main.js is a symlink', `${PUBLISHED_ROOT}/dist/main.js`, 'symlink'],
+  ] as const)('is false when %s, because the install is not immutable to the agent', async (_label, target, kind) => {
+    const entries = publishedEntries(PUBLISHED_ROOT)
+    entries.set(`${PUBLISHED_ROOT}/dist/trace-relay.js`, 'file')
+    entries.set(target, kind)
+
+    expect(await isInstalledEntryScriptUsable(installDeps(entries), RELAY)).toBe(false)
+  })
+
+  it('is false for an install that is not a published one (a local uses: ./ in the checkout)', async () => {
+    const entries = publishedEntries(PUBLISHED_ROOT)
+    entries.set(`${PUBLISHED_ROOT}/dist/trace-relay.js`, 'file')
+    const local = installDeps(entries, {
+      bundleDir: '/home/runner/work/repo/repo/dist',
+      invokedAs: '/home/runner/work/repo/repo/dist/main.js',
+    })
+
+    expect(await isInstalledEntryScriptUsable(local, RELAY)).toBe(false)
+  })
+
+  it('is false, and never throws, when the install cannot be located', async () => {
+    const entries = publishedEntries(PUBLISHED_ROOT)
+    entries.set(`${PUBLISHED_ROOT}/dist/trace-relay.js`, 'file')
+
+    expect(await isInstalledEntryScriptUsable(installDeps(entries, {invokedAs: null}), RELAY)).toBe(false)
+    expect(await isInstalledEntryScriptUsable(installDeps(entries, {bundleDir: null}), RELAY)).toBe(false)
+    expect(await isInstalledEntryScriptUsable(installDeps(entries, {env: {}}), RELAY)).toBe(false)
+  })
+
+  it('is false, and never throws, when the filesystem call itself fails', async () => {
+    const entries = publishedEntries(PUBLISHED_ROOT)
+    entries.set(`${PUBLISHED_ROOT}/dist/trace-relay.js`, 'file')
+    const failing = installDeps(entries, {
+      lstat: async () => {
+        throw new Error('EIO')
+      },
+    })
+
+    expect(await isInstalledEntryScriptUsable(failing, RELAY)).toBe(false)
+  })
+
+  it('checks only the scripts it is given, and adds nothing to the preflight list', async () => {
+    const entries = publishedEntries(PUBLISHED_ROOT)
+    entries.delete(`${PUBLISHED_ROOT}/dist/key-proxy.js`)
+    entries.set(`${PUBLISHED_ROOT}/dist/trace-relay.js`, 'file')
+
+    // key-proxy.js is gone, so the full preflight would refuse; a caller that asks about the relay alone still gets false
+    // because the shared walk checks the Action's own entry files as well.
+    expect(await isInstalledEntryScriptUsable(installDeps(entries), RELAY)).toBe(false)
   })
 })

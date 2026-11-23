@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
   setSecret: vi.fn<(value: string) => void>(),
   warning: vi.fn<(message: string) => void>(),
   info: vi.fn<(message: string) => void>(),
+  notice: vi.fn<(message: string) => void>(),
   githubContext: {
     payload: {},
   },
@@ -22,6 +23,7 @@ vi.mock('@actions/core', () => ({
   setSecret: mocks.setSecret,
   warning: mocks.warning,
   info: mocks.info,
+  notice: mocks.notice,
 }))
 
 vi.mock('@actions/github', () => ({
@@ -1602,5 +1604,162 @@ describe('parseModelInput', () => {
 
   it('throws error for whitespace-only string', () => {
     expect(() => parseModelInput('   ')).toThrow('Invalid model format')
+  })
+})
+
+describe('parseActionInputs tracing inputs', () => {
+  const ENDPOINT = 'https://collector-canary.example.test/api/public/otel/v1/traces'
+  const HEADERS =
+    'Authorization: Basic cGstbGYtY2FuYXJ5LTAwMDE6c2stbGYtY2FuYXJ5LTAwMDItc2VjcmV0\nx-langfuse-ingestion-version: 4'
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    setGitHubPayload({})
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.unstubAllEnvs()
+  })
+
+  it('is off by default, and says nothing and masks nothing for it', () => {
+    // #given neither input
+    mockInputs({})
+
+    // #when
+    const result = parseActionInputs()
+
+    // #then
+    expect(result.success && result.data.tracing).toEqual({enabled: false})
+    expect(mocks.warning).not.toHaveBeenCalled()
+    expect(mocks.notice).not.toHaveBeenCalled()
+    // only the github token and the auth json: the tracing inputs add no registration when empty
+    expect(mocks.setSecret).toHaveBeenCalledTimes(2)
+  })
+
+  it('is on with the endpoint and the headers when both are set, and masks them', () => {
+    // #given
+    mockInputs({'trace-endpoint': ENDPOINT, 'trace-headers': HEADERS})
+
+    // #when
+    const result = parseActionInputs()
+
+    // #then
+    expect(result.success && result.data.tracing).toEqual({
+      enabled: true,
+      url: ENDPOINT,
+      headers: [
+        {name: 'Authorization', value: 'Basic cGstbGYtY2FuYXJ5LTAwMDE6c2stbGYtY2FuYXJ5LTAwMDItc2VjcmV0'},
+        {name: 'x-langfuse-ingestion-version', value: '4'},
+      ],
+    })
+    expect(mocks.setSecret).toHaveBeenCalledWith(ENDPOINT)
+    expect(mocks.setSecret).toHaveBeenCalledWith(HEADERS)
+    expect(mocks.setSecret).toHaveBeenCalledWith('sk-lf-canary-0002-secret')
+    expect(mocks.warning).not.toHaveBeenCalled()
+  })
+
+  it('removes both INPUT_ variables from the process environment after parsing', () => {
+    // #given the runner's names for the two inputs (hyphen preserved), as for auth-json
+    vi.stubEnv('INPUT_TRACE-ENDPOINT', ENDPOINT)
+    vi.stubEnv('INPUT_TRACE-HEADERS', HEADERS)
+    mockInputs({'trace-endpoint': ENDPOINT, 'trace-headers': HEADERS})
+
+    // #when
+    const result = parseActionInputs()
+
+    // #then the server child, which inherits the process environment, cannot see either
+    expect(result.success).toBe(true)
+    expect(process.env['INPUT_TRACE-ENDPOINT']).toBeUndefined()
+    expect(process.env['INPUT_TRACE-HEADERS']).toBeUndefined()
+  })
+
+  it('removes both INPUT_ variables when the inputs are refused too', () => {
+    vi.stubEnv('INPUT_TRACE-ENDPOINT', 'http://collector.example.test/v1/traces')
+    vi.stubEnv('INPUT_TRACE-HEADERS', HEADERS)
+    mockInputs({'trace-endpoint': 'http://collector.example.test/v1/traces', 'trace-headers': HEADERS})
+
+    parseActionInputs()
+
+    expect(process.env['INPUT_TRACE-ENDPOINT']).toBeUndefined()
+    expect(process.env['INPUT_TRACE-HEADERS']).toBeUndefined()
+  })
+
+  it('never fails the run for a bad endpoint or header: tracing is off with one warning and the rest parses', () => {
+    // #given an http endpoint to a public host, and a header line with no colon
+    mockInputs({'trace-endpoint': 'http://collector.example.test/v1/traces', prompt: 'Still runs'})
+    const badEndpoint = parseActionInputs()
+    vi.clearAllMocks()
+    mockInputs({'trace-endpoint': ENDPOINT, 'trace-headers': 'no colon here', prompt: 'Still runs'})
+    const badHeader = parseActionInputs()
+
+    // #then both parse, with tracing off and the other inputs intact
+    expect(badEndpoint.success && badEndpoint.data.tracing).toEqual({enabled: false})
+    expect(badHeader.success && badHeader.data.tracing).toEqual({enabled: false})
+    expect(badHeader.success && badHeader.data.prompt).toBe('Still runs')
+    expect(mocks.warning).toHaveBeenCalledTimes(1)
+    expect(String(mocks.warning.mock.calls[0]?.[0])).toContain('trace-headers line 1')
+  })
+
+  it('is on with one notice, and no headers, for an endpoint with empty headers', () => {
+    mockInputs({'trace-endpoint': ENDPOINT})
+
+    const result = parseActionInputs()
+
+    expect(result.success && result.data.tracing).toEqual({enabled: true, url: ENDPOINT, headers: []})
+    expect(mocks.notice).toHaveBeenCalledTimes(1)
+    expect(mocks.warning).not.toHaveBeenCalled()
+  })
+
+  describe('when a required input fails before the tracing inputs are reached', () => {
+    const BASIC = 'Basic cGstbGYtY2FuYXJ5LTAwMDE6c2stbGYtY2FuYXJ5LTAwMDItc2VjcmV0'
+    const HEADERS = `Authorization: ${BASIC}\nx-langfuse-ingestion-version: 4`
+
+    it.each([
+      ['an empty github-token', {'github-token': ''}],
+      ['an empty auth-json', {'auth-json': ''}],
+      ['an auth-json that is not JSON', {'auth-json': 'not json'}],
+    ])('still masks every form of the headers and removes both variables, for %s', (_name, bad) => {
+      // #given both tracing inputs set (as the runner exports them) and a required input that fails
+      vi.stubEnv('INPUT_TRACE-ENDPOINT', ENDPOINT)
+      vi.stubEnv('INPUT_TRACE-HEADERS', HEADERS)
+      mockInputs({'trace-endpoint': ENDPOINT, 'trace-headers': HEADERS, ...bad})
+
+      // #when
+      const result = parseActionInputs()
+
+      // #then the run fails on the required input, and nothing of the tracing inputs is left unmasked or in the environment
+      expect(result.success).toBe(false)
+      const masked = mocks.setSecret.mock.calls.map(call => String(call[0]))
+      for (const form of [
+        ENDPOINT,
+        HEADERS,
+        BASIC,
+        'cGstbGYtY2FuYXJ5LTAwMDE6c2stbGYtY2FuYXJ5LTAwMDItc2VjcmV0',
+        'sk-lf-canary-0002-secret',
+      ]) {
+        expect(masked).toContain(form)
+      }
+      expect(process.env['INPUT_TRACE-ENDPOINT']).toBeUndefined()
+      expect(process.env['INPUT_TRACE-HEADERS']).toBeUndefined()
+    })
+
+    it('masks each value once on a run that goes on, and logs no tracing message for a run that fails early', () => {
+      // #given a good run, and then a failing one
+      mockInputs({'trace-endpoint': ENDPOINT, 'trace-headers': HEADERS})
+      parseActionInputs()
+      const maskedOnce = mocks.setSecret.mock.calls.map(call => String(call[0])).filter(value => value === ENDPOINT)
+      vi.clearAllMocks()
+      mockInputs({
+        'trace-endpoint': 'http://collector.example.test/v1/traces',
+        'trace-headers': HEADERS,
+        'github-token': '',
+      })
+      parseActionInputs()
+
+      // #then the endpoint is registered once for a run that parses, and a run that fails early warns about nothing
+      expect(maskedOnce).toEqual([ENDPOINT])
+      expect(mocks.warning).not.toHaveBeenCalled()
+    })
   })
 })

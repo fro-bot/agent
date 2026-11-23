@@ -40,6 +40,7 @@ Environment bootstrap logic: OpenCode CLI (stock V2, digest-pinned) and plugin i
 - **Default Version**: `latest` (and an empty input) resolves to the recorded stock V2 pin in `opencode-v2-pin.json` with no network lookup (`resolveRequestedVersion`). `resolveStockV2Policy` accepts only that pin and runs before any cache lookup or download. A V1 value never gets this far: `parseOpenCodeVersion` (`src/harness/config/inputs.ts`) rejects it at input parsing. There is no fallback: a failed install throws.
 - **Verification**: Validates binaries (`--version`) BEFORE caching.
 - **Plugin install**: `installPluginsV2` installs `@fro.bot/systematic` and `@fro.bot/opencode-plugin` at exact versions before the server starts.
+- **Tracing**: `tracing.ts` splits the parsed tracing inputs into the relay's config (URL and credential) and the plugin's host declaration (relay port and run identity); the credential never reaches the second. `orderPlugins` in `ci-config-v2.ts` lists the Fro Bot plugin last only when the run traces.
 
 ## SECURITY
 

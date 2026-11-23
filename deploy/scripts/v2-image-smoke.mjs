@@ -9,7 +9,7 @@
 //     '@fro.bot/systematic@<DEFAULT_SYSTEMATIC_VERSION>' '@fro.bot/opencode-plugin@<FRO_BOT_PLUGIN_VERSION>'
 //
 // The versions are the pins in packages/runtime/src/shared/constants.ts (today @fro.bot/systematic@3.27.2 and
-// @fro.bot/opencode-plugin@0.1.0); .github/workflows/ci.yaml ("Workspace Image Smoke Test") reads them from there.
+// @fro.bot/opencode-plugin@0.2.0); .github/workflows/ci.yaml ("Workspace Image Smoke Test") reads them from there.
 //
 // What it proves that nothing else here can, because Docker is what builds the image:
 // 1. the musl stock binary starts on Alpine as the agent uid (`serve --stdio`, held stdin, explicit port);
