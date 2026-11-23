@@ -383,11 +383,12 @@ With `isolate-agent`, the Action creates a per-run local user, hands it only the
 
 ### Run Tracing (Action + Plugin)
 
-Opt-in OpenTelemetry tracing of a run. `@fro.bot/opencode-plugin` (`packages/opencode-plugin/src/tracing/`) turns hook calls and session events into GenAI spans and exports them over OTLP/HTTP through the shared scrubber and exporter in `packages/runtime/src/tracing/`, which the plugin bundles inline (its built output imports only `effect`, `@opencode/plugin` and `node:` modules). In the Action, a relay child (`dist/trace-relay.js`, supervised by `src/harness/phases/trace-relay-process.ts`) holds the collector URL and credential from `trace-endpoint` and `trace-headers`.
+Opt-in OpenTelemetry tracing of a run. `@fro.bot/opencode-plugin` (`packages/opencode-plugin/src/tracing/`) turns hook calls and session events into GenAI spans and exports them over OTLP/HTTP through the shared scrubber and exporter in `packages/runtime/src/tracing/`, which the plugin bundles inline (its built output imports only `effect`, `@opencode/plugin` and `node:` modules). In the Action, a relay child (`dist/trace-relay.js`, supervised by `src/harness/phases/trace-relay-process.ts`) forwards the plugin's spans. The Action sends its own run trace directly (`src/shared/lifecycle-tracer.ts`, `src/harness/post-trace.ts`), scrubbed of every secret the run masks (`src/shared/secret-registry.ts`).
 
 - Only the operator turns tracing on or picks the destination: Action inputs, or a user-owned settings file for a local session. Plugin options, project config and repository content never do.
 - The server gets only the relay's loopback address and the run identity (`packages/runtime/src/agent/tracing-launcher.ts`), never the credential or collector host.
-- Fail-soft: the relay never joins the abort signal, the sandbox outcome or the persistence decision.
+- Fail-soft: tracing never joins the abort signal, the sandbox outcome or the persistence decision.
+- One signal owner (`src/harness/signal-owner.ts`) handles cancellation; writes check its flag before submitting.
 
 > See also: [Setup and Configuration](docs/wiki/Setup%20and%20Configuration.md#tracing-a-run)
 

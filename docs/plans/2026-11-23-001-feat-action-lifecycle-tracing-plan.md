@@ -258,7 +258,7 @@ Early-exit span matrix (a trace never invents unreached phases):
 
 - A recorded yes or no for inputs and for state, on both paths.
 
-- [ ] **Unit 2: Move the exporter and scrubber into the shared runtime**
+- [x] **Unit 2: Move the exporter and scrubber into the shared runtime**
 
 **Goal:** One implementation of OTLP export and scrubbing that the plugin and the Action both bundle, with no change to plugin behaviour.
 
@@ -294,7 +294,7 @@ Early-exit span matrix (a trace never invents unreached phases):
 
 - Plugin tests, the release import check and a packed install pass. The Action's `dist/` size delta is measured and recorded.
 
-- [ ] **Unit 3: Plugin launcher fields and the run link**
+- [x] **Unit 3: Plugin launcher fields and the run link**
 
 **Goal:** Turn traces use the session id the Action passes as their Langfuse session, carry the invocation id, and link to the run's root span. Plugin-only, released on its own.
 
@@ -326,7 +326,7 @@ Early-exit span matrix (a trace never invents unreached phases):
 
 - Plugin and runtime tests and the release dry run pass, then the release publishes.
 
-- [ ] **Unit 4: The lifecycle tracer**
+- [x] **Unit 4: The lifecycle tracer**
 
 **Goal:** A run-wide recorder that keeps spans, events and outcomes, scrubs at serialization with a set that grows during the run, and sends directly with a bounded wait.
 
@@ -376,7 +376,7 @@ Early-exit span matrix (a trace never invents unreached phases):
 
 - Unit tests pass. Unit 9 confirms the output against a real receiver.
 
-- [ ] **Unit 5: Read trace inputs first and instrument the run**
+- [x] **Unit 5: Read trace inputs first and instrument the run**
 
 **Goal:** The tracer exists before bootstrap, every mask site records into it, every phase and the listed inner work opens and closes spans, and early exits match the matrix.
 
@@ -419,7 +419,7 @@ Early-exit span matrix (a trace never invents unreached phases):
 
 - Focused tests pass, and the whole `run()` suite is unchanged with tracing off.
 
-- [ ] **Unit 6: One signal owner for every run**
+- [x] **Unit 6: One signal owner for every run**
 
 **Goal:** A cancelled run flushes what it reached, isolated or not, without delaying the sandbox teardown.
 
@@ -457,7 +457,7 @@ Early-exit span matrix (a trace never invents unreached phases):
 
 - Signal tests pass locally. Unit 9 confirms it on hosted runners.
 
-- [ ] **Unit 7: The post step's span**
+- [x] **Unit 7: The post step's span**
 
 **Goal:** The post step adds its span to the run's trace.
 
@@ -492,7 +492,7 @@ Early-exit span matrix (a trace never invents unreached phases):
 
 - Post tests pass. If Unit 1 fails, this unit is dropped and Unit 10 documents that the post step isn't traced.
 
-- [ ] **Unit 8: Action launcher wiring and the plugin pin**
+- [x] **Unit 8: Action launcher wiring and the plugin pin**
 
 **Goal:** The Action sends the three new launcher fields and pins the plugin release that reads them.
 
@@ -521,7 +521,7 @@ Early-exit span matrix (a trace never invents unreached phases):
 
 - Tests pass, the build is stable, and the pins match the published release.
 
-- [ ] **Unit 9: Real-receiver and hosted-runner tests**
+- [x] **Unit 9: Real-receiver and hosted-runner tests**
 
 **Goal:** Prove the wire format, links, shared session, cancellation and credential isolation against real components.
 
