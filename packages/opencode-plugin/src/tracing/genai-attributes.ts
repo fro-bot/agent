@@ -239,12 +239,11 @@ function toolSpan(record: ToolRecord, options: AttributeOptions): PendingSpan {
 /**
  * A turn's root span links to the Action run's root span: a link, not a parent, because the turn is a trace of its own (Langfuse
  * ignores links; Tempo follows them). Any other span of the turn is reached through its root. The link is its two ids and
- * nothing else: it relies on no link attribute (the shared core's `SpanLink` still requires an empty `attributes` object, which
- * goes when the core drops link attributes).
+ * nothing else, as the shared core's `SpanLink` is.
  */
 function runLinks(record: InvokeRecord, options: AttributeOptions): Pick<PendingSpan, 'links'> {
   if (record.role !== 'root' || options.rootSpan === undefined) return {}
-  return {links: [{traceId: options.rootSpan.traceId, spanId: options.rootSpan.spanId, attributes: {}}]}
+  return {links: [{traceId: options.rootSpan.traceId, spanId: options.rootSpan.spanId}]}
 }
 
 function invokeSpan(record: InvokeRecord, options: AttributeOptions): PendingSpan {

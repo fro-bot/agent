@@ -600,9 +600,6 @@ describe('the run link', () => {
   const INVOCATION_ID = '3f2a9c1e-7b4d-4e8a-9d6c-1a2b3c4d5e6f'
   const LINKED = {identity: IDENTITY, rootSpan: ROOT_SPAN, sessionId: SESSION_ID, invocationId: INVOCATION_ID}
   const linked = (record: SpanRecord): ScrubbedSpan => toExportSpan(record, LINKED, scrubber)
-  /** The ids of a span's links: all a link is relied on for. */
-  const linkIds = (span: ScrubbedSpan): {traceId: string; spanId: string}[] | undefined =>
-    span.links?.map(({traceId, spanId}) => ({traceId, spanId}))
 
   it('uses the launcher’s session id verbatim as the Langfuse session on every span, and keeps the OpenCode session ids', () => {
     // #given a child span of a tree and the session id the Action computed
@@ -636,8 +633,8 @@ describe('the run link', () => {
     const others = [linked(invoke({role: 'child'})), linked(chat()), linked(tool())]
 
     // #then
-    expect(linkIds(root)).toEqual([ROOT_SPAN])
-    expect(linkIds(standalone)).toEqual([ROOT_SPAN])
+    expect(root.links).toEqual([ROOT_SPAN])
+    expect(standalone.links).toEqual([ROOT_SPAN])
     for (const span of others) expect(span.links).toBeUndefined()
   })
 
@@ -656,7 +653,7 @@ describe('the run link', () => {
     expect(onlyInvocation.links).toBeUndefined()
     expect(onlyRoot.attributes['langfuse.session.id']).toBe('ses_root')
     expect(onlyRoot.attributes['fro_bot.invocation.id']).toBeUndefined()
-    expect(linkIds(onlyRoot)).toEqual([ROOT_SPAN])
+    expect(onlyRoot.links).toEqual([ROOT_SPAN])
   })
 
   it('behaves exactly as before for an Action launcher without the fields', () => {
