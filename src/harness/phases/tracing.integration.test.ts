@@ -683,46 +683,57 @@ describe.skipIf(!enabled)('Action tracing against the real OpenCode V2 binary an
   }, 180_000)
 })
 
+/**
+ * One Action run's two traces against the real binary: the lifecycle tracer (real, exporting to its own loopback collector: the
+ * test process does not trust the turn collector's certificate, and the lifecycle exporter verifies TLS), and one turn with the
+ * link the Action computes and sends (`buildTraceSessionId` and `buildTracingRunLink`, as `run()` uses them).
+ */
+async function linkedRun(repository: {readonly owner: string; readonly repo: string}) {
+  const lifecycleSink = await startOtlpSink()
+  cleanups.push(lifecycleSink.stop)
+  const registry = createSecretRegistry(() => undefined)
+  const tracer = createLifecycleTracer({
+    inputs: {enabled: true, url: lifecycleSink.url, headers: []},
+    logger: createMockLogger(),
+    registry,
+    env: {},
+    identity: {
+      repository: `${repository.owner}/${repository.repo}`,
+      runId: '4242',
+      attempt: '3',
+      job: 'review',
+      trigger: 'issue_comment',
+    },
+  })
+  expect(tracer.enabled).toBe(true)
+  const sessionId = buildTraceSessionId(repository.owner, repository.repo, 'issue-42', createRegistryScrubber(registry))
+  if (sessionId !== undefined) tracer.setSessionId(sessionId)
+  const phase = tracer.startSpan('execution')
+
+  const turn = await runTurn({
+    tracing: 'on',
+    upstream: 'up',
+    steps: SIMPLE,
+    prompt: 'S-ONE hello',
+    finalText: 'simple answer',
+    link: buildTracingRunLink(tracer.ids, sessionId),
+  })
+  phase.end({outcome: 'succeeded'})
+  tracer.root.end({outcome: 'succeeded'})
+  await tracer.flush()
+  return {sessionId, tracer, turn, lifecycle: decodeSpans(lifecycleSink.accepted())}
+}
+
 describe.skipIf(!enabled)(
   'the lifecycle trace and the turn trace of one run, against the real binary and the built plugin',
   () => {
     it('give every span the same session and invocation id, and link the turn root to the lifecycle root span', async () => {
-      // #given the real lifecycle tracer, exporting to its own loopback collector (the test process does not trust the turn
-      // collector's certificate, and the lifecycle exporter verifies TLS)
-      const lifecycleSink = await startOtlpSink()
-      cleanups.push(lifecycleSink.stop)
-      const registry = createSecretRegistry(() => undefined)
-      const tracer = createLifecycleTracer({
-        inputs: {enabled: true, url: lifecycleSink.url, headers: []},
-        logger: createMockLogger(),
-        registry,
-        env: {},
-        identity: {repository: 'owner/repo', runId: '4242', attempt: '3', job: 'review', trigger: 'pull_request'},
-      })
-      expect(tracer.enabled).toBe(true)
-      // The session id exactly as the Action computes it, once, and the link as `run()` builds it
-      const sessionId = buildTraceSessionId('owner', 'repo', 'issue-42', createRegistryScrubber(registry))
-      expect(sessionId).toBe('owner/repo:issue-42')
-      if (sessionId !== undefined) tracer.setSessionId(sessionId)
-      const link = buildTracingRunLink(tracer.ids, sessionId)
-      const phase = tracer.startSpan('execution')
-
-      // #when one turn runs with that link, and then the lifecycle trace ends and is exported
-      const turn = await runTurn({
-        tracing: 'on',
-        upstream: 'up',
-        steps: SIMPLE,
-        prompt: 'S-ONE hello',
-        finalText: 'simple answer',
-        link,
-      })
-      phase.end({outcome: 'succeeded'})
-      tracer.root.end({outcome: 'succeeded'})
-      await tracer.flush()
+      // #given / #when one run's lifecycle trace and its turn
+      const {sessionId, tracer, turn, lifecycle} = await linkedRun({owner: 'owner', repo: 'repo'})
 
       // #then both traces were delivered
+      expect(sessionId).toBe('owner/repo:issue-42')
       expect(turn.started.success).toBe(true)
-      const lifecycle = decodeSpans(lifecycleSink.accepted())
       expect(lifecycle.map(span => span.name).toSorted()).toEqual(['action.main', 'execution'])
       expect(turn.spans.length).toBeGreaterThan(0)
 
@@ -744,6 +755,29 @@ describe.skipIf(!enabled)(
       // #and the OpenCode session is still each turn span's own `session.id`, apart from the shared Langfuse session
       for (const span of turn.spans) expect(span.attrs['session.id']).not.toBe('owner/repo:issue-42')
     }, 180_000)
+
+    it('gives two repositories on the same issue number one session each, shared by that repository’s two traces, and different from each other', async () => {
+      // #given two runs, one per repository, both on issue 42
+      const first = await linkedRun({owner: 'fro-bot', repo: 'agent'})
+      const second = await linkedRun({owner: 'fro-bot', repo: 'other'})
+
+      // #when each run's spans are grouped by session
+      const sessionsOf = (run: typeof first): Set<unknown> =>
+        new Set([...run.lifecycle, ...run.turn.spans].map(span => span.attrs['langfuse.session.id']))
+
+      // #then each repository's lifecycle and turn spans share exactly one session, and the two differ
+      expect(sessionsOf(first)).toEqual(new Set(['fro-bot/agent:issue-42']))
+      expect(sessionsOf(second)).toEqual(new Set(['fro-bot/other:issue-42']))
+      expect(first.sessionId).not.toBe(second.sessionId)
+      // #and the runs are separate traces, each turn root linking to its own run's root
+      expect(first.tracer.ids?.traceId).not.toBe(second.tracer.ids?.traceId)
+      expect(first.turn.spans.find(isRoot)?.links).toEqual([
+        {traceId: first.tracer.ids?.traceId, spanId: first.tracer.ids?.rootSpanId},
+      ])
+      expect(second.turn.spans.find(isRoot)?.links).toEqual([
+        {traceId: second.tracer.ids?.traceId, spanId: second.tracer.ids?.rootSpanId},
+      ])
+    }, 360_000)
 
     it('keeps the OpenCode session, and links nothing, when the Action sends no session id', async () => {
       // #given a link with the root span and invocation id but no session (no scrub-safe id existed)
