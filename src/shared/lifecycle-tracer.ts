@@ -128,13 +128,42 @@ export interface LifecycleTracer {
   readonly flush: () => Promise<FlushResult>
 }
 
-const NOOP_SPAN: LifecycleSpan = {
+/** The span of a tracer that is off, and of a span nobody has to end. Safe to call anything on. */
+export const NOOP_SPAN: LifecycleSpan = {
   spanId: '',
   setAttribute: () => undefined,
   addEvent: () => undefined,
   recordException: () => undefined,
   startChild: () => NOOP_SPAN,
   end: () => undefined,
+}
+
+/**
+ * Runs `work` inside `span`, and ends the span with what `classify` says of the result (default: succeeded). A throw is
+ * recorded on the span as an exception, the span ends failed, and the error goes on unchanged: tracing never alters what
+ * a phase does.
+ */
+export async function withSpan<T>(
+  span: LifecycleSpan,
+  work: (span: LifecycleSpan) => Promise<T>,
+  classify?: (value: T) => SpanResult,
+): Promise<T> {
+  let value: T
+  try {
+    value = await work(span)
+  } catch (error) {
+    span.recordException(error)
+    span.end({outcome: 'failed', reason: 'exception'})
+    throw error
+  }
+  let result: SpanResult = {outcome: 'succeeded'}
+  try {
+    result = classify?.(value) ?? result
+  } catch {
+    // A classifier that throws must not change the phase's result.
+  }
+  span.end(result)
+  return value
 }
 
 const NOOP_RESULT: FlushResult = {spans: 0, undelivered: 0}

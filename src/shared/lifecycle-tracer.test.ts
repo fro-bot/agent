@@ -13,6 +13,8 @@ import {
   freeText,
   LIFECYCLE_SERVICE_NAME,
   NODE_DEBUG_WARNING,
+  NOOP_SPAN,
+  withSpan,
 } from './lifecycle-tracer.js'
 import {createSecretRegistry} from './secret-registry.js'
 import {createMockLogger, serializeLoggerCalls} from './test-helpers.js'
@@ -837,5 +839,72 @@ describe('createLifecycleTracer', () => {
       expect(logger.warning).toHaveBeenCalledTimes(1)
       expect(serializeLoggerCalls(logger)).not.toContain(target.url)
     })
+  })
+})
+
+describe('withSpan', () => {
+  const recording = async () => {
+    const {createRecordingTracer} = await import('./lifecycle-tracer.testing.js')
+    return createRecordingTracer()
+  }
+
+  it('ends the span succeeded with the classifier’s result, and returns the value', async () => {
+    // #given
+    const {tracer, exported} = await recording()
+    const span = tracer.startSpan('phase')
+
+    // #when
+    const value = await withSpan(
+      span,
+      async () => 41,
+      result => ({outcome: 'skipped', reason: `got-${result}`}),
+    )
+    tracer.root.end()
+    await tracer.flush()
+
+    // #then
+    expect(value).toBe(41)
+    const phase = exported.find(item => item.name === 'phase')
+    expect(phase?.attributes['fro_bot.outcome']).toBe('skipped')
+    expect(phase?.attributes['fro_bot.reason']).toBe('got-41')
+  })
+
+  it('records the throw as an exception, ends the span failed, and rethrows the same error', async () => {
+    // #given
+    const {tracer, exported} = await recording()
+    const boom = new Error('boom')
+
+    // #when
+    await expect(
+      withSpan(tracer.startSpan('phase'), async () => {
+        throw boom
+      }),
+    ).rejects.toBe(boom)
+    tracer.root.end()
+    await tracer.flush()
+
+    // #then
+    const phase = exported.find(item => item.name === 'phase')
+    expect(phase?.attributes['fro_bot.outcome']).toBe('failed')
+    expect(phase?.events.some(event => event.name === 'exception')).toBe(true)
+  })
+
+  it('keeps the phase’s result when the classifier itself throws', async () => {
+    // #given / #when
+    const {tracer} = await recording()
+    const value = await withSpan(
+      tracer.startSpan('phase'),
+      async () => 'ok',
+      () => {
+        throw new Error('classifier')
+      },
+    )
+
+    // #then
+    expect(value).toBe('ok')
+  })
+
+  it('does nothing on the no-op span', async () => {
+    await expect(withSpan(NOOP_SPAN, async () => 'fine')).resolves.toBe('fine')
   })
 })
