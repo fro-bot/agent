@@ -703,6 +703,8 @@ export function runnerFirstLine(command: string, run?: InspectionRunner): string
 export interface SecretEnvRangeReport {
   /** The registry's own verdict: false as soon as one registered credential is outside the scrubber's matchable range. */
   readonly matchable: boolean
+  /** How many secret-named, non-blank variables the registry took: zero would make "matchable" mean nothing. */
+  readonly inspected: number
   /** The secret-named variables whose value is outside the range: names and lengths only. */
   readonly outOfRange: readonly {readonly name: string; readonly length: number}[]
 }
@@ -715,17 +717,15 @@ export interface SecretEnvRangeReport {
 export function secretEnvRangeReport(env: Readonly<Record<string, string | undefined>>): SecretEnvRangeReport {
   const registry = createSecretRegistry(() => undefined)
   registry.addSecretEnv(env)
-  const outOfRange = Object.entries(env)
-    .filter(
-      (entry): entry is [string, string] =>
-        SECRET_ENV_NAME.test(entry[0]) &&
-        entry[1] !== undefined &&
-        entry[1].trim().length > 0 &&
-        (entry[1].length < MIN_LITERAL_CHARS || entry[1].length > MAX_LITERAL_CHARS),
-    )
+  const secretNamed = Object.entries(env).filter(
+    (entry): entry is [string, string] =>
+      SECRET_ENV_NAME.test(entry[0]) && entry[1] !== undefined && entry[1].trim().length > 0,
+  )
+  const outOfRange = secretNamed
+    .filter(([, value]) => value.length < MIN_LITERAL_CHARS || value.length > MAX_LITERAL_CHARS)
     .map(([name, value]) => ({name, length: value.length}))
     .toSorted((a, b) => a.name.localeCompare(b.name))
-  return {matchable: registry.matchable(), outOfRange}
+  return {matchable: registry.matchable(), inspected: secretNamed.length, outOfRange}
 }
 
 /** `NAME (12 characters)`, one per offender. Safe to print: names and lengths only. */

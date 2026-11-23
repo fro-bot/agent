@@ -66,12 +66,17 @@ import {
   getSessionDbBasenames,
 } from '@fro-bot/runtime'
 import {afterAll, beforeAll, describe, expect, it} from 'vitest'
-import {waitUntil} from '../../../packages/opencode-plugin/src/tracing/tracing.integration.fixture.js'
+import {
+  decodeSpans,
+  sleep,
+  waitUntil,
+} from '../../../packages/opencode-plugin/src/tracing/tracing.integration.fixture.js'
 import {
   startTlsUpstream,
   type RecordedRequest,
   type TlsUpstream,
 } from '../../../packages/runtime/src/agent/key-proxy-test-kit.js'
+import {startOtlpSink, type OtlpSink} from '../../../packages/runtime/src/tracing/otlp-sink.testing.js'
 import {resolveBrokeredPushCommitMessage} from '../../features/delegated/commit-message.js'
 import {reconstructChanges} from '../../features/delegated/reconstruct-changes.js'
 import {
@@ -89,12 +94,21 @@ import {installPluginsV2} from '../../services/setup/plugin-install-v2.js'
 import {admitRepoSkills, createRepoSkillsStagingRoot} from '../../services/setup/repo-skills.js'
 import {createSandboxPreflightDeps, runSandboxPreflight} from '../../services/setup/sandbox-preflight.js'
 import {createViewProbe} from '../../services/setup/sandbox-view-probe.js'
-import {buildActionTracingHost, buildTracingRunIdentity, relayRequestFromInputs} from '../../services/setup/tracing.js'
+import {
+  buildActionTracingHost,
+  buildTraceSessionId,
+  buildTracingRunIdentity,
+  buildTracingRunLink,
+  relayRequestFromInputs,
+} from '../../services/setup/tracing.js'
 import {STORAGE_VERSION} from '../../shared/constants.js'
 import {getGitHubRunAttempt, getInvocationIdentity} from '../../shared/env.js'
+import {createLifecycleTracer, createRegistryScrubber} from '../../shared/lifecycle-tracer.js'
 import {createLogger} from '../../shared/logger.js'
+import {createSecretRegistry} from '../../shared/secret-registry.js'
 import {unwrapOk} from '../../shared/test-helpers.js'
 import {parseTraceInputs} from '../config/trace-inputs.js'
+import {createSignalOwner, type SignalHost, type SignalName} from '../signal-owner.js'
 import {startKeyProxyProcess, type KeyProxyProcess} from './key-proxy-process.js'
 import {snapshotLogDirectory} from './log-snapshot.js'
 import {createSandboxLifecycle} from './sandbox-lifecycle.js'
@@ -121,6 +135,7 @@ import {
   controlCoversMatrix,
   copyBundleWithImports,
   describeNamespaceMembers,
+  describeOutOfRangeSecretEnv,
   describeReconstruction,
   failuresFor,
   findPaths,
@@ -137,6 +152,7 @@ import {
   runnerFirstLine,
   safeEnvPath,
   safeEnvToken,
+  secretEnvRangeReport,
   startPlainScriptedSession,
   startScriptedProvider,
   startScriptedSession,
@@ -3156,6 +3172,29 @@ function tracingOffEnvProbe(expectedLauncherLine: string, collectorAddress: stri
 }
 
 /**
+ * What the server was told about the run, read from its own environment (the tool shell's parent): the launcher variable holds
+ * the lifecycle trace's ids and the session, each once. The credential's absence from the same variable is the canary search's
+ * `environ` group, which reads this environment too.
+ */
+function launcherLinkProbe(
+  ids: {readonly traceId: string; readonly rootSpanId: string; readonly invocationId: string} | null,
+  session: string | undefined,
+): Probe {
+  const count = (needle: string): string => `$(printf %s "$doc" | grep -cF -- ${q(needle)})`
+  return {
+    id: 'launcher_link',
+    category: 'works',
+    cmd:
+      `doc=$(tr '\0' '\n' < /proc/$PPID/environ 2>/dev/null | grep '^OPENCODE_FROBOT_TRACING='); ` +
+      `[ -n "$doc" ] || { R launcher_link FAILED "the launcher variable could not be read"; exit 0; }; ` +
+      `t=${count(ids?.traceId ?? 'absent')}; s=${count(ids?.rootSpanId ?? 'absent')}; ` +
+      `n=${count(session ?? 'absent')}; i=${count(ids?.invocationId ?? 'absent')}; ` +
+      `[ "$t" = 1 ] && [ "$s" = 1 ] && [ "$n" = 1 ] && [ "$i" = 1 ] && st=WORKS || st=FAILED; ` +
+      `R launcher_link $st "trace=$t span=$s session=$n invocation=$i"`,
+  }
+}
+
+/**
  * That the fallback is really in place, as the plugin would find it: at `$XDG_CONFIG_HOME/fro-bot/opencode-plugin/tracing.json`,
  * a regular file the sandbox user owns, mode 0600, naming the sink. Without this a silent sink could mean a file that was
  * never there.
@@ -3199,6 +3238,44 @@ function exportedSpanNames(requests: readonly RecordedRequest[]): string[] {
   return exportedSpans(requests.map(request => request.body)).map(span => span.name)
 }
 
+/** The turn root spans (`invoke_agent` with no parent) in the collector's requests, with their string attributes and links. */
+function turnRootSpans(requests: readonly RecordedRequest[]): {
+  readonly attributes: Record<string, string>
+  readonly links: readonly {readonly traceId: string; readonly spanId: string}[]
+}[] {
+  const roots: {attributes: Record<string, string>; links: {traceId: string; spanId: string}[]}[] = []
+  for (const request of requests) {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(request.body.toString('utf8'))
+    } catch {
+      continue
+    }
+    const resources = (parsed as {resourceSpans?: {scopeSpans?: {spans?: Record<string, unknown>[]}[]}[]} | null)
+      ?.resourceSpans
+    for (const resource of resources ?? []) {
+      for (const scope of resource.scopeSpans ?? []) {
+        for (const span of scope.spans ?? []) {
+          const parent = span.parentSpanId
+          if (typeof span.name !== 'string' || !span.name.startsWith('invoke_agent')) continue
+          if (typeof parent === 'string' && parent !== '') continue
+          const attributes: Record<string, string> = {}
+          for (const item of (span.attributes ?? []) as {key?: unknown; value?: {stringValue?: unknown}}[]) {
+            if (typeof item.key === 'string' && typeof item.value?.stringValue === 'string') {
+              attributes[item.key] = item.value.stringValue
+            }
+          }
+          const links = ((span.links ?? []) as {traceId?: unknown; spanId?: unknown}[])
+            .filter(link => typeof link.traceId === 'string' && typeof link.spanId === 'string')
+            .map(link => ({traceId: link.traceId as string, spanId: link.spanId as string}))
+          roots.push({attributes, links})
+        }
+      }
+    }
+  }
+  return roots
+}
+
 const hasRootSpan = (requests: readonly RecordedRequest[]): boolean =>
   exportedSpanNames(requests).some(name => name.startsWith('invoke_agent'))
 
@@ -3225,6 +3302,19 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
   const relayBundle = path.join(realDist, 'trace-relay.js')
   const pluginSpec = `${FRO_BOT_PLUGIN_PACKAGE}@${FRO_BOT_PLUGIN_VERSION}`
   const cleanups: (() => Promise<void> | void)[] = []
+  // The lifecycle trace of these runs, never exported here: its ids and session are what the Action hands the launcher (so the
+  // server's environment holds them) and keeps in Action state (so a file in the step's directory holds them).
+  const lifecycleRegistry = createSecretRegistry(() => undefined)
+  const lifecycleTracer = createLifecycleTracer({
+    inputs: {enabled: true, url: 'http://127.0.0.1:9/v1/traces', headers: []},
+    logger,
+    registry: lifecycleRegistry,
+    env: {},
+  })
+  const lifecycleSession = buildTraceSessionId('owner', 'repo', 'issue-42', createRegistryScrubber(lifecycleRegistry))
+  const runLink = buildTracingRunLink(lifecycleTracer.ids, lifecycleSession)
+  /** The Action's identity record and session, as `core.saveState` writes them: one `name=value` line each. */
+  const stateText = `lifecycleTrace=${JSON.stringify(lifecycleTracer.ids)}\nlifecycleSession=${lifecycleSession ?? ''}\n`
   const scanSpecFor = (workspace: string): ScanSpec => ({
     canary: TRACE_CANARY,
     ...SCAN_CONTROLS,
@@ -3235,7 +3325,7 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
     runnerTemp,
     checkout: [workspace, responseDir],
     // Opened by exact path as well as walked for: a directory can refuse listing and still allow access to a known child.
-    knownPaths: [path.join(scratch, 'step', 'file_commands.txt')],
+    knownPaths: [path.join(scratch, 'step', 'file_commands.txt'), path.join(scratch, 'step', 'lifecycle_state.txt')],
   })
   let isolated: TracedTurn | undefined
   let plain: TracedTurn | undefined
@@ -3320,13 +3410,16 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
     const tracing: ScriptedTracing = {
       specs: [pluginSpec],
       expectedPluginIds: [FRO_BOT_PLUGIN_ID],
-      host: buildActionTracingHost(relay?.port ?? null, identity),
+      host: buildActionTracingHost(relay?.port ?? null, identity, runLink),
     }
     const scanSpec = scanSpecFor(workspace)
     const offHost = buildActionTracingHost(null, identity)
     const steps: Probe[] =
       options.tracing === 'on'
-        ? [{id: 'canary_scan', category: 'blocked', cmd: `: ${TOOL_ARGUMENT_MARKER}\n${scanCommand(scanSpec)}`}]
+        ? [
+            launcherLinkProbe(lifecycleTracer.ids, lifecycleSession),
+            {id: 'canary_scan', category: 'blocked', cmd: `: ${TOOL_ARGUMENT_MARKER}\n${scanCommand(scanSpec)}`},
+          ]
         : [
             noRelayProcessProbe(),
             ...(sink === null ? [] : [tracingFallbackPlantedProbe(sink.address, machine)]),
@@ -3420,6 +3513,8 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
     const stepDir = path.join(scratch, 'step')
     fs.mkdirSync(stepDir, {recursive: true, mode: 0o700})
     fs.writeFileSync(path.join(stepDir, 'file_commands.txt'), `INPUT_TRACE-HEADERS=${TRACE_HEADERS}\n`, {mode: 0o600})
+    // The Action's state for the run, in the same private directory: the identity record and session, never an input.
+    fs.writeFileSync(path.join(stepDir, 'lifecycle_state.txt'), stateText, {mode: 0o600})
     await startStepStandIn()
     // The runner's detector controls, in the directories the sandbox reaches OpenCode's storage through links to.
     plantScanControls(xdgRoot, scanSpecFor(path.join(scratch, 'ws-isolated')))
@@ -3473,8 +3568,9 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
     for (const group of ['environ', 'cmdline', 'temp', 'checkout', 'home', 'xdg', 'known']) {
       expect(counts.get(`canary.${group}`)).toBe('0')
     }
-    // #and the step file, opened by its exact path, was refused (not absent, which would be a skip) and not read
-    expect(counts.get('denied.known')).toBe('1')
+    // #and the step file and the Action's state file, opened by their exact paths, were refused (not absent, which would be a
+    // skip) and not read
+    expect(counts.get('denied.known')).toBe('2')
     expect(counts.get('read.known')).toBe('0')
     expect(counts.get('skip.known')).toBe('0')
 
@@ -3499,10 +3595,71 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
     const counts = scanCounts(plain)
     expect(Number(counts.get('canary.environ'))).toBeGreaterThanOrEqual(1)
     expect(Number(counts.get('canary.temp'))).toBeGreaterThanOrEqual(1)
-    // #and the step file, opened by its exact path, was read and held it
-    expect(counts.get('read.known')).toBe('1')
+    // #and the step file and the state file, opened by their exact paths, were read, and only the step file held the canary
+    expect(counts.get('read.known')).toBe('2')
     expect(counts.get('canary.known')).toBe('1')
     for (const group of ['cmdline', 'checkout', 'home', 'xdg']) expect(counts.get(`canary.${group}`)).toBe('0')
+  })
+
+  it('tells the server the run’s root span, session and invocation id, and the credential is in none of it', () => {
+    // #given the launcher document the Action builds for these runs
+    const document = buildTracingLauncherValue(
+      buildActionTracingHost(
+        43_210,
+        unwrapOk(
+          buildTracingRunIdentity({
+            repository: 'owner/repo',
+            runId: '4242',
+            attempt: 1,
+            job: 'sandbox-it',
+            trigger: 'workflow_dispatch',
+          }),
+        ),
+        runLink,
+      ),
+    )
+
+    // #then it carries the link, and no form of the credential or the collector
+    expect(JSON.parse(document)).toMatchObject({
+      rootSpan: {traceId: lifecycleTracer.ids?.traceId, spanId: lifecycleTracer.ids?.rootSpanId},
+      sessionId: 'owner/repo:issue-42',
+      invocationId: lifecycleTracer.ids?.invocationId,
+    })
+    expect(canaryForms(Buffer.from(document), TRACE_CANARY)).toEqual([])
+    expect(document).not.toContain('Authorization')
+
+    // #and the isolated agent and the plain one each read that same link from the server's own environment
+    for (const turn of [isolated, plain])
+      expect(failuresFor(turn?.rows ?? new Map(), 'launcher_link', 'WORKS')).toEqual([])
+  })
+
+  it('keeps the credential out of the Action’s state, and the agent user cannot open the state file', () => {
+    // #given the state the Action saves for the run
+    // #then it holds the ids and the session and no form of the credential, the headers or the collector
+    expect(stateText).toContain(lifecycleTracer.ids?.traceId)
+    expect(canaryForms(Buffer.from(stateText), TRACE_CANARY)).toEqual([])
+    expect(stateText).not.toContain('Authorization')
+
+    // #and the isolated agent was refused when it opened the state file by its path (the scan's `denied.known` counts the
+    // step file and this one); the runner's own user read it, and found no canary there
+    expect(scanCounts(isolated).get('denied.known')).toBe('2')
+    expect(scanCounts(plain).get('read.known')).toBe('2')
+    expect(scanCounts(plain).get('canary.known')).toBe('1')
+  })
+
+  it('links each turn root to the lifecycle root span, in the lifecycle trace’s session', () => {
+    for (const turn of [isolated, plain]) {
+      // #given the traced turn's root span as the collector received it
+      const roots = turnRootSpans(turn?.requests ?? [])
+
+      // #then one root, linking to the lifecycle root, with the session and invocation id the launcher carried
+      expect(roots).toHaveLength(1)
+      expect(roots[0]?.links).toEqual([
+        {traceId: lifecycleTracer.ids?.traceId, spanId: lifecycleTracer.ids?.rootSpanId},
+      ])
+      expect(roots[0]?.attributes['langfuse.session.id']).toBe('owner/repo:issue-42')
+      expect(roots[0]?.attributes['fro_bot.invocation.id']).toBe(lifecycleTracer.ids?.invocationId)
+    }
   })
 
   it('exports no span that holds the canary, in any form a span could carry it', () => {
@@ -3559,5 +3716,256 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
     expect(off?.requests).toEqual([])
     expect(off?.relayStop).toBeNull()
     expect(off?.relayLeft).toBe('')
+  })
+})
+
+// --- 15. A cancelled run -----------------------------------------------------------------------------------------------
+
+/** The runner cancels a step with SIGINT and, if it is still running 7.5 seconds later, sends SIGTERM. */
+const RUNNER_SIGTERM_DELAY_MS = 7_500
+
+/** A stand-in for `process`: the owner listens on it and re-raises on it, and the test says when each signal arrives. */
+function fakeSignalHost(): SignalHost & {
+  readonly deliver: (signal: SignalName) => void
+  readonly killed: SignalName[]
+} {
+  const handlers = new Map<SignalName, (() => void)[]>()
+  const killed: SignalName[] = []
+  return {
+    pid: 4242,
+    killed,
+    on: (signal, listener) => {
+      handlers.set(signal, [...(handlers.get(signal) ?? []), listener])
+    },
+    off: (signal, listener) => {
+      handlers.set(
+        signal,
+        (handlers.get(signal) ?? []).filter(item => item !== listener),
+      )
+    },
+    kill: (_pid, signal) => {
+      killed.push(signal)
+    },
+    deliver: signal => {
+      for (const listener of handlers.get(signal) ?? []) listener()
+    },
+  }
+}
+
+/**
+ * What a cancelled run has when the runner's SIGTERM would arrive: the real lifecycle tracer, the real signal owner and a real
+ * OTLP receiver. The kernel's signal is the one thing replaced (by `deliver` on the owner's host): a signal handler that
+ * re-raises would end the test process, and the real-process rows of `signal-owner.test.ts` already run with real signals.
+ */
+async function startCancellableRun(logger: Logger, cleanups: (() => Promise<void> | void)[]) {
+  const sink: OtlpSink = await startOtlpSink()
+  cleanups.push(sink.stop)
+  const tracer = createLifecycleTracer({
+    inputs: {enabled: true, url: sink.url, headers: []},
+    logger,
+    registry: createSecretRegistry(() => undefined),
+    env: {},
+    identity: {repository: 'owner/repo', runId: '4242', attempt: '1', job: 'sandbox-it', trigger: 'workflow_dispatch'},
+  })
+  const host = fakeSignalHost()
+  const owner = createSignalOwner({
+    logger,
+    host,
+    onCancel: signal => tracer.cancel(signal === 'SIGINT' ? 'sigint' : 'sigterm'),
+    flush: async options => tracer.flush(options),
+  })
+  cleanups.push(() => owner.dispose())
+  // The phases the run had reached: bootstrap is done, execution is where the cancel finds it.
+  tracer.startSpan('bootstrap').end({outcome: 'succeeded'})
+  tracer.startSpan('execution')
+  return {sink, tracer, host, owner}
+}
+
+type CancellableRun = Awaited<ReturnType<typeof startCancellableRun>>
+
+interface CancelledOutcome {
+  /** The spans were at the receiver within the runner's window, before the SIGTERM it would send. */
+  readonly deliveredBeforeSigterm: boolean
+  readonly spans: ReturnType<typeof decodeSpans>
+  /** The signals the owner re-raised on its host: one, the first. */
+  readonly reRaised: readonly SignalName[]
+}
+
+/** SIGINT now; the SIGTERM the runner would send 7.5 s later; then the owner is waited for, as the process would be. */
+async function cancelAsTheRunnerDoes(run: CancellableRun): Promise<CancelledOutcome> {
+  const sigintAt = Date.now()
+  run.host.deliver('SIGINT')
+  const reached = (): boolean => decodeSpans(run.sink.accepted()).some(span => span.name === 'action.main')
+  let deliveredBeforeSigterm = true
+  try {
+    await waitUntil('the reached spans at the receiver', reached, RUNNER_SIGTERM_DELAY_MS - 500)
+  } catch {
+    deliveredBeforeSigterm = false
+  }
+  await sleep(Math.max(0, sigintAt + RUNNER_SIGTERM_DELAY_MS - Date.now()))
+  run.host.deliver('SIGTERM')
+  await run.owner.drain()
+  return {deliveredBeforeSigterm, spans: decodeSpans(run.sink.accepted()), reRaised: [...run.host.killed]}
+}
+
+const spanByName = (outcome: CancelledOutcome | undefined, name: string) =>
+  outcome?.spans.find(span => span.name === name)
+
+describe.skipIf(!gated)('a cancelled isolated run delivers its reached spans before the runner’s SIGTERM', () => {
+  const logger = createLogger({phase: 'sandbox-integration-cancel'})
+  const scratch = path.join(runnerTemp, `sandbox-it-cancel-${process.pid}`)
+  const xdgRoot = path.join(runnerTemp, `sandbox-it-cancel-xdg-${process.pid}`)
+  const workspace = path.join(scratch, 'ws')
+  const responseDir = path.join(scratch, 'response')
+  const env = hostedEnv(workspace, xdgRoot)
+  const strayPattern = 'sleep 779[34]'
+  const cleanups: (() => Promise<void> | void)[] = []
+  const states: string[] = []
+
+  let provider: ScriptedProvider | undefined
+  let lifecycle: SandboxLifecycle | undefined
+  let outcome: CancelledOutcome | undefined
+  let strays = 'not checked'
+
+  beforeAll(async () => {
+    const tools = await preflightTools(logger)
+    fs.mkdirSync(responseDir, {recursive: true})
+    const keyFile = writeKeyFile(path.join(scratch, 'keys'))
+    initWorkspace(workspace)
+    // A tool that leaves a process that leaves its session and one that ignores SIGTERM: what the teardown must still end.
+    provider = await startScriptedProvider(() => [
+      {
+        id: 'cancel_setup',
+        category: 'info',
+        cmd:
+          `(setsid sleep 7793 >/dev/null 2>&1 &); (trap '' TERM HUP; exec sleep 7794 >/dev/null 2>&1 &); ` +
+          `sleep 0.3; R cancel_setup INFO "$(pgrep -d, -f 'sleep 779')"`,
+      },
+    ])
+    const run = await startCancellableRun(logger, cleanups)
+    lifecycle = createSandboxLifecycle({
+      tools,
+      env,
+      runnerPath: env.PATH,
+      runnerHome,
+      workspacePath: workspace,
+      responseDir,
+      logger,
+      viewLauncher,
+      signalOwner: run.owner,
+      recordState: state => states.push(state),
+    })
+    const prepared = await lifecycle.prepare({keyFilePaths: [keyFile], ghConfigDir: null, repoSkills: null})
+    if (!prepared.success) throw new Error(prepared.error)
+    // The server is up and the agent has run its tool: the run is mid-execution when it is cancelled.
+    await startScriptedSession({binary: BINARY ?? '', workspace, env, lifecycle, keyFile, provider, logger})
+
+    outcome = await cancelAsTheRunnerDoes(run)
+    strays = strayProcesses(strayPattern)
+  }, 600_000)
+
+  afterAll(async () => {
+    await lifecycle?.release()
+    await provider?.close()
+    for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
+    spawnSync('sudo', ['-n', 'pkill', '-KILL', '-f', strayPattern])
+    fs.rmSync(scratch, {recursive: true, force: true})
+    fs.rmSync(xdgRoot, {recursive: true, force: true})
+  }, 120_000)
+
+  it('delivered the spans it had reached to the receiver before the SIGTERM the runner would have sent', () => {
+    // #given a run cancelled mid-execution, with the SIGTERM 7.5 s behind the SIGINT
+    // #then the receiver had the trace inside that window
+    expect(outcome?.deliveredBeforeSigterm).toBe(true)
+    expect(spanByName(outcome, 'bootstrap')).toMatchObject({attrs: {'fro_bot.outcome': 'succeeded'}})
+    // #and the phase it was in and the root are cancelled, with the signal as the reason, and not errors
+    for (const name of ['execution', 'action.main']) {
+      expect(spanByName(outcome, name)?.attrs).toMatchObject({
+        'fro_bot.outcome': 'cancelled',
+        'fro_bot.reason': 'sigint',
+      })
+      expect(spanByName(outcome, name)?.status.code).not.toBe(2)
+    }
+  })
+
+  it('tore the sandbox down inside the same cancel: restored, no stray process, and the signal re-raised once, after it', () => {
+    // #then the teardown ended restored (the owner re-raises only after it), nothing of the launch is left, and the second
+    // signal changed nothing
+    expect(states.at(-1)).toBe('restored')
+    expect(strays).toBe('')
+    expect(outcome?.reRaised).toEqual(['SIGINT'])
+  })
+})
+
+// Needs no sandbox, so it can also run off a hosted runner when asked:
+// `FRO_BOT_CANCEL_IT=1 bunx vitest run src/harness/phases/v2-server.sandbox.integration.test.ts -t 'without isolation'`.
+const cancelPlainEnabled = gated || process.env.FRO_BOT_CANCEL_IT === '1'
+
+describe.skipIf(!cancelPlainEnabled)(
+  'a cancelled run without isolation delivers its reached spans before the runner’s SIGTERM',
+  () => {
+    const logger = createLogger({phase: 'sandbox-integration-cancel-plain'})
+    const cleanups: (() => Promise<void> | void)[] = []
+    const strayPattern = 'sleep 7795'
+
+    let outcome: CancelledOutcome | undefined
+    let commandEnded: 'ended' | 'still running' = 'still running'
+    let strays = 'not checked'
+
+    beforeAll(async () => {
+      const run = await startCancellableRun(logger, cleanups)
+      // A command the run is waiting on, through the exec adapter every setup and server command goes through.
+      const exec = createExecAdapter().execWithTimeout
+      if (exec === undefined) throw new Error('execWithTimeout is not configured')
+      const running = exec('sh', ['-c', `exec ${strayPattern}`], 120_000, {silent: true}).then(() => {
+        commandEnded = 'ended'
+      })
+      await sleep(500)
+
+      outcome = await cancelAsTheRunnerDoes(run)
+      await running
+      strays = strayProcesses(strayPattern)
+    }, 120_000)
+
+    afterAll(async () => {
+      for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
+      spawnSync('pkill', ['-KILL', '-f', strayPattern])
+    }, 60_000)
+
+    it('delivered the spans it had reached to the receiver before the SIGTERM the runner would have sent', () => {
+      expect(outcome?.deliveredBeforeSigterm).toBe(true)
+      for (const name of ['execution', 'action.main']) {
+        expect(spanByName(outcome, name)?.attrs).toMatchObject({
+          'fro_bot.outcome': 'cancelled',
+          'fro_bot.reason': 'sigint',
+        })
+      }
+      expect(spanByName(outcome, 'bootstrap')).toMatchObject({attrs: {'fro_bot.outcome': 'succeeded'}})
+    })
+
+    it('stopped the command the run was waiting on, and re-raised the signal once', () => {
+      expect(commandEnded).toBe('ended')
+      expect(strays).toBe('')
+      expect(outcome?.reRaised).toEqual(['SIGINT'])
+    })
+  },
+)
+
+// --- 16. The lifecycle trace's secret registry on a hosted runner ------------------------------------------------------
+
+describe.skipIf(!gated)('the lifecycle tracer’s secret registry on a hosted runner', () => {
+  const report = secretEnvRangeReport(process.env)
+
+  it('has a secret-named variable to look at, so the next row is not vacuous', () => {
+    // #given the step's environment: the workflow sets `PROBE_DUMMY_TOKEN`, and the runner may add more (a token of its own)
+    expect(report.inspected).toBeGreaterThanOrEqual(1)
+  })
+
+  it('can match every secret-named value of the environment, so the fail-closed rule does not strip free text from the run', () => {
+    // #then no secret-named value is outside the scrubber's 8 to 4,096 character range. A value outside it would make the
+    // registry not matchable and the tracer export no free text on every hosted run. Names and lengths only are reported.
+    const offenders = report.outOfRange.length === 0 ? 'none' : describeOutOfRangeSecretEnv(report)
+    expect(offenders, 'secret-named runner variables outside the matchable range').toBe('none')
+    expect(report.matchable).toBe(true)
   })
 })

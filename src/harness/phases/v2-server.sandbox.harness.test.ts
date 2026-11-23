@@ -677,7 +677,7 @@ describe('secretEnvRangeReport', () => {
     })
 
     // #then
-    expect(report).toEqual({matchable: true, outOfRange: []})
+    expect(report).toEqual({matchable: true, inspected: 3, outOfRange: []})
   })
 
   it('is not matchable when a secret-named value is too short, and names it with its length only', () => {
