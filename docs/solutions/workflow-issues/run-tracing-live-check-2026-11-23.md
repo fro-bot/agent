@@ -29,7 +29,7 @@ tags:
 
 ## Context
 
-Run tracing has two halves: the Fro Bot OpenCode plugin captures spans, and in the Action a relay forwards them to the operator's collector with the credential. Unit tests and the real-binary suites cover each half against a local stand-in. Only a real model, a real collector and a published install show that a backend can read the trace. Plugin 0.2.0 and Action v0.147.0 were checked this way before tracing was announced.
+Run tracing has two halves: the Fro Bot OpenCode plugin captures spans, and in the Action a relay forwards them to the operator's collector with the credential. Unit tests and the real-binary suites cover each half against a local stand-in. Only a real model, a real collector and a published install show that a backend can read the trace. Before publishing, a local session with a local build of plugin 0.2.0 was read in the backends; after the release, three runs of the published Action v0.147.0 were. A local session on a registry install of the plugin has not been checked.
 
 ## Guidance
 
@@ -46,7 +46,8 @@ This check loads a local build of the plugin. A session on a registry install of
 
 - Run from a throwaway branch in a public repository with no private content. Put the probe in an existing dispatchable workflow file, as in [the published-install learning](published-install-live-check-before-rollout-2026-11-17.md).
 - Dispatch three runs: isolated, not isolated, and isolated with a wrong credential. Use `output-mode: working-dir` and `response-mode: none` so the runs post nothing, and pass `github.token` with `contents: read`, because the non-isolated agent can read whatever token it is given.
-- Mint a collector token for the check alone: write-only, and revoked as soon as the runs finish. While it is live, the non-isolated run's agent can read it, and with it write misleading spans into the store and spend its quota; deleting the check's traces afterwards does not undo that. A token confined to a test project, or a disposable collector, removes the risk. These runs used a write-only token on the single-operator collector and accepted it.
+- Mint a collector token for the check alone, write-only, and revoke it as soon as the runs finish. For the credentialed non-isolated run, use a token scoped to a test project or a disposable collector: while the token is live, that run's agent can read it, write misleading spans and spend the ingest quota, and deleting the check's traces afterwards does not undo that. If neither is available, skip that run and record the gap.
+- The runs recorded here used a write-only token on the single-operator collector for the non-isolated run, with the risk accepted by the operator, and the token was revoked afterwards.
 - The collector token for an Action sender group is delivered as a bare token secret. Build the header in the workflow: `trace-headers: "Authorization: Bearer ${{ secrets.<NAME> }}"`. A bare token in `trace-headers` is refused and tracing turns off.
 - Read the relay's lines in each run log:
 
