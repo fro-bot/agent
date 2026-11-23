@@ -69,6 +69,7 @@ export async function runCacheRestore(
     authPath: getOpenCodeAuthPath(),
     projectIdPath,
     storeConfig: bootstrap.inputs.storeConfig,
+    skipCache: bootstrap.inputs.skipCache,
   })
 
   let cacheStatus: 'corrupted' | 'hit' | 'miss' = cacheResult.corrupted ? 'corrupted' : cacheResult.hit ? 'hit' : 'miss'

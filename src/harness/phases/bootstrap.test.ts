@@ -763,6 +763,30 @@ describe('runBootstrap isolate-agent preflight', () => {
     expect(mocks.saveState).toHaveBeenCalledWith('isolatedRun', 'true')
   })
 
+  it('records skip-cache for the post hook when the input is true', async () => {
+    // #given the skip-cache input is on
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({skipCache: true})})
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when bootstrap runs
+    await runBootstrap(createMockLogger())
+
+    // #then the post hook is told, so its retry cannot save a cache the run was told to skip
+    expect(mocks.saveState).toHaveBeenCalledWith('skipCache', 'true')
+  })
+
+  it('records nothing for the post hook when skip-cache is false', async () => {
+    // #given the skip-cache input is off
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({skipCache: false})})
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when bootstrap runs
+    await runBootstrap(createMockLogger())
+
+    // #then
+    expect(mocks.saveState).not.toHaveBeenCalledWith('skipCache', expect.anything())
+  })
+
   it('does not mark a run isolated when isolation is off', async () => {
     // #given the input is off
     mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: false})})

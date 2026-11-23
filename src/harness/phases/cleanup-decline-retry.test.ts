@@ -244,6 +244,45 @@ describe('a cleanup-declined cache save is retried by the post hook (decline rec
     expect(logger.info).toHaveBeenCalledWith('Skipping post-action: main action skipped the save', expect.any(Object))
   })
 
+  it.each([
+    {label: 'not-persisted', cacheSaved: 'not-persisted'},
+    {label: 'absent (the main step died before cleanup)', cacheSaved: undefined},
+  ])('does not retry the save when skip-cache was set and the main step recorded $label', async ({cacheSaved}) => {
+    // #given the main step recorded the skip-cache input, then ended without a recorded save result
+    mocks.stateStore.set('shouldSaveCache', 'true')
+    mocks.stateStore.set('skipCache', 'true')
+    if (cacheSaved !== undefined) mocks.stateStore.set('cacheSaved', cacheSaved)
+    const {saveCache} = await import('../../services/cache/index.js')
+
+    // #when the post hook runs
+    const {runPost} = await import('../post.js')
+    const logger = createMockLogger()
+    await runPost({logger})
+
+    // #then it never attempts the save a retry would have made
+    expect(saveCache).not.toHaveBeenCalled()
+    expect(logger.info).toHaveBeenCalledWith(
+      'Skipping post-action session save: skip-cache was set',
+      expect.any(Object),
+    )
+  })
+
+  it('still retries a not-persisted save when skip-cache was recorded as false', async () => {
+    // #given the state value a run with skip-cache off would carry, if one were written
+    mocks.stateStore.set('shouldSaveCache', 'true')
+    mocks.stateStore.set('skipCache', 'false')
+    mocks.stateStore.set('cacheSaved', 'not-persisted')
+    const {saveCache} = await import('../../services/cache/index.js')
+    vi.mocked(saveCache).mockResolvedValueOnce({cachePersisted: true, storePersisted: false, outcome: 'persisted'})
+
+    // #when the post hook runs
+    const {runPost} = await import('../post.js')
+    await runPost({logger: createMockLogger()})
+
+    // #then the retry runs
+    expect(saveCache).toHaveBeenCalledTimes(1)
+  })
+
   it('retries when the state key holds an unrecognized value (e.g. the boolean "true" from an older action version)', async () => {
     // #given a garbled or stale CACHE_SAVED value that never went through
     // toCacheSaveStateValue -- an absent or unrecognized value must retry, not skip,

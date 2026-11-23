@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-11-15"
-updated-by: "962b70bc"
+last-updated: "2026-11-23"
+updated-by: "8ca1022d"
 sources:
   - src/services/cache/paths.ts
   - src/harness/phases/log-snapshot.ts
@@ -37,6 +37,7 @@ sources:
   - packages/runtime/src/session/storage-message-mappers.ts
   - packages/runtime/src/object-store/content-sync.ts
   - packages/runtime/src/object-store/s3-adapter.ts
+  - packages/runtime/src/object-store/sanitize-s3-error.ts
   - packages/runtime/src/object-store/key-builder.ts
   - packages/runtime/src/object-store/validation.ts
   - packages/runtime/src/object-store/types.ts
@@ -120,7 +121,7 @@ The result is that a run can restore prior state successfully while its cache wr
 
 `saveCache` returns a structured `CacheSaveResult` (`src/shared/cache-save-result.ts`) rather than a boolean. The shape has two independent persistence axes — `cachePersisted` and `storePersisted` — plus a named `outcome` describing the terminal condition that produced them. Durability overall is the disjunction of the two axes, never either one alone.
 
-The reason for the shape is that a boolean collapsed three genuinely different situations into the same value: a deliberate opt-out (`SKIP_CACHE`), a denied write, and a successful write. Naming them separately makes the run's actual persistence story legible in the job summary and in the `cache-save-result` action output. The outcomes are `skipped-by-configuration`, `skipped-empty`, `checkpoint-declined`, `ownership-declined`, `cache-rejected`, `cache-error`, and `persisted`.
+The reason for the shape is that a boolean collapsed three genuinely different situations into the same value: a deliberate opt-out (`skip-cache: true`, or the legacy `SKIP_CACHE=true` environment variable), a denied write, and a successful write. Naming them separately makes the run's actual persistence story legible in the job summary and in the `cache-save-result` action output. The outcomes are `skipped-by-configuration`, `skipped-empty`, `checkpoint-declined`, `ownership-declined`, `cache-rejected`, `cache-error`, and `persisted`.
 
 `ownership-declined` means the save was never attempted at all. Cleanup's persistence safety gate (`runCleanup`, `src/harness/phases/cleanup.ts`) refused it because it could not confirm no other writer was still touching this session's state: background subagent work this run owns was still unresolved, the OpenCode server's shutdown never confirmed the writer had quiesced, or the coordination lease could not be renewed. The three reasons are checked in a fixed order and only the first match is reported, on the reasoning that a reader needs one clear cause rather than a list of everything that happened to be true. Unlike the other outcomes here, it is not a retry candidate — it maps to its own `declined-for-safety` state value (see [[Execution Lifecycle]]) precisely so the post-action hook honors the refusal instead of second-guessing it with less information than cleanup had. [[Background Subagents and Ownership]] covers the gate and why a save on top of a live writer is worse than no save at all.
 
@@ -147,6 +148,8 @@ The implementation lives in `packages/runtime/src/object-store/` and consists of
 - **`types.ts`** — Defines the `ObjectStoreAdapter` interface and typed error factories (`ValidationError`, `PathTraversalError`, `ObjectStoreOperationError`). The interface keeps the core upload/download/list operations required and exposes the conditional (ETag-guarded) and recency-aware operations — `conditionalPut`, `conditionalDelete`, `getObject`, and `listWithMetadata` — as optional, so backends that do not need them are not forced to implement them. `conditionalPut` also accepts an optional `tagging` string: the coordination layer (see [[Execution Lifecycle]]) tags its run-state objects so a bucket lifecycle policy can expire them on its own schedule. Tagging is applied only on real AWS S3 (`config.endpoint == null`); custom S3-compatible endpoints skip it, since their tagging support varies. Session database objects themselves are not tagged — the tag path is specific to the short-lived coordination records, not the durable session backup.
 
 The coordination read and delete operations also accept an optional abort signal. The S3 adapter passes it to the SDK request and, for a streamed `getObject` response, destroys the body stream when the signal aborts. Cancellation therefore covers both waiting for headers and consuming the body, and returns an error result rather than a successful partial read. This lets the post-action lock-release deadline bound real I/O, not merely stop awaiting a request that continues in the background ([[Execution Lifecycle]]).
+
+The adapter's error formatter (`packages/runtime/src/object-store/sanitize-s3-error.ts`) redacts signing parameters and authorization values before truncating the diagnostic to 500 characters. It scans signing parameters without repeatedly rescanning long names, so malformed error text does not turn redaction into an expensive part of a failed storage operation.
 
 ### How It Integrates
 

@@ -558,7 +558,7 @@ Span shape for one turn:
 
 **Verification:** No test finds a path that leaves a relay process alive, or that changes a run's outcome because of tracing.
 
-- [ ] **Unit 8: Inputs and the plugin handoff**
+- [x] **Unit 8: Inputs and the plugin handoff**
 
 **Goal:** Two inputs turn tracing on, the plugin receives the relay address and run identity, and every launcher declares its host.
 
@@ -605,7 +605,9 @@ Span shape for one turn:
 
 ### Stage 3: prove, publish, document
 
-- [ ] **Unit 9: Langfuse proof, publish, pin, real-runner proof**
+- [x] **Unit 9: Langfuse proof, publish, pin, real-runner proof**
+
+**Evidence:** the pre-publish local session sent 18 spans (two subagents, none dropped) and the operator confirmed the Langfuse and Tempo views; counts and the operator's confirmation stand in for the screenshots or exported span structure this unit asked for. Plugin 0.2.0 was published from main, and the pin and real-runner rows shipped in #2315.
 
 **Goal:** The plugin is published once, after it is shown readable in Langfuse, and the Action runs it on hosted runners, isolated and not.
 
@@ -634,7 +636,7 @@ Span shape for one turn:
 
 **Verification:** `Sandbox integration` passes on both runner images with the new rows, and the Langfuse check is recorded with screenshots or exported span structure, without trace content.
 
-- [ ] **Unit 10: Docs and policy**
+- [x] **Unit 10: Docs and policy**
 
 **Goal:** The docs say what tracing sends and how to turn it on, and the recorded policy matches.
 
@@ -657,6 +659,8 @@ Span shape for one turn:
 **Verification:** The link check passes, and every file path and input name in the new text exists.
 
 - [ ] **Unit 11: Published-install live check**
+
+**Status:** the three published Action runs are done and recorded in `docs/solutions/workflow-issues/run-tracing-live-check-2026-11-23.md`. Still open: the local session on a registry install of the plugin, and a continuation trace found through its session.
 
 **Goal:** Show the feature end to end on a release, in the operator's backend.
 

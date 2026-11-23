@@ -1,7 +1,7 @@
 ---
 type: convention
-last-updated: "2026-11-15"
-updated-by: "962b70bc"
+last-updated: "2026-11-23"
+updated-by: "8ca1022d"
 sources:
   - packages/runtime/src/session/generation.ts
   - packages/runtime/src/agent/event-v2.ts
@@ -14,7 +14,7 @@ sources:
   - src/harness/outcome.ts
   - src/features/agent/streaming-v2.ts
   - packages/runtime/src/agent/ownership-ledger.ts
-  - packages/runtime/src/agent/server.ts
+  - packages/runtime/src/agent/ensure-opencode.ts
   - src/shared/cache-save-result.ts
   - src/services/cache/checkpoint.ts
   - scripts/module-taxonomy.test.ts
@@ -134,6 +134,8 @@ This pattern means the setup, cache, and execution modules can be tested without
 All interface properties use `readonly`. This is enforced project-wide and prevents accidental mutation of shared state. Combined with the functional style (no classes, no mutable instance state), this makes data flow through the system predictable.
 
 The rule carries one named exception, and naming it explicitly is the point — a silent exception invites a second one. Per-invocation mutable trackers threaded through the V2 SSE event loop (`ActivityTrackerV2` in `src/features/agent/streaming-v2.ts`) hold mutable fields, because a functional update would allocate a fresh object on every token delta. The exception is bounded by scope rather than convention: these objects live for one invocation and are not shared across runs.
+
+The Action also uses discriminated unions to keep configuration states explicit. In `packages/runtime/src/shared/types.ts`, disabled tracing carries no collector URL or headers; only the enabled branch carries those values. The Action's `src/shared/types.ts` re-exports the shared type rather than defining a second version. [[Setup and Configuration#Tracing a run]] explains where those values go.
 
 ## Veto, Not Certificate
 

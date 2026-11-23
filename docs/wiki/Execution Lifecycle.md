@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-11-15"
-updated-by: "962b70bc"
+last-updated: "2026-11-23"
+updated-by: "8ca1022d"
 sources:
   - src/harness/phases/sandbox-lifecycle.ts
   - src/harness/phases/repo-skills.ts
@@ -15,6 +15,7 @@ sources:
   - src/harness/phases/release-v2.ts
   - src/harness/phases/observed-turn-v2.ts
   - src/harness/phases/v2-server.ts
+  - src/harness/phases/trace-relay-process.ts
   - src/harness/phases/v1-import-wait.ts
   - src/features/agent/execution-v2.ts
   - src/features/agent/prompt-sender-v2.ts
@@ -60,6 +61,7 @@ sources:
   - src/services/github/context.ts
   - packages/runtime/src/agent/response-delivery.ts
   - packages/runtime/src/agent/response-file.ts
+  - packages/runtime/src/agent/remote-client-v2.ts
   - packages/runtime/src/coordination/lock.ts
   - packages/runtime/src/coordination/types.ts
   - packages/runtime/src/coordination/lease-loop.ts
@@ -168,6 +170,8 @@ V2 reads context through the native `/api/session` and session-context routes (`
 
 ### V2 submission and observation
 
+For an opted-in run, `src/harness/run.ts` starts the trace relay before OpenCode and stops it after server shutdown, letting cleanup proceed while it stops. The server launch checks that the relay is still live before enabling the plugin exporter. An unavailable relay does not block the turn or change its outcome. [[Setup and Configuration#Tracing a run]] describes what is exported and what stays with the relay.
+
 `execute-v2.ts` selects a backend whose session creation, prompt submission, overflow recovery, and prior-work search all use V2. Agent and model are session properties, while a prompt carries text and files. The event subscription must connect before the first send because the stream has no replay.
 
 V2 does not replay a failed admitted turn. The server handles transient provider retries. The Action retries eligible pre-send connection failures or explicit submission refusals; a transport failure of the prompt POST is instead `sendUncertain`. The request may already have been admitted, so resending could duplicate external effects. That case fails, stops the directory, and declines persistence and endorsement even if teardown later looks quiet.
@@ -244,7 +248,7 @@ The irreversible consumers use a _known execution veto_ rather than assuming tha
 
 ### The Cleanup-to-Post Handoff
 
-Two state keys cross the process boundary between the main step and the post hook (`src/harness/config/state-keys.ts`), and they answer different questions.
+State keys cross the process boundary between the main step and the post hook (`src/harness/config/state-keys.ts`). The persistence keys and the credential-cleanup key answer separate questions.
 
 `CACHE_SAVED` carries a five-value enum rather than a boolean — `durable`, `store-only`, `skipped`, `declined-for-safety`, or `not-persisted` — derived from cleanup's `CacheSaveResult` (see [[Session Persistence]]). The boolean it replaced conflated a store-only save with total failure. The enum lets the hook gate on durability actually achieved rather than on cache-write success alone: `durable` and `store-only` skip because the database already reached a durable backend, and `skipped` skips because the operator opted out. `declined-for-safety` also skips — cleanup could not confirm persistence safety, and the post hook has less information than the step that declined. Only `not-persisted` retries, including an absent or unrecognized value, because the post hook is the last chance to save the Actions cache. The retry writes the Actions cache only (`objectStorePublish: 'withhold'`); a session that reached neither backend in the main step is not published to the store afterwards.
 
@@ -253,6 +257,8 @@ Two state keys cross the process boundary between the main step and the post hoo
 `CLEANUP_METADATA_WRITTEN` answers a question `CACHE_SAVED` structurally cannot. Cleanup uploads a rich run-metadata payload — token usage, timing, session IDs, PRs and commits, errors — to the object store, and the post hook has only a thin `cleanupSkipped: true` placeholder to write. But `run.ts` seeds `CACHE_SAVED` with `not-persisted` before cleanup ever executes, so that value is equally consistent with "cleanup ran and its cache write was denied" and "cleanup never ran at all." Using it to gate the metadata write meant the placeholder could clobber the real payload. The dedicated key is set unconditionally by cleanup, independent of the cache outcome, and the post hook writes its placeholder only when the key is absent.
 
 A run saves session state only after it has restored the cache and started the V2 server. `run.ts` writes `shouldSaveCache=false` first and flips it to `true` only once the server is up, and it declines the cleanup save for a run that ended earlier: a rejected input, a failed setup, a skipped event, or a failed restore. Until the server starts, the OpenCode data on the runner is whatever the runner already held, not this run's history, and saving it under the V2 keys could overwrite good history. A crash after the server started still gets the post hook's retry, under the same V2 keys.
+
+`GH_CONFIG_DIR` records the invocation's temporary CLI configuration so `src/harness/post.ts` can remove it if the main step died first. This cleanup runs even if persistence or lock release fails. For an isolated run, the hook leaves the directory alone unless the main step recorded confirmed sandbox take-back.
 
 ## Event Types
 
@@ -305,6 +311,8 @@ Two scoped S3 conditional-write locks (`If-None-Match` / `If-Match`) coordinate 
 **Stuck busy status.** While the workspace status endpoint is unavailable (`unknown`), expired gateway leases stay blocked — a stopped container cannot be corroborated, so stopping it does not unblock anything. If a repo's workspace reports `busy` and the lease has expired, first wait for or cancel that repo's running sessions. If it stays busy, pause gateway admissions and restart the workspace service (keep the volume; the restart ends its sessions), wait until its status endpoint is reachable again, then run the guarded `force-release-lock` or retry acquisition — the check now reports `clear`. There is no unguarded bypass.
 
 ### Gateway Event Stream Loss
+
+The shared remote event reader (`packages/runtime/src/agent/remote-client-v2.ts`) caps each decoded SSE frame at 32 Mi characters, including frames still waiting for a delimiter. An oversized frame fails the run rather than triggering a reconnect; a network chunk containing many small frames is still valid.
 
 A gateway run listens to one OpenCode event stream (`packages/gateway/src/execute/run-core-v2.ts`) and treats losing it as the end of the run. A transport failure ends the stream rather than reconnecting past events the run never saw, and the transport error is kept as the failure's cause. The prompt is sent only after the stream's first frame, `server.connected`, has been read (the server registers its listener before it emits that frame, and replays nothing to a late connection); a stream that does not connect within 10 s, ends first, fails, or opens with another frame fails the run as `unreachable` before anything is sent. It leaves through the termination barrier like any other early exit: a run that owns nothing sends no abort, while sessions it already owns from an earlier turn are settled first (and the run is quarantined if they cannot be confirmed settled). A second `server.connected` on one stream counts as a loss. A silence watchdog (`streamSilenceTimeoutMs`, 30 s, set in `packages/gateway/src/execute/run.ts`) fails the run when no event at all, heartbeats included, arrives for that long. Unlike the inactivity watchdog it is never paused by a drain or a pending approval or question. Every one of these ends the run as `stream-ended` through the termination barrier: the run's directory is stopped and confirmed quiet before the lock is released, or the run is quarantined. The `/event` connection is closed on every exit of the run, so it never outlives the lock and slot. The barrier is also where pending approvals and questions are fail-closed, for every failure it handles, not only these: it rejects them to OpenCode before any root stop, so a button pressed while the barrier is confirming is refused (`already-claimed`, then `not-found`) and cannot reach OpenCode.
 
