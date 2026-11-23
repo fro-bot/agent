@@ -44,6 +44,22 @@ export function holdSignalOwnership(): () => void {
   }
 }
 
+/** Every child `execWithTimeout` is running now, so the signal owner can reap them. */
+const runningChildren = new Set<ChildProcess>()
+
+/**
+ * Kills the process group of every command `execWithTimeout` is running, and says how many it signalled. For the signal
+ * owner on a cancellation that has no teardown of its own to run: the commands are part of what the cancel stops. With
+ * a teardown registered, the owner does not call it, because the teardown's own commands are among them.
+ */
+export function killRunningExecChildren(signal: NodeJS.Signals = 'SIGKILL'): number {
+  let signalled = 0
+  for (const child of runningChildren) {
+    if (killChildProcessGroup(child, signal)) signalled += 1
+  }
+  return signalled
+}
+
 /**
  * True once the child has already exited, even if the `close` event hasn't fired yet.
  *
@@ -158,6 +174,7 @@ async function execWithTimeout(
     let graceId: ReturnType<typeof setTimeout> | undefined
     let finished = false
     let timedOut = false
+    runningChildren.add(child)
 
     const clearTimers = (): void => {
       if (timeoutId != null) clearTimeout(timeoutId)
@@ -177,6 +194,7 @@ async function execWithTimeout(
       killChildProcessGroup(child, 'SIGKILL')
     }
     function removeParentSignalListeners(): void {
+      runningChildren.delete(child)
       process.off('SIGTERM', handleParentSigterm)
       process.off('SIGINT', handleParentSigint)
       process.off('exit', handleParentExit)

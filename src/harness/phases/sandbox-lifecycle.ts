@@ -20,6 +20,7 @@ import type {SandboxToolPaths} from '../../services/setup/sandbox-preflight.js'
 import type {ExecAdapter} from '../../services/setup/types.js'
 import type {LifecycleSpan} from '../../shared/lifecycle-tracer.js'
 import type {Logger} from '../../shared/logger.js'
+import type {SignalHost, SignalOwner} from '../signal-owner.js'
 import {Buffer} from 'node:buffer'
 import * as fsSync from 'node:fs'
 import * as fs from 'node:fs/promises'
@@ -185,12 +186,7 @@ export interface SandboxLifecycle {
 export const LAUNCH_SETTLE_BUDGET_MS = 30_000
 
 /** The slice of `process` the signal handling uses; injectable so the tests need no real signals. */
-export interface SignalHost {
-  readonly pid: number
-  readonly on: (signal: 'SIGINT' | 'SIGTERM', listener: () => void) => unknown
-  readonly off: (signal: 'SIGINT' | 'SIGTERM', listener: () => void) => unknown
-  readonly kill: (pid: number, signal: 'SIGINT' | 'SIGTERM') => unknown
-}
+export type {SignalHost}
 
 /**
  * Longest a cancellation waits for the sandbox to be stopped and taken back before the process ends anyway. GitHub
@@ -239,6 +235,12 @@ export interface SandboxLifecycleOptions {
   readonly deps?: Partial<SandboxLifecycleDeps>
   /** Defaults to the real `process`. */
   readonly signals?: SignalHost
+  /**
+   * The run's signal owner. With one, this lifecycle installs no handlers of its own: it registers its teardown with the owner
+   * (at the points it used to install handlers) and the owner runs it beside the export and re-raises when both have settled.
+   * Without one (the integration harness, the unit tests) it handles signals itself, as it always did.
+   */
+  readonly signalOwner?: SignalOwner
   readonly signalTeardownBudgetMs?: number
   /** Overrides {@link LAUNCH_SETTLE_BUDGET_MS} (tests). */
   readonly launchSettleBudgetMs?: number
@@ -555,12 +557,16 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   // adapter's own once-handlers also fire on the same signal and re-raise it, so this handler runs at most once.
   const signalHost: SignalHost = options.signals ?? process
   const installedSignalListeners: ['SIGINT' | 'SIGTERM', () => void][] = []
+  // With a signal owner: this lifecycle's teardown is registered there instead of handlers being installed here.
+  let unregisterTeardown: (() => void) | null = null
   let signalled = false
   // Held from the first handler until the last is removed: while the sandbox is live this lifecycle decides what a signal
   // does. The exec adapter would otherwise SIGKILL the teardown's own commands on a second signal, and re-raise before the
   // teardown had finished.
   let releaseSignalOwnership: (() => void) | null = null
   const removeSignalHandlers = (): void => {
+    unregisterTeardown?.()
+    unregisterTeardown = null
     releaseSignalOwnership?.()
     releaseSignalOwnership = null
     for (const [signal, listener] of installedSignalListeners.splice(0)) signalHost.off(signal, listener)
@@ -588,7 +594,8 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       // The sandbox's own teardown decides the outcome; an extra stop that failed has nothing to add.
     }
   }
-  const onSignal = async (signal: 'SIGINT' | 'SIGTERM'): Promise<void> => {
+  /** The sandbox's part of a cancellation: everything but ending the process. Runs at most once. */
+  const runSignalTeardown = async (signal: 'SIGINT' | 'SIGTERM'): Promise<void> => {
     if (signalled) return
     signalled = true
     cancelled = true
@@ -610,11 +617,20 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       // The post hook must not read a `pending` left behind as "nothing happened": say outright that it is not restored.
       record('unsafe')
     }
+  }
+  const onSignal = async (signal: 'SIGINT' | 'SIGTERM'): Promise<void> => {
+    if (signalled) return
+    await runSignalTeardown(signal)
     removeSignalHandlers()
     // The handlers are gone, so this ends the process with the signal's default action.
     signalHost.kill(signalHost.pid, signal)
   }
   const installSignalHandlers = (): void => {
+    if (options.signalOwner !== undefined) {
+      // The owner holds the handlers and the exec adapter's signal ownership; the teardown is all this lifecycle adds.
+      unregisterTeardown ??= options.signalOwner.registerTeardown(runSignalTeardown)
+      return
+    }
     if (installedSignalListeners.length > 0) return
     releaseSignalOwnership = holdSignalOwnership()
     for (const signal of ['SIGINT', 'SIGTERM'] as const) {

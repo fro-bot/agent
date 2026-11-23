@@ -14,6 +14,7 @@ import {admitLaunch, createSandboxAccount} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi, type Mock} from 'vitest'
 import {isSignalOwned} from '../../services/setup/adapters.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
+import {createSignalOwner} from '../signal-owner.js'
 import {createPrivilegedRun, createSandboxLifecycle, DEFAULT_PRIVILEGED_TIMEOUT_MS} from './sandbox-lifecycle.js'
 import {createTraceRelayLaunch, startTraceRelayProcess} from './trace-relay-process.js'
 
@@ -1205,6 +1206,100 @@ describe('createSandboxLifecycle', () => {
 
       // #then at the moment of the re-raise the adapter had its say back
       expect(owned).toEqual([false])
+    })
+
+    describe('with the run’s signal owner', () => {
+      const ownerFor = (host: ReturnType<typeof fakeHost>, flush = vi.fn(async () => undefined)) => ({
+        owner: createSignalOwner({
+          logger: createMockLogger(),
+          host,
+          onCancel: vi.fn(),
+          flush,
+          reapChildren: () => 0,
+          holdOwnership: () => () => undefined,
+          flushDeadlineMs: 50,
+        }),
+        flush,
+      })
+
+      it('installs no handlers of its own: the owner’s host hears the signal, the lifecycle’s own host never does', async () => {
+        // #given a lifecycle given an owner, and a separate (unused) host of its own
+        const harness = createHarness()
+        const ownerHost = fakeHost()
+        const ownHost = fakeHost()
+        const {owner} = ownerFor(ownerHost)
+        const lifecycle = create(harness, {signals: ownHost, signalOwner: owner})
+
+        // #when prepared
+        await lifecycle.prepare(prepareInput)
+
+        // #then
+        expect(ownHost.emitter.listenerCount('SIGTERM')).toBe(0)
+        expect(isSignalOwned()).toBe(false)
+        owner.dispose()
+      })
+
+      it('runs its teardown on the owner’s signal, beside the export, and the owner re-raises only after it', async () => {
+        // #given a prepared sandbox registered with the owner
+        const harness = createHarness()
+        const ownerHost = fakeHost()
+        const {owner, flush} = ownerFor(ownerHost)
+        const lifecycle = create(harness, {signals: fakeHost(), signalOwner: owner})
+        await lifecycle.prepare(prepareInput)
+
+        // #when SIGTERM arrives at the owner
+        ownerHost.emitter.emit('SIGTERM')
+        await owner.drain()
+
+        // #then the sandbox was stopped and taken back once, the export ran, and the signal was re-raised after both
+        expect(harness.mocks.stop).toHaveBeenCalledTimes(1)
+        expect(harness.mocks.takeBack).toHaveBeenCalledTimes(1)
+        expect(flush).toHaveBeenCalledTimes(1)
+        expect(ownerHost.killed).toEqual(['4242:SIGTERM'])
+      })
+
+      it('records unsafe when the teardown outlasts its budget, and still lets the owner re-raise', async () => {
+        // #given a stop that never finishes and a 30 ms budget
+        const harness = createHarness()
+        harness.mocks.stop.mockImplementation(async () => new Promise(() => undefined))
+        const records: string[] = []
+        const ownerHost = fakeHost()
+        const {owner} = ownerFor(ownerHost)
+        const lifecycle = create(harness, {
+          signals: fakeHost(),
+          signalOwner: owner,
+          signalTeardownBudgetMs: 30,
+          recordState: state => records.push(state),
+        })
+        await lifecycle.prepare(prepareInput)
+
+        // #when
+        ownerHost.emitter.emit('SIGINT')
+        await owner.drain()
+
+        // #then
+        expect(records.at(-1)).toBe('unsafe')
+        expect(ownerHost.killed).toEqual(['4242:SIGINT'])
+      })
+
+      it('unregisters its teardown on a normal release, so a later signal does not run it', async () => {
+        // #given a sandbox that was released normally
+        const harness = createHarness()
+        const ownerHost = fakeHost()
+        const {owner} = ownerFor(ownerHost)
+        const lifecycle = create(harness, {signals: fakeHost(), signalOwner: owner})
+        await lifecycle.prepare(prepareInput)
+        await lifecycle.release()
+        const stopsBefore = harness.mocks.stop.mock.calls.length
+
+        // #when a signal arrives later in the run
+        ownerHost.emitter.emit('SIGINT')
+        await owner.drain()
+
+        // #then the sandbox teardown did not run again
+        expect(harness.mocks.stop.mock.calls.length).toBe(stopsBefore)
+        expect(ownerHost.killed).toEqual(['4242:SIGINT'])
+      })
     })
 
     it('does not own signal handling when preparation fails before any handler is needed', async () => {

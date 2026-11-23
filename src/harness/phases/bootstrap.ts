@@ -5,6 +5,7 @@ import type {LifecycleSpan} from '../../shared/lifecycle-tracer.js'
 import type {Logger} from '../../shared/logger.js'
 import type {SecretRegistry} from '../../shared/secret-registry.js'
 import type {ActionInputs, TracingInputs} from '../../shared/types.js'
+import type {SignalOwner} from '../signal-owner.js'
 import * as crypto from 'node:crypto'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
@@ -77,6 +78,8 @@ export interface BootstrapOptions {
   readonly tracing?: TracingInputs
   /** The bootstrap span: the installs are its children. */
   readonly traceSpan?: LifecycleSpan
+  /** The run's signal owner: an isolated run's sandbox lifecycle registers its teardown with it instead of installing handlers. */
+  readonly signalOwner?: SignalOwner
 }
 
 export async function runBootstrap(
@@ -202,6 +205,7 @@ export async function runBootstrap(
       // `opencodeResult.path` is the executable setup resolved; the agent's `PATH` wants its directory.
       path.isAbsolute(opencodeResult.path) ? path.dirname(opencodeResult.path) : null,
       inputs.agentStateHome,
+      bootstrapOptions.signalOwner,
     ),
   }
 }
@@ -213,6 +217,7 @@ function createRunSandbox(
   runnerPath: string | undefined,
   opencodeDirectory: string | null,
   agentStateHome: string | null,
+  signalOwner: SignalOwner | undefined,
 ): SandboxLifecycle | null {
   if (tools === null) return null
   const runnerTemp = process.env.RUNNER_TEMP?.trim() ?? ''
@@ -230,6 +235,7 @@ function createRunSandbox(
         : buildAttachmentDir({runnerTemp, runId: getGitHubRunId(), runAttempt: getGitHubRunAttempt()}),
     logger: createLogger({phase: 'sandbox'}),
     recordState: state => core.saveState(STATE_KEYS.SANDBOX_STATE, state),
+    ...(signalOwner === undefined ? {} : {signalOwner}),
   })
 }
 
