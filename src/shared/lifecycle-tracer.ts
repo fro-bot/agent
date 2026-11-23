@@ -8,7 +8,8 @@ import {randomBytes} from 'node:crypto'
 import process from 'node:process'
 import {parseTraceRelayConfig} from '@fro-bot/runtime'
 import {createSpanExporter} from '@fro-bot/runtime/tracing/exporter'
-import {createScrubber, scrubSpan} from '@fro-bot/runtime/tracing/scrub'
+import {scrubSpan} from '@fro-bot/runtime/tracing/scrub'
+import {createRegistryScrubber} from './secret-registry.js'
 
 /**
  * The Action's own trace of one invocation: a run-wide recorder (held like `metrics`) that keeps spans, events and outcomes
@@ -481,8 +482,7 @@ export function createLifecycleTracer(options: CreateLifecycleTracerOptions): Li
     const spans = records.length
     try {
       // The registry holds everything, so nothing is captured from the environment here, and no cap drops a literal.
-      const scrubber = createScrubber({env: {}})
-      scrubber.addLiterals?.(registry.literals())
+      const scrubber = createRegistryScrubber(registry)
       const exporter = (options.createExporter ?? createSpanExporter)({
         url,
         serviceName: LIFECYCLE_SERVICE_NAME,

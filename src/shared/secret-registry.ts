@@ -1,5 +1,6 @@
+import type {Scrubber} from '@fro-bot/runtime/tracing/scrub'
 import {Buffer} from 'node:buffer'
-import {MAX_LITERAL_CHARS, MIN_LITERAL_CHARS, SECRET_ENV_NAME} from '@fro-bot/runtime/tracing/scrub'
+import {createScrubber, MAX_LITERAL_CHARS, MIN_LITERAL_CHARS, SECRET_ENV_NAME} from '@fro-bot/runtime/tracing/scrub'
 
 /**
  * The secrets this process knows, for the lifecycle tracer's scrubber.
@@ -147,4 +148,15 @@ export function createSecretRegistry(masker: (value: string) => void): SecretReg
     literals: () => [...known],
     matchable: () => matchable,
   }
+}
+
+/**
+ * A scrubber that knows everything the registry knows right now: the one the lifecycle tracer exports with, and the one the
+ * session id is checked against. Nothing is captured from the environment (the registry already holds the secret-named values),
+ * and no cap drops a literal. Built on each call, so a later registration is seen by the next scrubber, not by an earlier one.
+ */
+export function createRegistryScrubber(registry: Pick<SecretRegistry, 'literals'>): Scrubber {
+  const scrubber = createScrubber({env: {}})
+  scrubber.addLiterals?.(registry.literals())
+  return scrubber
 }

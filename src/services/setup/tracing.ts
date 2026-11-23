@@ -1,9 +1,10 @@
 import type {Result} from '@bfra.me/es/result'
-import type {OpenCodeV2ActionTracingHost, TraceRelayHeader, TracingRunIdentity} from '@fro-bot/runtime'
+import type {OpenCodeV2ActionTracingHost, TraceRelayHeader, TracingRunIdentity, TracingRunLink} from '@fro-bot/runtime'
+import type {Scrubber} from '@fro-bot/runtime/tracing/scrub'
 import type {TracingInputs} from '../../shared/types.js'
-import {createHash} from 'node:crypto'
 import {err, ok} from '@bfra.me/es/result'
 import {ACTION_TRACING_OFF, isUsableTracingIdentity} from '@fro-bot/runtime'
+import {scrubSafeSessionId} from '@fro-bot/runtime/tracing/session-id'
 
 /**
  * Turns the parsed tracing inputs and the facts of a routed run into the two things the rest of the run needs: the relay's
@@ -80,11 +81,12 @@ export interface TraceRelayLiveness {
 export function liveActionTracingHost(
   relay: TraceRelayLiveness,
   identity: TracingRunIdentity,
+  link?: TracingRunLink,
 ): () => OpenCodeV2ActionTracingHost {
   let dead = false
   return () => {
     dead ||= relay.crashed()
-    return buildActionTracingHost(dead ? null : relay.port, identity)
+    return buildActionTracingHost(dead ? null : relay.port, identity, link)
   }
 }
 
@@ -95,25 +97,43 @@ export function liveActionTracingHost(
 export function buildActionTracingHost(
   relayPort: number | null,
   identity: TracingRunIdentity | null,
+  link?: TracingRunLink,
 ): OpenCodeV2ActionTracingHost {
   if (relayPort === null || identity === null) return ACTION_TRACING_OFF
-  return {host: 'action', tracing: 'on', relayPort, identity}
+  return {host: 'action', tracing: 'on', relayPort, identity, ...link}
 }
 
-/** Langfuse's longest session id. */
-export const TRACE_SESSION_ID_MAX_CHARS = 200
+/**
+ * What ties the turn traces to the lifecycle trace: the run's root span (each turn root links to it), the one session id and the
+ * invocation id. Each is present only when the lifecycle tracer has it; a tracer that is off (no trace ids) gives none of the
+ * ids, and a conversation with no usable session id gives no session, so the turn spans keep OpenCode's own.
+ */
+export function buildTracingRunLink(
+  ids: {readonly traceId: string; readonly rootSpanId: string; readonly invocationId: string} | null,
+  sessionId: string | undefined,
+): TracingRunLink {
+  return {
+    ...(ids === null ? {} : {rootSpan: {traceId: ids.traceId, spanId: ids.rootSpanId}, invocationId: ids.invocationId}),
+    ...(sessionId === undefined ? {} : {sessionId}),
+  }
+}
 
 /**
- * The one Langfuse session id for a conversation: the logical key, which is repository-local (`issue-42`), qualified by the
- * repository (`<owner>/<repo>:<logical key>`) so two repositories' issue 42 never share a session. Lifecycle and turn spans
- * carry this exact value, and neither derives it. Past 200 characters it is cut and ends in a hash of the whole, so two long
- * keys that share a prefix stay apart and the result is the same wherever it is computed.
+ * The one Langfuse session id for a conversation, or undefined when there is none to send. The candidate is the logical key,
+ * which is repository-local (`issue-42`), qualified by the repository (`<owner>/<repo>:<logical key>`) so two repositories'
+ * issue 42 never share a session. `scrubSafeSessionId` then makes it survive export: the candidate itself when the scrubber
+ * leaves it byte-identical and the launcher would accept it (non-empty, at most 200 characters, no control characters), else
+ * `sha256:` and 32 hex characters of its hash (so a repository named `password-manager`, or a key past 200 characters, still
+ * gets a distinct session), else nothing. The lifecycle tracer and the launcher both take this exact value, and neither
+ * derives or alters it, so the two traces cannot disagree about the session.
  */
-export function buildTraceSessionId(owner: string, repo: string, logicalKey: string): string {
-  const full = `${owner}/${repo}:${logicalKey}`
-  if (full.length <= TRACE_SESSION_ID_MAX_CHARS) return full
-  const digest = createHash('sha256').update(full).digest('hex').slice(0, 16)
-  return `${full.slice(0, TRACE_SESSION_ID_MAX_CHARS - digest.length - 1)}~${digest}`
+export function buildTraceSessionId(
+  owner: string,
+  repo: string,
+  logicalKey: string,
+  scrubber: Scrubber,
+): string | undefined {
+  return scrubSafeSessionId(`${owner}/${repo}:${logicalKey}`, scrubber)
 }
 
 /**

@@ -5,8 +5,11 @@ import type {BootstrapPhaseResult} from './phases/bootstrap.js'
 import type {CacheRestorePhaseResult, CacheRestoreTrace} from './phases/cache-restore.js'
 import type {RoutingPhaseResult, RoutingPhaseSkip} from './phases/routing.js'
 import type {SandboxLifecycle} from './phases/sandbox-lifecycle.js'
+import {createHash} from 'node:crypto'
+import {buildTracingLauncherValue, TRACING_IDENTITY_FIELD_MAX_CHARS} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {startOtlpSink} from '../../packages/runtime/src/tracing/otlp-sink.testing.js'
+import {resolveActionTracing} from '../services/setup/tracing.js'
 import {run} from './run.js'
 
 /**
@@ -71,9 +74,18 @@ vi.mock('../services/github/review-delivery-receipt.js', () => ({
   createReviewDeliveryReceiptOperations: vi.fn(() => ({reserve: vi.fn(), recordDelivered: vi.fn(), release: vi.fn()})),
 }))
 vi.mock('./phases/routing.js', () => ({runRouting: vi.fn()}))
+// The real launch unless a row says a relay is live: the supervisor needs the relay bundle and a child process.
+vi.mock('./phases/trace-relay-process.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('./phases/trace-relay-process.js')>()
+  return {...actual, createTraceRelayLaunch: vi.fn(actual.createTraceRelayLaunch)}
+})
 vi.mock('./phases/session-prep.js', () => ({runSessionPrep: vi.fn()}))
 
+let target: OtlpSink
+const sinks: OtlpSink[] = []
+
 const MAIN_SECRET = 'mid-run-server-password-0xCAFE'
+const RELAY_CREDENTIAL = 'Basic cmVsYXktY2FuYXJ5OnJlbGF5LXNlY3JldA=='
 
 interface RunPlan {
   readonly bootstrap?: 'null' | 'real-parser'
@@ -87,12 +99,16 @@ interface RunPlan {
   readonly cleanup?: 'throws'
   readonly cacheSaveOutcome?: 'persisted'
   readonly traced?: boolean
+  /** A trace relay that starts and stays up: the run's launcher host is then on, with the run's link. */
+  readonly relay?: 'live'
+  /** A dispatched run, whose logical key ends in the job's identity: a long job id makes the session id past 200 characters. */
+  readonly dispatch?: true
 }
 
-function triggerContext(repo: {owner: string; repo: string}): TriggerContext {
+function triggerContext(repo: {owner: string; repo: string}, dispatch = false): TriggerContext {
   return {
-    eventType: 'issue_comment',
-    eventName: 'issue_comment',
+    eventType: dispatch ? 'workflow_dispatch' : 'issue_comment',
+    eventName: dispatch ? 'workflow_dispatch' : 'issue_comment',
     repo,
     ref: 'refs/heads/main',
     sha: 'sha',
@@ -110,7 +126,10 @@ function triggerContext(repo: {owner: string; repo: string}): TriggerContext {
   } as unknown as TriggerContext
 }
 
-function createBootstrap(sandbox?: SandboxLifecycle): BootstrapPhaseResult {
+function createBootstrap(
+  sandbox?: SandboxLifecycle,
+  tracing?: BootstrapPhaseResult['inputs']['tracing'],
+): BootstrapPhaseResult {
   return {
     inputs: {
       githubToken: 'github-token',
@@ -136,7 +155,7 @@ function createBootstrap(sandbox?: SandboxLifecycle): BootstrapPhaseResult {
       repoSkills: false,
       isolateAgent: sandbox !== undefined,
       agentStateHome: null,
-      tracing: {enabled: false},
+      tracing: tracing ?? {enabled: false},
     },
     logger: {info: vi.fn(), debug: vi.fn(), warning: vi.fn(), error: vi.fn()},
     opencodeResult: {path: 'opencode', version: '2.2.5'},
@@ -150,10 +169,10 @@ function createBootstrap(sandbox?: SandboxLifecycle): BootstrapPhaseResult {
   }
 }
 
-function createRouting(repo: {owner: string; repo: string}): RoutingPhaseResult {
+function createRouting(repo: {owner: string; repo: string}, dispatch = false): RoutingPhaseResult {
   return {
     githubClient: {} as RoutingPhaseResult['githubClient'],
-    triggerResult: {shouldProcess: true, context: triggerContext(repo)},
+    triggerResult: {shouldProcess: true, context: triggerContext(repo, dispatch)},
     agentContext: {
       eventName: 'issue_comment',
       repo: `${repo.owner}/${repo.repo}`,
@@ -219,7 +238,34 @@ async function arrange(plan: RunPlan): Promise<void> {
   else if (plan.bootstrap === 'real-parser') {
     const actual = await vi.importActual<typeof import('./phases/bootstrap.js')>('./phases/bootstrap.js')
     vi.mocked(runBootstrap).mockImplementation(actual.runBootstrap)
-  } else vi.mocked(runBootstrap).mockResolvedValue(createBootstrap(sandbox))
+  } else {
+    vi.mocked(runBootstrap).mockResolvedValue(
+      createBootstrap(
+        sandbox,
+        plan.relay === 'live'
+          ? {enabled: true, url: target.url, headers: [{name: 'Authorization', value: RELAY_CREDENTIAL}]}
+          : undefined,
+      ),
+    )
+  }
+  const {createTraceRelayLaunch} = await import('./phases/trace-relay-process.js')
+  const actualLaunch = await vi.importActual<typeof import('./phases/trace-relay-process.js')>(
+    './phases/trace-relay-process.js',
+  )
+  if (plan.relay === 'live') {
+    vi.mocked(createTraceRelayLaunch).mockReturnValue({
+      start: async () => ({
+        success: true,
+        data: {
+          pid: 1,
+          port: 43_210,
+          crashed: () => false,
+          stop: async () => ({outcome: 'stopped', counts: 'incomplete'}),
+        },
+      }),
+      stop: async () => undefined,
+    } as unknown as ReturnType<typeof createTraceRelayLaunch>)
+  } else vi.mocked(createTraceRelayLaunch).mockImplementation(actualLaunch.createTraceRelayLaunch)
 
   if (plan.routing === 'skip') {
     const skipped: RoutingPhaseSkip = {
@@ -229,7 +275,7 @@ async function arrange(plan: RunPlan): Promise<void> {
       context: triggerContext(repo),
     }
     vi.mocked(runRouting).mockResolvedValue(skipped)
-  } else vi.mocked(runRouting).mockResolvedValue(createRouting(repo))
+  } else vi.mocked(runRouting).mockResolvedValue(createRouting(repo, plan.dispatch === true))
 
   vi.mocked(runDedup).mockResolvedValue(
     plan.dedup === 'duplicate'
@@ -376,9 +422,6 @@ const byName = (spans: readonly Decoded[], name: string): Decoded => {
   if (found === undefined) throw new Error(`no span named ${name}`)
   return found
 }
-
-let target: OtlpSink
-const sinks: OtlpSink[] = []
 
 async function execute(plan: RunPlan = {}): Promise<{exitCode: number; spans: Decoded[]}> {
   await arrange(plan)
@@ -626,6 +669,150 @@ describe('run with lifecycle tracing', () => {
       // #then
       expect([...(sessions.get('agent') ?? [])]).toEqual(['fro-bot/agent:issue-42'])
       expect([...(sessions.get('other') ?? [])]).toEqual(['fro-bot/other:issue-42'])
+    })
+  })
+
+  describe('the launcher’s link to the lifecycle trace', () => {
+    /** The host the server start was given, as the plugin would read it from the launcher document. */
+    const launcherOf = async (): Promise<{host: ReturnType<typeof resolveActionTracing>; document: unknown}> => {
+      const {runCacheRestore} = await import('./phases/cache-restore.js')
+      const source = vi.mocked(runCacheRestore).mock.calls[0]?.[3]
+      if (source === undefined) throw new Error('the server start was never reached')
+      const host = resolveActionTracing(source)
+      return {host, document: JSON.parse(buildTracingLauncherValue(host))}
+    }
+    const sessionsOf = (spans: readonly Decoded[]): Set<unknown> =>
+      new Set(spans.map(span => attr(span, 'langfuse.session.id')))
+
+    it('carries the run’s session id, invocation id and root span context, and the lifecycle spans carry the same session', async () => {
+      // #given a run with a live relay
+      const {spans} = await execute({relay: 'live'})
+
+      // #when the launcher document the server start was given is read
+      const {document} = await launcherOf()
+
+      // #then it names the lifecycle root (trace id and root span id), the invocation id and the one session
+      const root = rootOf(spans)
+      expect(document).toMatchObject({
+        host: 'action',
+        tracing: 'on',
+        rootSpan: {traceId: root.traceId, spanId: root.spanId},
+        sessionId: 'fro-bot/agent:issue-42',
+        invocationId: attr(root, 'fro_bot.invocation.id'),
+      })
+      // #and every lifecycle span exported that very session
+      expect(sessionsOf(spans)).toEqual(new Set(['fro-bot/agent:issue-42']))
+    })
+
+    it('saves the same value for the post step as the launcher and the lifecycle spans carry', async () => {
+      // #given / #when
+      const {spans} = await execute({relay: 'live'})
+      const {document} = await launcherOf()
+      const core = await import('@actions/core')
+      const saved = vi
+        .mocked(core.saveState)
+        .mock.calls.filter(call => call[0] === 'lifecycleSession')
+        .map((call): unknown => call[1])
+
+      // #then
+      expect(saved).toEqual(['fro-bot/agent:issue-42'])
+      expect((document as {sessionId: string}).sessionId).toBe(saved[0])
+      expect(attr(rootOf(spans), 'langfuse.session.id')).toBe(saved[0])
+    })
+
+    it('sends no session id from a run that fails before routing: no launcher, no session on any span, none in state', async () => {
+      // #given a run whose bootstrap fails
+      const {createTraceRelayLaunch} = await import('./phases/trace-relay-process.js')
+      const {spans} = await execute({bootstrap: 'null', relay: 'live'})
+      const core = await import('@actions/core')
+
+      // #then the relay was never started, so no document was built; no span or state holds a session
+      expect(createTraceRelayLaunch).not.toHaveBeenCalled()
+      expect(sessionsOf(spans)).toEqual(new Set([undefined]))
+      expect(vi.mocked(core.saveState).mock.calls.filter(call => call[0] === 'lifecycleSession')).toEqual([])
+    })
+
+    it('sends no session on either side, keeping the root span link, when no scrub-safe id exists', async () => {
+      // #given secret-named variables that hold the candidate and its hash, so the scrubber knows each as a secret
+      const candidate = 'fro-bot/agent:issue-42'
+      const hashed = `sha256:${createHash('sha256').update(candidate, 'utf8').digest('hex').slice(0, 32)}`
+      vi.stubEnv('FRO_TEST_ONE_SECRET', candidate)
+      vi.stubEnv('FRO_TEST_TWO_SECRET', hashed)
+
+      // #when
+      const {spans} = await execute({relay: 'live'})
+      const {document} = await launcherOf()
+      const core = await import('@actions/core')
+
+      // #then neither side holds a session; the link to the root and the invocation id stay
+      expect(document).not.toHaveProperty('sessionId')
+      expect(document).toMatchObject({rootSpan: {traceId: rootOf(spans).traceId}})
+      expect(sessionsOf(spans)).toEqual(new Set([undefined]))
+      expect(vi.mocked(core.saveState).mock.calls.filter(call => call[0] === 'lifecycleSession')).toEqual([])
+    })
+
+    it('bounds a session id past 200 characters the same way on the launcher and on the lifecycle spans', async () => {
+      // #given a dispatched run whose job id is long enough to push `<owner>/<repo>:dispatch-<run>-<job>` past 200 characters
+      const job = 'j'.repeat(TRACING_IDENTITY_FIELD_MAX_CHARS - 10)
+      vi.stubEnv('GITHUB_JOB', job)
+      const candidate = `fro-bot/agent:dispatch-77-${job}`
+      expect(candidate.length).toBeGreaterThan(TRACING_IDENTITY_FIELD_MAX_CHARS)
+
+      // #when
+      const {spans} = await execute({relay: 'live', dispatch: true})
+      const {document} = await launcherOf()
+
+      // #then both carry the one hashed form
+      const session = (document as {sessionId: string}).sessionId
+      expect(session).toBe(`sha256:${createHash('sha256').update(candidate, 'utf8').digest('hex').slice(0, 32)}`)
+      expect(sessionsOf(spans)).toEqual(new Set([session]))
+    })
+
+    it('hashes a session id the scrubber would redact, the same on both sides', async () => {
+      // #given a repository named like a secret
+      const repo = {owner: 'acme', repo: 'password-manager'}
+
+      // #when
+      const {spans} = await execute({relay: 'live', repo})
+      const {document} = await launcherOf()
+
+      // #then
+      const session = (document as {sessionId: string}).sessionId
+      expect(session).toMatch(/^sha256:[0-9a-f]{32}$/)
+      expect(sessionsOf(spans)).toEqual(new Set([session]))
+    })
+
+    it('puts none of the trace input values in the launcher document or the saved state', async () => {
+      // #given a relay request that holds a collector credential (the relay alone gets it)
+
+      // #when
+      await execute({relay: 'live'})
+      const {document} = await launcherOf()
+      const core = await import('@actions/core')
+
+      // #then
+      const everything = JSON.stringify([document, vi.mocked(core.saveState).mock.calls])
+      for (const canary of [
+        target.url,
+        new URL(target.url).host,
+        RELAY_CREDENTIAL,
+        'cmVsYXktY2FuYXJ5OnJlbGF5LXNlY3JldA==',
+      ]) {
+        expect(everything).not.toContain(canary)
+      }
+    })
+
+    it('adds nothing to the launcher of an untraced run', async () => {
+      // #given no trace inputs
+      inputs.values.clear()
+
+      // #when
+      await execute({relay: 'live'})
+      const {runCacheRestore} = await import('./phases/cache-restore.js')
+      const source = vi.mocked(runCacheRestore).mock.calls[0]?.[3]
+
+      // #then a host with no link fields
+      expect(source === undefined ? undefined : resolveActionTracing(source)).not.toHaveProperty('sessionId')
     })
   })
 

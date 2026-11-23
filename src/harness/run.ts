@@ -30,6 +30,7 @@ import {
   buildActionTracingHost,
   buildTraceSessionId,
   buildTracingRunIdentity,
+  buildTracingRunLink,
   liveActionTracingHost,
   readLifecycleRunIdentity,
   relayRequestFromInputs,
@@ -39,7 +40,7 @@ import {getGitHubRunAttempt, getInvocationIdentity, getOpenCodeLogPath} from '..
 import {toErrorMessage} from '../shared/errors.js'
 import {createLifecycleTracer, freeText, withSpan} from '../shared/lifecycle-tracer.js'
 import {createLogger} from '../shared/logger.js'
-import {createSecretRegistry} from '../shared/secret-registry.js'
+import {createRegistryScrubber, createSecretRegistry} from '../shared/secret-registry.js'
 import {isIsolationRequested} from './config/inputs.js'
 import {setActionOutputs, setInvocationOutcomeOutput} from './config/outputs.js'
 import {STATE_KEYS} from './config/state-keys.js'
@@ -174,17 +175,30 @@ async function runWithTrace(trace: RunTrace, startTime: number, bootstrapLogger:
     work: (span: LifecycleSpan) => Promise<T>,
     classify?: (value: T) => SpanResult,
   ): Promise<T> => withSpan(tracer.startSpan(name), work, classify)
-  /** Lifecycle and turn traces share the conversation as their session, once routing has named it (a skipped event included). */
+  /**
+   * The one session id of the conversation, computed once right after routing (a skipped event included) and never again:
+   * the lifecycle tracer's `langfuse.session.id`, the post step's, and the launcher's `sessionId` (so the turn spans) all take
+   * this value. Undefined until routing has named the conversation, and for good when no scrub-safe id exists; neither trace
+   * then sends a session.
+   */
+  let traceSessionId: string | undefined
   const bindTraceSession = (context: TriggerContext | undefined): void => {
     if (!tracer.enabled || context === undefined) return
     try {
       const logicalKey = buildLogicalKey(context, getInvocationIdentity())
       if (logicalKey == null) return
-      const sessionId = buildTraceSessionId(context.repo.owner, context.repo.repo, logicalKey.key)
+      tracer.root.setAttribute('fro_bot.logical_key', logicalKey.key)
+      const sessionId = buildTraceSessionId(
+        context.repo.owner,
+        context.repo.repo,
+        logicalKey.key,
+        createRegistryScrubber(registry),
+      )
+      if (sessionId === undefined) return
+      traceSessionId = sessionId
       tracer.setSessionId(sessionId)
       // For the post step's span. Saved here, once: routing is the first point the conversation is known.
       core.saveState(STATE_KEYS.LIFECYCLE_SESSION, sessionId)
-      tracer.root.setAttribute('fro_bot.logical_key', logicalKey.key)
     } catch {
       // Tracing never changes a run.
     }
@@ -589,7 +603,11 @@ async function runWithTrace(trace: RunTrace, startTime: number, bootstrapLogger:
           })
           if (started.success) {
             traceRelay = started.data
-            tracingHost = liveActionTracingHost(started.data, identity.data)
+            tracingHost = liveActionTracingHost(
+              started.data,
+              identity.data,
+              buildTracingRunLink(tracer.ids, traceSessionId),
+            )
             if (sandboxLifecycle === null && !isolationRequested) bootstrapLogger.warning(TRACE_EXPOSURE_WARNING)
             return {outcome: 'succeeded', reason: 'started'}
           }

@@ -1,3 +1,4 @@
+import {createHash} from 'node:crypto'
 import {
   buildTracingLauncherValue,
   encodeTraceRelayConfig,
@@ -5,17 +6,19 @@ import {
   TRACE_RELAY_PATH,
   TRACING_IDENTITY_FIELD_MAX_CHARS,
 } from '@fro-bot/runtime'
+import {createScrubber} from '@fro-bot/runtime/tracing/scrub'
 import {describe, expect, it, vi} from 'vitest'
+import {createRegistryScrubber, createSecretRegistry} from '../../shared/secret-registry.js'
 import {unwrapErr, unwrapOk} from '../../shared/test-helpers.js'
 import {
   buildActionTracingHost,
   buildTraceSessionId,
   buildTracingRunIdentity,
+  buildTracingRunLink,
   liveActionTracingHost,
   readLifecycleRunIdentity,
   relayRequestFromInputs,
   resolveActionTracing,
-  TRACE_SESSION_ID_MAX_CHARS,
 } from './tracing.js'
 
 const HOST_CANARY = 'collector-canary.example.test'
@@ -177,32 +180,123 @@ describe('resolveActionTracing', () => {
 })
 
 describe('buildTraceSessionId', () => {
+  const hashed = (candidate: string): string =>
+    `sha256:${createHash('sha256').update(candidate, 'utf8').digest('hex').slice(0, 32)}`
+
   it('qualifies the repository-local logical key with the repository', () => {
-    expect(buildTraceSessionId('fro-bot', 'agent', 'issue-42')).toBe('fro-bot/agent:issue-42')
+    expect(buildTraceSessionId('fro-bot', 'agent', 'issue-42', createScrubber())).toBe('fro-bot/agent:issue-42')
   })
 
   it('differs between two repositories on the same issue number', () => {
-    expect(buildTraceSessionId('fro-bot', 'agent', 'issue-42')).not.toBe(
-      buildTraceSessionId('fro-bot', 'other', 'issue-42'),
+    const scrubber = createScrubber()
+    expect(buildTraceSessionId('fro-bot', 'agent', 'issue-42', scrubber)).not.toBe(
+      buildTraceSessionId('fro-bot', 'other', 'issue-42', scrubber),
     )
   })
 
-  it('is bounded to 200 characters, deterministically, and keeps two long keys that share a prefix apart', () => {
+  it('is bounded to the launcher’s 200 characters by the shared helper’s hashed form, and keeps long keys apart', () => {
     // #given two keys that agree for the first 300 characters
+    const scrubber = createScrubber()
     const prefix = 'x'.repeat(300)
-    const a = buildTraceSessionId('fro-bot', 'agent', `${prefix}-a`)
-    const b = buildTraceSessionId('fro-bot', 'agent', `${prefix}-b`)
+    const a = buildTraceSessionId('fro-bot', 'agent', `${prefix}-a`, scrubber)
+    const b = buildTraceSessionId('fro-bot', 'agent', `${prefix}-b`, scrubber)
 
-    // #then
-    expect(a).toHaveLength(TRACE_SESSION_ID_MAX_CHARS)
-    expect(b).toHaveLength(TRACE_SESSION_ID_MAX_CHARS)
+    // #then both are the hashed form (39 characters), differ, and are the same every time
+    expect(a).toBe(hashed(`fro-bot/agent:${prefix}-a`))
+    expect(b).toBe(hashed(`fro-bot/agent:${prefix}-b`))
     expect(a).not.toBe(b)
-    expect(buildTraceSessionId('fro-bot', 'agent', `${prefix}-a`)).toBe(a)
+    expect(a).toHaveLength(39)
+    expect(buildTraceSessionId('fro-bot', 'agent', `${prefix}-a`, scrubber)).toBe(a)
   })
 
   it('leaves a key that fits exactly at the limit untouched', () => {
-    const key = 'k'.repeat(TRACE_SESSION_ID_MAX_CHARS - 'fro-bot/agent:'.length)
-    expect(buildTraceSessionId('fro-bot', 'agent', key)).toBe(`fro-bot/agent:${key}`)
+    const key = 'k'.repeat(TRACING_IDENTITY_FIELD_MAX_CHARS - 'fro-bot/agent:'.length)
+    expect(buildTraceSessionId('fro-bot', 'agent', key, createScrubber())).toBe(`fro-bot/agent:${key}`)
+  })
+
+  it('hashes a repository name the Action’s scrubber would redact, with the registry’s literals in it', () => {
+    // #given a registry that holds the candidate's repository as a secret, as a masked input could
+    const registry = createSecretRegistry(vi.fn())
+    registry.add('payments-secret-repo')
+    const scrubber = createRegistryScrubber(registry)
+
+    // #when
+    const id = buildTraceSessionId('acme', 'payments-secret-repo', 'issue-42', scrubber)
+
+    // #then no id holds the literal: the hashed form stands in
+    expect(id).toBe(hashed('acme/payments-secret-repo:issue-42'))
+    expect(id).not.toContain('payments-secret-repo')
+  })
+
+  it('returns nothing when the scrubber would change both the candidate and its hash', () => {
+    const candidate = 'acme/repo:issue-42'
+    const scrubber = createScrubber({extraSecrets: [candidate, hashed(candidate)]})
+    expect(buildTraceSessionId('acme', 'repo', 'issue-42', scrubber)).toBeUndefined()
+  })
+
+  it('returns nothing for a key with a lone surrogate, rather than one id for two keys', () => {
+    const scrubber = createScrubber()
+    expect([
+      buildTraceSessionId('acme', 'repo', 'issue-\uD800', scrubber),
+      buildTraceSessionId('acme', 'repo', 'issue-\uD801', scrubber),
+    ]).toEqual([undefined, undefined])
+  })
+})
+
+describe('buildTracingRunLink', () => {
+  const ids = {traceId: 'a'.repeat(32), rootSpanId: 'b'.repeat(16), invocationId: 'c'.repeat(16)}
+
+  it('carries the root span (trace and span id), the invocation id and the session', () => {
+    expect(buildTracingRunLink(ids, 'fro-bot/agent:issue-42')).toEqual({
+      rootSpan: {traceId: ids.traceId, spanId: ids.rootSpanId},
+      invocationId: ids.invocationId,
+      sessionId: 'fro-bot/agent:issue-42',
+    })
+  })
+
+  it('carries no session when there is none, and nothing but the session when the tracer is off', () => {
+    expect(buildTracingRunLink(ids, undefined)).toEqual({
+      rootSpan: {traceId: ids.traceId, spanId: ids.rootSpanId},
+      invocationId: ids.invocationId,
+    })
+    expect(buildTracingRunLink(null, 'fro-bot/agent:issue-42')).toEqual({sessionId: 'fro-bot/agent:issue-42'})
+    expect(buildTracingRunLink(null, undefined)).toEqual({})
+  })
+
+  it('produces a launcher document the plugin reads: the three fields, and nothing of the collector', () => {
+    // #given an on host with the link
+    const identity = unwrapOk(buildTracingRunIdentity(FACTS))
+    const value = buildTracingLauncherValue(
+      buildActionTracingHost(43_210, identity, buildTracingRunLink(ids, 'fro-bot/agent:issue-42')),
+    )
+
+    // #then
+    expect(JSON.parse(value)).toMatchObject({
+      version: 1,
+      host: 'action',
+      tracing: 'on',
+      rootSpan: {traceId: ids.traceId, spanId: ids.rootSpanId},
+      sessionId: 'fro-bot/agent:issue-42',
+      invocationId: ids.invocationId,
+    })
+    expect(value).not.toContain(HOST_CANARY)
+    expect(value).not.toContain(CREDENTIAL_CANARY)
+  })
+
+  it('keeps the link through every read of a live source, and drops all of it with the relay', () => {
+    // #given
+    const identity = unwrapOk(buildTracingRunIdentity(FACTS))
+    let crashed = false
+    const source = liveActionTracingHost(
+      {port: 43_210, crashed: () => crashed},
+      identity,
+      buildTracingRunLink(ids, 'fro-bot/agent:issue-42'),
+    )
+
+    // #then
+    expect(source()).toMatchObject({tracing: 'on', sessionId: 'fro-bot/agent:issue-42', invocationId: ids.invocationId})
+    crashed = true
+    expect(source()).toEqual({host: 'action', tracing: 'off'})
   })
 })
 
