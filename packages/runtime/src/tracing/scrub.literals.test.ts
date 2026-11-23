@@ -153,6 +153,19 @@ describe('span links', () => {
     ['an all-zero span id', {traceId: 'c'.repeat(32), spanId: '0'.repeat(16)}],
     ['uppercase hex', {traceId: 'C'.repeat(32), spanId: 'd'.repeat(16)}],
     ['non-hex text', {traceId: 'c'.repeat(32), spanId: 'not-a-span-id!!!!'}],
+    // `RegExp.test` coerces its argument, so these would read as valid hex unless the type is checked first.
+    [
+      'an array trace id',
+      {traceId: ['c'.repeat(32)], spanId: 'd'.repeat(16)} as unknown as {traceId: string; spanId: string},
+    ],
+    [
+      'an object span id',
+      {traceId: 'c'.repeat(32), spanId: {toString: () => 'd'.repeat(16)}} as unknown as {
+        traceId: string
+        spanId: string
+      },
+    ],
+    ['a missing span id', {traceId: 'c'.repeat(32)} as unknown as {traceId: string; spanId: string}],
   ])('drops a link with %s and keeps the span, marked with a fixed reason', (_label, bad) => {
     // #given a span with one good link and one bad one
     const good = {traceId: 'e'.repeat(32), spanId: 'f'.repeat(16)}
