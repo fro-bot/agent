@@ -9,6 +9,7 @@ import {
   TRACE_RELAY_COUNTS_HEADER,
   TRACE_RELAY_PATH,
   TRACING_IDENTITY_FIELD_MAX_CHARS,
+  TRACING_LAUNCHER_MAX_CHARS,
   TRACING_LAUNCHER_VERSION,
   tracingRelayUrl,
   WORKSPACE_TRACING_HOST,
@@ -41,7 +42,19 @@ const IDENTITY: TracingRunIdentity = {
   trigger: 'pull_request',
 }
 
-const on = (overrides: Partial<{relayPort: number; identity: TracingRunIdentity}> = {}): OpenCodeV2TracingHost => ({
+const ROOT_SPAN = {traceId: '0af7651916cd43dd8448eb211c80319c', spanId: 'b7ad6b7169203331'}
+const SESSION_ID = 'fro-bot/agent:issue-42'
+const INVOCATION_ID = '3f2a9c1e-7b4d-4e8a-9d6c-1a2b3c4d5e6f'
+
+const on = (
+  overrides: Partial<{
+    relayPort: number
+    identity: TracingRunIdentity
+    rootSpan: {traceId: string; spanId: string}
+    sessionId: string
+    invocationId: string
+  }> = {},
+): OpenCodeV2TracingHost => ({
   host: 'action',
   tracing: 'on',
   relayPort: 43_210,
@@ -67,6 +80,10 @@ describe('the launcher variable', () => {
     expect(FRO_BOT_TRACING_LAUNCHER_ENV).toBe('OPENCODE_FROBOT_TRACING')
   })
 
+  it('has the same ceiling on the serialized document on both sides', () => {
+    expect(MAX_LAUNCHER_CHARS).toBe(TRACING_LAUNCHER_MAX_CHARS)
+  })
+
   it('has the same document version on both sides', () => {
     expect(TRACING_SETTINGS_VERSION).toBe(TRACING_LAUNCHER_VERSION)
   })
@@ -86,6 +103,67 @@ describe('the launcher document, as the runtime writes it and the plugin reads i
     })
     expect(new URL((settings as {endpoint: string}).endpoint).pathname).toBe(TRACE_RELAY_PATH)
     expect(lines).toEqual([])
+  })
+
+  it('reads the run link the runtime writes as the same three values, and a document without it as before', () => {
+    // #given an on host with all three fields, and one with none
+    const full = resolve(on({rootSpan: ROOT_SPAN, sessionId: SESSION_ID, invocationId: INVOCATION_ID}))
+    const bare = resolve(on())
+
+    // #then the plugin reads each value unchanged, and the bare document carries no key for them
+    expect(full.settings).toEqual({
+      mode: 'on',
+      host: 'action',
+      endpoint: tracingRelayUrl(43_210),
+      identity: IDENTITY,
+      rootSpan: ROOT_SPAN,
+      sessionId: SESSION_ID,
+      invocationId: INVOCATION_ID,
+    })
+    expect(full.lines).toEqual([])
+    expect(Object.keys(bare.settings)).toEqual(['mode', 'host', 'endpoint', 'identity'])
+  })
+
+  it('agrees on the longest session id and invocation id, with every other field at its limit, inside the document ceiling', () => {
+    // #given the longest value of each text field, and an identity at its limit
+    const longest = {
+      repository: 'r'.repeat(MAX_IDENTITY_FIELD_CHARS),
+      runId: '1'.repeat(MAX_IDENTITY_FIELD_CHARS),
+      attempt: '2'.repeat(MAX_IDENTITY_FIELD_CHARS),
+      job: 'j'.repeat(MAX_IDENTITY_FIELD_CHARS),
+      trigger: 't'.repeat(MAX_IDENTITY_FIELD_CHARS),
+    }
+    const sessionId = 's'.repeat(MAX_IDENTITY_FIELD_CHARS)
+    const invocationId = 'i'.repeat(MAX_IDENTITY_FIELD_CHARS)
+    const host = on({identity: longest, rootSpan: ROOT_SPAN, sessionId, invocationId})
+
+    // #then it fits and reads as on; one character more is off on the runtime's side
+    expect(buildTracingLauncherValue(host).length).toBeLessThan(MAX_LAUNCHER_CHARS)
+    expect(resolve(host).settings).toMatchObject({mode: 'on', sessionId, invocationId})
+    expect(resolve(on({sessionId: `${sessionId}s`})).settings).toEqual({mode: 'off', reason: 'action-off'})
+  })
+
+  it('reads every document the runtime writes as on exactly when the writer says on, even where escapes make it long', () => {
+    // #given hosts whose text fields are `n` lone surrogates (control-free, so each field is valid, but each escapes to six
+    // characters), from far under the plugin's ceiling to far over it, and the same with quotes, which escape to two
+    for (const unit of ['\uD800', '"']) {
+      for (let n = 1; n <= MAX_IDENTITY_FIELD_CHARS; n += 7) {
+        const text = unit.repeat(n)
+        const host = on({
+          identity: {repository: text, runId: text, attempt: text, job: text, trigger: text},
+          sessionId: text,
+          invocationId: text,
+        })
+        const value = buildTracingLauncherValue(host)
+
+        // #then the document is within the plugin's ceiling, and the plugin reads it as the writer meant: never a refusal
+        expect(value.length).toBeLessThanOrEqual(MAX_LAUNCHER_CHARS)
+        const written = JSON.parse(value) as {tracing: string}
+        const {settings} = resolve(host)
+        expect(settings.mode).toBe(written.tracing)
+        expect(settings).not.toMatchObject({reason: 'launcher-malformed'})
+      }
+    }
   })
 
   it('reads Action off as a silent off', () => {

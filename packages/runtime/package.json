@@ -33,6 +33,11 @@
       "types": "./src/tracing/scrub.ts",
       "import": "./src/tracing/scrub.ts",
       "default": "./src/tracing/scrub.ts"
+    },
+    "./tracing/session-id": {
+      "types": "./src/tracing/session-id.ts",
+      "import": "./src/tracing/session-id.ts",
+      "default": "./src/tracing/session-id.ts"
     }
   },
   "main": "src/index.ts",

@@ -1185,9 +1185,18 @@ export interface SpanLink {
 const TRACE_ID = /^(?!0{32}$)[0-9a-f]{32}$/
 const SPAN_ID = /^(?!0{16}$)[0-9a-f]{16}$/
 
-/** The links whose ids are well formed, in order. An invalid link is dropped; the span that held it is not. */
+/**
+ * The links whose ids are well formed, in order. An invalid link is dropped; the span that held it is not. Both ids must be
+ * strings before either is matched: `RegExp.test` coerces, so an array or an object that stringifies to valid hex would pass.
+ */
 export function validSpanLinks(links: readonly SpanLink[] | undefined): readonly SpanLink[] {
-  return (links ?? []).filter(link => TRACE_ID.test(link.traceId) && SPAN_ID.test(link.spanId))
+  return (links ?? []).filter(
+    link =>
+      typeof link.traceId === 'string' &&
+      typeof link.spanId === 'string' &&
+      TRACE_ID.test(link.traceId) &&
+      SPAN_ID.test(link.spanId),
+  )
 }
 
 export interface PendingSpan {

@@ -406,8 +406,11 @@ export type {StartTraceRelayOptions, TraceRelayServer} from './trace-relay.js'
 export {
   ACTION_TRACING_OFF,
   buildTracingLauncherValue,
+  isUsableTracingField,
   isUsableTracingIdentity,
+  isUsableTracingRootSpan,
   TRACING_IDENTITY_FIELD_MAX_CHARS,
+  TRACING_LAUNCHER_MAX_CHARS,
   TRACING_LAUNCHER_VERSION,
   tracingRelayUrl,
   WORKSPACE_TRACING_HOST,
@@ -417,7 +420,9 @@ export type {
   OpenCodeV2TracingDecision,
   OpenCodeV2TracingHost,
   OpenCodeV2TracingSetting,
+  TracingRootSpanContext,
   TracingRunIdentity,
+  TracingRunLink,
 } from './tracing-launcher.js'
 export type {
   AcknowledgmentState,

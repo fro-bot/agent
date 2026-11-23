@@ -594,6 +594,143 @@ describe('identity', () => {
   })
 })
 
+describe('the run link', () => {
+  const ROOT_SPAN = {traceId: '0af7651916cd43dd8448eb211c80319c', spanId: 'b7ad6b7169203331'}
+  const SESSION_ID = 'fro-bot/agent:issue-42'
+  const INVOCATION_ID = '3f2a9c1e-7b4d-4e8a-9d6c-1a2b3c4d5e6f'
+  const LINKED = {identity: IDENTITY, rootSpan: ROOT_SPAN, sessionId: SESSION_ID, invocationId: INVOCATION_ID}
+  const linked = (record: SpanRecord): ScrubbedSpan => toExportSpan(record, LINKED, scrubber)
+
+  it('uses the launcher’s session id verbatim as the Langfuse session on every span, and keeps the OpenCode session ids', () => {
+    // #given a child span of a tree and the session id the Action computed
+    for (const record of [chat(), tool(), invoke(), invoke({role: 'child'})]) {
+      // #when mapped with the launcher's fields
+      const span = linked(record)
+
+      // #then the Langfuse session is that string, not the OpenCode root; the standard session attributes are unchanged
+      expect(span.attributes['langfuse.session.id']).toBe(SESSION_ID)
+      expect(span.attributes).toMatchObject({
+        'session.id': 'ses_child',
+        'gen_ai.conversation.id': 'ses_child',
+        'fro_bot.root_session.id': 'ses_root',
+      })
+    }
+  })
+
+  it('carries the invocation id on every span, and mirrors it into Langfuse trace metadata', () => {
+    for (const record of [chat(), tool(), invoke()]) {
+      expect(linked(record).attributes).toMatchObject({
+        'fro_bot.invocation.id': INVOCATION_ID,
+        'langfuse.trace.metadata.invocation_id': INVOCATION_ID,
+      })
+    }
+  })
+
+  it('links each turn root span to the run’s root span, and no other span', () => {
+    // #given
+    const root = linked(invoke({role: 'root'}))
+    const standalone = linked(invoke({role: 'root', standalone: 'compaction'}))
+    const others = [linked(invoke({role: 'child'})), linked(chat()), linked(tool())]
+
+    // #then
+    expect(root.links).toEqual([ROOT_SPAN])
+    expect(standalone.links).toEqual([ROOT_SPAN])
+    for (const span of others) expect(span.links).toBeUndefined()
+  })
+
+  it('uses what the launcher carries and nothing else: a lone field changes only its own attribute', () => {
+    // #given each field alone
+    const onlySession = toExportSpan(invoke(), {identity: IDENTITY, sessionId: SESSION_ID}, scrubber)
+    const onlyInvocation = toExportSpan(invoke(), {identity: IDENTITY, invocationId: INVOCATION_ID}, scrubber)
+    const onlyRoot = toExportSpan(invoke(), {identity: IDENTITY, rootSpan: ROOT_SPAN}, scrubber)
+
+    // #then
+    expect(onlySession.attributes['langfuse.session.id']).toBe(SESSION_ID)
+    expect(onlySession.attributes['fro_bot.invocation.id']).toBeUndefined()
+    expect(onlySession.links).toBeUndefined()
+    expect(onlyInvocation.attributes['langfuse.session.id']).toBe('ses_root')
+    expect(onlyInvocation.attributes['fro_bot.invocation.id']).toBe(INVOCATION_ID)
+    expect(onlyInvocation.links).toBeUndefined()
+    expect(onlyRoot.attributes['langfuse.session.id']).toBe('ses_root')
+    expect(onlyRoot.attributes['fro_bot.invocation.id']).toBeUndefined()
+    expect(onlyRoot.links).toEqual([ROOT_SPAN])
+  })
+
+  it('behaves exactly as before for an Action launcher without the fields', () => {
+    // #given the options the plugin builds from today's launcher
+    for (const record of [chat(), tool(), invoke()]) {
+      const span = exported(record, IDENTITY)
+
+      // #then the Langfuse session is the OpenCode root session, and no invocation attribute or link exists
+      expect(span.attributes['langfuse.session.id']).toBe('ses_root')
+      expect(Object.keys(span.attributes).filter(name => name.includes('invocation'))).toEqual([])
+      expect(span.links).toBeUndefined()
+    }
+  })
+
+  it('keeps the OpenCode root session in a local session, which has no launcher', () => {
+    for (const record of [chat(), tool(), invoke()]) {
+      const span = exported(record)
+      expect(span.attributes['langfuse.session.id']).toBe('ses_root')
+      expect(Object.keys(span.attributes).filter(name => name.includes('invocation'))).toEqual([])
+      expect(span.links).toBeUndefined()
+    }
+  })
+
+  it('falls back to the OpenCode root session, never a redacted value, when scrubbing would change the session id', () => {
+    // #given a session id the scrubber reads as a name and value (`password…:`), as the Action could compute for such a repository
+    const raw = 'acme/password-manager:issue-42'
+    expect(scrubber.scrub(raw)).not.toMatchObject({text: raw})
+
+    // #when every kind of span is exported with it
+    for (const record of [chat(), tool(), invoke(), invoke({role: 'child'})]) {
+      const span = toExportSpan(record, {identity: IDENTITY, sessionId: raw}, scrubber)
+
+      // #then the Langfuse session is the OpenCode root, and no `[REDACTED]` stands in for the id
+      expect(span.attributes['langfuse.session.id']).toBe('ses_root')
+      expect(String(span.attributes['langfuse.session.id'])).not.toContain('[REDACTED]')
+    }
+  })
+
+  it('falls back when a literal added after the span was recorded matches the session id', () => {
+    // #given a scrubber that did not know the id when it was built, and a record made before it learns it
+    const late = createScrubber()
+    const record = chat()
+    expect(toExportSpan(record, LINKED, late).attributes['langfuse.session.id']).toBe(SESSION_ID)
+
+    // #when a literal matching it arrives
+    late.addLiterals?.([SESSION_ID])
+
+    // #then the same record exports under the root session, not a redacted id, and the other attributes still scrub
+    const span = toExportSpan(record, LINKED, late)
+    expect(span.attributes['langfuse.session.id']).toBe('ses_root')
+    expect(span.attributes['session.id']).toBe('ses_child')
+  })
+
+  it('exports a session id the scrubber leaves alone verbatim, hashed ids included', () => {
+    // #given an id in the helper's hashed form
+    const hashed = 'sha256:0123456789abcdef0123456789abcdef'
+
+    // #then it is exported as given
+    expect(
+      toExportSpan(chat(), {identity: IDENTITY, sessionId: hashed}, scrubber).attributes['langfuse.session.id'],
+    ).toBe(hashed)
+  })
+
+  it('scrubs the session id and the invocation id like every other string attribute', () => {
+    // #given ids carrying a secret shape
+    const secret = ['ghp_', 'aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5'].join('')
+    const span = toExportSpan(
+      chat(),
+      {identity: IDENTITY, sessionId: `o/r:${secret}`, invocationId: `inv-${secret}`},
+      scrubber,
+    )
+
+    // #then neither the session, the invocation id nor its Langfuse mirror holds it
+    expect(JSON.stringify(span.attributes)).not.toContain(secret)
+  })
+})
+
 describe('the exported payload', () => {
   it('holds no fixture secret anywhere, in any string, after a recursive walk', () => {
     // #given records whose every string field carries a secret shape

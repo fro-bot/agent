@@ -132,7 +132,13 @@ describe('what the exporter sends', () => {
     // #given a span that links to a span in another trace, beside a malformed link, and a span with no links
     const target = await sink()
     const exporter = exporterFor({url: target.url})
-    const linked = {traceId: hex(0xdef, 32), spanId: hex(0x42, 16)}
+    const SENTINEL = 'LINK-ATTRIBUTE-SENTINEL'
+    // A caller (or a stale build) that still hangs an attribute on a link: the type forbids it, so the test casts, and the payload must not carry it.
+    const linked = {
+      traceId: hex(0xdef, 32),
+      spanId: hex(0x42, 16),
+      attributes: {[SENTINEL]: SENTINEL},
+    } as unknown as {traceId: string; spanId: string}
     const malformed = {traceId: 'not-hex', spanId: hex(0x43, 16)}
     exporter.export(span({links: [malformed, linked]}))
     exporter.export(span())
@@ -149,8 +155,31 @@ describe('what the exporter sends', () => {
     expect(String(link?.traceId)).toMatch(/^[0-9a-f]{32}$/)
     expect(String(link?.spanId)).toMatch(/^[0-9a-f]{16}$/)
     expect((request as SinkRequest).text).not.toContain('not-hex')
+    // #and the attribute a caller tried to put on the link is nowhere in the payload
+    expect((request as SinkRequest).text).not.toContain(SENTINEL)
     // #and a span without links carries none
     expect(without?.links ?? []).toEqual([])
+  })
+
+  it('keeps a span and drops a link whose id is not a string, even when it reads as valid hex', async () => {
+    // #given a link whose ids are an array and an object that stringify to valid ids (`RegExp.test` coerces), beside a valid link
+    const target = await sink()
+    const exporter = exporterFor({url: target.url})
+    const valid = {traceId: hex(0xdef, 32), spanId: hex(0x42, 16)}
+    const asArray = {traceId: [hex(0xaaa, 32)], spanId: hex(0x44, 16)} as unknown as typeof valid
+    const asObject = {traceId: hex(0xbbb, 32), spanId: {toString: () => hex(0x45, 16)}} as unknown as typeof valid
+    exporter.export(span({links: [asArray, asObject, valid]}))
+
+    // #when it is received
+    await exporter.close(3_000)
+
+    // #then the span is exported with only the valid link
+    const [request] = target.accepted()
+    const [exported] = spansOf(request as SinkRequest)
+    expect(exported?.links).toHaveLength(1)
+    expect(exported?.links?.[0]).toMatchObject(valid)
+    expect((request as SinkRequest).text).not.toContain(hex(0xaaa, 32))
+    expect((request as SinkRequest).text).not.toContain(hex(0xbbb, 32))
   })
 
   it('names the sender with the service name it was given, on the resource and the scope', async () => {
