@@ -352,7 +352,7 @@ RUN set -euo pipefail \
 # Systematic installs at SYSTEMATIC_VERSION (declared above), and the versions must equal DEFAULT_SYSTEMATIC_VERSION
 # and FRO_BOT_PLUGIN_VERSION in packages/runtime/src/shared/constants.ts; deploy/scripts/workspace-v2-image.test.mjs
 # keeps them in step, and the plugin gate refuses a server whose plugins differ from what the workspace expects.
-ARG FRO_BOT_PLUGIN_VERSION=0.2.0
+ARG FRO_BOT_PLUGIN_VERSION=0.3.0
 COPY deploy/scripts/install-opencode-v2-plugins.sh /usr/local/lib/workspace-scripts/install-opencode-v2-plugins.sh
 RUN sh /usr/local/lib/workspace-scripts/install-opencode-v2-plugins.sh \
       "@fro.bot/systematic@${SYSTEMATIC_VERSION}" \
