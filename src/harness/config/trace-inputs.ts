@@ -1,5 +1,6 @@
 import type {TracingInputs} from '../../shared/types.js'
 import {Buffer} from 'node:buffer'
+import process from 'node:process'
 import {
   isValidTraceRelayHeaderName,
   isValidTraceRelayHeaderValue,
@@ -211,4 +212,41 @@ export function parseTraceInputs(
     io.warning(TRACE_INPUT_MESSAGES.headersTogether)
     return OFF
   }
+}
+
+/** The environment names `@actions/core` reads the two inputs from. The hyphen is preserved, as for `auth-json`. */
+const TRACE_INPUT_ENV = ['INPUT_TRACE-ENDPOINT', 'INPUT_TRACE-HEADERS'] as const
+
+export interface TraceInputSource {
+  /** `core.getInput`. */
+  readonly getInput: (name: string) => string
+  /** Where the raw inputs are removed from, so a child never inherits them. Default `process.env`. */
+  readonly env?: Record<string, string | undefined>
+}
+
+/**
+ * Reads `trace-endpoint` and `trace-headers`, removes them from the environment and registers every form they could appear
+ * as, in that order and before anything else can fail. Nothing is validated and nothing is logged. It never throws.
+ */
+export function takeTraceInputs(
+  source: TraceInputSource,
+  io: Pick<TraceInputIo, 'mask'>,
+): {readonly endpoint: string; readonly headers: string} {
+  const env = source.env ?? process.env
+  const raw = {endpoint: source.getInput('trace-endpoint'), headers: source.getInput('trace-headers')}
+  for (const name of TRACE_INPUT_ENV) delete env[name]
+  maskTraceInputs(raw, io)
+  return raw
+}
+
+/**
+ * The one reader of the trace inputs: reads, masks (through `io.mask`, which the run points at its secret registry), removes
+ * and validates them. The main step calls it first of everything, before bootstrap, and hands the result on; the post step
+ * calls it again in its own process, where the runner injects the same inputs. A refused input is tracing off with one
+ * fixed-text warning, as `parseTraceInputs` says.
+ */
+export function readTraceInputs(source: TraceInputSource, io: TraceInputIo): TracingInputs {
+  const raw = takeTraceInputs(source, io)
+  // Masked above: the parse does not repeat it.
+  return parseTraceInputs(raw, {...io, mask: () => undefined})
 }
