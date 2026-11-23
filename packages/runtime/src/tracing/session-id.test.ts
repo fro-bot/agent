@@ -1,3 +1,4 @@
+import {Buffer} from 'node:buffer'
 import {createHash} from 'node:crypto'
 import {describe, expect, it} from 'vitest'
 
@@ -76,6 +77,36 @@ describe('scrubSafeSessionId', () => {
     expect(scrubSafeSessionId(candidate, scrubber)).toBe(hashed(candidate))
     scrubber.addLiterals?.([hashed(candidate)])
     expect(scrubSafeSessionId(candidate, scrubber)).toBeUndefined()
+  })
+
+  it.each([
+    ['a lone high surrogate', 'acme/repo:issue-\uD800'],
+    ['a lone low surrogate', 'acme/repo:issue-\uDC00'],
+    ['a lone surrogate at the end of a longer key', `acme/repo:${'k'.repeat(300)}\uD83D`],
+  ])('returns nothing for ill-formed Unicode: %s', (_label, candidate) => {
+    // #given a candidate that is not well-formed UTF-16, which UTF-8 hashing would silently replace with U+FFFD
+    const scrubber = createScrubber()
+
+    // #when / #then no id: neither the candidate (the exporter would encode it lossily) nor a hash of it
+    expect(scrubSafeSessionId(candidate, scrubber)).toBeUndefined()
+  })
+
+  it('does not let two different ill-formed candidates share one hashed id', () => {
+    // #given two keys that differ only in which lone surrogate they hold; both encode to the same UTF-8 bytes
+    const scrubber = createScrubber()
+    const first = 'acme/repo:\uD800'
+    const second = 'acme/repo:\uD801'
+    expect(Buffer.from(first, 'utf8').equals(Buffer.from(second, 'utf8'))).toBe(true)
+
+    // #then neither gets an id at all, so they cannot be merged into one session
+    expect([scrubSafeSessionId(first, scrubber), scrubSafeSessionId(second, scrubber)]).toEqual([undefined, undefined])
+  })
+
+  it('keeps a well-formed astral character, in the candidate and in the hashed form', () => {
+    // #given a surrogate PAIR (one code point), which is valid
+    const scrubber = createScrubber()
+    expect(scrubSafeSessionId('acme/repo:issue-\u{1F600}', scrubber)).toBe('acme/repo:issue-\u{1F600}')
+    expect(scrubSafeSessionId(`acme/repo:${'\u{1F600}'.repeat(100)}`, scrubber)).toMatch(/^sha256:[0-9a-f]{32}$/)
   })
 
   it('returns nothing for an empty candidate', () => {

@@ -34,6 +34,7 @@ import {
   extractToolArguments,
   extractToolDefinitions,
   extractToolResult,
+  MARKER,
   scrubSpan,
   type ContentLimits,
   type PendingAttributeValue,
@@ -299,6 +300,22 @@ export function toPendingSpan(record: SpanRecord, options: AttributeOptions = {}
   }
 }
 
+const SESSION_ATTRIBUTE = 'langfuse.session.id'
+
+/**
+ * Whether the span carries the launcher's session id exactly as given. Equal text is not enough: a value the scrubber withheld
+ * is exported as the fixed marker `[omitted]`, so an id that is literally `[omitted]` would equal its own withheld form. The
+ * omission status the scrub wrote (`<attribute>:<reason>`) is what says whether it was withheld.
+ */
+function sessionIdExportedAsGiven(span: ScrubbedSpan, sessionId: string): boolean {
+  if (span.attributes[SESSION_ATTRIBUTE] !== sessionId) return false
+  const omitted = span.attributes[MARKER.omitted]
+  return !(
+    Array.isArray(omitted) &&
+    omitted.some((entry: unknown) => typeof entry === 'string' && entry.startsWith(`${SESSION_ATTRIBUTE}:`))
+  )
+}
+
 /**
  * Record to an exportable span: attributes, then the one scrubbing pass.
  *
@@ -314,6 +331,6 @@ export function toExportSpan(
   limits?: ContentLimits,
 ): ScrubbedSpan {
   const span = scrubSpan(toPendingSpan(record, options), scrubber, limits)
-  if (options.sessionId === undefined || span.attributes['langfuse.session.id'] === options.sessionId) return span
+  if (options.sessionId === undefined || sessionIdExportedAsGiven(span, options.sessionId)) return span
   return scrubSpan(toPendingSpan(record, {...options, sessionId: undefined}), scrubber, limits)
 }

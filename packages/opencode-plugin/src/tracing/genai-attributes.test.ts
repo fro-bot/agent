@@ -692,6 +692,33 @@ describe('the run link', () => {
     }
   })
 
+  it('falls back when the scrubber withholds the session id, even when the id is literally the withheld marker', () => {
+    // #given an id that is exactly the text a withheld value is replaced with, and a scrubber that cannot process that text
+    const base = createScrubber()
+    const failing = {
+      ...base,
+      scrub: (text: string) =>
+        text === '[omitted]' ? ({ok: false, reason: 'scrub-failed'} as const) : base.scrub(text),
+    }
+
+    // #when every kind of span is exported with it
+    for (const record of [chat(), tool(), invoke(), invoke({role: 'child'})]) {
+      const span = toExportSpan(record, {identity: IDENTITY, sessionId: '[omitted]'}, failing)
+
+      // #then the value equality alone would have passed (`[omitted]` is `[omitted]`); the omission status sends it to the root
+      expect(span.attributes['langfuse.session.id']).toBe('ses_root')
+    }
+  })
+
+  it('falls back when the safety net withholds the session id', () => {
+    // #given a scrubber whose scrub leaves the text but whose safety net says a literal survived in the id
+    const base = createScrubber()
+    const net = {...base, survived: (text: string) => text === SESSION_ID}
+
+    // #then the id is withheld by `scrubSpan` and the span falls back to the root session
+    expect(toExportSpan(chat(), LINKED, net).attributes['langfuse.session.id']).toBe('ses_root')
+  })
+
   it('falls back when a literal added after the span was recorded matches the session id', () => {
     // #given a scrubber that did not know the id when it was built, and a record made before it learns it
     const late = createScrubber()
