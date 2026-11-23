@@ -84,7 +84,14 @@ export async function startTracing(
     sink: exporter,
     scrubber,
     ledger,
-    ...(settings.host === 'action' ? {identity: settings.identity} : {}),
+    ...(settings.host === 'action'
+      ? {
+          identity: settings.identity,
+          rootSpan: settings.rootSpan,
+          sessionId: settings.sessionId,
+          invocationId: settings.invocationId,
+        }
+      : {}),
     ...(options.now === undefined ? {} : {now: options.now}),
   })
 

@@ -20,7 +20,7 @@
  * convention use the `fro_bot.` prefix, so they never collide with OpenCode's own `opencode.*` attributes.
  */
 
-import type {ActionIdentity} from './settings.js'
+import type {ActionIdentity, ActionRunContext} from './settings.js'
 import type {ChatRecord, InvokeRecord, SpanRecord, ToolRecord} from './turn-model.js'
 
 import {
@@ -45,7 +45,7 @@ import {omittedReason} from './snapshot.js'
 
 export const GENAI_SEMCONV_REVISION = 'open-telemetry/semantic-conventions-genai@76e0c19'
 
-export interface AttributeOptions {
+export interface AttributeOptions extends ActionRunContext {
   /** Set in Action mode: repository and run identity go on every span. Absent in local mode: none do. */
   readonly identity?: ActionIdentity | undefined
 }
@@ -68,10 +68,14 @@ function identityAttributes(record: SpanRecord, options: AttributeOptions): Attr
     // id here, so a subagent shows under its parent's session; `session.id` stays each span's own session. It is set on every span,
     // not only the root: Langfuse filters and aggregates per observation. The turn model sets `rootSessionId` when a child's
     // dispatch link resolves (a child that finished before its link is replayed with it), and an unlinked session is its own root.
-    'langfuse.session.id': record.rootSessionId,
+    // An Action run overrides it with the launcher's session id, which the Action computed (`<owner>/<repo>:<logical key>`) so the
+    // run's own trace and every turn trace share one Langfuse session. It is used verbatim: never derived or altered here.
+    'langfuse.session.id': options.sessionId ?? record.rootSessionId,
   }
   set(attributes, 'gen_ai.agent.name', record.agent)
-  if (options.identity !== undefined) Object.assign(attributes, actionIdentityAttributes(options.identity))
+  if (options.identity !== undefined) {
+    Object.assign(attributes, actionIdentityAttributes(options.identity, options.invocationId))
+  }
   return attributes
 }
 
@@ -232,6 +236,17 @@ function toolSpan(record: ToolRecord, options: AttributeOptions): PendingSpan {
   }
 }
 
+/**
+ * A turn's root span links to the Action run's root span: a link, not a parent, because the turn is a trace of its own (Langfuse
+ * ignores links; Tempo follows them). Any other span of the turn is reached through its root. The link is its two ids and
+ * nothing else: it relies on no link attribute (the shared core's `SpanLink` still requires an empty `attributes` object, which
+ * goes when the core drops link attributes).
+ */
+function runLinks(record: InvokeRecord, options: AttributeOptions): Pick<PendingSpan, 'links'> {
+  if (record.role !== 'root' || options.rootSpan === undefined) return {}
+  return {links: [{traceId: options.rootSpan.traceId, spanId: options.rootSpan.spanId, attributes: {}}]}
+}
+
 function invokeSpan(record: InvokeRecord, options: AttributeOptions): PendingSpan {
   const omitted: string[] = []
   const attributes: Attributes = {
@@ -268,6 +283,7 @@ function invokeSpan(record: InvokeRecord, options: AttributeOptions): PendingSpa
     attributes,
     status: statusOf(record),
     events: eventsOf(record),
+    ...runLinks(record, options),
     ...(omitted.length === 0 ? {} : {omitted}),
   }
 }

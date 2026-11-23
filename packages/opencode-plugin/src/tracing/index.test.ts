@@ -245,6 +245,83 @@ describe('startTracing', () => {
     expect(request?.text).toContain('fro-bot/agent')
   })
 
+  describe('the run link from the launcher', () => {
+    const ROOT_SPAN = {traceId: '0af7651916cd43dd8448eb211c80319c', spanId: 'b7ad6b7169203331'}
+    const SESSION_ID = 'fro-bot/agent:issue-42'
+    const INVOCATION_ID = '3f2a9c1e-7b4d-4e8a-9d6c-1a2b3c4d5e6f'
+
+    interface WireSpan {
+      readonly name: string
+      readonly parentSpanId?: string
+      readonly attributes?: readonly {readonly key: string; readonly value: {readonly stringValue?: string}}[]
+      readonly links?: readonly {readonly traceId: string; readonly spanId: string}[]
+    }
+    const wireSpans = (body: unknown): WireSpan[] =>
+      (body as {resourceSpans: {scopeSpans: {spans: WireSpan[]}[]}[]}).resourceSpans.flatMap(resource =>
+        resource.scopeSpans.flatMap(scope => scope.spans),
+      )
+    const attribute = (span: WireSpan, key: string): string | undefined =>
+      span.attributes?.find(entry => entry.key === key)?.value.stringValue
+
+    async function exportTurn(settings: OnSettings): Promise<WireSpan[]> {
+      const target = await sink()
+      const fake = fakeObserverHost()
+      const handle = await startTracing(
+        fake.host,
+        {...settings, endpoint: target.url},
+        {
+          env: {},
+          log: () => {},
+        },
+      )
+      textTurn(fake)
+      await new Promise(resolve => setTimeout(resolve, 50))
+      await handle.stop()
+      fake.end()
+      return target.accepted().flatMap(request => wireSpans(request.body))
+    }
+
+    it('puts the launcher’s session id, the invocation id and a link to the run root on the exported turn', async () => {
+      // #given an Action launcher carrying all three fields
+      const spans = await exportTurn({
+        ...ACTION('http://unused'),
+        rootSpan: ROOT_SPAN,
+        sessionId: SESSION_ID,
+        invocationId: INVOCATION_ID,
+      } as OnSettings)
+
+      // #then the turn's root span links to the run root, and every span has the session and the invocation id
+      const root = spans.find(span => span.name.startsWith('invoke_agent') && span.parentSpanId === undefined)
+      expect(root?.links).toEqual([expect.objectContaining(ROOT_SPAN)])
+      expect(spans.length).toBeGreaterThan(1)
+      for (const span of spans) {
+        expect(attribute(span, 'langfuse.session.id')).toBe(SESSION_ID)
+        expect(attribute(span, 'fro_bot.invocation.id')).toBe(INVOCATION_ID)
+      }
+    })
+
+    it('exports exactly what it did before when the launcher has none of them', async () => {
+      // #given today's Action launcher
+      const spans = await exportTurn(ACTION('http://unused'))
+
+      // #then the Langfuse session is the OpenCode session, and no span has a link or an invocation id
+      expect(spans.length).toBeGreaterThan(1)
+      for (const span of spans) {
+        expect(attribute(span, 'langfuse.session.id')).toBe(SES)
+        expect(attribute(span, 'fro_bot.invocation.id')).toBeUndefined()
+        expect(span.links ?? []).toEqual([])
+      }
+    })
+
+    it('keeps the OpenCode session in a local session', async () => {
+      const spans = await exportTurn(LOCAL('http://unused'))
+      for (const span of spans) {
+        expect(attribute(span, 'langfuse.session.id')).toBe(SES)
+        expect(span.links ?? []).toEqual([])
+      }
+    })
+  })
+
   it('closes spans still open at stop as interrupted and incomplete', async () => {
     // #given a turn that has started and not finished
     const target = await sink()

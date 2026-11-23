@@ -225,8 +225,14 @@ export function extractPromptMessage(prompt: unknown): Json | undefined {
  * level, where it is shown and filterable, and treats a span carrying one as a trace update; a string value is kept as sent
  * (JSON-decoding applies only to its own SDKs). The values are strings and the very same ones as their twins, so they pass the
  * same scrubber and identifier bounds. The keys are short and stable.
+ *
+ * The launcher's invocation id, when it has one, is part of the same identity: it names the one Action step that started the
+ * server, which `run.id`, `run.attempt` and `job` cannot do (two steps of one job share all three).
  */
-export const actionIdentityAttributes = (identity: ActionIdentity): Record<string, string> => ({
+export const actionIdentityAttributes = (
+  identity: ActionIdentity,
+  invocationId?: string | undefined,
+): Record<string, string> => ({
   'fro_bot.repository': identity.repository,
   'fro_bot.run.id': identity.runId,
   'fro_bot.run.attempt': identity.attempt,
@@ -237,4 +243,7 @@ export const actionIdentityAttributes = (identity: ActionIdentity): Record<strin
   'langfuse.trace.metadata.run_attempt': identity.attempt,
   'langfuse.trace.metadata.job': identity.job,
   'langfuse.trace.metadata.trigger': identity.trigger,
+  ...(invocationId === undefined
+    ? {}
+    : {'fro_bot.invocation.id': invocationId, 'langfuse.trace.metadata.invocation_id': invocationId}),
 })
