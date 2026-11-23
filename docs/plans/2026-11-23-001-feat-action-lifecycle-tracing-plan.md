@@ -167,13 +167,13 @@ All 26 origin requirements carry forward. R12 and R24 depend on Unit 1; if it fa
 - **IDs are minted at the start and saved as one state record.** The trace id, root span id and a random invocation id are saved before routing. Partial or invalid state in post means no telemetry. No credential or input ever goes into state.
 - **Outcomes reuse the existing values, plus `cancelled`.** `cancelled` is a tracing-only outcome for a signalled run. The Action's outputs and job summary are unchanged.
 - **The final writes get their own span.** The origin's R5 puts them under finalize, but they run after cleanup, so they become a `report` span after cleanup. The finalize phase span keeps its place before cleanup.
-- **The session is the repository-qualified logical key.** The logical key is repository-local (`issue-42`), so the Langfuse session id is `<owner>/<repo>:<logical key>`, bounded to Langfuse's 200 characters. Lifecycle and turn traces use the same value. The OpenCode continuity key is unchanged. The key is computed right after routing; `RoutingPhaseSkip` keeps the trigger context so skipped runs get one too. Spans that ended before routing gain the session attribute at export. Run identity comes from the GitHub environment, so it exists from the first span.
+- **The session is the repository-qualified logical key.** The logical key is repository-local (`issue-42`), so the Langfuse session id is `<owner>/<repo>:<logical key>`, bounded to Langfuse's 200 characters. The Action computes this one canonical session id and passes it to the plugin verbatim; neither exporter derives it. Lifecycle and turn traces use the same value. The OpenCode continuity key is unchanged. The key is computed right after routing; `RoutingPhaseSkip` keeps the trigger context so skipped runs get one too. Spans that ended before routing gain the session attribute at export. Run identity comes from the GitHub environment, so it exists from the first span.
 - **One signal owner for every run, without changing cancellation semantics.** It takes over the exec adapter's signal ownership from the sandbox handler. On a signal it sets a cancelled flag synchronously, and every irreversible write (a comment, review, approval, reaction or push) checks the flag at the point of submission and stops. The export starts at once with its own deadline. The owner re-raises when the sandbox teardown settles, as today, so the teardown keeps its 10 s budget and its safety-state write. The export never extends or shortens that.
 - **No launcher version negotiation.** The new plugin accepts the launcher document with or without the new fields. The Action sends them only in the change that pins the new plugin.
 - **Turns link to the root span.** The plugin starts before the execution span exists, and the root span id is known from the start.
 - **The post step rebuilds its own redaction set.** Its environment still holds the GitHub token, `auth-json` and the AWS keys, so it reads them into its set and exports scrubbed error text like main.
-- **Direct sends refuse transport debug output.** The relay's child runs with an empty environment and discarded stderr; the Action's own process doesn't. If `NODE_DEBUG` names `http`, `https`, `net`, `tls` or `undici`, lifecycle export is off and one fixed-text warning says so.
-- **Delivery is counted per batch.** The response body is never read, so a partial rejection inside an acknowledged batch isn't counted. The undelivered count covers spans in batches that weren't acknowledged.
+- **Direct sends refuse transport debug output.** The relay's child runs with an empty environment and discarded stderr; the Action's own process doesn't. Node matches `NODE_DEBUG` case-insensitively and with wildcards, so whenever `NODE_DEBUG` is non-empty, lifecycle export is off in main and post, and one fixed-text warning says so.
+- **Delivery is counted per batch.** The response body is never read, so a partial rejection inside an acknowledged batch isn't counted. The undelivered count is the spans in unacknowledged batches, not an exact count of spans the collector didn't ingest.
 - **Lifecycle tracing doesn't depend on the turn-trace identity.** An incomplete run identity turns the relay off today; the lifecycle trace still sends whatever identity exists.
 
 ## Open Questions
@@ -206,10 +206,10 @@ sequenceDiagram
     participant Col as Collector
     Main->>Main: read trace inputs, mint traceId, rootSpanId, invocationId
     Main->>State: save identity record
-    Main->>Main: bootstrap, routing, compute logical key
+    Main->>Main: bootstrap, routing, compute session id (owner/repo:logical key)
     Main->>Relay: start
     Main->>Srv: start with launcher {identity, logicalKey, invocationId, root span context}
-    Srv->>Relay: turn traces (session = logical key, link to root span)
+    Srv->>Relay: turn traces (session id verbatim, link to root span)
     Relay->>Col: forward
     Main->>Main: phases, cleanup, report
     Main->>Col: flush lifecycle spans (bounded wait)
@@ -296,7 +296,7 @@ Early-exit span matrix (a trace never invents unreached phases):
 
 - [ ] **Unit 3: Plugin launcher fields and the run link**
 
-**Goal:** Turn traces use the logical key as their Langfuse session, carry the invocation id, and link to the run's root span. Plugin-only, released on its own.
+**Goal:** Turn traces use the session id the Action passes as their Langfuse session, carry the invocation id, and link to the run's root span. Plugin-only, released on its own.
 
 **Requirements:** R17, R18, R20, R21.
 
@@ -309,14 +309,14 @@ Early-exit span matrix (a trace never invents unreached phases):
 
 **Approach:**
 
-- The launcher document gains optional fields: the root span context, the logical key and the invocation id. The parser accepts the document with or without them and still rejects any other key.
-- With a logical key, `langfuse.session.id` is the logical key. Without one, including local sessions, it stays the OpenCode root session.
+- The launcher document gains optional fields: the root span context, the session id and the invocation id. The parser accepts the document with or without them and still rejects any other key.
+- With a session id, `langfuse.session.id` is that value, used verbatim; the plugin never derives or alters it. Without one, including local sessions, it stays the OpenCode root session.
 - Each turn's root span gets a link to the run's root span.
 - Publish the plugin release after merge. The Action doesn't send the new fields until Unit 8.
 
 **Test scenarios:**
 
-- Happy path: a document with all three fields gives turn spans the logical key as session, the invocation id, and a link to the given root span.
+- Happy path: a document with all three fields gives turn spans the given session id verbatim, the invocation id, and a link to the given root span.
 - Edge case: a document without the new fields behaves as today.
 - Edge case: a local session keeps the OpenCode root session.
 - Error path: an unknown key or a malformed root span context turns tracing off, as an invalid document does today.
@@ -365,7 +365,7 @@ Early-exit span matrix (a trace never invents unreached phases):
 - Error path: a value the scrubber can't process is omitted with a marker.
 - Error path: 401, 413 and a stalled connection each leave the run's result unchanged, end within the bound, and give the right undelivered count.
 - Edge case: a 200 with a partial rejection counts the batch as delivered and logs nothing from the body.
-- Error path: with `NODE_DEBUG=http,tls`, nothing is sent, one warning is logged, and stderr carries neither the endpoint nor the credential.
+- Error path: with `NODE_DEBUG` set to `http,tls`, `*`, `HT*` or `Net`, nothing is sent, one warning is logged, and stderr carries neither the endpoint nor the credential.
 - Error path: a 503 with `Retry-After` inside the bound is retried and delivered.
 - Error path: a 3xx with a `Location` to a second listener sends nothing to the second listener.
 - Error path: a collector response body containing a canary never reaches a log line.
@@ -486,6 +486,7 @@ Early-exit span matrix (a trace never invents unreached phases):
 - Error path: an S3 metadata or log sync error carrying an AWS key exports the message with the key redacted.
 - Error path: short and long opaque canaries in post's `opencode-config` and trace credential never appear in the request body.
 - Edge case: a collector answering 503 with a long `Retry-After` doesn't keep post alive past its bound.
+- Error path: with `NODE_DEBUG` set to `*` or `HT*`, post sends nothing and stderr carries neither the endpoint nor the credential.
 
 **Verification:**
 
@@ -501,7 +502,7 @@ Early-exit span matrix (a trace never invents unreached phases):
 
 **Files:**
 
-- Modify: `src/services/setup/tracing.ts`, `src/harness/run.ts` (pass the logical key, invocation id and root span context into the launcher), `packages/runtime/src/shared/constants.ts` (`FRO_BOT_PLUGIN_VERSION`), `deploy/workspace.Dockerfile` (the plugin `ARG`), committed `dist/`, `dist/THIRD_PARTY_NOTICES.txt`.
+- Modify: `src/services/setup/tracing.ts`, `src/harness/run.ts` (compute the session id and pass it, the invocation id and the root span context into the launcher), `packages/runtime/src/shared/constants.ts` (`FRO_BOT_PLUGIN_VERSION`), `deploy/workspace.Dockerfile` (the plugin `ARG`), committed `dist/`, `dist/THIRD_PARTY_NOTICES.txt`.
 - Test: `src/services/setup/tracing.test.ts`, `src/harness/run-tracing.test.ts`.
 
 **Approach:**
@@ -511,8 +512,9 @@ Early-exit span matrix (a trace never invents unreached phases):
 
 **Test scenarios:**
 
-- Happy path: the launcher document carries the logical key, invocation id and root span context of the run.
-- Edge case: a run that fails before routing sends no logical key.
+- Happy path: the launcher document carries the run's session id (`<owner>/<repo>:<logical key>`), invocation id and root span context.
+- Edge case: a run that fails before routing sends no session id.
+- Edge case: a logical key long enough to push the session id past 200 characters is bounded the same way for lifecycle and turn spans.
 - Integration: the launcher document and Action state contain none of the trace input values.
 
 **Verification:**
@@ -540,6 +542,7 @@ Early-exit span matrix (a trace never invents unreached phases):
 **Test scenarios:**
 
 - Integration: a full run against the real receiver yields one lifecycle trace and turn traces that link to its root span, all with the same session.
+- Integration: runs from two repositories on the same issue number, with the pinned plugin: each repository's lifecycle and turn spans share one session id, and the two repositories' session ids differ.
 - Integration: on both hosted images, both cancelled rows deliver reached spans before SIGTERM.
 - Integration: the isolated agent user can't read the canary credential from the environment, files, the launcher document or state.
 
