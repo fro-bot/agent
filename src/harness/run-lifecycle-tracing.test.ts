@@ -723,6 +723,27 @@ describe('run with lifecycle tracing', () => {
       }
     })
 
+    it('saves the session id for the post step once routing has named the conversation, and not before', async () => {
+      // #given a run that routes, and one that fails in bootstrap
+      const core = await import('@actions/core')
+      const sessionRecords = (): unknown[] =>
+        vi
+          .mocked(core.saveState)
+          .mock.calls.filter(call => call[0] === 'lifecycleSession')
+          .map((call): unknown => call[1])
+
+      // #when
+      await execute({})
+      const routed = sessionRecords()
+      vi.mocked(core.saveState).mockClear()
+      await execute({bootstrap: 'null'})
+      const failed = sessionRecords()
+
+      // #then
+      expect(routed).toEqual(['fro-bot/agent:issue-42'])
+      expect(failed).toEqual([])
+    })
+
     it('flushes the reached spans when cleanup throws, and keeps the original error', async () => {
       // #given a cleanup that rejects
       // #when

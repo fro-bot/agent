@@ -180,7 +180,10 @@ async function runWithTrace(trace: RunTrace, startTime: number, bootstrapLogger:
     try {
       const logicalKey = buildLogicalKey(context, getInvocationIdentity())
       if (logicalKey == null) return
-      tracer.setSessionId(buildTraceSessionId(context.repo.owner, context.repo.repo, logicalKey.key))
+      const sessionId = buildTraceSessionId(context.repo.owner, context.repo.repo, logicalKey.key)
+      tracer.setSessionId(sessionId)
+      // For the post step's span. Saved here, once: routing is the first point the conversation is known.
+      core.saveState(STATE_KEYS.LIFECYCLE_SESSION, sessionId)
       tracer.root.setAttribute('fro_bot.logical_key', logicalKey.key)
     } catch {
       // Tracing never changes a run.
