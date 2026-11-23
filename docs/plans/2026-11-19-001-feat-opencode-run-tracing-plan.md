@@ -607,7 +607,7 @@ Span shape for one turn:
 
 - [x] **Unit 9: Langfuse proof, publish, pin, real-runner proof**
 
-**Evidence:** the pre-publish local session sent 18 spans (two subagents, none dropped) and the operator confirmed the Langfuse and Tempo views; it is recorded as counts, not screenshots. Plugin 0.2.0 was published from main, and the pin and real-runner rows shipped in #2315.
+**Evidence:** the pre-publish local session sent 18 spans (two subagents, none dropped) and the operator confirmed the Langfuse and Tempo views; counts and the operator's confirmation stand in for the screenshots or exported span structure this unit asked for. Plugin 0.2.0 was published from main, and the pin and real-runner rows shipped in #2315.
 
 **Goal:** The plugin is published once, after it is shown readable in Langfuse, and the Action runs it on hosted runners, isolated and not.
 

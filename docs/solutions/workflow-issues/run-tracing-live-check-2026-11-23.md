@@ -35,6 +35,8 @@ Run tracing has two halves: the Fro Bot OpenCode plugin captures spans, and in t
 
 **Local check, before publishing the plugin**
 
+This check loads a local build of the plugin. A session on a registry install of the published plugin has not been checked yet.
+
 - Trace a local session through the TUI or a plain `opencode serve`, driven over its HTTP API. `opencode run` starts a private `serve --stdio` when no service is running, and the plugin treats that as a headless host and stays off. It traces only when `run` attaches to a running service.
 - Run on the OpenCode profile's own config dir and `HOME`, with the plugin and the tracing settings added on top. When provider credentials are OAuth connections served by auth plugins, those plugins load only from that config, so a bare temporary config sends requests with no valid bearer.
 - The settings file is consent for the whole machine. Remove it after the check.
@@ -44,7 +46,7 @@ Run tracing has two halves: the Fro Bot OpenCode plugin captures spans, and in t
 
 - Run from a throwaway branch in a public repository with no private content. Put the probe in an existing dispatchable workflow file, as in [the published-install learning](published-install-live-check-before-rollout-2026-11-17.md).
 - Dispatch three runs: isolated, not isolated, and isolated with a wrong credential. Use `output-mode: working-dir` and `response-mode: none` so the runs post nothing, and pass `github.token` with `contents: read`, because the non-isolated agent can read whatever token it is given.
-- Mint a collector token for the check alone: write-only, and revoked as soon as the runs finish. The non-isolated run's agent can read it while it is live, and a read-only GitHub token does not limit what the collector token can do. If the collector cannot scope a token to a test project, the check's traces land beside real data; delete them after reading.
+- Mint a collector token for the check alone: write-only, and revoked as soon as the runs finish. While it is live, the non-isolated run's agent can read it, and with it write misleading spans into the store and spend its quota; deleting the check's traces afterwards does not undo that. A token confined to a test project, or a disposable collector, removes the risk. These runs used a write-only token on the single-operator collector and accepted it.
 - The collector token for an Action sender group is delivered as a bare token secret. Build the header in the workflow: `trace-headers: "Authorization: Bearer ${{ secrets.<NAME> }}"`. A bare token in `trace-headers` is refused and tracing turns off.
 - Read the relay's lines in each run log:
 
@@ -54,7 +56,7 @@ Run tracing has two halves: the Fro Bot OpenCode plugin captures spans, and in t
 | Not isolated | same counts | Warning: the agent can read the collector credential and the content of every span |
 | Isolated, wrong credential | `acknowledged: 0`, `dropped: 3`; plugin reported 0 spans | The run succeeds |
 
-- Then read the trace in the backend: one Langfuse session per run with its subagent grouped under it, and the prompt, tool inputs and tool results readable. Tempo holds structure only.
+- Then read the trace in the backend: the two runs with the valid credential each show one Langfuse session with the subagent grouped under it, and the prompt, tool inputs and tool results readable. The wrong-credential run sends nothing. Tempo holds structure only.
 - Afterwards delete the branch and the caches it created, revoke the token and delete the secret.
 
 **Release workflow**
