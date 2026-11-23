@@ -4,6 +4,7 @@ import type {MetricsCollector} from '../../features/observability/index.js'
 import type {CommentSummaryOptions} from '../../features/observability/types.js'
 import type {ReviewDeliveryReceiptOperations} from '../../services/github/review-delivery-receipt.js'
 import type {CommentTarget} from '../../services/github/types.js'
+import type {LifecycleSpan} from '../../shared/lifecycle-tracer.js'
 import type {Logger} from '../../shared/logger.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {CacheRestorePhaseResult} from './cache-restore.js'
@@ -20,6 +21,7 @@ import {runBrokeredPush} from '../../features/delegated/brokered-push.js'
 import {writeJobSummary} from '../../features/observability/index.js'
 import {createExecAdapter} from '../../services/setup/adapters.js'
 import {toErrorMessage} from '../../shared/errors.js'
+import {NOOP_SPAN, withSpan} from '../../shared/lifecycle-tracer.js'
 import {createLogger} from '../../shared/logger.js'
 import {htmlParagraph, htmlText} from '../../shared/summary-html.js'
 import {setActionOutputs, setDeliveryKindOutput} from '../config/outputs.js'
@@ -205,6 +207,8 @@ export interface FinalizePhaseOptions {
    * unmodified; `run.ts` always provides all three in production.
    */
   readonly reviewDeliveryReceiptOps?: ReviewDeliveryReceiptOperations
+  /** The finalize span of the lifecycle trace: posting the response is its child. */
+  readonly traceSpan?: LifecycleSpan
 }
 
 export async function runFinalizeWithResult(
@@ -217,7 +221,7 @@ export async function runFinalizeWithResult(
   logger: Logger,
   options: FinalizePhaseOptions = {},
 ): Promise<FinalizeResult> {
-  const {knownExecutionVeto = false, reviewDeliveryReceiptOps} = options
+  const {knownExecutionVeto = false, reviewDeliveryReceiptOps, traceSpan} = options
   const duration = Date.now() - startTime
 
   setActionOutputs({
@@ -430,7 +434,11 @@ export async function runFinalizeWithResult(
         ...(reviewDeliveryReceiptOps == null ? {} : {reviewDeliveryReceiptOps}),
       }
 
-      result = await runResponsePost(responsePostParams, responsePostLogger)
+      result = await withSpan(
+        (traceSpan ?? NOOP_SPAN).startChild('response post'),
+        async () => runResponsePost(responsePostParams, responsePostLogger),
+        posted => (posted.delivered ? {outcome: 'succeeded'} : {outcome: 'failed', reason: posted.reason}),
+      )
     }
 
     if (result.delivered === false) {

@@ -3,7 +3,8 @@ import type {ReactionContext} from '../../features/agent/types.js'
 import type {AttachmentResult} from '../../features/attachments/index.js'
 import type {MetricsCollector} from '../../features/observability/metrics.js'
 import type {Octokit} from '../../services/github/types.js'
-import type {CacheSaveResult} from '../../shared/cache-save-result.js'
+import type {CacheSaveOutcome, CacheSaveResult} from '../../shared/cache-save-result.js'
+import type {LifecycleSpan, SpanResult} from '../../shared/lifecycle-tracer.js'
 import type {Logger} from '../../shared/logger.js'
 import type {AgentIdentity} from '../../shared/types.js'
 import type {LeaseController} from './acquire-lock.js'
@@ -38,6 +39,7 @@ import {
   isOpenCodePromptArtifactEnabled,
 } from '../../shared/env.js'
 import {toErrorMessage} from '../../shared/errors.js'
+import {NOOP_SPAN, withSpan} from '../../shared/lifecycle-tracer.js'
 import {createLogger} from '../../shared/logger.js'
 import {setCacheSaveResultOutput} from '../config/outputs.js'
 import {STATE_KEYS} from '../config/state-keys.js'
@@ -107,6 +109,8 @@ export interface CleanupPhaseOptions {
   readonly isolatedRun?: boolean
   /** The runner-owned log snapshot this invocation took at its confirmed take-back. Absent: it took none, so no logs are published. */
   readonly logSnapshotPath?: string | null
+  /** The cleanup span of the lifecycle trace: the cache save is its child. */
+  readonly traceSpan?: LifecycleSpan
 }
 
 /**
@@ -131,6 +135,27 @@ export interface CleanupSafetyResult {
    * held-by-other already short-circuited the run).
    */
   readonly continuityUnverified: boolean
+  /**
+   * What the cache save ended with, for the lifecycle trace's root span. `null` when cleanup threw before it had a result, so
+   * the save never ran. Optional only so a test double of this phase need not name it.
+   */
+  readonly cacheSaveOutcome?: CacheSaveOutcome | null
+}
+
+/** The cache save span's result: the save's own outcome is the reason, and only a thrown or errored save is a failure. */
+function cacheSaveSpanResult(saved: CacheSaveResult): SpanResult {
+  switch (saved.outcome) {
+    case 'persisted':
+      return {outcome: 'succeeded', reason: saved.outcome}
+    case 'cache-error':
+    case 'cache-rejected':
+      return {outcome: 'failed', reason: saved.outcome}
+    case 'skipped-by-configuration':
+    case 'skipped-empty':
+    case 'checkpoint-declined':
+    case 'ownership-declined':
+      return {outcome: 'skipped', reason: saved.outcome}
+  }
 }
 
 export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupSafetyResult> {
@@ -154,6 +179,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
     sandboxOutputUntrusted = false,
     isolatedRun = false,
     logSnapshotPath = null,
+    traceSpan = NOOP_SPAN,
   } = options
 
   // The one directory a log upload may read this invocation: the shared path for a normal run, only the invocation's own
@@ -183,6 +209,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
   // from skipping the shutdown attempt itself in the first place.
   let quiescenceConfirmed = serverHandleV2 == null
   let continuityUnverified = false
+  let cacheSaveOutcome: CacheSaveOutcome | null = null
 
   try {
     // Attachment cleanup, working-label removal, and session pruning are all best-effort --
@@ -401,21 +428,28 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
 
     let cacheSaveResult: CacheSaveResult
     if (declineReason == null) {
-      cacheSaveResult = await saveCache({
-        components: cacheComponents,
-        runId: getGitHubRunId(),
-        logger: cacheLogger,
-        storagePath: getOpenCodeStoragePath(),
-        authPath: getOpenCodeAuthPath(),
-        projectIdPath: finalProjectIdPath,
-        storeConfig,
-        objectStorePublish: holdsLease ? 'publish' : 'withhold',
-        skipCache,
-      })
+      cacheSaveResult = await withSpan(
+        traceSpan.startChild('cache save'),
+        async () =>
+          saveCache({
+            components: cacheComponents,
+            runId: getGitHubRunId(),
+            logger: cacheLogger,
+            storagePath: getOpenCodeStoragePath(),
+            authPath: getOpenCodeAuthPath(),
+            projectIdPath: finalProjectIdPath,
+            storeConfig,
+            objectStorePublish: holdsLease ? 'publish' : 'withhold',
+            skipCache,
+          }),
+        saved => cacheSaveSpanResult(saved),
+      )
     } else {
       cacheLogger.warning('Declining cache save: persistence safety could not be confirmed', {reason: declineReason})
       cacheSaveResult = {cachePersisted: false, storePersisted: false, outcome: 'ownership-declined'}
+      traceSpan.startChild('cache save').end({outcome: 'skipped', reason: 'ownership-declined'})
     }
+    cacheSaveOutcome = cacheSaveResult.outcome
 
     // Written on every path a result exists, not just success: a boolean-only-on-success
     // write left store-only persistence unrecorded, so the post hook saw an unset
@@ -524,5 +558,5 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
     continuityUnverified = leaseRenewal != null && (leaseRenewal.continuityUnverified?.() ?? leaseRenewal.hasFailed())
   }
 
-  return {quiescenceConfirmed, continuityUnverified}
+  return {quiescenceConfirmed, continuityUnverified, cacheSaveOutcome}
 }
