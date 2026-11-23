@@ -3,6 +3,9 @@ import type {OtlpSink, SinkRequest} from '../../packages/runtime/src/tracing/otl
 import type {InvocationOutcome} from '../harness/outcome.js'
 import type {CreateLifecycleTracerOptions, LifecycleTracer, SpanOutcome} from './lifecycle-tracer.js'
 import {Buffer} from 'node:buffer'
+import childProcess from 'node:child_process'
+import fs from 'node:fs'
+import os from 'node:os'
 import {createSpanExporter} from '@fro-bot/runtime/tracing/exporter'
 import {CONTENT_ATTRIBUTE_NAMES} from '@fro-bot/runtime/tracing/scrub'
 import {afterEach, describe, expect, expectTypeOf, it, vi} from 'vitest'
@@ -906,5 +909,38 @@ describe('withSpan', () => {
 
   it('does nothing on the no-op span', async () => {
     await expect(withSpan(NOOP_SPAN, async () => 'fine')).resolves.toBe('fine')
+  })
+})
+
+describe('the resource', () => {
+  it('holds the service name and nothing else, and no detector reads the machine id, the registry or the host', async () => {
+    // #given every route a resource detector takes to the host: the machine-id files, the registry and `ioreg`/`kenv` through a
+    // child process, and the host name. (The bundle ships `@opentelemetry/resources`' detector code; none of it may run.)
+    const reads = [
+      vi.spyOn(fs.promises, 'readFile'),
+      vi.spyOn(fs, 'readFileSync'),
+      vi.spyOn(childProcess, 'exec'),
+      vi.spyOn(childProcess, 'execFile'),
+      vi.spyOn(childProcess, 'execSync'),
+      vi.spyOn(childProcess, 'spawn'),
+      vi.spyOn(os, 'hostname'),
+    ]
+    const target = await sink()
+    const {tracer} = harness(target.url)
+    tracer.startSpan('bootstrap').end({outcome: 'succeeded'})
+    tracer.root.end({outcome: 'succeeded'})
+
+    // #when
+    await tracer.flush()
+
+    // #then the resource is the one attribute we set
+    const body = target.requests[0]?.body as {
+      resourceSpans: {resource: {attributes: {key: string; value: unknown}[]}}[]
+    }
+    expect(body.resourceSpans[0]?.resource.attributes).toEqual([
+      {key: 'service.name', value: {stringValue: LIFECYCLE_SERVICE_NAME}},
+    ])
+    // #and nothing went looking for the host
+    for (const spy of reads) expect(spy).not.toHaveBeenCalled()
   })
 })
