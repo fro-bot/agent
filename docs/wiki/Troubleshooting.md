@@ -1,7 +1,7 @@
 ---
 type: convention
-last-updated: "2026-11-15"
-updated-by: "962b70bc"
+last-updated: "2026-11-23"
+updated-by: "8ca1022d"
 sources:
   - src/harness/phases/sandbox-lifecycle.ts
   - src/harness/phases/log-snapshot.ts
@@ -15,6 +15,7 @@ sources:
   - src/services/setup/ci-config-v2.ts
   - src/features/agent/retry-v2.ts
   - src/harness/phases/v2-server.ts
+  - src/harness/phases/trace-relay-process.ts
   - src/harness/phases/v1-import-wait.ts
   - src/features/agent/prompt-sender-v2.ts
   - src/features/agent/drain-v2.ts
@@ -174,6 +175,10 @@ There is no install fallback. A V1 request (a harness build or a stock V1 versio
 `Sandbox PATH left out directories the agent cannot enter` is expected when the runner advertises private home paths. Hosted tool-cache binaries remain usable; Bun and pnpm have narrow read/execute grants. General XDG roots and uv/pip caches belong to the sandbox home. A write failure elsewhere in the runner home is not a reason to grant the whole home.
 
 An isolated run without a confirmed log snapshot publishes no logs and never reads the shared directory as a fallback. A snapshot over 100 MiB or 10,000 entries is discarded whole; this can explain absent artifacts even after the agent completed. [[Session Persistence]] describes snapshot ownership and verified file reads.
+
+### Missing or partial run traces
+
+Tracing is independent of the run result. No `Trace relay started` line can mean tracing was off or that the optional relay was unavailable. A `Trace relay stopped` line with dropped batches or incomplete counts means the collector may have received only part of the trace. Even an acknowledged batch confirms only the collector's HTTP response, not that its backend retained all the spans. See [[Setup and Configuration#Tracing a run]] for the relay's lifecycle, exporter limits, and collector configuration.
 
 ## Model Resolution Failures
 

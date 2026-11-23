@@ -1,7 +1,7 @@
 ---
 type: architecture
-last-updated: "2026-11-15"
-updated-by: "962b70bc"
+last-updated: "2026-11-23"
+updated-by: "8ca1022d"
 sources:
   - src/harness/phases/sandbox-lifecycle.ts
   - src/services/setup/sandbox-preflight.ts
@@ -22,6 +22,8 @@ sources:
   - packages/runtime/src/shared/opencode-v2-pin.json
   - src/post.ts
   - src/harness/run.ts
+  - src/harness/phases/trace-relay-process.ts
+  - packages/runtime/src/agent/response-delivery.ts
   - src/harness/outcome.ts
   - src/harness/post.ts
   - packages/runtime/src/agent/ownership-ledger.ts
@@ -127,7 +129,7 @@ Shared execution policy no longer lives inside V1 implementation modules. The Ac
 The action defines two Node 24 entry points in `action.yaml`:
 
 - **`dist/main.js`** — The primary execution path. Bootstraps the environment, routes the incoming GitHub event, acquires the per-repo Action lock (`action.json`; fail-closed when S3 is configured), acknowledges the request, runs the AI agent, finalizes results, and attempts a first cache save.
-- **`dist/post.js`** — A post-action hook (RFC-017) that retries eligible Actions-cache saves and recovers a lock still owned by this invocation, even on failure or cancellation. It withholds the shared S3 session upload because it no longer holds the publication lease.
+- **`dist/post.js`** — A post-action hook (RFC-017) that retries eligible Actions-cache saves, recovers a lock still owned by this invocation, and removes leftover run-scoped `gh` configuration when safe. It withholds the shared S3 session upload because it no longer holds the publication lease.
 
 Both entry points are thin wrappers. `main.ts` delegates to `harness/run.ts`; `post.ts` delegates to `harness/post.ts`.
 
@@ -186,6 +188,8 @@ The proxy ties connection lifetimes together: an upstream error or incomplete cl
 ### Action isolation
 
 The Action has a separate, opt-in boundary for hosted Linux runners. `sandbox-preflight.ts` validates the published install and runner prerequisites; `sandbox-lifecycle.ts` manages an unprivileged account, a private mount namespace, path handoff, and confirmed teardown. Shared filesystem paths are read-only inside that view, while the checkout and run-owned state remain writable. A runner-owned key-proxy process holds provider keys and forwards only supported model routes. This is distinct from the workspace container's identity split: provisioned GitHub credentials and the OpenCode server password remain accessible to the Action's agent. [[Setup and Configuration]] describes the limits and toolchain access.
+
+GitHub credential provisioning is separate from the isolation switch: only scheduled and manually dispatched runs receive the Action's credential in the agent. Optional run tracing is separate again. The Fro Bot OpenCode plugin exports spans to a runner-owned loopback relay (`src/harness/phases/trace-relay-process.ts`); the relay, not the plugin, receives the collector URL and headers. The separate user protects the relay credential on isolated runs. See [[Setup and Configuration#Tracing a run]].
 
 ### Runtime Package (`packages/runtime/`)
 
