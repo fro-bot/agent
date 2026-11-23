@@ -79,19 +79,22 @@ describe.skipIf(!hasBun)('the post entry point as a process', () => {
     await Promise.all(sinks.splice(0).map(async sink => sink.stop()))
   })
 
-  it('ends within its bound when the collector answers 503 with a Retry-After of five minutes', async () => {
-    // #given a collector that tells the SDK to come back in 300 s
-    const sink = await startOtlpSink({respond: () => ({status: 503, headers: {'Retry-After': '300'}})})
+  it('ends within its bound when the collector answers 503 with a Retry-After longer than that bound', async () => {
+    // #given a collector that asks the SDK to come back in 9 s (the longest wait it honours, past the 6 s export bound)
+    const sink = await startOtlpSink({
+      respond: n => (n === 1 ? {status: 503, headers: {'Retry-After': '9'}} : {status: 200}),
+    })
     sinks.push(sink)
 
     // #when the post step runs
     const result = await runEntry({'INPUT_TRACE-ENDPOINT': sink.url})
 
-    // #then it was not killed by the test's limit, it ended cleanly, and it did not wait for the Retry-After
+    // #then it ended cleanly at the export bound. The SDK's retry timer (a plain referenced `setTimeout`, nine seconds here)
+    // would hold a process that waits for its event loop to drain until it fired; the entry point does not wait for it.
     expect(result.signal).toBeNull()
     expect(result.code).toBe(0)
-    expect(sink.received()).toBeGreaterThanOrEqual(1)
-    expect(result.elapsedMs).toBeLessThan(15_000)
+    expect(sink.received()).toBe(1)
+    expect(result.elapsedMs).toBeLessThan(8_000)
   })
 
   it('ends at once, with a span delivered, when the collector answers', async () => {

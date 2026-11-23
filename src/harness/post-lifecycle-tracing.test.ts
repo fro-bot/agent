@@ -393,21 +393,23 @@ describe('the post step’s span', () => {
 
     it('every leaf of auth-json and opencode-config, not only the ones the runner masks', async () => {
       // #given leaves in the post environment's own copies of the two inputs
-      vi.stubEnv('INPUT_AUTH-JSON', JSON.stringify({anthropic: {type: 'api', key: 'sk-auth-leaf-canary-0001'}}))
+      vi.stubEnv('INPUT_AUTH-JSON', JSON.stringify({anthropic: {type: 'api', key: 'opaque-auth-leaf-canary-0001'}}))
       vi.stubEnv(
         'INPUT_OPENCODE-CONFIG',
         JSON.stringify({mcp: {remote: {headers: {Authorization: 'Bearer mcp-leaf-canary-0002'}}}}),
       )
       setState(traced())
       const {saveCache} = await import('../services/cache/index.js')
-      vi.mocked(saveCache).mockRejectedValue(new Error('failed with sk-auth-leaf-canary-0001 and mcp-leaf-canary-0002'))
+      vi.mocked(saveCache).mockRejectedValue(
+        new Error('failed with opaque-auth-leaf-canary-0001 and mcp-leaf-canary-0002'),
+      )
 
       // #when
       await post()
 
       // #then
       const body = target.requests.map(request => request.text).join('')
-      expect(body).not.toContain('sk-auth-leaf-canary-0001')
+      expect(body).not.toContain('opaque-auth-leaf-canary-0001')
       expect(body).not.toContain('mcp-leaf-canary-0002')
     })
 
