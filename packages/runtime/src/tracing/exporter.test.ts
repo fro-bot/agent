@@ -5,13 +5,6 @@ import {Buffer} from 'node:buffer'
 import {createServer as createHttpServer} from 'node:http'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 import {
-  opensslAvailable,
-  startOtlpSink,
-  startTlsSink,
-  type OtlpSink,
-  type SinkRequest,
-} from '../../../opencode-plugin/src/integration.fixture.js'
-import {
   COLLECTOR_BODY_LIMIT_BYTES,
   createSpanExporter,
   DEFAULT_EXPORTER_LIMITS,
@@ -19,6 +12,7 @@ import {
   SDK_SPAN_LIMITS,
   TRACE_COUNTS_HEADER,
 } from './exporter.js'
+import {opensslAvailable, startOtlpSink, startTlsSink, type OtlpSink, type SinkRequest} from './otlp-sink.testing.js'
 import {scrubbedBrand} from './scrub.js'
 
 const FAST = {batchIntervalMs: 15, requestTimeoutMs: 2_500, maxConsecutiveFailures: 3}
