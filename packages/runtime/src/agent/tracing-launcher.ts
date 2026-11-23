@@ -21,6 +21,13 @@ export const TRACING_LAUNCHER_VERSION = 1
 /** The longest identity field the plugin accepts. A longer one would make the plugin refuse the whole document. */
 export const TRACING_IDENTITY_FIELD_MAX_CHARS = 200
 
+/**
+ * The longest launcher document the plugin reads, counted in characters of the serialized value. Longer is malformed there
+ * (`MAX_LAUNCHER_CHARS`; a parity test keeps the two equal). The fields' own limits do not bound it: a lone surrogate is one
+ * character in a field and a six-character escape in the document, so the writer checks the serialized length.
+ */
+export const TRACING_LAUNCHER_MAX_CHARS = 4096
+
 const LOOPBACK = '127.0.0.1'
 
 /** The Action run's root span, which each turn's root span links to. Hex, as OTLP writes ids. */
@@ -121,14 +128,17 @@ const SPAN_ID = /^[\da-f]{16}$/
 const NON_ZERO = /[1-9a-f]/
 
 /** Whether both ids are lower-case hex of the right length and not all zero, which W3C trace context makes invalid. */
-export function isUsableTracingRootSpan(rootSpan: TracingRootSpanContext): boolean {
+export function isUsableTracingRootSpan(rootSpan: unknown): rootSpan is TracingRootSpanContext {
+  // An untyped caller may pass anything: `null` and every non-object are refused, never thrown on.
+  if (typeof rootSpan !== 'object' || rootSpan === null) return false
+  const {traceId, spanId} = rootSpan as {readonly traceId?: unknown; readonly spanId?: unknown}
   return (
-    typeof rootSpan.traceId === 'string' &&
-    typeof rootSpan.spanId === 'string' &&
-    TRACE_ID.test(rootSpan.traceId) &&
-    SPAN_ID.test(rootSpan.spanId) &&
-    NON_ZERO.test(rootSpan.traceId) &&
-    NON_ZERO.test(rootSpan.spanId)
+    typeof traceId === 'string' &&
+    typeof spanId === 'string' &&
+    TRACE_ID.test(traceId) &&
+    SPAN_ID.test(spanId) &&
+    NON_ZERO.test(traceId) &&
+    NON_ZERO.test(spanId)
   )
 }
 
@@ -165,7 +175,7 @@ export function buildTracingLauncherValue(host: OpenCodeV2TracingHost): string {
     isUsableTracingRunLink(host)
   ) {
     const {repository, runId, attempt, job, trigger} = host.identity
-    return JSON.stringify({
+    const value = JSON.stringify({
       version: TRACING_LAUNCHER_VERSION,
       host: 'action',
       tracing: 'on',
@@ -177,6 +187,8 @@ export function buildTracingLauncherValue(host: OpenCodeV2TracingHost): string {
       ...(host.sessionId === undefined ? {} : {sessionId: host.sessionId}),
       ...(host.invocationId === undefined ? {} : {invocationId: host.invocationId}),
     })
+    // Measured on the serialized value: escapes make it longer than its fields, and the plugin refuses a document over its ceiling.
+    if (value.length <= TRACING_LAUNCHER_MAX_CHARS) return value
   }
   return JSON.stringify({version: TRACING_LAUNCHER_VERSION, host: 'action', tracing: 'off'})
 }

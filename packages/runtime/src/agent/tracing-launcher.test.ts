@@ -8,6 +8,7 @@ import {
   isUsableTracingIdentity,
   isUsableTracingRootSpan,
   TRACING_IDENTITY_FIELD_MAX_CHARS,
+  TRACING_LAUNCHER_MAX_CHARS,
   tracingRelayUrl,
   WORKSPACE_TRACING_HOST,
   type OpenCodeV2TracingHost,
@@ -143,6 +144,55 @@ describe('the run link fields', () => {
   it('keeps a session id exactly at the limit', () => {
     const sessionId = 's'.repeat(TRACING_IDENTITY_FIELD_MAX_CHARS)
     expect(JSON.parse(buildTracingLauncherValue(on({sessionId}))) as {sessionId: string}).toMatchObject({sessionId})
+  })
+
+  it.each([
+    ['null', null],
+    ['a string', 'abc'],
+    ['a number', 7],
+    ['an array', []],
+  ])('says off, and does not throw, for a root span that is %s (an untyped caller)', (_name, rootSpan) => {
+    expect(buildTracingLauncherValue(on({rootSpan: rootSpan as unknown as {traceId: string; spanId: string}}))).toBe(
+      buildTracingLauncherValue(ACTION_TRACING_OFF),
+    )
+  })
+
+  it('writes only the two ids of a root span, whatever else the caller put on it', () => {
+    const rootSpan = {...ROOT_SPAN, extra: 'SENTINEL'}
+    const value = buildTracingLauncherValue(on({rootSpan}))
+    expect(value).not.toContain('SENTINEL')
+    expect(JSON.parse(value) as {rootSpan: unknown}).toMatchObject({rootSpan: ROOT_SPAN})
+  })
+
+  it('says off when the serialized document is over the plugin’s ceiling, and never writes one the plugin would refuse', () => {
+    // #given a host whose every text field is `n` lone surrogates: control-free, so each field is accepted, but JSON.stringify
+    // writes each lone surrogate as a six-character escape, so the document grows far past its fields' own lengths
+    const lone = (n: number): string => '\uD800'.repeat(n)
+    const host = (n: number): OpenCodeV2TracingHost =>
+      on({
+        identity: {repository: lone(n), runId: lone(n), attempt: lone(n), job: lone(n), trigger: lone(n)},
+        sessionId: lone(n),
+        invocationId: lone(n),
+      })
+
+    // #when the field length grows to its limit
+    const lengths: number[] = []
+    let sawOn = false
+    let sawOff = false
+    for (let n = 1; n <= TRACING_IDENTITY_FIELD_MAX_CHARS; n += 1) {
+      const value = buildTracingLauncherValue(host(n))
+      lengths.push(value.length)
+      if ((JSON.parse(value) as {tracing: string}).tracing === 'on') sawOn = true
+      else sawOff = true
+    }
+
+    // #then no document is over the ceiling, short fields are still on, and the longest are off
+    expect(Math.max(...lengths)).toBeLessThanOrEqual(TRACING_LAUNCHER_MAX_CHARS)
+    expect(sawOn).toBe(true)
+    expect(sawOff).toBe(true)
+    expect(buildTracingLauncherValue(host(TRACING_IDENTITY_FIELD_MAX_CHARS))).toBe(
+      buildTracingLauncherValue(ACTION_TRACING_OFF),
+    )
   })
 
   it('does not write the fields for an off host', () => {

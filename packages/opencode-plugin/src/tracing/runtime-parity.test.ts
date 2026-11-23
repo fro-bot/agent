@@ -9,6 +9,7 @@ import {
   TRACE_RELAY_COUNTS_HEADER,
   TRACE_RELAY_PATH,
   TRACING_IDENTITY_FIELD_MAX_CHARS,
+  TRACING_LAUNCHER_MAX_CHARS,
   TRACING_LAUNCHER_VERSION,
   tracingRelayUrl,
   WORKSPACE_TRACING_HOST,
@@ -79,6 +80,10 @@ describe('the launcher variable', () => {
     expect(FRO_BOT_TRACING_LAUNCHER_ENV).toBe('OPENCODE_FROBOT_TRACING')
   })
 
+  it('has the same ceiling on the serialized document on both sides', () => {
+    expect(MAX_LAUNCHER_CHARS).toBe(TRACING_LAUNCHER_MAX_CHARS)
+  })
+
   it('has the same document version on both sides', () => {
     expect(TRACING_SETTINGS_VERSION).toBe(TRACING_LAUNCHER_VERSION)
   })
@@ -136,6 +141,29 @@ describe('the launcher document, as the runtime writes it and the plugin reads i
     expect(buildTracingLauncherValue(host).length).toBeLessThan(MAX_LAUNCHER_CHARS)
     expect(resolve(host).settings).toMatchObject({mode: 'on', sessionId, invocationId})
     expect(resolve(on({sessionId: `${sessionId}s`})).settings).toEqual({mode: 'off', reason: 'action-off'})
+  })
+
+  it('reads every document the runtime writes as on exactly when the writer says on, even where escapes make it long', () => {
+    // #given hosts whose text fields are `n` lone surrogates (control-free, so each field is valid, but each escapes to six
+    // characters), from far under the plugin's ceiling to far over it, and the same with quotes, which escape to two
+    for (const unit of ['\uD800', '"']) {
+      for (let n = 1; n <= MAX_IDENTITY_FIELD_CHARS; n += 7) {
+        const text = unit.repeat(n)
+        const host = on({
+          identity: {repository: text, runId: text, attempt: text, job: text, trigger: text},
+          sessionId: text,
+          invocationId: text,
+        })
+        const value = buildTracingLauncherValue(host)
+
+        // #then the document is within the plugin's ceiling, and the plugin reads it as the writer meant: never a refusal
+        expect(value.length).toBeLessThanOrEqual(MAX_LAUNCHER_CHARS)
+        const written = JSON.parse(value) as {tracing: string}
+        const {settings} = resolve(host)
+        expect(settings.mode).toBe(written.tracing)
+        expect(settings).not.toMatchObject({reason: 'launcher-malformed'})
+      }
+    }
   })
 
   it('reads Action off as a silent off', () => {

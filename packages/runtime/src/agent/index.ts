@@ -410,6 +410,7 @@ export {
   isUsableTracingIdentity,
   isUsableTracingRootSpan,
   TRACING_IDENTITY_FIELD_MAX_CHARS,
+  TRACING_LAUNCHER_MAX_CHARS,
   TRACING_LAUNCHER_VERSION,
   tracingRelayUrl,
   WORKSPACE_TRACING_HOST,
