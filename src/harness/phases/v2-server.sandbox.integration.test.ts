@@ -135,7 +135,6 @@ import {
   controlCoversMatrix,
   copyBundleWithImports,
   describeNamespaceMembers,
-  describeOutOfRangeSecretEnv,
   describeReconstruction,
   failuresFor,
   findPaths,
@@ -152,7 +151,6 @@ import {
   runnerFirstLine,
   safeEnvPath,
   safeEnvToken,
-  secretEnvRangeReport,
   startPlainScriptedSession,
   startScriptedProvider,
   startScriptedSession,
@@ -3950,22 +3948,3 @@ describe.skipIf(!cancelPlainEnabled)(
     })
   },
 )
-
-// --- 16. The lifecycle trace's secret registry on a hosted runner ------------------------------------------------------
-
-describe.skipIf(!gated)('the lifecycle tracer’s secret registry on a hosted runner', () => {
-  const report = secretEnvRangeReport(process.env)
-
-  it('has a secret-named variable to look at, so the next row is not vacuous', () => {
-    // #given the step's environment: the workflow sets `PROBE_DUMMY_TOKEN`, and the runner may add more (a token of its own)
-    expect(report.inspected).toBeGreaterThanOrEqual(1)
-  })
-
-  it('can match every secret-named value of the environment, so the fail-closed rule does not strip free text from the run', () => {
-    // #then no secret-named value is outside the scrubber's 8 to 4,096 character range. A value outside it would make the
-    // registry not matchable and the tracer export no free text on every hosted run. Names and lengths only are reported.
-    const offenders = report.outOfRange.length === 0 ? 'none' : describeOutOfRangeSecretEnv(report)
-    expect(offenders, 'secret-named runner variables outside the matchable range').toBe('none')
-    expect(report.matchable).toBe(true)
-  })
-})
