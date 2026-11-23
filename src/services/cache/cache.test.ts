@@ -160,6 +160,58 @@ describe('restoreCache', () => {
     await expect(fs.stat(storagePath)).resolves.toBeDefined()
   })
 
+  it.each([
+    {label: 'true', skipCache: true, expectHit: false},
+    {label: 'false', skipCache: false, expectHit: true},
+  ])('reaches the object-store fallback only when skipCache is $label', async ({skipCache, expectHit}) => {
+    // #given a cache miss with an object store holding a session database
+    vi.stubEnv('SKIP_CACHE', '')
+    const list = onlyV2Listing(['fro-bot-state/github/owner/repo/sessions-v2/opencode.db'])
+    const download = vi.fn(async (key: string, localPath: string) => {
+      await fs.mkdir(path.dirname(localPath), {recursive: true})
+      await fs.writeFile(localPath, key)
+      return ok(undefined)
+    })
+
+    // #when restoring with the option
+    const result = await restoreCache({
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      cacheAdapter: createMockCacheAdapter({restoreResult: undefined}),
+      storeConfig: testStoreConfig,
+      storeAdapter: createMockStoreAdapter({list, download}),
+      skipCache,
+    })
+
+    // #then the store is listed and downloaded from only when the restore is not skipped
+    expect(result.hit).toBe(expectHit)
+    expect(list).toHaveBeenCalledTimes(expectHit ? 1 : 0)
+    expect(download).toHaveBeenCalledTimes(expectHit ? 1 : 0)
+  })
+
+  it('skips the restore when SKIP_CACHE=true even though the harness forwards skipCache: false', async () => {
+    // #given the environment variable set and the option explicitly false
+    vi.stubEnv('SKIP_CACHE', 'true')
+    const adapter = createMockCacheAdapter({restoreResult: 'opencode-storage-github-owner-repo-main-Linux'})
+    const restoreSpy = vi.spyOn(adapter, 'restoreCache')
+
+    // #when restoring
+    const result = await restoreCache({
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      cacheAdapter: adapter,
+      skipCache: false,
+    })
+
+    // #then the variable still wins
+    expect(result.hit).toBe(false)
+    expect(restoreSpy).not.toHaveBeenCalled()
+  })
+
   it('still skips the restore when SKIP_CACHE=true and the option is unset', async () => {
     // #given the environment variable callers set today
     vi.stubEnv('SKIP_CACHE', 'true')
@@ -1507,13 +1559,16 @@ describe('saveCache', () => {
     }
   })
 
-  it('skips both backends when the skipCache option is true, and not when it is false or unset', async () => {
-    // #given storage with content, no SKIP_CACHE in the environment, and an object store configured
-    vi.stubEnv('SKIP_CACHE', '')
-    await fs.mkdir(storagePath, {recursive: true})
-    await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
-
+  describe('skipCache option with an upload-eligible database', () => {
     const run = async (skipOptions: {readonly skipCache?: boolean}) => {
+      // A real session database in the place the object-store sync reads, so a save that runs does upload it.
+      await fs.mkdir(storagePath, {recursive: true})
+      await fs.writeFile(path.join(storagePath, 'session.db'), 'test data')
+      const db = new DatabaseSync(path.join(path.dirname(storagePath), 'opencode.db'))
+      db.exec('CREATE TABLE sessions(id INTEGER PRIMARY KEY, data TEXT)')
+      db.exec("INSERT INTO sessions (data) VALUES ('session-1')")
+      db.close()
+
       const upload = vi.fn<ObjectStoreAdapter['upload']>(async () => ok(undefined))
       const saveCacheSpy = vi.fn(async () => 1)
       const result = await saveCache({
@@ -1530,22 +1585,47 @@ describe('saveCache', () => {
       return {result, upload, saveCacheSpy}
     }
 
-    // #when saving with skipCache: true
-    const skipped = await run({skipCache: true})
+    it('skips both backends when skipCache is true', async () => {
+      // #given no SKIP_CACHE in the environment
+      vi.stubEnv('SKIP_CACHE', '')
 
-    // #then neither backend is attempted
-    expect(skipped.result).toEqual({cachePersisted: false, storePersisted: false, outcome: 'skipped-by-configuration'})
-    expect(skipped.saveCacheSpy).not.toHaveBeenCalled()
-    expect(skipped.upload).not.toHaveBeenCalled()
+      // #when saving with skipCache: true
+      const {result, upload, saveCacheSpy} = await run({skipCache: true})
 
-    // #when saving with skipCache: false or unset
-    for (const skipOptions of [{skipCache: false}, {}]) {
-      const attempted = await run(skipOptions)
+      // #then neither backend is attempted
+      expect(result).toEqual({cachePersisted: false, storePersisted: false, outcome: 'skipped-by-configuration'})
+      expect(saveCacheSpy).not.toHaveBeenCalled()
+      expect(upload).not.toHaveBeenCalled()
+    })
 
-      // #then the save is attempted
-      expect(attempted.result.outcome).not.toBe('skipped-by-configuration')
-      expect(attempted.saveCacheSpy).toHaveBeenCalled()
-    }
+    it.each([
+      {label: 'false', skipOptions: {skipCache: false}},
+      {label: 'unset', skipOptions: {}},
+    ])('uploads the database and writes the cache when skipCache is $label', async ({skipOptions}) => {
+      // #given no SKIP_CACHE in the environment
+      vi.stubEnv('SKIP_CACHE', '')
+
+      // #when saving
+      const {result, upload, saveCacheSpy} = await run(skipOptions)
+
+      // #then both backends really run
+      expect(result).toMatchObject({cachePersisted: true, storePersisted: true, outcome: 'persisted'})
+      expect(upload).toHaveBeenCalledTimes(1)
+      expect(saveCacheSpy).toHaveBeenCalledTimes(1)
+    })
+
+    it('skips when SKIP_CACHE=true even though the harness forwards skipCache: false', async () => {
+      // #given the environment variable set and the option explicitly false
+      vi.stubEnv('SKIP_CACHE', 'true')
+
+      // #when saving
+      const {result, upload, saveCacheSpy} = await run({skipCache: false})
+
+      // #then the variable still wins
+      expect(result.outcome).toBe('skipped-by-configuration')
+      expect(saveCacheSpy).not.toHaveBeenCalled()
+      expect(upload).not.toHaveBeenCalled()
+    })
   })
 
   it('returns false when storage has no content', async () => {

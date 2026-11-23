@@ -4,7 +4,7 @@
  * persistence axes) plus a named terminal condition, rather than a single boolean that
  * collapses "deliberately skipped", "denied", and "succeeded" into the same two poles.
  *
- * - `skipped-by-configuration`: `skip-cache` is `true` or `SKIP_CACHE` is set. Neither backend was attempted.
+ * - `skipped-by-configuration`: `skip-cache` is `true` or `SKIP_CACHE=true`. Neither backend was attempted.
  * - `skipped-empty`: no cacheable content existed. Neither backend was attempted.
  * - `checkpoint-declined`: the SQLite write-ahead log could not be checkpointed before
  *   the save could proceed. Neither backend was attempted.
@@ -77,7 +77,7 @@ export interface CacheSaveResult {
  *   cache write the store already makes redundant for the database. See the branch in
  *   `post.ts` for why this is not the futility inference the plan's Key Technical
  *   Decisions reject.
- * - `skipped`: `skip-cache` is `true` or `SKIP_CACHE` is set. A deliberate configuration opt-out; retry would just
+ * - `skipped`: `skip-cache` is `true` or `SKIP_CACHE=true`. A deliberate configuration opt-out; retry would just
  *   repeat the same no-op.
  * - `declined-for-safety`: cleanup's persistence safety gate declined the save
  *   (`ownership-declined`) because it could not confirm no other writer could still be

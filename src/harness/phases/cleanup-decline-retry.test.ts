@@ -261,7 +261,10 @@ describe('a cleanup-declined cache save is retried by the post hook (decline rec
 
     // #then it never attempts the save a retry would have made
     expect(saveCache).not.toHaveBeenCalled()
-    expect(logger.info).toHaveBeenCalledWith('Skipping post-action: skip-cache was set', expect.any(Object))
+    expect(logger.info).toHaveBeenCalledWith(
+      'Skipping post-action session save: skip-cache was set',
+      expect.any(Object),
+    )
   })
 
   it('still retries a not-persisted save when skip-cache was recorded as false', async () => {

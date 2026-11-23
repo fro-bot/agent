@@ -632,6 +632,25 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
     expect(setOutput).toHaveBeenCalledWith('cache-save-result', 'declined-for-safety')
   })
 
+  it('still reports declined-for-safety when skip-cache is on and the safety gate declines', async () => {
+    // #given skip-cache on and a ledger with an unsettled session
+    const {createOwnershipLedger} = await import('@fro-bot/runtime')
+    const {saveCache} = await import('../../services/cache/index.js')
+    const ledger = createOwnershipLedger()
+    ledger.adopt('ses_child', 'reviewer')
+    ledger.markUnknown('ses_child')
+    const {runCleanup} = await import('./cleanup.js')
+
+    // #when cleanup runs
+    await runCleanup(baseOptions({ownershipLedger: ledger, skipCache: true}))
+
+    // #then the safety gate runs before the save, where the skip is checked, so the decline is what is reported
+    expect(saveCache).not.toHaveBeenCalled()
+    const {saveState, setOutput} = await import('@actions/core')
+    expect(saveState).toHaveBeenCalledWith('cacheSaved', 'declined-for-safety')
+    expect(setOutput).toHaveBeenCalledWith('cache-save-result', 'declined-for-safety')
+  })
+
   it('persists normally when the ownership ledger is empty (every run today, unchanged behavior)', async () => {
     // #given an empty ledger -- persistence-safe by definition
     const {createOwnershipLedger} = await import('@fro-bot/runtime')
