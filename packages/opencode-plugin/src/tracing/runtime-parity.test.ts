@@ -15,14 +15,13 @@ import {
   type OpenCodeV2TracingHost,
   type TracingRunIdentity,
 } from '@fro-bot/runtime'
-import {describe, expect, it} from 'vitest'
-
 import {
   COLLECTOR_BODY_LIMIT_BYTES,
   DEFAULT_EXPORTER_LIMITS,
   formatCountsHeader,
   TRACE_COUNTS_HEADER,
-} from './exporter.js'
+} from '@fro-bot/runtime/tracing/exporter'
+import {describe, expect, it} from 'vitest'
 import {
   MAX_IDENTITY_FIELD_CHARS,
   MAX_LAUNCHER_CHARS,

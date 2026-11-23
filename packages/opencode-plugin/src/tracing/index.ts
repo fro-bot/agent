@@ -9,8 +9,8 @@
 
 import type {TracingSettings} from './settings.js'
 
+import {createSpanExporter} from '@fro-bot/runtime/tracing/exporter'
 import {createScrubber, type Scrubber} from './content.js'
-import {createSpanExporter} from './exporter.js'
 import {createTracePipeline} from './pipeline.js'
 import {registerObservers, type ObserverHost} from './record-observations.js'
 import {createSnapshotLedger, type PendingLimits} from './snapshot.js'
@@ -30,6 +30,9 @@ export const CLEANUP_BOUND_MS = 3_000
  * rest (about two thirds) to deliver the final batch. What the pipeline has not done by then is dropped and counted.
  */
 export const DRAIN_BOUND_MS = 1_000
+
+/** The `service.name` of every span this plugin exports. The Action's own spans carry a different one. */
+const PLUGIN_SERVICE_NAME = 'fro-bot-opencode-plugin'
 
 export type OnSettings = Extract<TracingSettings, {mode: 'on'}>
 
@@ -67,6 +70,7 @@ export async function startTracing(
     })
   const exporter = createSpanExporter({
     url: settings.endpoint,
+    serviceName: PLUGIN_SERVICE_NAME,
     headers: local ? settings.headers : {},
     // Action mode only: a local collector did not ask for the header.
     reportCounts: !local,

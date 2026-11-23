@@ -23,6 +23,16 @@
       "types": "./src/agent/event-v2.fixtures.ts",
       "import": "./src/agent/event-v2.fixtures.ts",
       "default": "./src/agent/event-v2.fixtures.ts"
+    },
+    "./tracing/exporter": {
+      "types": "./src/tracing/exporter.ts",
+      "import": "./src/tracing/exporter.ts",
+      "default": "./src/tracing/exporter.ts"
+    },
+    "./tracing/scrub": {
+      "types": "./src/tracing/scrub.ts",
+      "import": "./src/tracing/scrub.ts",
+      "default": "./src/tracing/scrub.ts"
     }
   },
   "main": "src/index.ts",
@@ -37,6 +47,11 @@
   "dependencies": {
     "@bfra.me/es": "0.1.0",
     "@opencode-ai/sdk": "1.19.5",
+    "@opentelemetry/api": "1.9.0",
+    "@opentelemetry/otlp-exporter-base": "0.219.0",
+    "@opentelemetry/otlp-transformer": "0.219.0",
+    "@opentelemetry/resources": "2.8.0",
+    "@opentelemetry/sdk-trace-base": "2.8.0",
     "zod": "4.6.7"
   }
 }

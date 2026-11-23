@@ -16,13 +16,13 @@
  * by 1.5, at most five retries) until the per-batch timeout; every other status is final, a 3xx included: Node's `http`
  * does not follow redirects and the delegate does not either (pinned by `exporter.test.ts`), so the credential in a
  * local-mode header goes only to the URL in the settings file, which must be `https` for a remote collector with
- * certificate verification left at the platform default (`settings.ts` accepts nothing else). The relay's `503` is
+ * certificate verification left at the platform default (the plugin's `settings.ts` accepts nothing else). The relay's `503` is
  * therefore a retry and its `422` a drop. One batch is in flight at a time, far under the relay's refusal threshold of eight;
  * the next one starts only after the delegate has finished with the last (see `startBatch`).
  */
 
 import type {ReadableSpan, SpanProcessor} from '@opentelemetry/sdk-trace-base'
-import type {ScrubbedSpan} from './content.js'
+import type {ScrubbedSpan} from './scrub.js'
 
 import {Buffer} from 'node:buffer'
 
@@ -33,13 +33,14 @@ import {JsonTraceSerializer} from '@opentelemetry/otlp-transformer'
 import {resourceFromAttributes} from '@opentelemetry/resources'
 import {AlwaysOnSampler, BasicTracerProvider} from '@opentelemetry/sdk-trace-base'
 
-import {CONTENT_ATTRIBUTE_NAMES, MARKER} from './content.js'
+import {CONTENT_ATTRIBUTE_NAMES, MARKER, validSpanLinks} from './scrub.js'
 
 /**
  * The request header that carries the plugin's running totals to the Action's relay, in Action mode only.
  * MIRRORS `TRACE_RELAY_COUNTS_HEADER` and `formatTraceRelayCountsHeader` in `packages/runtime/src/agent/trace-relay-wire.ts`,
- * which is the source of truth: this package may not import the runtime at run time. The form is exactly
- * `exported=<n>;dropped=<n>`, each `n` one to twelve ASCII digits.
+ * which is the source of truth: this module does not import it, because that module reaches the network and IP
+ * classification code and the plugin bundles this one whole. `runtime-parity.test.ts` pins the two together. The form is
+ * exactly `exported=<n>;dropped=<n>`, each `n` one to twelve ASCII digits.
  */
 export const TRACE_COUNTS_HEADER = 'x-frobot-trace-counts'
 
@@ -114,6 +115,8 @@ export const SDK_SPAN_LIMITS = {
 export interface SpanExporterOptions {
   /** Full OTLP traces URL. */
   readonly url: string
+  /** The resource's `service.name`, and the tracer's name: which sender a span came from. Fixed text, never content. */
+  readonly serviceName: string
   readonly headers: Readonly<Record<string, string>>
   /** Action mode: send the running counts on every batch. Local mode: never. */
   readonly reportCounts: boolean
@@ -265,7 +268,7 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
   }
   const provider = new BasicTracerProvider({
     // Hand-built: no detectors, so no process arguments, host name or environment-derived attributes.
-    resource: resourceFromAttributes({'service.name': 'fro-bot-opencode-plugin'}),
+    resource: resourceFromAttributes({'service.name': options.serviceName}),
     sampler: new AlwaysOnSampler(),
     idGenerator,
     spanLimits: SDK_SPAN_LIMITS,
@@ -275,7 +278,7 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
     },
     spanProcessors: [processor],
   })
-  const tracer = provider.getTracer('fro-bot-opencode-plugin')
+  const tracer = provider.getTracer(options.serviceName)
 
   function trip(): void {
     // Shutdown's permanent cancellation (`cancelled`) already counted the queue and returned the totals: a stop announced after
@@ -416,6 +419,7 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
             spanId: span.parentSpanId,
             traceFlags: TraceFlags.SAMPLED,
           })
+    const links = validSpanLinks(span.links)
     nextTraceId = span.traceId
     nextSpanId = span.spanId
     ended = undefined
@@ -425,6 +429,14 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
         kind: span.kind === 'client' ? SpanKind.CLIENT : SpanKind.INTERNAL,
         startTime: hrTime(span.startMs),
         attributes: {...span.attributes} as Record<string, string | number | boolean | string[]>,
+        // Re-checked here: an id the SDK cannot use would otherwise be dropped without a trace.
+        ...(links.length === 0
+          ? {}
+          : {
+              links: links.map(link => ({
+                context: {traceId: link.traceId, spanId: link.spanId, traceFlags: TraceFlags.SAMPLED},
+              })),
+            }),
       },
       // Always explicit: an ambient context another library registered in this process must never become a parent.
       parent,

@@ -23,7 +23,7 @@ sources:
   - src/harness/phases/trace-relay-process.ts
   - packages/runtime/src/agent/trace-relay.ts
   - packages/runtime/src/agent/tracing-launcher.ts
-  - packages/opencode-plugin/src/tracing/exporter.ts
+  - packages/runtime/src/tracing/exporter.ts
   - src/harness/phases/default-model.ts
   - src/harness/phases/repo-skills.ts
   - src/services/setup/repo-skills.ts
