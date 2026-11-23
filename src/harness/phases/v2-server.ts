@@ -643,7 +643,7 @@ export async function startActionOpenCodeV2(
 
   // One event per gate on the server start span, with the gate's name and its result: how a run's start was decided.
   const gateDecision = (gate: string, result: 'failed' | 'passed' | 'skipped'): void => {
-    options.traceSpan?.addEvent('gate.decision', {gate, result})
+    options.traceSpan?.addEvent('gate.decision', {'fro_bot.gate': gate, 'fro_bot.result': result})
   }
 
   const runGates = async (): Promise<Result<OpenCodeV2ServerHandle, V2StartError>> => {

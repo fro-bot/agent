@@ -1779,7 +1779,7 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
     expect(handoff.attributes['fro_bot.outcome']).toBe('succeeded')
     expect(sandbox.prepare.mock.calls[0]?.[0]).toHaveProperty('traceSpan')
     const gates = spanNamed(exported, 'server start').events.filter(event => event.name === 'gate.decision')
-    expect(gates.map(gate => [gate.attributes.gate, gate.attributes.result])).toEqual([
+    expect(gates.map(gate => [gate.attributes['fro_bot.gate'], gate.attributes['fro_bot.result']])).toEqual([
       ['permission', 'passed'],
       ['key-proxy-probe', 'passed'],
       ['credential', 'passed'],

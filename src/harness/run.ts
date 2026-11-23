@@ -475,7 +475,7 @@ async function runWithTrace(trace: RunTrace, startTime: number, bootstrapLogger:
       'dedup',
       async span => {
         const checked = await runDedup(bootstrap.inputs.dedupWindow, routing.triggerResult.context, repo, startTime)
-        span.addEvent('dedup.result', {result: checked.shouldProceed ? 'proceed' : 'duplicate'})
+        span.addEvent('dedup.result', {'fro_bot.result': checked.shouldProceed ? 'proceed' : 'duplicate'})
         return checked
       },
       checked =>
@@ -499,7 +499,7 @@ async function runWithTrace(trace: RunTrace, startTime: number, bootstrapLogger:
           runAttempt: getGitHubRunAttempt(),
           jobIdentity: getInvocationIdentity(),
         })
-        span.addEvent('lock.result', {result: acquired.outcome})
+        span.addEvent('lock.result', {'fro_bot.result': acquired.outcome})
         if (acquired.outcome === 'error') span.recordException(acquired.error)
         return acquired
       },
@@ -812,7 +812,10 @@ async function runWithTrace(trace: RunTrace, startTime: number, bootstrapLogger:
         ? reconciliationTriggerContext.target.number
         : null
     await phase('review reconciliation', async span => {
-      span.addEvent('gate.decision', {gate: 'execution-veto', result: knownExecutionVeto ? 'vetoed' : 'clear'})
+      span.addEvent('gate.decision', {
+        'fro_bot.gate': 'execution-veto',
+        'fro_bot.result': knownExecutionVeto ? 'vetoed' : 'clear',
+      })
       await runReviewReconciliation(
         {
           octokit: routing.githubClient,

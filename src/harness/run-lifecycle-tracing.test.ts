@@ -503,12 +503,21 @@ describe('run with lifecycle tracing', () => {
       const {spans} = await execute()
 
       // #then
-      const eventResult = (span: Decoded, name: string): unknown =>
-        span.events?.find(event => event.name === name)?.attributes?.find(item => item.key === 'result')?.value
-          .stringValue
+      const eventAttr = (span: Decoded, name: string, key: string): unknown =>
+        span.events?.find(event => event.name === name)?.attributes?.find(item => item.key === key)?.value.stringValue
+      const eventResult = (span: Decoded, name: string): unknown => eventAttr(span, name, 'fro_bot.result')
       expect(eventResult(byName(spans, 'dedup'), 'dedup.result')).toBe('proceed')
       expect(eventResult(byName(spans, 'coordination lock'), 'lock.result')).toBe('s3-disabled')
       expect(eventResult(byName(spans, 'review reconciliation'), 'gate.decision')).toBe('clear')
+      expect(eventAttr(byName(spans, 'review reconciliation'), 'gate.decision', 'fro_bot.gate')).toBe('execution-veto')
+      // #and the bare names are not used: the collector's keep-list is one global list, so a key a span carries must be ours
+      for (const span of spans) {
+        for (const event of span.events ?? []) {
+          const keys = (event.attributes ?? []).map(item => item.key)
+          expect(keys).not.toContain('gate')
+          expect(keys).not.toContain('result')
+        }
+      }
     })
   })
 
