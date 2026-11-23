@@ -9,7 +9,8 @@ import {writeCacheSaveResultSummary} from '../features/observability/job-summary
 import {uploadLogArtifact} from '../services/artifact/index.js'
 import {buildCacheKeyComponents, saveCache} from '../services/cache/index.js'
 import {removeGhConfigDir} from '../services/setup/gh-config-dir.js'
-import {cacheSaveSpanResult, parseCacheSaveStateValue} from '../shared/cache-save-result.js'
+import {parseCacheSaveStateValue} from '../shared/cache-save-result.js'
+import {cacheSaveSpanResult} from '../shared/cache-save-span.js'
 import {
   getGitHubRepository,
   getGitHubRunAttempt,

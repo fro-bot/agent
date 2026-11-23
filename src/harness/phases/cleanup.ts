@@ -28,7 +28,8 @@ import {cleanupTempFiles} from '../../features/attachments/index.js'
 import {writeCacheSaveResultSummary} from '../../features/observability/job-summary.js'
 import {uploadLogArtifact} from '../../services/artifact/index.js'
 import {buildCacheKeyComponents, saveCache} from '../../services/cache/index.js'
-import {cacheSaveSpanResult, toCacheSaveStateValue} from '../../shared/cache-save-result.js'
+import {toCacheSaveStateValue} from '../../shared/cache-save-result.js'
+import {cacheSaveSpanResult} from '../../shared/cache-save-span.js'
 import {
   getGitHubRunAttempt,
   getGitHubRunId,

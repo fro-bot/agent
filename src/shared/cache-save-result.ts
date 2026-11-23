@@ -1,5 +1,3 @@
-import type {SpanResult} from './lifecycle-tracer.js'
-
 /**
  * Terminal outcome of a `saveCache` attempt, mirroring the shape of `CheckpointOutcome`
  * (`src/services/cache/checkpoint.ts`): a structural axis (here, two independent
@@ -157,20 +155,4 @@ export function parseCacheSaveStateValue(value: string): CacheSaveStateValue {
   return (CACHE_SAVE_STATE_VALUES as readonly string[]).includes(value)
     ? (value as CacheSaveStateValue)
     : 'not-persisted'
-}
-
-/** A cache save span's result: the save's own outcome is the reason, and only a thrown or errored save is a failure. */
-export function cacheSaveSpanResult(saved: CacheSaveResult): SpanResult {
-  switch (saved.outcome) {
-    case 'persisted':
-      return {outcome: 'succeeded', reason: saved.outcome}
-    case 'cache-error':
-    case 'cache-rejected':
-      return {outcome: 'failed', reason: saved.outcome}
-    case 'skipped-by-configuration':
-    case 'skipped-empty':
-    case 'checkpoint-declined':
-    case 'ownership-declined':
-      return {outcome: 'skipped', reason: saved.outcome}
-  }
 }
