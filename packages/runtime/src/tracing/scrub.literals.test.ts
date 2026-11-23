@@ -5,7 +5,17 @@
 
 import {describe, expect, it} from 'vitest'
 
-import {collectLiterals, createScrubber, MARKER, REDACTION, scrubSpan, type PendingSpan} from './scrub.js'
+import {
+  collectLiterals,
+  createScrubber,
+  MARKER,
+  MAX_LITERAL_CHARS,
+  MIN_LITERAL_CHARS,
+  REDACTION,
+  scrubSpan,
+  type PendingSpan,
+} from './scrub.js'
+import {minCpuMs} from './timing.testing.js'
 
 // Words, not secret shapes: no pattern in `SCRUB_PATTERNS` matches them, so only the literal pass can redact them.
 const LATE = 'harbor-lantern-quartz-7731'
@@ -193,5 +203,113 @@ describe('span links', () => {
 
     // #then
     expect('links' in exported).toBe(false)
+  })
+})
+
+describe('the literal length range', () => {
+  // A letter run no pattern in `SCRUB_PATTERNS` reads as a secret (a `ghs_`-style prefix would be redacted anyway).
+  const shaped = (length: number): string => `lit-${'k'.repeat(Math.max(0, length - 4))}`.slice(0, length)
+
+  it('reaches 65,536 characters, so an Actions runtime token of 4,152 characters is a literal', () => {
+    expect(MIN_LITERAL_CHARS).toBe(8)
+    expect(MAX_LITERAL_CHARS).toBe(65_536)
+  })
+
+  it.each([8, 4_096, 4_152, 8_192, 65_536])('redacts a %i-character literal wherever it appears', length => {
+    // #given a literal of that length, known at creation and one known later
+    const value = shaped(length)
+    const early = createScrubber({env: {}, patterns: [], extraSecrets: [value]})
+    const late = createScrubber({env: {}, patterns: []})
+    late.addLiterals?.([value])
+
+    for (const scrubber of [early, late]) {
+      // #when it sits in ordinary text, twice
+      const result = text(scrubber, `before ${value} between ${value} after`)
+
+      // #then both are redacted and the text around them survives
+      expect(result).toBe(`before ${REDACTION} between ${REDACTION} after`)
+      expect(scrubber.survived?.(`x ${value} y`)).toBe(true)
+    }
+  })
+
+  it('redacts the JSON-escaped form of a long literal that needs escaping', () => {
+    // #given a 5,000-character value with quotes and backslashes, which doubles its escaped form
+    const value = String.raw`a"b\c`.repeat(1_000)
+    const scrubber = createScrubber({env: {}, patterns: []})
+    scrubber.addLiterals?.([value])
+
+    // #when / #then it is removed raw and inside a JSON string
+    expect(text(scrubber, `raw ${value} end`)).toBe(`raw ${REDACTION} end`)
+    expect(text(scrubber, JSON.stringify({k: value}))).not.toContain(String.raw`a\"b`)
+  })
+
+  it.each([7, 65_537])('still ignores a %i-character literal', length => {
+    // #given a value outside the range, known at creation and later
+    const value = shaped(length)
+    const scrubber = createScrubber({env: {}, patterns: [], extraSecrets: [value]})
+    scrubber.addLiterals?.([value])
+
+    // #then it is never matched, which is why a caller must know the range
+    expect(text(scrubber, `x ${value} y`)).toContain(value)
+    expect(collectLiterals({A_TOKEN: value})).toEqual([])
+  })
+
+  it('finds every occurrence of a long literal, overlapping ones included', () => {
+    // #given a 5,000-character literal that overlaps itself by all but 8 characters
+    const unit = 'abcdefgh'
+    const value = unit.repeat(625)
+    const scrubber = createScrubber({env: {}, patterns: [], extraSecrets: [value]})
+
+    // #when the text holds it shifted by one unit: 630 units, so the two occurrences overlap
+    const result = text(scrubber, `<${unit.repeat(626)}>`)
+
+    // #then the union of the overlapping occurrences is one range, with the delimiters left
+    expect(result).toBe(`<${REDACTION}>`)
+  })
+})
+
+describe('literal matching stays linear however long the literal is', () => {
+  // The worst case for a native search: the literal ends in a character that is everywhere in the text, so a mismatch lets it skip
+  // nothing, and the text is the literal's own long prefix over and over, so each alignment matches almost to the end before it
+  // fails. V8's `indexOf` then costs length(text) x length(literal): seconds for a megabyte.
+  const literal = `b${'a'.repeat(65_535)}`
+  const block = `${literal.slice(0, 65_535)}#`
+  const textOf = (blocks: number): string => block.repeat(blocks)
+
+  it.each(['scrub', 'survived'] as const)(
+    'takes about eight times as long for eight times the text (%s)',
+    operation => {
+      // #given a scrubber that knows the 64 KiB literal
+      const scrubber = createScrubber({env: {}, patterns: [], extraSecrets: [literal]})
+      const run = (input: string): void => {
+        if (operation === 'scrub') scrubber.scrub(input)
+        else scrubber.survived?.(input)
+      }
+      // CPU time, the least of three runs (see `timing.testing.ts`): load on the machine cannot fail it.
+      const time = (blocks: number): number => {
+        const input = textOf(blocks)
+        return minCpuMs(() => {
+          run(input)
+        }, 3)
+      }
+
+      // #when the text is 2 and then 16 blocks (131 KiB and 1 MiB)
+      const small = Math.max(time(2), 1)
+      const large = time(16)
+
+      // #then about eight times the time, far from sixty-four, and quick in absolute terms
+      expect(large).toBeLessThan(2_000)
+      expect(large / small).toBeLessThan(24)
+    },
+    120_000,
+  )
+
+  it('also holds for a literal that really occurs, many times', () => {
+    // #given the literal itself repeated
+    const scrubber = createScrubber({env: {}, patterns: [], extraSecrets: [literal]})
+    const result = scrubber.scrub(literal.repeat(8))
+
+    // #then it is one removal per occurrence, united into one range
+    expect(result).toMatchObject({ok: true, text: REDACTION, redactions: 1})
   })
 })

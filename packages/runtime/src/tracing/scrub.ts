@@ -850,9 +850,13 @@ export const SCRUB_PATTERNS: readonly ScrubMatcher[] = [
 /** Env names whose value the literal pass removes. `OPENCODE_PASSWORD` is the server's own credential. */
 export const SECRET_ENV_NAME =
   /SECRET|TOKEN|PASSWORD|PASSWD|PASSPHRASE|CREDENTIAL|API_?KEY|PRIVATE_?KEY|ACCESS_?KEY|AUTHORIZATION/i
-/** The length range a literal secret must be in to be matched. Exported so a caller can tell what the scrubber cannot match. */
+/**
+ * The length range a literal secret must be in to be matched. Exported so a caller can tell what the scrubber cannot match.
+ * The ceiling is 64 KiB because real credentials are long: a JavaScript action's `ACTIONS_RUNTIME_TOKEN` is 4,152 characters,
+ * and a value the scrubber cannot match makes the Action's lifecycle tracer drop every free-text field of the run.
+ */
 export const MIN_LITERAL_CHARS = 8
-export const MAX_LITERAL_CHARS = 4096
+export const MAX_LITERAL_CHARS = 65_536
 const MAX_LITERALS = 128
 
 /**
@@ -888,17 +892,93 @@ export function collectLiterals(
 }
 
 /**
+ * Literals longer than this are searched with a search that cannot go quadratic. `String.prototype.indexOf` is fast (native,
+ * and skips ahead on a mismatch) but not linear in the worst case: V8 takes seconds to search a megabyte for a 64 KiB literal
+ * when each alignment matches almost to the end. Short literals are bounded by their own length, so they stay native.
+ */
+const NATIVE_SEARCH_MAX_CHARS = 64
+
+/** Where a literal can resume after a partial match: `table[i]` is the length of the longest proper border of `literal[0..i]`. */
+function failureTable(literal: string): Int32Array {
+  const table = new Int32Array(literal.length)
+  for (let index = 1, matched = 0; index < literal.length; index += 1) {
+    while (matched > 0 && literal.charCodeAt(index) !== literal.charCodeAt(matched)) matched = table[matched - 1] ?? 0
+    if (literal.charCodeAt(index) === literal.charCodeAt(matched)) matched += 1
+    table[index] = matched
+  }
+  return table
+}
+
+/**
+ * Finds literals in text: every occurrence, overlapping ones included, in time linear in the text for any literal. Tables of
+ * the long literals are built on first use and kept, so a scrubber that scrubs many strings builds each once.
+ */
+export interface LiteralSearch {
+  /** Calls `found(start, end)` for every occurrence of `literal` in `text`. */
+  readonly each: (text: string, literal: string, found: (start: number, end: number) => void) => void
+  /** Whether `text` holds `literal`. Stops at the first occurrence. */
+  readonly has: (text: string, literal: string) => boolean
+}
+
+export function createLiteralSearch(): LiteralSearch {
+  const tables = new Map<string, Int32Array>()
+  const tableOf = (literal: string): Int32Array => {
+    let table = tables.get(literal)
+    if (table === undefined) {
+      table = failureTable(literal)
+      tables.set(literal, table)
+    }
+    return table
+  }
+  // Calls `found` at each end of an occurrence; returns early when `found` says to stop.
+  const scan = (text: string, literal: string, found: (end: number) => boolean): void => {
+    const table = tableOf(literal)
+    for (let index = 0, matched = 0; index < text.length; index += 1) {
+      const code = text.charCodeAt(index)
+      while (matched > 0 && code !== literal.charCodeAt(matched)) matched = table[matched - 1] ?? 0
+      if (code === literal.charCodeAt(matched)) matched += 1
+      if (matched === literal.length) {
+        if (found(index + 1)) return
+        matched = table[matched - 1] ?? 0
+      }
+    }
+  }
+  return {
+    each: (text, literal, found) => {
+      if (literal.length <= NATIVE_SEARCH_MAX_CHARS) {
+        for (let at = text.indexOf(literal); at !== -1; at = text.indexOf(literal, at + 1))
+          found(at, at + literal.length)
+        return
+      }
+      scan(text, literal, end => {
+        found(end - literal.length, end)
+        return false
+      })
+    },
+    has: (text, literal) => {
+      if (literal.length <= NATIVE_SEARCH_MAX_CHARS) return text.includes(literal)
+      let seen = false
+      scan(text, literal, () => {
+        seen = true
+        return true
+      })
+      return seen
+    },
+  }
+}
+
+/**
  * The environment's literal secrets as a matcher: every occurrence of each, overlapping ones included (the union covers a
  * secret that overlaps itself or another). The literals were collected once at start; they are never named.
  */
-export function literalMatcher(literals: readonly string[]): ScrubMatcher {
+export function literalMatcher(
+  literals: readonly string[],
+  search: LiteralSearch = createLiteralSearch(),
+): ScrubMatcher {
   return {
     id: 'environment-literal',
     find: (text, _lower, emit) => {
-      for (const literal of literals) {
-        for (let at = text.indexOf(literal); at !== -1; at = text.indexOf(literal, at + 1))
-          emit(at, at + literal.length)
-      }
+      for (const literal of literals) search.each(text, literal, emit)
     },
   }
 }
@@ -1015,7 +1095,8 @@ export function createScrubber(options: ScrubberOptions = {}): Scrubber {
   // Mutable: `addLiterals` appends, and the literal matcher reads this same array on every scrub.
   const literals = [...collectLiterals(options.env ?? {}, options.extraSecrets)]
   const known = new Set(literals)
-  const matchers = [...(options.patterns ?? SCRUB_PATTERNS), literalMatcher(literals)]
+  const search = createLiteralSearch()
+  const matchers = [...(options.patterns ?? SCRUB_PATTERNS), literalMatcher(literals, search)]
   let survivals = 0
   return {
     addLiterals: values => {
@@ -1030,7 +1111,7 @@ export function createScrubber(options: ScrubberOptions = {}): Scrubber {
     inputCeilingChars: ceiling,
     survived: text => {
       for (const literal of literals) {
-        if (text.includes(literal)) {
+        if (search.has(text, literal)) {
           survivals += 1
           return true
         }
