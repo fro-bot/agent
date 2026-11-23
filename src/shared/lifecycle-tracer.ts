@@ -8,8 +8,7 @@ import {randomBytes} from 'node:crypto'
 import process from 'node:process'
 import {parseTraceRelayConfig} from '@fro-bot/runtime'
 import {createSpanExporter} from '@fro-bot/runtime/tracing/exporter'
-import {scrubSpan} from '@fro-bot/runtime/tracing/scrub'
-import {createRegistryScrubber} from './secret-registry.js'
+import {createScrubber, scrubSpan} from '@fro-bot/runtime/tracing/scrub'
 
 /**
  * The Action's own trace of one invocation: a run-wide recorder (held like `metrics`) that keeps spans, events and outcomes
@@ -264,6 +263,17 @@ function scrubsUnchanged(scrubber: Scrubber, text: string): boolean {
   const result = scrubber.scrub(text)
   if (!result.ok || result.text !== text) return false
   return scrubber.survived?.(result.text) !== true
+}
+
+/**
+ * A scrubber that knows everything the registry knows right now: the one the lifecycle tracer exports with, and the one the
+ * session id is checked against. Nothing is captured from the environment (the registry already holds the secret-named values),
+ * and no cap drops a literal. Built on each call, so a later registration is seen by the next scrubber, not by an earlier one.
+ */
+export function createRegistryScrubber(registry: Pick<SecretRegistry, 'literals'>): Scrubber {
+  const scrubber = createScrubber({env: {}})
+  scrubber.addLiterals?.(registry.literals())
+  return scrubber
 }
 
 /** Scrubs FIRST, then caps, so a cut cannot leave part of a secret. What cannot be scrubbed is omitted. */

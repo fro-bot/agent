@@ -65,8 +65,8 @@ import {
   buildTracingRunLink,
   relayRequestFromInputs,
 } from '../../services/setup/tracing.js'
-import {createLifecycleTracer} from '../../shared/lifecycle-tracer.js'
-import {createRegistryScrubber, createSecretRegistry} from '../../shared/secret-registry.js'
+import {createLifecycleTracer, createRegistryScrubber} from '../../shared/lifecycle-tracer.js'
+import {createSecretRegistry} from '../../shared/secret-registry.js'
 import {createMockLogger, serializeLoggerCalls, unwrapOk} from '../../shared/test-helpers.js'
 import {parseTraceInputs} from '../config/trace-inputs.js'
 import {startTraceRelayProcess} from './trace-relay-process.js'

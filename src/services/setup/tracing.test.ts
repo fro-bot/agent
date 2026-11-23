@@ -8,7 +8,8 @@ import {
 } from '@fro-bot/runtime'
 import {createScrubber} from '@fro-bot/runtime/tracing/scrub'
 import {describe, expect, it, vi} from 'vitest'
-import {createRegistryScrubber, createSecretRegistry} from '../../shared/secret-registry.js'
+import {createRegistryScrubber} from '../../shared/lifecycle-tracer.js'
+import {createSecretRegistry} from '../../shared/secret-registry.js'
 import {unwrapErr, unwrapOk} from '../../shared/test-helpers.js'
 import {
   buildActionTracingHost,
