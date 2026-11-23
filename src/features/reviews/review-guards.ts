@@ -15,6 +15,7 @@ import type {
 import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
 import type {ReviewEvent, ReviewResult} from './types.js'
+import {assertRunNotCancelled, isRunCancelled} from '../../shared/cancellation.js'
 import {submitReview} from './reviewer.js'
 
 export interface ForkOrSelfGuardParams {
@@ -189,6 +190,10 @@ export async function submitReviewWithHeadGuard(
     return {submitted: false, reason: 'head-moved-before-submit'}
   }
 
+  // After the head read above, which may have been in flight when a signal arrived. Before the reservation, so a cancelled run
+  // never takes a reservation slot for a review it will not send (a held slot would block a rerun's review).
+  assertRunNotCancelled('the review')
+
   // Publication receipt reservation -- placed here, immediately before the submit call
   // below, and strictly after the head-moved guard above: a head-guard rejection must never
   // consume a reservation slot for a review that was never going to be submitted anyway.
@@ -232,6 +237,13 @@ export async function submitReviewWithHeadGuard(
         return {submitted: false, reason: 'head-moved-before-submit'}
       }
     }
+  }
+
+  // The reservation was an awaited round trip: a signal may have arrived during it. The slot is released (the review will
+  // not be sent), so a rerun can still deliver it.
+  if (isRunCancelled()) {
+    if (receipt != null && reservationEtag != null) await receipt.ops.release(receipt.identity, reservationEtag)
+    assertRunNotCancelled('the review')
   }
 
   logger.info('Review guard: submitting review', {prNumber, event, reviewedHeadSha})

@@ -5,8 +5,9 @@ import type {
 } from '../../services/github/review-delivery-receipt.js'
 import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
-import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createReviewDeliveryReceiptOperations} from '../../services/github/review-delivery-receipt.js'
+import {markRunCancelled, resetRunCancellation} from '../../shared/cancellation.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {checkForkOrSelfGuard, submitReviewWithHeadGuard} from './review-guards.js'
 
@@ -663,5 +664,67 @@ describe('submitReviewWithHeadGuard publication receipt', () => {
     expect((octokit as unknown as MockOctokit).rest.pulls.createReview).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({event: 'REQUEST_CHANGES', commit_id: 'head-sha-abc'}),
     )
+  })
+})
+
+describe('submitReviewWithHeadGuard after a cancel', () => {
+  const IDENTITY: ReviewDeliveryReceiptIdentity = {repo: 'owner/repo', runId: 'run-1', prNumber: 1}
+  const params = (octokit: Octokit, receipt?: ReviewDeliveryReceiptOperations) => ({
+    octokit,
+    owner: 'owner',
+    repo: 'repo',
+    prNumber: 1,
+    event: 'APPROVE' as const,
+    body: 'lgtm',
+    reviewedHeadSha: 'head-sha-abc',
+    ...(receipt === undefined ? {} : {receipt: {ops: receipt, identity: IDENTITY, attempt: 1}}),
+  })
+
+  afterEach(() => {
+    resetRunCancellation()
+  })
+
+  it('submits no approval when the signal arrives while the pre-approval head read is in flight, and reserves nothing', async () => {
+    // #given a head read that is in flight when the signal arrives
+    const octokit = makeOctokit()
+    octokit.rest.pulls.get.mockImplementation(async () => {
+      markRunCancelled()
+      return {
+        data: {
+          head: {sha: 'head-sha-abc', repo: {full_name: 'owner/repo'}},
+          base: {repo: {full_name: 'owner/repo'}},
+          user: {login: 'pr-author'},
+        },
+      }
+    })
+    const reserve = vi.fn(async () => ({kind: 'reserved-configured' as const, etag: 'e'}))
+    const ops = makeReservationOps({reserve})
+
+    // #when the read finishes after the signal
+    const outcome = submitReviewWithHeadGuard(params(octokit as unknown as Octokit, ops), createMockLogger())
+
+    // #then the approval is refused before anything is reserved or sent
+    await expect(outcome).rejects.toMatchObject({name: 'RunCancelledError'})
+    expect(reserve).not.toHaveBeenCalled()
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+  })
+
+  it('releases the reservation and sends nothing when the signal arrives during the reservation round trip', async () => {
+    // #given a reservation that takes a signal with it
+    const octokit = makeOctokit()
+    const reserve = vi.fn(async () => {
+      markRunCancelled()
+      return {kind: 'reserved-configured' as const, etag: 'reservation-etag'}
+    })
+    const release = vi.fn(async () => undefined)
+    const ops = makeReservationOps({reserve, release})
+
+    // #when
+    const outcome = submitReviewWithHeadGuard(params(octokit as unknown as Octokit, ops), createMockLogger())
+
+    // #then the slot is given back (a rerun can still deliver the review) and no review was created
+    await expect(outcome).rejects.toMatchObject({name: 'RunCancelledError'})
+    expect(release).toHaveBeenCalledExactlyOnceWith(IDENTITY, 'reservation-etag')
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
   })
 })

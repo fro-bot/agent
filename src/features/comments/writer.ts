@@ -8,6 +8,7 @@ import type {
   UpdateDiscussionCommentResponse,
 } from './types.js'
 import {BOT_COMMENT_MARKER} from '../../services/github/types.js'
+import {assertRunNotCancelled} from '../../shared/cancellation.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {findBotComment, readThread} from './reader.js'
 
@@ -35,6 +36,7 @@ async function createIssueComment(
   logger: Logger,
 ): Promise<PostCommentResult | null> {
   try {
+    assertRunNotCancelled('the comment')
     const {data} = await client.rest.issues.createComment({
       owner: target.owner,
       repo: target.repo,
@@ -69,6 +71,7 @@ async function updateIssueComment(
   logger: Logger,
 ): Promise<PostCommentResult | null> {
   try {
+    assertRunNotCancelled('the comment update')
     const {data} = await client.rest.issues.updateComment({
       owner: target.owner,
       repo: target.repo,
@@ -159,6 +162,7 @@ async function postDiscussionComment(
       if (thread != null) {
         const existingComment = findBotComment(thread, options.botLogin)
         if (existingComment != null && typeof existingComment.id === 'string') {
+          assertRunNotCancelled('the discussion comment update')
           const updateResult = await client.graphql<UpdateDiscussionCommentResponse>(
             UPDATE_DISCUSSION_COMMENT_MUTATION,
             {commentId: existingComment.id, body: options.body},
@@ -174,6 +178,7 @@ async function postDiscussionComment(
       }
     }
 
+    assertRunNotCancelled('the discussion comment')
     const result = await client.graphql<AddDiscussionCommentResponse>(ADD_DISCUSSION_COMMENT_MUTATION, {
       discussionId: discussion.id,
       body: options.body,
