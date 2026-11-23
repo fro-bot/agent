@@ -607,6 +607,8 @@ Span shape for one turn:
 
 - [x] **Unit 9: Langfuse proof, publish, pin, real-runner proof**
 
+**Evidence:** the pre-publish local session sent 18 spans (two subagents, none dropped) and the operator confirmed the Langfuse and Tempo views; it is recorded as counts, not screenshots. Plugin 0.2.0 was published from main, and the pin and real-runner rows shipped in #2315.
+
 **Goal:** The plugin is published once, after it is shown readable in Langfuse, and the Action runs it on hosted runners, isolated and not.
 
 **Requirements:** R12, R14, R15, R17, success criteria
@@ -656,7 +658,9 @@ Span shape for one turn:
 
 **Verification:** The link check passes, and every file path and input name in the new text exists.
 
-- [x] **Unit 11: Published-install live check**
+- [ ] **Unit 11: Published-install live check**
+
+**Status:** the three published Action runs are done and recorded in `docs/solutions/workflow-issues/run-tracing-live-check-2026-11-23.md`. Still open: the local session on a registry install of the plugin, and a continuation trace found through its session.
 
 **Goal:** Show the feature end to end on a release, in the operator's backend.
 

@@ -44,6 +44,7 @@ Run tracing has two halves: the Fro Bot OpenCode plugin captures spans, and in t
 
 - Run from a throwaway branch in a public repository with no private content. Put the probe in an existing dispatchable workflow file, as in [the published-install learning](published-install-live-check-before-rollout-2026-11-17.md).
 - Dispatch three runs: isolated, not isolated, and isolated with a wrong credential. Use `output-mode: working-dir` and `response-mode: none` so the runs post nothing, and pass `github.token` with `contents: read`, because the non-isolated agent can read whatever token it is given.
+- Mint a collector token for the check alone: write-only, and revoked as soon as the runs finish. The non-isolated run's agent can read it while it is live, and a read-only GitHub token does not limit what the collector token can do. If the collector cannot scope a token to a test project, the check's traces land beside real data; delete them after reading.
 - The collector token for an Action sender group is delivered as a bare token secret. Build the header in the workflow: `trace-headers: "Authorization: Bearer ${{ secrets.<NAME> }}"`. A bare token in `trace-headers` is refused and tracing turns off.
 - Read the relay's lines in each run log:
 
