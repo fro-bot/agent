@@ -71,6 +71,22 @@ export interface ActionIdentity {
   readonly trigger: string
 }
 
+/** The Action run's root span, which each turn's root span links to. Both ids are lower-case hex, not all zero. */
+export interface RootSpanContext {
+  readonly traceId: string
+  readonly spanId: string
+}
+
+/**
+ * What ties a turn trace to the Action run that started it. All three come from the launcher, each is optional, and none is
+ * derived or altered here: `sessionId` (the Action's `<owner>/<repo>:<logical key>`) is used verbatim.
+ */
+export interface ActionRunContext {
+  readonly rootSpan?: RootSpanContext | undefined
+  readonly sessionId?: string | undefined
+  readonly invocationId?: string | undefined
+}
+
 /**
  * Why tracing is off. Fixed strings: they are the only thing a log line says about a refused setting. The first group is
  * a deliberate off and stays silent; the rest are logged once.
@@ -85,6 +101,7 @@ export type OffReason =
   | 'launcher-unsupported'
   | 'launcher-relay-invalid'
   | 'launcher-identity-invalid'
+  | 'launcher-run-invalid'
   | 'headless-host'
   | 'settings-file-unreadable'
   | 'settings-file-unsafe'
@@ -101,13 +118,13 @@ const SILENT_REASONS: ReadonlySet<OffReason> = new Set([
 
 export type TracingSettings =
   | {readonly mode: 'off'; readonly reason: OffReason}
-  | {
+  | ({
       readonly mode: 'on'
       readonly host: 'action'
       /** The relay's loopback traces URL. The collector credential never reaches the plugin. */
       readonly endpoint: string
       readonly identity: ActionIdentity
-    }
+    } & ActionRunContext)
   | {
       readonly mode: 'on'
       readonly host: 'local'
@@ -138,8 +155,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 /** True when `value` has exactly the listed keys, no more and no fewer. */
 function hasExactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
-  const actual = Object.keys(value)
-  return actual.length === keys.length && keys.every(key => Object.hasOwn(value, key))
+  return hasKeys(value, keys, [])
+}
+
+/** True when `value` has every required key and no key outside `required` and `optional`. */
+function hasKeys(value: Record<string, unknown>, required: readonly string[], optional: readonly string[]): boolean {
+  return (
+    required.every(key => Object.hasOwn(value, key)) &&
+    Object.keys(value).every(key => required.includes(key) || optional.includes(key))
+  )
 }
 
 function hasControlCharacter(value: string): boolean {
@@ -204,6 +228,48 @@ function parseIdentity(value: unknown): ActionIdentity | undefined {
   return {repository, runId, attempt, job, trigger}
 }
 
+const TRACE_ID = /^[\da-f]{32}$/
+const SPAN_ID = /^[\da-f]{16}$/
+const NON_ZERO = /[1-9a-f]/
+
+/** 32 and 16 lower-case hex characters, neither all zero: what W3C trace context accepts as ids. */
+function parseRootSpan(value: unknown): RootSpanContext | undefined {
+  if (!isRecord(value) || !hasExactKeys(value, ['traceId', 'spanId'])) return undefined
+  const {traceId, spanId} = value
+  if (typeof traceId !== 'string' || typeof spanId !== 'string') return undefined
+  if (!TRACE_ID.test(traceId) || !SPAN_ID.test(spanId) || !NON_ZERO.test(traceId) || !NON_ZERO.test(spanId)) {
+    return undefined
+  }
+  return {traceId, spanId}
+}
+
+/** A non-empty string, at most as long as an identity field, free of control characters. */
+function parseTextField(value: unknown): string | undefined {
+  if (typeof value !== 'string' || value.length === 0 || value.length > MAX_IDENTITY_FIELD_CHARS) return undefined
+  return hasControlCharacter(value) ? undefined : value
+}
+
+/** The launcher's optional run link fields. A field that is present and not acceptable refuses them all: `undefined`. */
+function parseRunContext(document: Record<string, unknown>): ActionRunContext | undefined {
+  const context: {rootSpan?: RootSpanContext; sessionId?: string; invocationId?: string} = {}
+  if (Object.hasOwn(document, 'rootSpan')) {
+    const rootSpan = parseRootSpan(document.rootSpan)
+    if (rootSpan === undefined) return undefined
+    context.rootSpan = rootSpan
+  }
+  if (Object.hasOwn(document, 'sessionId')) {
+    const sessionId = parseTextField(document.sessionId)
+    if (sessionId === undefined) return undefined
+    context.sessionId = sessionId
+  }
+  if (Object.hasOwn(document, 'invocationId')) {
+    const invocationId = parseTextField(document.invocationId)
+    if (invocationId === undefined) return undefined
+    context.invocationId = invocationId
+  }
+  return context
+}
+
 /** Resolves the launcher variable's value. Pure: no environment, no file. */
 function resolveLauncher(raw: string): TracingSettings {
   if (raw.length === 0 || raw.length > MAX_LAUNCHER_CHARS) return off('launcher-malformed')
@@ -219,13 +285,19 @@ function resolveLauncher(raw: string): TracingSettings {
   if (document.host !== 'action') return off('launcher-unsupported')
   if (document.tracing === 'off') return off('action-off')
   if (document.tracing !== 'on') return off('launcher-malformed')
-  if (!hasExactKeys(document, ['version', 'host', 'tracing', 'relay', 'identity'])) return off('launcher-malformed')
+  if (
+    !hasKeys(document, ['version', 'host', 'tracing', 'relay', 'identity'], ['rootSpan', 'sessionId', 'invocationId'])
+  ) {
+    return off('launcher-malformed')
+  }
 
   const endpoint = parseRelayUrl(document.relay)
   if (endpoint === undefined) return off('launcher-relay-invalid')
   const identity = parseIdentity(document.identity)
   if (identity === undefined) return off('launcher-identity-invalid')
-  return {mode: 'on', host: 'action', endpoint, identity}
+  const run = parseRunContext(document)
+  if (run === undefined) return off('launcher-run-invalid')
+  return {mode: 'on', host: 'action', endpoint, identity, ...run}
 }
 
 /** Header names the exporter or the transport owns. A user file cannot set them. */
