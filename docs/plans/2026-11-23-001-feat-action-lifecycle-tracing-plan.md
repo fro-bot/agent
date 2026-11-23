@@ -162,16 +162,18 @@ All 26 origin requirements carry forward. R12 and R24 depend on Unit 1; if it fa
 - **The SDK serializer, not a hand-written encoder.** The plugin's serializer-plus-own-transport path is already proven against Langfuse and Tempo.
 - **The Action-only lifecycle tracer lives in `src/`.** Only the shared exporter and scrubber go to the runtime package. The tracer is a run-wide recorder held like `metrics`; a no-op tracer is the default.
 - **Trace inputs are read first.** One trace-input reader runs before bootstrap. It reads, masks, removes and validates the two inputs, and both the main and post steps use it. Bootstrap receives its result instead of re-reading the removed variables. A run whose trace inputs are missing or invalid is untraced from the start.
-- **The redaction set grows during the run.** `core.setSecret` can't be read back, and the server password and key-proxy values appear after the start. Every mask site calls one recording mask function that both masks and adds to the tracer's set. The trace credential and its derived forms (the Bearer token, the Basic pair) are added. The shared scrubber accepts literals after creation.
+- **The redaction set grows during the run, and fails closed.** `core.setSecret` can't be read back, and the server password and key-proxy values appear after the start. Every mask site calls one recording mask function that both masks and adds to the tracer's registry. The trace credential and its derived forms (the Bearer token, the Basic pair) are added. The registry is the tracer's own, built the same way in main and post, and doesn't depend on GitHub's log masking. The scrubber only matches literals of 8 to 4,096 characters, so when any registered value falls outside that range, the tracer exports no free text at all: error messages and ref names become their category.
 - **Spans are buffered and exported once.** Normal completion and a signal share one idempotent flush, and `main.ts` waits for it before exiting.
 - **IDs are minted at the start and saved as one state record.** The trace id, root span id and a random invocation id are saved before routing. Partial or invalid state in post means no telemetry. No credential or input ever goes into state.
 - **Outcomes reuse the existing values, plus `cancelled`.** `cancelled` is a tracing-only outcome for a signalled run. The Action's outputs and job summary are unchanged.
 - **The final writes get their own span.** The origin's R5 puts them under finalize, but they run after cleanup, so they become a `report` span after cleanup. The finalize phase span keeps its place before cleanup.
-- **The logical key is computed right after routing.** `RoutingPhaseSkip` keeps the trigger context so skipped runs get a key too. Spans that ended before routing gain the session attribute at export. Run identity comes from the GitHub environment, so it exists from the first span.
-- **One signal owner for every run.** It takes over the exec adapter's signal ownership from the sandbox handler. On a signal, the export starts at once beside teardown and must finish before SIGTERM at 7.5 s.
+- **The session is the repository-qualified logical key.** The logical key is repository-local (`issue-42`), so the Langfuse session id is `<owner>/<repo>:<logical key>`, bounded to Langfuse's 200 characters. Lifecycle and turn traces use the same value. The OpenCode continuity key is unchanged. The key is computed right after routing; `RoutingPhaseSkip` keeps the trigger context so skipped runs get one too. Spans that ended before routing gain the session attribute at export. Run identity comes from the GitHub environment, so it exists from the first span.
+- **One signal owner for every run, without changing cancellation semantics.** It takes over the exec adapter's signal ownership from the sandbox handler. On a signal it sets a cancelled flag synchronously, and every irreversible write (a comment, review, approval, reaction or push) checks the flag at the point of submission and stops. The export starts at once with its own deadline. The owner re-raises when the sandbox teardown settles, as today, so the teardown keeps its 10 s budget and its safety-state write. The export never extends or shortens that.
 - **No launcher version negotiation.** The new plugin accepts the launcher document with or without the new fields. The Action sends them only in the change that pins the new plugin.
 - **Turns link to the root span.** The plugin starts before the execution span exists, and the root span id is known from the start.
 - **The post step rebuilds its own redaction set.** Its environment still holds the GitHub token, `auth-json` and the AWS keys, so it reads them into its set and exports scrubbed error text like main.
+- **Direct sends refuse transport debug output.** The relay's child runs with an empty environment and discarded stderr; the Action's own process doesn't. If `NODE_DEBUG` names `http`, `https`, `net`, `tls` or `undici`, lifecycle export is off and one fixed-text warning says so.
+- **Delivery is counted per batch.** The response body is never read, so a partial rejection inside an acknowledged batch isn't counted. The undelivered count covers spans in batches that weren't acknowledged.
 - **Lifecycle tracing doesn't depend on the turn-trace identity.** An incomplete run identity turns the relay off today; the lifecycle trace still sends whatever identity exists.
 
 ## Open Questions
@@ -233,7 +235,9 @@ Early-exit span matrix (a trace never invents unreached phases):
 
 ## Implementation Units
 
-- [ ] **Unit 1: Hosted check of the post step's inputs and state**
+- [x] **Unit 1: Hosted check of the post step's inputs and state**
+
+**Result:** Passed on `ubuntu-24.04` (fro-bot/.github runs 45113286069 normal, 45113332527 cancelled). Post received both trace inputs unchanged after main removed them from its own environment, and saw early-saved state on both paths. On cancel, main got SIGINT, then SIGTERM 7.5 s later, and was killed about 2.5 s after that; post still ran.
 
 **Goal:** Confirm on a hosted runner that the trace inputs reach the post process with the same values, and that state saved early in main is visible to post after main is cancelled.
 
@@ -354,11 +358,14 @@ Early-exit span matrix (a trace never invents unreached phases):
 - Edge case: tracing off produces no request and creates no exporter.
 - Edge case: a long exception message or ref name is scrubbed before it is cut, so a cut can't leave part of a secret.
 - Edge case: more than 128 literals are all redacted, not only the longest.
+- Edge case: a registered value shorter than 8 or longer than 4,096 characters makes the export carry categories instead of any free text.
 - Error path: a canary secret placed in a span name, an attribute value, an event attribute, a status message and an exception message is absent from every position of the request body, raw and JSON-escaped.
 - Error path: a literal registered after spans were recorded is redacted at flush.
 - Error path: the trace credential and its Bearer and Basic forms never appear in a request body or a log line.
 - Error path: a value the scrubber can't process is omitted with a marker.
-- Error path: 401, 413, a stalled connection and a partial success each leave the run's result unchanged, end within the bound, and give the right undelivered count.
+- Error path: 401, 413 and a stalled connection each leave the run's result unchanged, end within the bound, and give the right undelivered count.
+- Edge case: a 200 with a partial rejection counts the batch as delivered and logs nothing from the body.
+- Error path: with `NODE_DEBUG=http,tls`, nothing is sent, one warning is logged, and stderr carries neither the endpoint nor the credential.
 - Error path: a 503 with `Retry-After` inside the bound is retried and delivered.
 - Error path: a 3xx with a `Location` to a second listener sends nothing to the second listener.
 - Error path: a collector response body containing a canary never reaches a log line.
@@ -400,7 +407,8 @@ Early-exit span matrix (a trace never invents unreached phases):
 - Happy path: a full run produces the phase spans in order under one root, with the invocation outcome, save result and exit code on the root.
 - Edge case: each row of the early-exit matrix produces exactly the listed spans and exit code.
 - Edge case: valid trace inputs with a missing required input give a traced bootstrap failure.
-- Edge case: a routing skip's spans carry the logical key; a bootstrap failure's spans carry run identity but no key.
+- Edge case: a routing skip's spans carry the session; a bootstrap failure's spans carry run identity but no session.
+- Edge case: two repositories each run twice on issue 42: each repository's runs share one session, and the two sessions differ.
 - Edge case: S3 V2 and V1 miss and the Actions cache hits: three tier spans with miss, miss, hit. Also an S3 hit (one tier span), S3 disabled (no S3 spans) and a corrupted entry.
 - Edge case: dedup, gate and dropped-PATH decisions appear as events on their phases.
 - Error path: a throw from cleanup still flushes the reached spans and keeps the original error and exit code.
@@ -422,13 +430,14 @@ Early-exit span matrix (a trace never invents unreached phases):
 **Files:**
 
 - Create: `src/harness/signal-owner.ts`.
-- Modify: `src/harness/run.ts`, `src/main.ts`, `src/harness/phases/sandbox-lifecycle.ts` (register with the owner instead of installing handlers), `src/services/setup/adapters.ts` (signal ownership moves to the owner).
+- Modify: `src/harness/run.ts`, `src/main.ts`, `src/harness/phases/sandbox-lifecycle.ts` (register with the owner instead of installing handlers), `src/services/setup/adapters.ts` (signal ownership moves to the owner), and the submission points in `src/features/comments/writer.ts`, `src/features/reviews/reviewer.ts` and the reaction and label writers.
 - Test: `src/harness/signal-owner.test.ts`; updates to `src/harness/phases/sandbox-signal.test.ts` and `src/harness/phases/sandbox-signal.fixture.ts`.
 
 **Approach:**
 
 - One SIGINT/SIGTERM handler is installed at the start of `run()` and holds the exec adapter's signal ownership until the final flush. Sandbox teardown and the flush register with it.
-- On a signal, the current phase span and the root end as `cancelled`, the flush starts at once beside teardown, and the owner re-raises when both settle or the deadline passes. The deadline falls before SIGTERM at 7.5 s.
+- On a signal, the owner sets the cancelled flag synchronously, ends the current phase span and the root as `cancelled`, and starts the flush with its own deadline before SIGTERM at 7.5 s. It re-raises when the sandbox teardown settles (isolated) or at once after the flush deadline (non-isolated), never earlier than today.
+- Irreversible writes check the flag at the point of submission: comment and review posting, the approval, reactions and labels, and pushes.
 - Normal completion and a signal share the tracer's one flush. `main.ts` waits for it before `process.exit`.
 - The isolated teardown's 10 s budget and ordering are unchanged.
 
@@ -441,6 +450,8 @@ Early-exit span matrix (a trace never invents unreached phases):
 - Edge case: a second signal during the flush doesn't start a second flush.
 - Edge case: normal completion racing a signal flushes exactly once and the process doesn't exit before the flush settles or its deadline.
 - Error path: a collector that never answers doesn't push the exit past the deadline.
+- Error path: a signal while a pre-approval GitHub read is in flight and the collector stalls: no approval or comment is submitted after the signal, and the sandbox teardown keeps its 10 s budget.
+- Edge case: with tracing off, a cancelled isolated run tears down exactly as today.
 
 **Verification:**
 
@@ -462,7 +473,8 @@ Early-exit span matrix (a trace never invents unreached phases):
 **Approach:**
 
 - Post reads the identity record from state and the trace inputs through the shared reader. It records one span carrying its outcome (retried save, skip or safety skip) and the retried save's result.
-- Its redaction set comes from its own environment: the GitHub token, `auth-json` leaves, the AWS keys, the trace credential and secret-named environment values. The main step's server password and key-proxy values don't exist here.
+- Its redaction set comes from its own environment through the same registry as main: the GitHub token, `auth-json` and `opencode-config` leaves, the AWS keys, the trace credential and secret-named environment values. The main step's server password and key-proxy values don't exist here. The same fail-closed rule applies.
+- Post bounds its own exit after the flush, so an SDK retry timer can't keep the process alive.
 - With missing or partial state, or unusable trace inputs, post sends nothing. An invalid trace input gets the same fixed-text, no-value warning as main.
 
 **Test scenarios:**
@@ -470,7 +482,10 @@ Early-exit span matrix (a trace never invents unreached phases):
 - Happy path: post after a main step that didn't save retries the save and exports a post span in the run's trace with the save result.
 - Edge case: no state, partial state or malformed ids send nothing.
 - Edge case: state but no trace inputs sends nothing.
-- Error path: a retried S3 save whose error carries an AWS key exports the message with the key redacted.
+- Error path: a retried Actions-cache save whose error carries the GitHub token exports the message with the token redacted.
+- Error path: an S3 metadata or log sync error carrying an AWS key exports the message with the key redacted.
+- Error path: short and long opaque canaries in post's `opencode-config` and trace credential never appear in the request body.
+- Edge case: a collector answering 503 with a long `Retry-After` doesn't keep post alive past its bound.
 
 **Verification:**
 

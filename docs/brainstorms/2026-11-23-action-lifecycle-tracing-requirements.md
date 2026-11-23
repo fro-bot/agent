@@ -64,7 +64,7 @@ The earlier run-tracing requirements listed spans for the Action's own phases as
 **Joining turns and runs**
 
 - R17. Lifecycle spans carry the run identity that turn spans already carry, under the same names: repository, run id, run attempt, job and trigger. They also carry an invocation id that tells apart two Action steps in one job. Turn spans gain the same invocation id.
-- R18. Lifecycle and turn traces use the Action's logical key as their Langfuse session: one per issue, PR or discussion, and one per run for dispatch and schedule. Langfuse's session view then shows every run of a conversation in order: each lifecycle trace beside that run's turns, including runs that a gate skipped.
+- R18. Lifecycle and turn traces use the Action's logical key, qualified by the repository, as their Langfuse session: one per issue, PR or discussion, and one per run for dispatch and schedule. Langfuse's session view then shows every run of a conversation in order: each lifecycle trace beside that run's turns, including runs that a gate skipped.
 - R19. A run that fails before routing has no logical key. Its lifecycle trace is found by run id.
 - R20. Each turn trace links to its run's root span. From a turn, Tempo leads to the run. From a run, a query on the link finds its turns. This needs a plugin release, the same one that carries the logical key and the invocation id.
 - R21. Local sessions keep today's behaviour: with no Action, the plugin's Langfuse session stays the OpenCode root session.
