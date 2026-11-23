@@ -133,9 +133,7 @@ inputs:
       results and model output of the run, so send them only to a collector you control. The URL must be `https`, or `http`
       to a loopback IP address such as `127.0.0.1` for a collector on the runner that needs no credential. A URL with a
       username, password or fragment, port 0, or any other fault turns tracing off with one warning; it never fails the
-      run. This release accepts the input and starts the relay, but the pinned plugin does not send traces yet. No traces
-      are sent until a later release of this Action that includes a plugin with tracing. Do not configure a production
-      credential for it yet.
+      run.
     required: false
     default: ''
   trace-headers:
