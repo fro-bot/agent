@@ -33,6 +33,8 @@ export interface DecodedSpan {
   readonly status: {readonly code: number; readonly message?: string}
   readonly attrs: Readonly<Record<string, unknown>>
   readonly events: readonly {readonly name: string}[]
+  /** The span's links, as the exporter wrote them: lower-case hex ids. */
+  readonly links: readonly {readonly traceId: string; readonly spanId: string}[]
   readonly resource: Readonly<Record<string, unknown>>
   readonly request: number
 }
@@ -68,6 +70,7 @@ interface RawSpan {
   attributes?: {key: string; value: RawValue}[]
   status?: {code?: number; message?: string}
   events?: {name: string}[]
+  links?: {traceId: string; spanId: string}[]
 }
 
 /** Every span in the accepted requests, decoded from the exporter's OTLP JSON, in arrival order. */
@@ -92,6 +95,7 @@ export function decodeSpans(requests: readonly SinkRequest[]): DecodedSpan[] {
           },
           attrs: decodeAttributes(span.attributes),
           events: span.events ?? [],
+          links: (span.links ?? []).map(link => ({traceId: link.traceId, spanId: link.spanId})),
           resource: decodeAttributes(resource.resource?.attributes),
           request: index,
         })),
