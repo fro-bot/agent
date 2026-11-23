@@ -386,6 +386,17 @@ describe('createSecretRegistry', () => {
       expect(registry.matchable()).toBe(false)
     })
 
+    it('lists a source and length once however often it is registered', () => {
+      // #given the same short value masked twice, and another of the same length from the same source
+      const {registry} = make()
+      registry.mask('short1')
+      registry.mask('short1')
+      registry.mask('other1')
+
+      // #then one entry
+      expect(registry.unmatchable()).toEqual({sources: [{source: 'masked-value', length: 6}], total: 1})
+    })
+
     it('reports each source and length once, caps the list, and still counts them all', () => {
       // #given sixty distinct out-of-range values from one source
       const {registry} = make()
