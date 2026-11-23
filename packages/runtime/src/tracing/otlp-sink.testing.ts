@@ -116,6 +116,11 @@ export async function startOtlpSink(options: OtlpSinkOptions = {}): Promise<Otlp
 export interface TlsSink {
   /** The full traces URL over https, for example `https://127.0.0.1:4318/v1/traces`. */
   readonly url: string
+  /**
+   * The self-signed certificate file, for a client that is meant to trust it (`NODE_EXTRA_CA_CERTS` of a child process).
+   * Removed by `stop`.
+   */
+  readonly certFile: string
   /** HTTP requests that got through TLS. A client that refuses the certificate never produces one. */
   readonly requests: SinkRequest[]
   /** TCP connections accepted, and TLS handshakes that completed or were refused by the client. */
@@ -210,6 +215,7 @@ export async function startTlsSink(options: OtlpSinkOptions = {}): Promise<TlsSi
   if (address == null || typeof address === 'string') throw new Error('TLS sink did not bind a TCP port')
   return {
     url: `https://127.0.0.1:${address.port}/v1/traces`,
+    certFile,
     requests,
     connections: () => connections,
     handshakes: () => handshakes,

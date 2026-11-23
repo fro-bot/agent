@@ -206,6 +206,37 @@ describe('createSecretRegistry', () => {
     })
   })
 
+  describe('a credential leaf that is a Bearer or Basic value', () => {
+    it('registers the token alone, because a message carries it without the scheme', () => {
+      // #given a header value in opencode-config and an auth-json entry
+      const registry = createSecretRegistry(vi.fn())
+      registry.addOpencodeConfig(
+        JSON.stringify({mcp: {remote: {headers: {Authorization: 'Bearer mcp-token-leaf-0001'}}}}),
+      )
+      registry.addAuthJson(JSON.stringify({custom: {type: 'api', key: 'Bearer auth-token-leaf-0002'}}))
+
+      // #then
+      expect(registry.literals()).toEqual(
+        expect.arrayContaining(['Bearer mcp-token-leaf-0001', 'mcp-token-leaf-0001', 'auth-token-leaf-0002']),
+      )
+    })
+
+    it('registers the decoded pair and password of a Basic value', () => {
+      const registry = createSecretRegistry(vi.fn())
+      const encoded = Buffer.from('some-user:some-password-0003').toString('base64')
+      registry.addOpencodeConfig(JSON.stringify({headers: {Authorization: `Basic ${encoded}`}}))
+      expect(registry.literals()).toEqual(
+        expect.arrayContaining([encoded, 'some-user:some-password-0003', 'some-password-0003']),
+      )
+    })
+
+    it('does not derive anything from a leaf that is not under a credential key', () => {
+      const registry = createSecretRegistry(vi.fn())
+      registry.addOpencodeConfig(JSON.stringify({note: 'Bearer not-a-credential-0004'}))
+      expect(registry.literals()).not.toContain('not-a-credential-0004')
+    })
+  })
+
   describe('addTraceCredential', () => {
     it('adds the whole header value', () => {
       // #given

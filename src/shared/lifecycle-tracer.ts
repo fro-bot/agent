@@ -109,6 +109,31 @@ export interface TraceIds {
   readonly invocationId: string
 }
 
+const TRACE_ID_PATTERN = /^(?!0{32}$)[0-9a-f]{32}$/
+const SPAN_ID_PATTERN = /^(?!0{16}$)[0-9a-f]{16}$/
+
+/**
+ * Reads the identity record the main step saved to Action state: exactly the three ids, each valid, and no other key. Anything
+ * else (missing, partial, malformed, extra keys) is null, and the caller sends nothing. The record is trusted for nothing but
+ * naming a trace, so it is checked as strictly as an input.
+ */
+export function parseTraceIds(text: string): TraceIds | null {
+  if (text.length === 0) return null
+  try {
+    const value: unknown = JSON.parse(text)
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return null
+    const keys = Object.keys(value)
+    if (keys.length !== 3) return null
+    const {traceId, rootSpanId, invocationId} = value as Record<string, unknown>
+    if (typeof traceId !== 'string' || !TRACE_ID_PATTERN.test(traceId)) return null
+    if (typeof rootSpanId !== 'string' || !SPAN_ID_PATTERN.test(rootSpanId)) return null
+    if (typeof invocationId !== 'string' || !SPAN_ID_PATTERN.test(invocationId)) return null
+    return {traceId, rootSpanId, invocationId}
+  } catch {
+    return null
+  }
+}
+
 export interface FlushResult {
   readonly spans: number
   /** Spans in batches the collector did not acknowledge, plus spans that never fit. Not a count of spans it did not ingest. */
@@ -197,6 +222,11 @@ export interface CreateLifecycleTracerOptions {
   readonly registry: SecretRegistry
   /** Whatever of the run identity exists: tracing does not depend on the turn trace's complete identity. */
   readonly identity?: Readonly<Partial<TracingRunIdentity>>
+  /**
+   * Adds spans to a trace another process started (the post step, after the main step's root has ended): the ids come from the
+   * main step's record, no root span is recorded or exported, and every span with no parent hangs from the main step's root.
+   */
+  readonly continueFrom?: TraceIds
   /** Where `NODE_DEBUG` is read. Default `process.env`. */
   readonly env?: Readonly<Record<string, string | undefined>>
   /** Milliseconds since the epoch; fractions allowed. Default: the monotonic clock anchored to the epoch. */
@@ -290,7 +320,7 @@ export function createLifecycleTracer(options: CreateLifecycleTracerOptions): Li
 
   const {url, headers} = inputs
   const now = options.now ?? defaultNow
-  const ids: TraceIds = {traceId: hex(16), rootSpanId: hex(8), invocationId: hex(8)}
+  const ids: TraceIds = options.continueFrom ?? {traceId: hex(16), rootSpanId: hex(8), invocationId: hex(8)}
   const records: SpanRecord[] = []
   let sessionId: string | undefined
   let closed = false
@@ -355,8 +385,9 @@ export function createLifecycleTracer(options: CreateLifecycleTracerOptions): Li
     attributes: new Map(),
     events: [],
   }
-  records.push(rootRecord)
-  const root = handleFor(rootRecord)
+  // A continuation exports no root: the main step already did.
+  if (options.continueFrom === undefined) records.push(rootRecord)
+  const root = options.continueFrom === undefined ? handleFor(rootRecord) : NOOP_SPAN
 
   const identityAttributes: Record<string, string> = {
     [LIFECYCLE_ATTRIBUTE.invocationId]: ids.invocationId,

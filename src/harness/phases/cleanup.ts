@@ -4,7 +4,7 @@ import type {AttachmentResult} from '../../features/attachments/index.js'
 import type {MetricsCollector} from '../../features/observability/metrics.js'
 import type {Octokit} from '../../services/github/types.js'
 import type {CacheSaveOutcome, CacheSaveResult} from '../../shared/cache-save-result.js'
-import type {LifecycleSpan, SpanResult} from '../../shared/lifecycle-tracer.js'
+import type {LifecycleSpan} from '../../shared/lifecycle-tracer.js'
 import type {Logger} from '../../shared/logger.js'
 import type {AgentIdentity} from '../../shared/types.js'
 import type {LeaseController} from './acquire-lock.js'
@@ -28,7 +28,7 @@ import {cleanupTempFiles} from '../../features/attachments/index.js'
 import {writeCacheSaveResultSummary} from '../../features/observability/job-summary.js'
 import {uploadLogArtifact} from '../../services/artifact/index.js'
 import {buildCacheKeyComponents, saveCache} from '../../services/cache/index.js'
-import {toCacheSaveStateValue} from '../../shared/cache-save-result.js'
+import {cacheSaveSpanResult, toCacheSaveStateValue} from '../../shared/cache-save-result.js'
 import {
   getGitHubRunAttempt,
   getGitHubRunId,
@@ -140,22 +140,6 @@ export interface CleanupSafetyResult {
    * the save never ran. Optional only so a test double of this phase need not name it.
    */
   readonly cacheSaveOutcome?: CacheSaveOutcome | null
-}
-
-/** The cache save span's result: the save's own outcome is the reason, and only a thrown or errored save is a failure. */
-function cacheSaveSpanResult(saved: CacheSaveResult): SpanResult {
-  switch (saved.outcome) {
-    case 'persisted':
-      return {outcome: 'succeeded', reason: saved.outcome}
-    case 'cache-error':
-    case 'cache-rejected':
-      return {outcome: 'failed', reason: saved.outcome}
-    case 'skipped-by-configuration':
-    case 'skipped-empty':
-    case 'checkpoint-declined':
-    case 'ownership-declined':
-      return {outcome: 'skipped', reason: saved.outcome}
-  }
 }
 
 export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupSafetyResult> {

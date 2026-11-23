@@ -54,7 +54,7 @@ describe('state-keys', () => {
     })
 
     it('has correct number of keys', () => {
-      expect(Object.keys(STATE_KEYS)).toHaveLength(23)
+      expect(Object.keys(STATE_KEYS)).toHaveLength(24)
     })
 
     it('values are string type compatible', () => {

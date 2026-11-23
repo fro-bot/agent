@@ -71,11 +71,26 @@ export function createSecretRegistry(masker: (value: string) => void): SecretReg
     else matchable = false
   }
 
+  /** The token of a `Bearer`/`Basic` value, and for Basic its decoded pair and password: what a person would paste on their own. */
+  const addSchemeForms = (value: string): void => {
+    const match = BASIC_OR_BEARER.exec(value)
+    if (match === null) return
+    const token = match[2] ?? ''
+    addCredential(token)
+    if ((match[1] ?? '').toLowerCase() !== 'basic') return
+    const pair = decodeBasicPair(token)
+    if (pair === undefined) return
+    addCredential(pair)
+    addCredential(pair.slice(pair.indexOf(':') + 1))
+  }
+
   /** A leaf that may or may not be a credential: in range it is a literal, out of range it is skipped unless `credential`. */
   const addLeaf = (value: string, credential: boolean): void => {
     if (value.trim().length === 0) return
     if (inRange(value)) known.add(value)
     else if (credential) matchable = false
+    // A credential leaf like `Authorization: Bearer <token>`: a message carries the token alone as often as the whole value.
+    if (credential) addSchemeForms(value)
   }
 
   function addJsonLeaves(text: string, isCredentialKey: JsonLeafPredicate): void {
@@ -126,15 +141,7 @@ export function createSecretRegistry(masker: (value: string) => void): SecretReg
     addTraceCredential: headers => {
       for (const {value} of headers) {
         addCredential(value)
-        const match = BASIC_OR_BEARER.exec(value)
-        if (match === null) continue
-        const token = match[2] ?? ''
-        addCredential(token)
-        if ((match[1] ?? '').toLowerCase() !== 'basic') continue
-        const pair = decodeBasicPair(token)
-        if (pair === undefined) continue
-        addCredential(pair)
-        addCredential(pair.slice(pair.indexOf(':') + 1))
+        addSchemeForms(value)
       }
     },
     literals: () => [...known],

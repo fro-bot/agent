@@ -17,6 +17,7 @@ import {
   LIFECYCLE_SERVICE_NAME,
   NODE_DEBUG_WARNING,
   NOOP_SPAN,
+  parseTraceIds,
   withSpan,
 } from './lifecycle-tracer.js'
 import {createSecretRegistry} from './secret-registry.js'
@@ -1091,5 +1092,51 @@ describe('the session attribute at flush', () => {
 
     // #then
     expect(sessionOf(allSpans(target))).toBeUndefined()
+  })
+})
+
+describe('continuing a trace', () => {
+  const ids = {traceId: '1'.repeat(32), rootSpanId: '2'.repeat(16), invocationId: '3'.repeat(16)}
+
+  it('adds spans under the saved root without exporting a root of its own, in the saved trace', async () => {
+    // #given a tracer continuing another process's trace
+    const target = await sink()
+    const {tracer} = harness(target.url, {continueFrom: ids})
+
+    // #when it records a span and flushes
+    tracer.startSpan('post').end({outcome: 'succeeded'})
+    tracer.root.end({outcome: 'succeeded'})
+    await tracer.flush()
+
+    // #then one span, in the saved trace, hung from the saved root, carrying the saved invocation id
+    const spans = allSpans(target)
+    expect(spans.map(span => span.name)).toEqual(['post'])
+    expect(spans[0]?.traceId).toBe(ids.traceId)
+    expect(spans[0]?.parentSpanId).toBe(ids.rootSpanId)
+    expect(attr(spans[0] as Decoded, 'fro_bot.invocation.id')).toBe(ids.invocationId)
+    expect(tracer.ids).toEqual(ids)
+  })
+})
+
+describe('parseTraceIds', () => {
+  const good = {traceId: '1'.repeat(32), rootSpanId: '2'.repeat(16), invocationId: '3'.repeat(16)}
+
+  it('accepts the record main saves', () => {
+    expect(parseTraceIds(JSON.stringify(good))).toEqual(good)
+  })
+
+  it.each([
+    ['empty', ''],
+    ['not JSON', 'nope'],
+    ['null', 'null'],
+    ['an array', '[]'],
+    ['a missing key', JSON.stringify({traceId: good.traceId, rootSpanId: good.rootSpanId})],
+    ['an extra key', JSON.stringify({...good, extra: 'x'})],
+    ['a short trace id', JSON.stringify({...good, traceId: '1'.repeat(31)})],
+    ['an all-zero span id', JSON.stringify({...good, rootSpanId: '0'.repeat(16)})],
+    ['an uppercase id', JSON.stringify({...good, invocationId: 'A'.repeat(16)})],
+    ['a number', JSON.stringify({...good, traceId: 1})],
+  ])('refuses %s', (_name, text) => {
+    expect(parseTraceIds(text)).toBeNull()
   })
 })

@@ -70,6 +70,11 @@ export const STATE_KEYS = {
    * Absent when the run is untraced.
    */
   LIFECYCLE_TRACE: 'lifecycleTrace',
+  /**
+   * The conversation's Langfuse session id (`<owner>/<repo>:<logical key>`), saved once after routing so the post step's span
+   * joins the same session. Not a credential. Absent for a run that failed before routing.
+   */
+  LIFECYCLE_SESSION: 'lifecycleSession',
   S3_ENABLED: 'storeConfig.enabled',
   S3_BUCKET: 'storeConfig.bucket',
   S3_REGION: 'storeConfig.region',
