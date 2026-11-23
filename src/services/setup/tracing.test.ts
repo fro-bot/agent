@@ -9,10 +9,13 @@ import {describe, expect, it, vi} from 'vitest'
 import {unwrapErr, unwrapOk} from '../../shared/test-helpers.js'
 import {
   buildActionTracingHost,
+  buildTraceSessionId,
   buildTracingRunIdentity,
   liveActionTracingHost,
+  readLifecycleRunIdentity,
   relayRequestFromInputs,
   resolveActionTracing,
+  TRACE_SESSION_ID_MAX_CHARS,
 } from './tracing.js'
 
 const HOST_CANARY = 'collector-canary.example.test'
@@ -170,5 +173,47 @@ describe('resolveActionTracing', () => {
     expect(resolveActionTracing(source)).toBe(off)
     expect(resolveActionTracing(source)).toBe(off)
     expect(source).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('buildTraceSessionId', () => {
+  it('qualifies the repository-local logical key with the repository', () => {
+    expect(buildTraceSessionId('fro-bot', 'agent', 'issue-42')).toBe('fro-bot/agent:issue-42')
+  })
+
+  it('differs between two repositories on the same issue number', () => {
+    expect(buildTraceSessionId('fro-bot', 'agent', 'issue-42')).not.toBe(
+      buildTraceSessionId('fro-bot', 'other', 'issue-42'),
+    )
+  })
+
+  it('is bounded to 200 characters, deterministically, and keeps two long keys that share a prefix apart', () => {
+    // #given two keys that agree for the first 300 characters
+    const prefix = 'x'.repeat(300)
+    const a = buildTraceSessionId('fro-bot', 'agent', `${prefix}-a`)
+    const b = buildTraceSessionId('fro-bot', 'agent', `${prefix}-b`)
+
+    // #then
+    expect(a).toHaveLength(TRACE_SESSION_ID_MAX_CHARS)
+    expect(b).toHaveLength(TRACE_SESSION_ID_MAX_CHARS)
+    expect(a).not.toBe(b)
+    expect(buildTraceSessionId('fro-bot', 'agent', `${prefix}-a`)).toBe(a)
+  })
+
+  it('leaves a key that fits exactly at the limit untouched', () => {
+    const key = 'k'.repeat(TRACE_SESSION_ID_MAX_CHARS - 'fro-bot/agent:'.length)
+    expect(buildTraceSessionId('fro-bot', 'agent', key)).toBe(`fro-bot/agent:${key}`)
+  })
+})
+
+describe('readLifecycleRunIdentity', () => {
+  it('reads whatever of the identity the environment holds, and leaves out the rest', () => {
+    expect(
+      readLifecycleRunIdentity({GITHUB_REPOSITORY: 'fro-bot/agent', GITHUB_RUN_ID: '77', GITHUB_EVENT_NAME: ' '}, null),
+    ).toEqual({repository: 'fro-bot/agent', runId: '77'})
+  })
+
+  it('takes the job from the invocation identity', () => {
+    expect(readLifecycleRunIdentity({GITHUB_RUN_ATTEMPT: '2'}, 'triage')).toEqual({attempt: '2', job: 'triage'})
   })
 })

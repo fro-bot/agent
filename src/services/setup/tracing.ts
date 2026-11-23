@@ -1,6 +1,7 @@
 import type {Result} from '@bfra.me/es/result'
 import type {OpenCodeV2ActionTracingHost, TraceRelayHeader, TracingRunIdentity} from '@fro-bot/runtime'
 import type {TracingInputs} from '../../shared/types.js'
+import {createHash} from 'node:crypto'
 import {err, ok} from '@bfra.me/es/result'
 import {ACTION_TRACING_OFF, isUsableTracingIdentity} from '@fro-bot/runtime'
 
@@ -97,4 +98,45 @@ export function buildActionTracingHost(
 ): OpenCodeV2ActionTracingHost {
   if (relayPort === null || identity === null) return ACTION_TRACING_OFF
   return {host: 'action', tracing: 'on', relayPort, identity}
+}
+
+/** Langfuse's longest session id. */
+export const TRACE_SESSION_ID_MAX_CHARS = 200
+
+/**
+ * The one Langfuse session id for a conversation: the logical key, which is repository-local (`issue-42`), qualified by the
+ * repository (`<owner>/<repo>:<logical key>`) so two repositories' issue 42 never share a session. Lifecycle and turn spans
+ * carry this exact value, and neither derives it. Past 200 characters it is cut and ends in a hash of the whole, so two long
+ * keys that share a prefix stay apart and the result is the same wherever it is computed.
+ */
+export function buildTraceSessionId(owner: string, repo: string, logicalKey: string): string {
+  const full = `${owner}/${repo}:${logicalKey}`
+  if (full.length <= TRACE_SESSION_ID_MAX_CHARS) return full
+  const digest = createHash('sha256').update(full).digest('hex').slice(0, 16)
+  return `${full.slice(0, TRACE_SESSION_ID_MAX_CHARS - digest.length - 1)}~${digest}`
+}
+
+/**
+ * Whatever of the run identity the runner's environment holds, for the lifecycle trace: it sends what exists, where the turn
+ * trace's launcher document needs all five fields (`buildTracingRunIdentity`).
+ */
+export function readLifecycleRunIdentity(
+  env: Readonly<Record<string, string | undefined>>,
+  job: string | null,
+): Partial<TracingRunIdentity> {
+  const present = (value: string | undefined): string | undefined => {
+    const trimmed = value?.trim() ?? ''
+    return trimmed === '' ? undefined : trimmed
+  }
+  const repository = present(env.GITHUB_REPOSITORY)
+  const runId = present(env.GITHUB_RUN_ID)
+  const attempt = present(env.GITHUB_RUN_ATTEMPT)
+  const trigger = present(env.GITHUB_EVENT_NAME)
+  return {
+    ...(repository === undefined ? {} : {repository}),
+    ...(runId === undefined ? {} : {runId}),
+    ...(attempt === undefined ? {} : {attempt}),
+    ...(job === null ? {} : {job}),
+    ...(trigger === undefined ? {} : {trigger}),
+  }
 }
