@@ -15,6 +15,8 @@ import http from 'node:http'
 import path from 'node:path'
 import {DatabaseSync} from 'node:sqlite'
 import {ACTION_TRACING_OFF, startOpenCodeV2Server} from '@fro-bot/runtime'
+import {MAX_LITERAL_CHARS, MIN_LITERAL_CHARS, SECRET_ENV_NAME} from '@fro-bot/runtime/tracing/scrub'
+import {createSecretRegistry} from '../../shared/secret-registry.js'
 
 export const PRELUDE = String.raw`R(){ echo "RESULT $1 $2 $3"; }; ev(){ head -c 240 | tr '\n\r\t' '   '; }; `
 export const q = (value: string): string => `'${value.replaceAll("'", String.raw`'\''`)}'`
@@ -693,4 +695,40 @@ export function newLaunchNamespaces(
 /** The first line of what the runner's own shell command prints. Throws when the command fails. */
 export function runnerFirstLine(command: string, run?: InspectionRunner): string {
   return inspectOutput('sh', ['-c', command], `running ${command}`, run).split('\n')[0]?.trim() ?? ''
+}
+
+// --- The lifecycle trace's secret registry on a hosted runner -----------------------------------------------------------
+
+/** What the Action's secret registry makes of an environment, without ever holding a value in the report. */
+export interface SecretEnvRangeReport {
+  /** The registry's own verdict: false as soon as one registered credential is outside the scrubber's matchable range. */
+  readonly matchable: boolean
+  /** The secret-named variables whose value is outside the range: names and lengths only. */
+  readonly outOfRange: readonly {readonly name: string; readonly length: number}[]
+}
+
+/**
+ * Feeds `env` to a fresh registry the way `run()` does (`addSecretEnv`) and reports it. A secret-named value shorter than 8 or
+ * longer than 4,096 characters cannot be matched by the scrubber, so the tracer would export no free text for the whole run:
+ * on a hosted runner that is a finding, not a detail. The report holds no value.
+ */
+export function secretEnvRangeReport(env: Readonly<Record<string, string | undefined>>): SecretEnvRangeReport {
+  const registry = createSecretRegistry(() => undefined)
+  registry.addSecretEnv(env)
+  const outOfRange = Object.entries(env)
+    .filter(
+      (entry): entry is [string, string] =>
+        SECRET_ENV_NAME.test(entry[0]) &&
+        entry[1] !== undefined &&
+        entry[1].trim().length > 0 &&
+        (entry[1].length < MIN_LITERAL_CHARS || entry[1].length > MAX_LITERAL_CHARS),
+    )
+    .map(([name, value]) => ({name, length: value.length}))
+    .toSorted((a, b) => a.name.localeCompare(b.name))
+  return {matchable: registry.matchable(), outOfRange}
+}
+
+/** `NAME (12 characters)`, one per offender. Safe to print: names and lengths only. */
+export function describeOutOfRangeSecretEnv(report: SecretEnvRangeReport): string {
+  return report.outOfRange.map(item => `${item.name} (${item.length} characters)`).join(', ')
 }

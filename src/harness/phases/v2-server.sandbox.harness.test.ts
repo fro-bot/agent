@@ -12,6 +12,7 @@ import {
   controlCoversMatrix,
   copyBundleWithImports,
   describeNamespaceMembers,
+  describeOutOfRangeSecretEnv,
   findPaths,
   inspectOutput,
   matrixDirectories,
@@ -23,6 +24,7 @@ import {
   PRELUDE,
   runInspection,
   runnerFirstLine,
+  secretEnvRangeReport,
   startPlainScriptedSession,
   writeMatrixProbe,
   writeWorksProbe,
@@ -656,5 +658,58 @@ describe('parseRows verdicts', () => {
 
     // #then the status is kept
     expect(rows.get('canary_scan')).toEqual([{status: 'INCOMPLETE', evidence: 'canary.xdg=0 skip.xdg=1'}])
+  })
+})
+
+describe('secretEnvRangeReport', () => {
+  const long = (length: number): string => `t${'x'.repeat(length - 1)}`
+
+  it('is matchable, with nothing out of range, for secret-named values of 8 to 4,096 characters and for any other name', () => {
+    // #given what a hosted step holds: long tokens, a short value under a name that is not a secret's
+    const report = secretEnvRangeReport({
+      ACTIONS_RUNTIME_TOKEN: long(1400),
+      ACTIONS_ID_TOKEN_REQUEST_TOKEN: long(8),
+      GITHUB_TOKEN: long(4096),
+      CI: 'true',
+      RUNNER_OS: 'Linux',
+      EMPTY_TOKEN: '',
+      BLANK_SECRET: '   ',
+    })
+
+    // #then
+    expect(report).toEqual({matchable: true, outOfRange: []})
+  })
+
+  it('is not matchable when a secret-named value is too short, and names it with its length only', () => {
+    // #given a 7-character token and a 4,097-character one, beside an in-range one
+    const secret7 = 'ghs_abc'
+    const report = secretEnvRangeReport({
+      GITHUB_TOKEN: secret7,
+      ACTIONS_RUNTIME_TOKEN: long(4097),
+      ACTIONS_ID_TOKEN_REQUEST_TOKEN: long(500),
+    })
+
+    // #then both are reported, sorted by name, and no value is anywhere in the report or its description
+    expect(report.matchable).toBe(false)
+    expect(report.outOfRange).toEqual([
+      {name: 'ACTIONS_RUNTIME_TOKEN', length: 4097},
+      {name: 'GITHUB_TOKEN', length: 7},
+    ])
+    const description = describeOutOfRangeSecretEnv(report)
+    expect(description).toBe('ACTIONS_RUNTIME_TOKEN (4097 characters), GITHUB_TOKEN (7 characters)')
+    expect(`${JSON.stringify(report)} ${description}`).not.toContain(secret7)
+  })
+
+  it('agrees with the registry: the report names an offender exactly when the registry is not matchable', () => {
+    for (const env of [
+      {},
+      {SOME_TOKEN: long(7)},
+      {SOME_TOKEN: long(8)},
+      {SOME_TOKEN: long(4097)},
+      {SOME_TOKEN: long(4096)},
+    ]) {
+      const report = secretEnvRangeReport(env)
+      expect(report.matchable).toBe(report.outOfRange.length === 0)
+    }
   })
 })
