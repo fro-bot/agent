@@ -71,6 +71,7 @@ import {runRouting} from './phases/routing.js'
 import {runSessionPrep} from './phases/session-prep.js'
 import {checkTraceRelayBundle} from './phases/trace-relay-bundle.js'
 import {createTraceRelayLaunch, startTraceRelayProcess, type TraceRelayProcess} from './phases/trace-relay-process.js'
+import {createSignalOwner, type SignalOwner} from './signal-owner.js'
 
 const KEY_PROXY_CRASHED_DECLINE_REASON =
   'the isolate-agent key proxy exited unexpectedly, so the run is incomplete and no session state is saved'
@@ -90,6 +91,7 @@ interface RunTrace {
   readonly registry: SecretRegistry
   /** The trace inputs `run` read first of everything, handed to bootstrap so it never reads them again. */
   readonly traceInputs: TracingInputs
+  readonly signalOwner: SignalOwner
   /** Set by the body as it learns them; the root span ends with whatever is set when the body returns or throws. */
   readonly outcome: {
     rootResult: SpanResult
@@ -129,10 +131,20 @@ export async function run(): Promise<number> {
   const refName = process.env.GITHUB_REF_NAME?.trim() ?? ''
   if (refName !== '') tracer.root.setAttribute('fro_bot.ref', freeText(refName, 'ref'))
 
+  // The one SIGINT/SIGTERM handler of the run, installed here (no await since the tracer was created, so no signal can arrive
+  // unseen) for every run, isolated or not. It takes the exec adapter's signal ownership; the sandbox lifecycle registers its
+  // teardown with it.
+  const signalOwner = createSignalOwner({
+    logger: bootstrapLogger,
+    onCancel: signal => tracer.cancel(signal === 'SIGINT' ? 'sigint' : 'sigterm'),
+    flush: async flushOptions => tracer.flush(flushOptions),
+  })
+
   const trace: RunTrace = {
     tracer,
     registry,
     traceInputs,
+    signalOwner,
     outcome: {rootResult: {outcome: 'failed', reason: 'exception'}, cacheSaveOutcome: null, exitCode: null},
   }
   try {
@@ -144,12 +156,18 @@ export async function run(): Promise<number> {
     if (trace.outcome.exitCode !== null) tracer.root.setAttribute('fro_bot.exit_code', trace.outcome.exitCode)
     tracer.root.setAttribute('fro_bot.cache.save_result', trace.outcome.cacheSaveOutcome ?? 'not-run')
     tracer.root.end(trace.outcome.rootResult)
+    // Normal completion and a signal share this one export (the tracer's flush is idempotent), and `main.ts` ends the process
+    // only after `run()` returns, so it never exits before the export has settled or hit its bound.
     await tracer.flush()
+    // A signal that is still being handled (its teardown running beside the finished run) ends the process itself, with the
+    // signal's own exit. Wait for that rather than let `main.ts` exit first with the run's code.
+    await signalOwner.drain()
+    signalOwner.dispose()
   }
 }
 
 async function runWithTrace(trace: RunTrace, startTime: number, bootstrapLogger: Logger): Promise<number> {
-  const {tracer, registry, traceInputs} = trace
+  const {tracer, registry, traceInputs, signalOwner} = trace
   /** A phase of the run: a span from the moment the phase starts to the moment it returns or throws. */
   const phase = async <T>(
     name: string,
@@ -391,7 +409,7 @@ async function runWithTrace(trace: RunTrace, startTime: number, bootstrapLogger:
     requestedOutputModeState = resolveRequestedOutputModeState()
     const bootstrap = await phase(
       'bootstrap',
-      async span => runBootstrap(bootstrapLogger, {registry, tracing: traceInputs, traceSpan: span}),
+      async span => runBootstrap(bootstrapLogger, {registry, tracing: traceInputs, traceSpan: span, signalOwner}),
       started => (started == null ? {outcome: 'failed', reason: 'bootstrap-failed'} : {outcome: 'succeeded'}),
     )
     if (bootstrap == null) {

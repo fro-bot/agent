@@ -629,6 +629,60 @@ describe('run with lifecycle tracing', () => {
     })
   })
 
+  describe('the signal owner', () => {
+    it('is installed before bootstrap for every run, handed to bootstrap, and removed when the run ends', async () => {
+      // #given the handlers the process has before the run, and a bootstrap that looks at them
+      const before = {int: process.listenerCount('SIGINT'), term: process.listenerCount('SIGTERM')}
+      const during: {int: number; term: number}[] = []
+      await arrange({})
+      const {runBootstrap} = await import('./phases/bootstrap.js')
+      vi.mocked(runBootstrap).mockImplementation(async () => {
+        during.push({int: process.listenerCount('SIGINT'), term: process.listenerCount('SIGTERM')})
+        return createBootstrap()
+      })
+
+      // #when
+      await run()
+
+      // #then one handler per signal was in place by bootstrap, bootstrap was given the owner, and none is left
+      expect(during).toEqual([{int: before.int + 1, term: before.term + 1}])
+      expect(vi.mocked(runBootstrap).mock.calls[0]?.[1]).toHaveProperty('signalOwner')
+      expect({int: process.listenerCount('SIGINT'), term: process.listenerCount('SIGTERM')}).toEqual(before)
+    })
+
+    it('is installed on an untraced run too', async () => {
+      // #given no trace inputs
+      inputs.values.clear()
+      const during: number[] = []
+      await arrange({})
+      const {runBootstrap} = await import('./phases/bootstrap.js')
+      vi.mocked(runBootstrap).mockImplementation(async () => {
+        during.push(process.listenerCount('SIGTERM'))
+        return createBootstrap()
+      })
+      const before = process.listenerCount('SIGTERM')
+
+      // #when
+      await run()
+
+      // #then
+      expect(during).toEqual([before + 1])
+      expect(process.listenerCount('SIGTERM')).toBe(before)
+    })
+
+    it('is removed when the run throws', async () => {
+      // #given a cleanup that rejects
+      const before = process.listenerCount('SIGINT')
+      await arrange({cleanup: 'throws'})
+
+      // #when
+      await run().catch(() => undefined)
+
+      // #then
+      expect(process.listenerCount('SIGINT')).toBe(before)
+    })
+  })
+
   describe('secrets and state', () => {
     it('redacts the server password minted mid-run from a later exception message, and masked it with GitHub too', async () => {
       // #given a start that mints a secret after the tracer exists, and a later throw that carries it
