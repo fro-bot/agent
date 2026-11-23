@@ -848,10 +848,11 @@ export const SCRUB_PATTERNS: readonly ScrubMatcher[] = [
 ]
 
 /** Env names whose value the literal pass removes. `OPENCODE_PASSWORD` is the server's own credential. */
-const SECRET_ENV_NAME =
+export const SECRET_ENV_NAME =
   /SECRET|TOKEN|PASSWORD|PASSWD|PASSPHRASE|CREDENTIAL|API_?KEY|PRIVATE_?KEY|ACCESS_?KEY|AUTHORIZATION/i
-const MIN_LITERAL_CHARS = 8
-const MAX_LITERAL_CHARS = 4096
+/** The length range a literal secret must be in to be matched. Exported so a caller can tell what the scrubber cannot match. */
+export const MIN_LITERAL_CHARS = 8
+export const MAX_LITERAL_CHARS = 4096
 const MAX_LITERALS = 128
 
 /**
