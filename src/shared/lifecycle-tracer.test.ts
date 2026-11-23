@@ -944,3 +944,152 @@ describe('the resource', () => {
     for (const spy of reads) expect(spy).not.toHaveBeenCalled()
   })
 })
+
+describe('cancel', () => {
+  it('ends every open span cancelled with the reason, root included, and leaves the ended ones alone', async () => {
+    // #given a finished phase, an open phase with an open child, and the open root
+    const target = await sink()
+    const {tracer} = harness(target.url)
+    tracer.startSpan('bootstrap').end({outcome: 'succeeded'})
+    const execution = tracer.startSpan('execution')
+    execution.startChild('install')
+
+    // #when a signal cancels the run
+    tracer.cancel('sigint')
+    await tracer.flush()
+
+    // #then
+    const spans = allSpans(target)
+    expect(attr(named(spans, 'bootstrap'), 'fro_bot.outcome')).toBe('succeeded')
+    for (const name of ['execution', 'install', 'action.main']) {
+      expect(attr(named(spans, name), 'fro_bot.outcome')).toBe('cancelled')
+      expect(attr(named(spans, name), 'fro_bot.reason')).toBe('sigint')
+    }
+    // A cancelled span is not an error.
+    expect(named(spans, 'execution').status?.code ?? 0).toBe(0)
+  })
+
+  it('keeps the cancelled outcome when the phase unwinds and ends itself afterwards (the first end wins)', async () => {
+    // #given
+    const target = await sink()
+    const {tracer} = harness(target.url)
+    const execution = tracer.startSpan('execution')
+    tracer.cancel('sigterm')
+
+    // #when the reaped command makes the phase end as failed, and the root as failed
+    execution.recordException(new Error('child was killed'))
+    execution.end({outcome: 'failed', reason: 'exception'})
+    tracer.root.setAttribute('fro_bot.exit_code', 1)
+    tracer.root.end({outcome: 'failed'})
+    await tracer.flush()
+
+    // #then
+    const spans = allSpans(target)
+    expect(attr(named(spans, 'execution'), 'fro_bot.outcome')).toBe('cancelled')
+    expect(named(spans, 'execution').events ?? []).toEqual([])
+    expect(attr(named(spans, 'action.main'), 'fro_bot.outcome')).toBe('cancelled')
+  })
+
+  it('does nothing after the flush has begun, and nothing on the no-op tracer', async () => {
+    // #given a flushed tracer and a no-op one
+    const target = await sink()
+    const {tracer} = harness(target.url)
+    tracer.root.end({outcome: 'succeeded'})
+    await tracer.flush()
+    const {tracer: off} = harness(undefined)
+
+    // #when
+    tracer.cancel('sigint')
+
+    // #then
+    expect(attr(named(allSpans(target), 'action.main'), 'fro_bot.outcome')).toBe('succeeded')
+    expect(() => off.cancel('sigint')).not.toThrow()
+  })
+})
+
+describe('flush bound', () => {
+  it('uses the bound of the first call, so a signal’s export ends at its own deadline', async () => {
+    // #given a collector that never answers
+    const target = await sink({respond: () => ({status: 200, hold: true})})
+    const {tracer} = harness(target.url, {flushBoundMs: 5_000})
+    tracer.root.end({outcome: 'succeeded'})
+
+    // #when flushed with a 300 ms bound
+    const started = Date.now()
+    const result = await tracer.flush({boundMs: 300})
+
+    // #then it ended near the bound, not the tracer's 5 s, with the spans counted undelivered
+    expect(Date.now() - started).toBeLessThan(2_500)
+    expect(result.undelivered).toBeGreaterThan(0)
+  })
+
+  it('ignores the bound of a later call: the first call exports, every later call gets its result', async () => {
+    // #given
+    const target = await sink()
+    const {tracer} = harness(target.url)
+    tracer.root.end({outcome: 'succeeded'})
+
+    // #when
+    const first = await tracer.flush({boundMs: 1_000})
+    const second = await tracer.flush({boundMs: 1})
+
+    // #then
+    expect(second).toBe(first)
+    expect(target.received()).toBe(1)
+  })
+})
+
+describe('the session attribute at flush', () => {
+  const sessionOf = (spans: readonly Decoded[]): unknown => attr(named(spans, 'action.main'), 'langfuse.session.id')
+
+  it('exports a session id that scrubbing leaves unchanged', async () => {
+    // #given
+    const target = await sink()
+    const {tracer} = harness(target.url)
+    tracer.setSessionId('fro-bot/agent:issue-42')
+    tracer.root.end({outcome: 'succeeded'})
+
+    // #when
+    await tracer.flush()
+
+    // #then
+    expect(sessionOf(allSpans(target))).toBe('fro-bot/agent:issue-42')
+  })
+
+  it('exports no session id at all when scrubbing would change it, never a redacted one', async () => {
+    // #given a repository whose name trips the scrubber's name/value rule
+    const target = await sink()
+    const {tracer} = harness(target.url)
+    tracer.setSessionId('acme/password-manager:issue-42')
+    tracer.startSpan('bootstrap').end({outcome: 'succeeded'})
+    tracer.root.end({outcome: 'succeeded'})
+
+    // #when
+    await tracer.flush()
+
+    // #then no span carries the attribute, and nothing was sent in its place
+    const spans = allSpans(target)
+    for (const span of spans) expect(attr(span, 'langfuse.session.id')).toBeUndefined()
+    expect(
+      target
+        .accepted()
+        .map(request => request.text)
+        .join(''),
+    ).not.toContain('REDACTED')
+  })
+
+  it('exports no session id that holds a registered secret', async () => {
+    // #given a session id with a registered literal in it
+    const target = await sink()
+    const made = harness(target.url)
+    made.registry.mask('sentinel-secret-9876')
+    made.tracer.setSessionId('fro-bot/agent:sentinel-secret-9876')
+    made.tracer.root.end({outcome: 'succeeded'})
+
+    // #when
+    await made.tracer.flush()
+
+    // #then
+    expect(sessionOf(allSpans(target))).toBeUndefined()
+  })
+})

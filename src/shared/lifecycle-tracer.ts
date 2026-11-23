@@ -124,8 +124,17 @@ export interface LifecycleTracer {
   readonly startSpan: (name: string, options?: {readonly parent?: LifecycleSpan}) => LifecycleSpan
   /** The Langfuse session. Spans that ended before it was known get it at export. */
   readonly setSessionId: (sessionId: string) => void
-  /** Idempotent: the first call exports, every later call returns the same result. Bounded. Never rejects. */
-  readonly flush: () => Promise<FlushResult>
+  /**
+   * A signal arrived: ends every span still open as `cancelled` with `reason` (a fixed word such as the signal's name), the
+   * root last, so the trace says where the run was when it stopped. Synchronous. Spans that end later (the phase unwinding as
+   * its child is reaped) change nothing: the first end wins. Does nothing to a span that already ended.
+   */
+  readonly cancel: (reason: string) => void
+  /**
+   * Idempotent: the first call exports, every later call returns the same result. Bounded: by `boundMs` of the first call
+   * when it gives one, else by the tracer's own bound. Never rejects.
+   */
+  readonly flush: (options?: {readonly boundMs?: number}) => Promise<FlushResult>
 }
 
 /** The span of a tracer that is off, and of a span nobody has to end. Safe to call anything on. */
@@ -175,6 +184,7 @@ export function createNoopTracer(): LifecycleTracer {
     root: NOOP_SPAN,
     startSpan: () => NOOP_SPAN,
     setSessionId: () => undefined,
+    cancel: () => undefined,
     flush: async () => NOOP_RESULT,
   }
 }
@@ -216,6 +226,13 @@ function cut(text: string, cap: number): string {
   const last = text.charCodeAt(end - 1)
   if (last >= 0xd8_00 && last <= 0xdb_ff) end -= 1
   return `${text.slice(0, end)}…[truncated]`
+}
+
+/** True when scrubbing leaves `text` exactly as it is, and no registered literal survives in it. */
+function scrubsUnchanged(scrubber: Scrubber, text: string): boolean {
+  const result = scrubber.scrub(text)
+  if (!result.ok || result.text !== text) return false
+  return scrubber.survived?.(result.text) !== true
 }
 
 /** Scrubs FIRST, then caps, so a cut cannot leave part of a secret. What cannot be scrubbed is omitted. */
@@ -377,7 +394,10 @@ export function createLifecycleTracer(options: CreateLifecycleTracerOptions): Li
     if (record.result?.outcome !== undefined) attributes[LIFECYCLE_ATTRIBUTE.outcome] = record.result.outcome
     if (record.result?.reason !== undefined) attributes[LIFECYCLE_ATTRIBUTE.reason] = record.result.reason
     else if (record.endMs === undefined) attributes[LIFECYCLE_ATTRIBUTE.reason] = 'unfinished'
-    if (sessionId !== undefined) attributes[LIFECYCLE_ATTRIBUTE.session] = sessionId
+    // Never a redacted session id: a value the scrubber would change (a name like `acme/password-manager:issue-42` trips its
+    // name/value rule) would collapse every conversation of that repository into one session. It is exported whole or not at all.
+    if (sessionId !== undefined && scrubsUnchanged(scrubber, sessionId))
+      attributes[LIFECYCLE_ATTRIBUTE.session] = sessionId
 
     const events = record.events.map(event => ({
       name: event.name,
@@ -426,7 +446,7 @@ export function createLifecycleTracer(options: CreateLifecycleTracerOptions): Li
     }
   }
 
-  async function exportAll(): Promise<FlushResult> {
+  async function exportAll(boundMs: number): Promise<FlushResult> {
     const spans = records.length
     try {
       // The registry holds everything, so nothing is captured from the environment here, and no cap drops a literal.
@@ -447,7 +467,7 @@ export function createLifecycleTracer(options: CreateLifecycleTracerOptions): Li
           exporter.drop()
         }
       }
-      const counts = await exporter.close(options.flushBoundMs ?? FLUSH_BOUND_MS)
+      const counts = await exporter.close(boundMs)
       const undelivered = counts.dropped + overflow
       const context = {spans: spans + overflow, undelivered}
       if (undelivered > 0) logger.warning(EXPORT_FINISHED_MESSAGE, context)
@@ -469,9 +489,19 @@ export function createLifecycleTracer(options: CreateLifecycleTracerOptions): Li
     setSessionId: id => {
       if (id.length > 0) sessionId = id
     },
-    flush: async () => {
+    cancel: reason => {
+      if (closed) return
+      const stoppedAt = now()
+      // Children before the root: the order a unwinding run would end them in.
+      for (const record of records.toReversed()) {
+        if (record.endMs !== undefined) continue
+        record.endMs = stoppedAt
+        record.result = {outcome: 'cancelled', reason}
+      }
+    },
+    flush: async flushOptions => {
       closed = true
-      flushed ??= exportAll()
+      flushed ??= exportAll(flushOptions?.boundMs ?? options.flushBoundMs ?? FLUSH_BOUND_MS)
       return flushed
     },
   }
