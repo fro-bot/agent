@@ -1,12 +1,8 @@
 import type {Socket} from 'node:net'
+import type {SpanExporter, SpanExporterOptions} from '@fro-bot/runtime/tracing/exporter'
 import type {ScrubbedSpan} from './content.js'
-import type {SpanExporter, SpanExporterOptions} from './exporter.js'
 import {Buffer} from 'node:buffer'
 import {createServer as createHttpServer} from 'node:http'
-import {afterEach, describe, expect, it, vi} from 'vitest'
-
-import {opensslAvailable, startOtlpSink, startTlsSink, type OtlpSink, type SinkRequest} from '../integration.fixture.js'
-import {scrubbedBrand} from './content.js'
 import {
   COLLECTOR_BODY_LIMIT_BYTES,
   createSpanExporter,
@@ -14,7 +10,10 @@ import {
   formatCountsHeader,
   SDK_SPAN_LIMITS,
   TRACE_COUNTS_HEADER,
-} from './exporter.js'
+} from '@fro-bot/runtime/tracing/exporter'
+import {afterEach, describe, expect, it, vi} from 'vitest'
+import {opensslAvailable, startOtlpSink, startTlsSink, type OtlpSink, type SinkRequest} from '../integration.fixture.js'
+import {scrubbedBrand} from './content.js'
 
 const FAST = {batchIntervalMs: 15, requestTimeoutMs: 2_500, maxConsecutiveFailures: 3}
 const sleep = async (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))

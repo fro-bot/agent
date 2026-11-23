@@ -781,7 +781,7 @@ describe('failure of the parts', () => {
   it('rejects when the SDK exporter cannot be constructed', async () => {
     // #given an exporter module that throws on construction
     vi.resetModules()
-    vi.doMock('./exporter.js', () => ({
+    vi.doMock('@fro-bot/runtime/tracing/exporter', () => ({
       createSpanExporter: () => {
         throw new TypeError('sdk construction failed')
       },
@@ -797,7 +797,7 @@ describe('failure of the parts', () => {
         {env: {}, log: () => {}},
       ),
     ).rejects.toThrow('sdk construction failed')
-    vi.doUnmock('./exporter.js')
+    vi.doUnmock('@fro-bot/runtime/tracing/exporter')
     vi.resetModules()
     fake.end()
   })

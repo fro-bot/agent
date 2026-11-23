@@ -9,8 +9,8 @@
 
 import type {TracingSettings} from './settings.js'
 
+import {createSpanExporter} from '@fro-bot/runtime/tracing/exporter'
 import {createScrubber, type Scrubber} from './content.js'
-import {createSpanExporter} from './exporter.js'
 import {createTracePipeline} from './pipeline.js'
 import {registerObservers, type ObserverHost} from './record-observations.js'
 import {createSnapshotLedger, type PendingLimits} from './snapshot.js'

@@ -37,11 +37,6 @@
   "devDependencies": {
     "@fro-bot/runtime": "workspace:*",
     "@opencode/plugin": "2.3.2",
-    "@opentelemetry/api": "1.9.0",
-    "@opentelemetry/otlp-exporter-base": "0.219.0",
-    "@opentelemetry/otlp-transformer": "0.219.0",
-    "@opentelemetry/resources": "2.8.0",
-    "@opentelemetry/sdk-trace-base": "2.8.0",
     "effect": "4.1.0"
   },
   "peerDependencies": {

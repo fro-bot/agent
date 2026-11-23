@@ -16,13 +16,13 @@
  * by 1.5, at most five retries) until the per-batch timeout; every other status is final, a 3xx included: Node's `http`
  * does not follow redirects and the delegate does not either (pinned by `exporter.test.ts`), so the credential in a
  * local-mode header goes only to the URL in the settings file, which must be `https` for a remote collector with
- * certificate verification left at the platform default (`settings.ts` accepts nothing else). The relay's `503` is
+ * certificate verification left at the platform default (the plugin's `settings.ts` accepts nothing else). The relay's `503` is
  * therefore a retry and its `422` a drop. One batch is in flight at a time, far under the relay's refusal threshold of eight;
  * the next one starts only after the delegate has finished with the last (see `startBatch`).
  */
 
 import type {ReadableSpan, SpanProcessor} from '@opentelemetry/sdk-trace-base'
-import type {ScrubbedSpan} from './content.js'
+import type {ScrubbedSpan} from './scrub.js'
 
 import {Buffer} from 'node:buffer'
 
@@ -33,13 +33,14 @@ import {JsonTraceSerializer} from '@opentelemetry/otlp-transformer'
 import {resourceFromAttributes} from '@opentelemetry/resources'
 import {AlwaysOnSampler, BasicTracerProvider} from '@opentelemetry/sdk-trace-base'
 
-import {CONTENT_ATTRIBUTE_NAMES, MARKER} from './content.js'
+import {CONTENT_ATTRIBUTE_NAMES, MARKER} from './scrub.js'
 
 /**
  * The request header that carries the plugin's running totals to the Action's relay, in Action mode only.
  * MIRRORS `TRACE_RELAY_COUNTS_HEADER` and `formatTraceRelayCountsHeader` in `packages/runtime/src/agent/trace-relay-wire.ts`,
- * which is the source of truth: this package may not import the runtime at run time. The form is exactly
- * `exported=<n>;dropped=<n>`, each `n` one to twelve ASCII digits.
+ * which is the source of truth: this module does not import it, because that module reaches the network and IP
+ * classification code and the plugin bundles this one whole. `runtime-parity.test.ts` pins the two together. The form is
+ * exactly `exported=<n>;dropped=<n>`, each `n` one to twelve ASCII digits.
  */
 export const TRACE_COUNTS_HEADER = 'x-frobot-trace-counts'
 
