@@ -52,6 +52,8 @@ export interface CleanupPhaseOptions {
   /** The run's OpenCode V2 server, shut down here before the cache save. Absent when execution never started one. */
   readonly serverHandleV2?: OpenCodeV2ServerHandle | null
   readonly storeConfig: ObjectStoreConfig
+  /** The `skip-cache` input: the session cache save is skipped (outcome `skipped-by-configuration`). */
+  readonly skipCache?: boolean
   readonly metrics: MetricsCollector
   readonly agentIdentity: AgentIdentity
   readonly repo: string
@@ -139,6 +141,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
     attachmentResult,
     serverHandleV2 = null,
     storeConfig,
+    skipCache = false,
     metrics,
     agentIdentity,
     repo,
@@ -407,6 +410,7 @@ export async function runCleanup(options: CleanupPhaseOptions): Promise<CleanupS
         projectIdPath: finalProjectIdPath,
         storeConfig,
         objectStorePublish: holdsLease ? 'publish' : 'withhold',
+        skipCache,
       })
     } else {
       cacheLogger.warning('Declining cache save: persistence safety could not be confirmed', {reason: declineReason})

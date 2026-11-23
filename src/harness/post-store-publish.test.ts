@@ -141,4 +141,64 @@ describe('post hook retry against the real saveCache', () => {
     expect(mocks.cacheSave).toHaveBeenCalledTimes(1)
     expect(mocks.upload).not.toHaveBeenCalled()
   })
+
+  it('with skip-cache on and no main cleanup result, saves nothing but still recovers metadata and trusted logs', async () => {
+    // #given the main step armed the post hook and died before cleanup: skip-cache was recorded, no save result
+    // and no cleanup metadata exist, and the object store is configured
+    await stubState({shouldSaveCache: 'true', skipCache: 'true', ...STORE_STATE})
+    const {syncArtifactsToStore, syncMetadataToStore} = await import('@fro-bot/runtime')
+
+    // #when the post hook runs
+    const {runPost} = await import('./post.js')
+    const logger = createMockLogger()
+    await runPost({logger})
+
+    // #then no session save is attempted, and no session object is published
+    expect(mocks.cacheSave).not.toHaveBeenCalled()
+    expect(mocks.upload).not.toHaveBeenCalled()
+    expect(logger.info).toHaveBeenCalledWith(
+      'Skipping post-action session save: skip-cache was set',
+      expect.any(Object),
+    )
+
+    // #and the diagnostics fallback still runs
+    expect(syncMetadataToStore).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(syncMetadataToStore).mock.calls[0]?.[5]).toMatchObject({cleanupSkipped: true})
+    expect(syncArtifactsToStore).toHaveBeenCalledTimes(1)
+  })
+
+  it('with skip-cache on, still leaves the rich metadata cleanup wrote alone but uploads the logs', async () => {
+    // #given cleanup already wrote the run metadata
+    await stubState({
+      shouldSaveCache: 'true',
+      skipCache: 'true',
+      cleanupMetadataWritten: 'true',
+      ...STORE_STATE,
+    })
+    const {syncArtifactsToStore, syncMetadataToStore} = await import('@fro-bot/runtime')
+
+    // #when the post hook runs
+    const {runPost} = await import('./post.js')
+    await runPost({logger: createMockLogger()})
+
+    // #then the overwrite guard holds, the save is skipped, and the logs are uploaded
+    expect(mocks.cacheSave).not.toHaveBeenCalled()
+    expect(syncMetadataToStore).not.toHaveBeenCalled()
+    expect(syncArtifactsToStore).toHaveBeenCalledTimes(1)
+  })
+
+  it('with skip-cache on, keeps the isolated-run guard: no save, no metadata, no shared-log upload', async () => {
+    // #given an isolated run whose sandbox teardown was never confirmed
+    await stubState({shouldSaveCache: 'true', skipCache: 'true', isolatedRun: 'true', ...STORE_STATE})
+    const {syncArtifactsToStore, syncMetadataToStore} = await import('@fro-bot/runtime')
+
+    // #when the post hook runs
+    const {runPost} = await import('./post.js')
+    await runPost({logger: createMockLogger()})
+
+    // #then nothing is saved or uploaded, as for an isolated run without the input
+    expect(mocks.cacheSave).not.toHaveBeenCalled()
+    expect(syncMetadataToStore).not.toHaveBeenCalled()
+    expect(syncArtifactsToStore).not.toHaveBeenCalled()
+  })
 })

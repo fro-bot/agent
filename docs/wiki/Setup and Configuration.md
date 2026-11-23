@@ -1,7 +1,7 @@
 ---
 type: subsystem
-last-updated: "2026-11-15"
-updated-by: "962b70bc"
+last-updated: "2026-11-23"
+updated-by: "8ca1022d"
 sources:
   - src/harness/phases/sandbox-lifecycle.ts
   - src/services/setup/sandbox-preflight.ts
@@ -20,6 +20,10 @@ sources:
   - src/services/setup/credential-files-v2.ts
   - src/services/setup/plugin-install-v2.ts
   - src/harness/phases/v2-server.ts
+  - src/harness/phases/trace-relay-process.ts
+  - packages/runtime/src/agent/trace-relay.ts
+  - packages/runtime/src/agent/tracing-launcher.ts
+  - packages/opencode-plugin/src/tracing/exporter.ts
   - src/harness/phases/default-model.ts
   - src/harness/phases/repo-skills.ts
   - src/services/setup/repo-skills.ts
@@ -65,9 +69,10 @@ sources:
   - src/features/delegated/brokered-push-validation.ts
   - action.yaml
   - RFCs/RFC-011-Setup-Action-Environment-Bootstrap.md
+  - RFCs/RFC-007-Observability-Run-Summary.md
   - RFCs/RFC-019-S3-Storage-Backend.md
   - ARCHITECTURE.md
-summary: "Pinned V2 installation, permission gates, trusted repository skills, and optional hosted-runner isolation"
+summary: "Pinned V2 installation, credential and permission boundaries, hosted-runner isolation, and optional run tracing"
 ---
 
 # Setup and Configuration
@@ -111,11 +116,11 @@ Default versions are defined in `packages/runtime/src/shared/constants.ts` (shar
 
 `systematic-version` can be overridden per run. `opencode-version` accepts only the recorded V2 pin (unset, `latest`, or the exact pin with or without a `v`): any other value fails input parsing, so a binary of another version already on the runner is never used. Stock tool pins are updated via Renovate-managed PRs. The OpenCode default is the stock V2 pin in `opencode-v2-pin.json`: Renovate bumps its `version` and a post-upgrade task regenerates the per-asset digests. A harness release does not change the Action default.
 
-The bundled Systematic default is currently `3.33.2`. Its pin participates in the tools-cache key, so advancing it triggers a fresh plugin installation even when the OpenCode binary itself is already cached.
+The bundled Systematic pin participates in the tools-cache key, so advancing it triggers a fresh plugin installation even when the OpenCode binary itself is already cached.
 
 Bun is the package manager for this project's own workspace, not a tool the Action installs. Every workflow in this repository gets its Bun from the root `package.json` `packageManager` field through `.github/actions/setup`, which fails the job if the installed Bun differs from it.
 
-`DEFAULT_OPENCODE_VERSION` is the **stock OpenCode V2 pin** (currently `2.3.0`), read from `packages/runtime/src/shared/opencode-v2-pin.json`, which records the version and each release asset's SHA-256. Installation requires both the recorded digest and the release's `SHA256SUMS` line to match. The build checks that the version and digests survive bundling (`tsdown.config.ts`). `latest` selects this same recorded pin without an upstream lookup.
+`DEFAULT_OPENCODE_VERSION` is the **stock OpenCode V2 pin**, read from `packages/runtime/src/shared/opencode-v2-pin.json`, which records the version and each release asset's SHA-256. Installation requires both the recorded digest and the release's `SHA256SUMS` line to match. The build checks that the version and digests survive bundling (`tsdown.config.ts`). `latest` selects this same recorded pin without an upstream lookup.
 
 The Action no longer runs V1. A V1 `opencode-version` (a stock 1.x version or a `+harness.`/`-harness.` build) fails input parsing with an error that names the input and the value, and so does any V2 version other than the pin. To keep running V1, pin the Action to its last pre-cut release, `fro-bot/agent@v0.137.0`, and set `opencode-version` to the final V1 harness build `1.19.5+harness.bf7f7dfe`. A V1 run cannot see sessions created on V2, and a later V2 run keeps its own copy; nothing reconciles the two. The gateway and the workspace image are V2-only too; to roll back past the cut, redeploy the previous image pair from GHCR.
 
@@ -331,7 +336,7 @@ Independently of whether a credential is provisioned, the OpenCode child process
 
 ## Tracing a run
 
-The Action can send an OpenTelemetry trace of each run to a collector you operate. Tracing is off unless you set `trace-endpoint`. There is no default destination, and the project never receives trace data.
+The Action can send an OpenTelemetry trace of each run to a collector you operate (RFC-007). Tracing is off unless `trace-endpoint` is set. There is no default destination and no project-operated collector.
 
 ```yaml
 - uses: fro-bot/agent@<ref>
@@ -384,7 +389,7 @@ The messages of each model request include the whole history sent to the model. 
 
 ### How the credential is kept
 
-The Action starts a small relay process before the agent. The relay holds the collector URL and credential, listens on a loopback port, and forwards trace batches to that one URL. The agent's server is given only the relay's loopback address.
+The Action starts a small relay process before the agent (`src/harness/phases/trace-relay-process.ts`). The relay holds the collector URL and credential, listens on a loopback port, and forwards trace batches to that one URL. The agent's server gets the relay port and run identity through a launcher-owned setting (`packages/runtime/src/agent/tracing-launcher.ts`), not through inherited workflow configuration. If the relay disappears before spawn, the launcher falls back to a non-tracing start.
 
 - With `isolate-agent: true`, the agent cannot read the collector credential.
 - Without it, the agent runs as the same user as the Action and can read the credential and every span. The run logs a warning saying so.

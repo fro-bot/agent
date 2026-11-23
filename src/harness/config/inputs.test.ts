@@ -609,6 +609,24 @@ describe('parseActionInputs', () => {
     })
   })
 
+  describe('skip-cache', () => {
+    it.each([
+      ['', false],
+      ['false', false],
+      ['true', true],
+      [' TRUE ', true],
+    ])('parses %j as %s', (value, expected) => {
+      // #given a skip-cache value
+      mockInputs({'skip-cache': value})
+
+      // #when parsing action inputs
+      const result = parseActionInputs()
+
+      // #then it is read case-insensitively and trimmed
+      expect(result.success && result.data.skipCache).toBe(expected)
+    })
+  })
+
   describe('repo-skills', () => {
     it('defaults to false when the input is empty', () => {
       // #given no repo-skills input

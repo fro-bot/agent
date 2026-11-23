@@ -206,6 +206,26 @@ describe('runCacheRestore database repair', () => {
     expect(mocks.startActionOpenCodeV2).toHaveBeenCalledWith(expect.objectContaining({workspacePath: '/workspace'}))
   })
 
+  it.each([
+    {label: 'true', skipCache: true},
+    {label: 'false', skipCache: false},
+  ])('hands the parsed skip-cache input ($label) to the cache restore', async ({skipCache}) => {
+    // #given a bootstrap whose inputs carry skip-cache
+    mocks.restoreCache.mockResolvedValue(createCacheResult({hit: false, corrupted: false, source: null}))
+    const {runCacheRestore} = await import('./cache-restore.js')
+
+    // #when the cache-restore phase runs
+    await runCacheRestore(
+      createBootstrapPhaseResult({inputs: createActionInputs({skipCache})}),
+      createMetricsCollector(),
+      null,
+      ACTION_TRACING_OFF,
+    )
+
+    // #then the restore receives it as an explicit option
+    expect(mocks.restoreCache).toHaveBeenCalledWith(expect.objectContaining({skipCache}))
+  })
+
   it('leaves an already-clean, usable database alone and logs nothing about repair', async () => {
     // #given a cache hit whose write-ahead log was already empty (the common healthy-run
     // case), and the database itself opens and reads fine

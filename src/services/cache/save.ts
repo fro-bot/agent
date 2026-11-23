@@ -166,8 +166,9 @@ export async function findUnsafeSessionPath(
 export async function saveCache(options: SaveCacheOptions): Promise<CacheSaveResult> {
   const {components, runId, logger, storagePath, authPath, projectIdPath, cacheAdapter = defaultCacheAdapter} = options
 
-  if (process.env.SKIP_CACHE === 'true') {
-    logger.debug('Skipping cache save (SKIP_CACHE=true)')
+  // The `skip-cache` input and the `SKIP_CACHE` variable are ORed so callers who set the variable keep their behavior.
+  if (options.skipCache === true || process.env.SKIP_CACHE === 'true') {
+    logger.debug('Skipping cache save (skip-cache input or SKIP_CACHE=true)')
     return {cachePersisted: false, storePersisted: false, outcome: 'skipped-by-configuration'}
   }
 

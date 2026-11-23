@@ -143,7 +143,7 @@ vi.mock('./phases/session-prep.js', () => ({
   runSessionPrep: vi.fn(),
 }))
 
-function createBootstrap(): BootstrapPhaseResult {
+function createBootstrap(skipCache = false): BootstrapPhaseResult {
   return {
     inputs: {
       githubToken: 'github-token',
@@ -158,7 +158,7 @@ function createBootstrap(): BootstrapPhaseResult {
       timeoutMs: 1_000,
       serverBootstrapTimeoutMs: 5000,
       opencodeVersion: '1.0.0',
-      skipCache: false,
+      skipCache,
       systematicVersion: '1.0.0',
       opencodeConfig: null,
       systematicConfig: null,
@@ -237,6 +237,7 @@ async function arrange(
   options: {
     readonly executeSuccess?: boolean
     readonly executeError?: Error
+    readonly skipCache?: boolean
     readonly ledger?: OwnershipLedger
     readonly extras?: Partial<Awaited<ReturnType<typeof import('./phases/execute.js').runExecute>>>
   } = {},
@@ -254,7 +255,7 @@ async function arrange(
   const {runCleanup} = await import('./phases/cleanup.js')
   const {runReleaseV2} = await import('./phases/release-v2.js')
 
-  const bootstrap = createBootstrap()
+  const bootstrap = createBootstrap(options.skipCache)
   vi.mocked(runBootstrap).mockResolvedValue({
     ...bootstrap,
     opencodeResult: {...bootstrap.opencodeResult, version: '2.2.5'},
@@ -531,6 +532,18 @@ describe('run on an OpenCode V2 server', () => {
     const cleanupOptions = vi.mocked(runCleanup).mock.calls[0]?.[0]
     expect(cleanupOptions?.serverHandleV2).toBe(v2Handle)
     expect(cleanupOptions?.skipSessionPersistence).toBe(false)
+  })
+
+  it.each([true, false])('hands the skip-cache input (%s) to cleanup for the save', async skipCache => {
+    // #given a run whose bootstrapped inputs carry skip-cache
+    const {runCleanup} = await import('./phases/cleanup.js')
+    await arrange({skipCache})
+
+    // #when
+    await run()
+
+    // #then cleanup, which runs the save, receives it
+    expect(vi.mocked(runCleanup).mock.calls[0]?.[0]?.skipCache).toBe(skipCache)
   })
 
   it('reports an expired drain as an incomplete invocation even when the stop that followed was confirmed', async () => {

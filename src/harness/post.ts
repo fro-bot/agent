@@ -160,6 +160,8 @@ async function persistRunState(logger: Logger): Promise<void> {
   // state) as 'not-persisted' -- fail toward retrying the save, never toward skipping it,
   // since this post hook is the last chance to persist state for the run.
   const cacheSaved = parseCacheSaveStateValue(core.getState(STATE_KEYS.CACHE_SAVED))
+  // Written by the main step's bootstrap from the `skip-cache` input; the post hook reads state, not inputs.
+  const skipCache = core.getState(STATE_KEYS.SKIP_CACHE) === 'true'
   const sessionId = core.getState(STATE_KEYS.SESSION_ID) || null
   const storeConfig = reconstructStoreConfigFromState()
   // On an isolated run the log directory is sandbox-writable until the main step confirms the teardown. Only an explicit
@@ -200,7 +202,7 @@ async function persistRunState(logger: Logger): Promise<void> {
     //   doc on cache-rejected). The retry below never publishes to the object store, so
     //   repeating the save here would only re-attempt the Actions cache write, which the
     //   store already makes redundant for the database.
-    // skipped: SKIP_CACHE=true -- a deliberate no-op; retrying would just repeat it.
+    // skipped: `skip-cache` is `true` or `SKIP_CACHE=true` -- a deliberate no-op; retrying would just repeat it.
     const skipReason =
       cacheSaved === 'durable'
         ? 'cache saved by main action'
@@ -250,89 +252,95 @@ async function persistRunState(logger: Logger): Promise<void> {
     )
   } else {
     const runId = String(getGitHubRunId())
-    try {
-      // No shutdown()/quiescence wait happens here, unlike cleanup.ts. There is no
-      // OpenCodeServerHandle in this process at all -- runPost is the Action's separate
-      // `post:` step, invoked by the runner as a fresh process well after the main step
-      // (and everything it spawned, including the OpenCode child cleanup.ts shut down)
-      // has already exited.
-      //
-      // This branch only ever runs for `not-persisted`: nothing durable happened yet
-      // (checkpoint declined for a reason unrelated to persistence safety, no cacheable
-      // content existed, or a cache write was rejected/errored with no store persistence),
-      // or the state was absent/garbled. It deliberately does NOT run for
-      // `declined-for-safety` (see the branch above) -- that decline is not a "nothing
-      // happened yet" gap this retry can safely close. A process boundary proves there is
-      // no live writer *in this run's own process tree*, which is enough to justify
-      // retrying an ordinary not-persisted save. It proves nothing about a failed lease
-      // renewal (another Action run entirely -- e.g. a retried run --
-      // may hold the lock and be writing the same object-store prefix right now, regardless
-      // of which process this one is) or about unconfirmed quiescence (a runner does not
-      // guarantee orphaned children are reaped between steps, so "the OpenCode child must be
-      // gone by now" is an assumption, not a guarantee, in exactly the case that produced
-      // that decline). That is why those two reasons, plus unresolved ownership, get their
-      // own state value that skips this branch entirely rather than relying on this retry's
-      // reasoning to cover them too.
-      const components = buildCacheKeyComponents()
-      // GITHUB_WORKSPACE is a runner-level environment variable set for the whole job,
-      // not something that requires STATE handoff from the main step — it is available
-      // here exactly the way getOpenCodeStoragePath/getOpenCodeAuthPath already are.
-      // Deriving it the same way cleanup.ts does (cleanup.ts:179) keeps the two save call
-      // sites symmetric: a save that only lands here still archives .git/opencode.
-      const projectIdPath = path.join(getGitHubWorkspace(), '.git', 'opencode')
-      const cacheSaveOptions = {
-        components,
-        runId: getGitHubRunId(),
-        logger,
-        storagePath: getOpenCodeStoragePath(),
-        authPath: getOpenCodeAuthPath(),
-        projectIdPath,
-        ...(storeConfig == null ? {} : {storeConfig}),
-        // The main step releases the coordination lease before this step runs (and a run that never held
-        // one has none), so this retry holds no lease. The object store keeps ONE shared session object per
-        // repo, written with an unconditional upload, so publishing from here could roll back a newer
-        // session a successor run already published. Only the Actions cache is retried.
-        objectStorePublish: 'withhold',
-      } as const
+    // Only the session save is gated on `skip-cache`; the metadata and log recovery below still run, because a main step
+    // that died after arming this hook (before cleanup) leaves them as the only record of the run.
+    if (skipCache) {
+      logger.info('Skipping post-action session save: skip-cache was set', {cacheSaved})
+    } else {
+      try {
+        // No shutdown()/quiescence wait happens here, unlike cleanup.ts. There is no
+        // OpenCodeServerHandle in this process at all -- runPost is the Action's separate
+        // `post:` step, invoked by the runner as a fresh process well after the main step
+        // (and everything it spawned, including the OpenCode child cleanup.ts shut down)
+        // has already exited.
+        //
+        // This branch only ever runs for `not-persisted`: nothing durable happened yet
+        // (checkpoint declined for a reason unrelated to persistence safety, no cacheable
+        // content existed, or a cache write was rejected/errored with no store persistence),
+        // or the state was absent/garbled. It deliberately does NOT run for
+        // `declined-for-safety` (see the branch above) -- that decline is not a "nothing
+        // happened yet" gap this retry can safely close. A process boundary proves there is
+        // no live writer *in this run's own process tree*, which is enough to justify
+        // retrying an ordinary not-persisted save. It proves nothing about a failed lease
+        // renewal (another Action run entirely -- e.g. a retried run --
+        // may hold the lock and be writing the same object-store prefix right now, regardless
+        // of which process this one is) or about unconfirmed quiescence (a runner does not
+        // guarantee orphaned children are reaped between steps, so "the OpenCode child must be
+        // gone by now" is an assumption, not a guarantee, in exactly the case that produced
+        // that decline). That is why those two reasons, plus unresolved ownership, get their
+        // own state value that skips this branch entirely rather than relying on this retry's
+        // reasoning to cover them too.
+        const components = buildCacheKeyComponents()
+        // GITHUB_WORKSPACE is a runner-level environment variable set for the whole job,
+        // not something that requires STATE handoff from the main step — it is available
+        // here exactly the way getOpenCodeStoragePath/getOpenCodeAuthPath already are.
+        // Deriving it the same way cleanup.ts does (cleanup.ts:179) keeps the two save call
+        // sites symmetric: a save that only lands here still archives .git/opencode.
+        const projectIdPath = path.join(getGitHubWorkspace(), '.git', 'opencode')
+        const cacheSaveOptions = {
+          components,
+          runId: getGitHubRunId(),
+          logger,
+          storagePath: getOpenCodeStoragePath(),
+          authPath: getOpenCodeAuthPath(),
+          projectIdPath,
+          ...(storeConfig == null ? {} : {storeConfig}),
+          // The main step releases the coordination lease before this step runs (and a run that never held
+          // one has none), so this retry holds no lease. The object store keeps ONE shared session object per
+          // repo, written with an unconditional upload, so publishing from here could roll back a newer
+          // session a successor run already published. Only the Actions cache is retried.
+          objectStorePublish: 'withhold',
+        } as const
 
-      // Said before the save, so it is on record even when the cache write throws.
-      const storePublishWithheld = storeConfig?.enabled === true
-      if (storePublishWithheld) {
-        logger.info(
-          'Post-action withheld the object-store session publish: the main step has released the coordination lease, so only the Actions cache is retried',
+        // Said before the save, so it is on record even when the cache write throws.
+        const storePublishWithheld = storeConfig?.enabled === true
+        if (storePublishWithheld) {
+          logger.info(
+            'Post-action withheld the object-store session publish: the main step has released the coordination lease, so only the Actions cache is retried',
+          )
+        }
+
+        const saveResult = await saveCache(cacheSaveOptions)
+
+        // The post hook cannot set `cache-save-result`: GitHub Actions `runs.post:` steps run
+        // after every other step in the job, so no downstream step could ever read it even if
+        // the write succeeded. The job summary is the only surface available here.
+        await writeCacheSaveResultSummary(
+          saveResult,
+          'post-retry',
+          logger,
+          undefined,
+          storePublishWithheld ? 'lease-released' : undefined,
         )
-      }
 
-      const saveResult = await saveCache(cacheSaveOptions)
-
-      // The post hook cannot set `cache-save-result`: GitHub Actions `runs.post:` steps run
-      // after every other step in the job, so no downstream step could ever read it even if
-      // the write succeeded. The job summary is the only surface available here.
-      await writeCacheSaveResultSummary(
-        saveResult,
-        'post-retry',
-        logger,
-        undefined,
-        storePublishWithheld ? 'lease-released' : undefined,
-      )
-
-      // "No cache content to save" is reserved for skipped-empty. Every other outcome gets
-      // its own line naming it, so a checkpoint decline is distinguishable from a
-      // rejected/errored cache write.
-      if (saveResult.cachePersisted === true) {
-        logger.info('Post-action cache saved', {sessionId})
-      } else if (saveResult.outcome === 'skipped-empty') {
-        logger.info('Post-action: no cache content to save', {sessionId})
-      } else {
-        logger.info(`Post-action cache save did not persist (${saveResult.outcome})`, {
-          sessionId,
-          storePersisted: saveResult.storePersisted,
+        // "No cache content to save" is reserved for skipped-empty. Every other outcome gets
+        // its own line naming it, so a checkpoint decline is distinguishable from a
+        // rejected/errored cache write.
+        if (saveResult.cachePersisted === true) {
+          logger.info('Post-action cache saved', {sessionId})
+        } else if (saveResult.outcome === 'skipped-empty') {
+          logger.info('Post-action: no cache content to save', {sessionId})
+        } else {
+          logger.info(`Post-action cache save did not persist (${saveResult.outcome})`, {
+            sessionId,
+            storePersisted: saveResult.storePersisted,
+          })
+        }
+      } catch (error) {
+        logger.warning('Post-action cache save failed (non-fatal)', {
+          error: toErrorMessage(error),
         })
       }
-    } catch (error) {
-      logger.warning('Post-action cache save failed (non-fatal)', {
-        error: toErrorMessage(error),
-      })
     }
 
     if (storeConfig?.enabled === true) {

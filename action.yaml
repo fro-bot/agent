@@ -92,7 +92,7 @@ inputs:
     description: Systematic plugin version to register with OpenCode. Defaults to version pinned in source code if not set.
     required: false
   skip-cache:
-    description: Skip session cache restore (default false)
+    description: Skip session cache restore and save (default false)
     required: false
     default: 'false'
   repo-skills:
@@ -133,9 +133,7 @@ inputs:
       results and model output of the run, so send them only to a collector you control. The URL must be `https`, or `http`
       to a loopback IP address such as `127.0.0.1` for a collector on the runner that needs no credential. A URL with a
       username, password or fragment, port 0, or any other fault turns tracing off with one warning; it never fails the
-      run. This release accepts the input and starts the relay, but the pinned plugin does not send traces yet. No traces
-      are sent until a later release of this Action that includes a plugin with tracing. Do not configure a production
-      credential for it yet.
+      run.
     required: false
     default: ''
   trace-headers:
@@ -218,8 +216,9 @@ outputs:
     description: >-
       Session persistence outcome for this run: durable (the Actions cache write
       persisted), store-only (the object store persisted the state but the Actions
-      cache write did not), skipped (SKIP_CACHE was set), declined-for-safety (the
-      save was deliberately refused because persistence safety could not be
+      cache write did not), skipped (`skip-cache` is `true`, or the legacy `SKIP_CACHE=true` environment
+      variable is set; a main-step safety decline still reports declined-for-safety),
+      declined-for-safety (the save was deliberately refused because persistence safety could not be
       confirmed -- a live writer may still exist; this run will not retry it), or
       not-persisted (nothing durable happened -- a rejected write, a declined
       checkpoint, or no cacheable content found; the job summary names which --
