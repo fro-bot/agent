@@ -33,7 +33,7 @@ import {JsonTraceSerializer} from '@opentelemetry/otlp-transformer'
 import {resourceFromAttributes} from '@opentelemetry/resources'
 import {AlwaysOnSampler, BasicTracerProvider} from '@opentelemetry/sdk-trace-base'
 
-import {CONTENT_ATTRIBUTE_NAMES, MARKER} from './scrub.js'
+import {CONTENT_ATTRIBUTE_NAMES, MARKER, validSpanLinks} from './scrub.js'
 
 /**
  * The request header that carries the plugin's running totals to the Action's relay, in Action mode only.
@@ -419,6 +419,7 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
             spanId: span.parentSpanId,
             traceFlags: TraceFlags.SAMPLED,
           })
+    const links = validSpanLinks(span.links)
     nextTraceId = span.traceId
     nextSpanId = span.spanId
     ended = undefined
@@ -428,12 +429,12 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
         kind: span.kind === 'client' ? SpanKind.CLIENT : SpanKind.INTERNAL,
         startTime: hrTime(span.startMs),
         attributes: {...span.attributes} as Record<string, string | number | boolean | string[]>,
-        ...(span.links === undefined
+        // Re-checked here: an id the SDK cannot use would otherwise be dropped without a trace.
+        ...(links.length === 0
           ? {}
           : {
-              links: span.links.map(link => ({
+              links: links.map(link => ({
                 context: {traceId: link.traceId, spanId: link.spanId, traceFlags: TraceFlags.SAMPLED},
-                attributes: {...link.attributes},
               })),
             }),
       },

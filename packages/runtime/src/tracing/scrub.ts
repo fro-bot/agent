@@ -1171,12 +1171,23 @@ const isContentAttribute = (value: unknown): value is ContentAttribute =>
 export type PlainAttributeValue = string | number | boolean | readonly string[]
 export type PendingAttributeValue = PlainAttributeValue | ContentAttribute
 
-/** A link from a span to another span, in this trace or another. The ids are hex, as the producer chose them. */
+/**
+ * A link from a span to another span, in this trace or another. Ids only: a link carries no text, so nothing in it needs
+ * scrubbing and nothing a caller supplies can reach the wire through it.
+ */
 export interface SpanLink {
+  /** 32 lowercase hex characters, not all zero. */
   readonly traceId: string
+  /** 16 lowercase hex characters, not all zero. */
   readonly spanId: string
-  /** Text attributes of the link. Scrubbed like an event's. */
-  readonly attributes: Readonly<Record<string, string>>
+}
+
+const TRACE_ID = /^(?!0{32}$)[0-9a-f]{32}$/
+const SPAN_ID = /^(?!0{16}$)[0-9a-f]{16}$/
+
+/** The links whose ids are well formed, in order. An invalid link is dropped; the span that held it is not. */
+export function validSpanLinks(links: readonly SpanLink[] | undefined): readonly SpanLink[] {
+  return (links ?? []).filter(link => TRACE_ID.test(link.traceId) && SPAN_ID.test(link.spanId))
 }
 
 export interface PendingSpan {
@@ -1222,7 +1233,7 @@ export interface ScrubbedSpan {
     readonly timeMs: number
     readonly attributes: Readonly<Record<string, string>>
   }[]
-  /** Present only when the span had links. */
+  /** Present only when the span had a valid link. */
   readonly links?: readonly SpanLink[]
 }
 
@@ -1494,16 +1505,9 @@ export function scrubSpan(
     ),
   }))
 
-  const links = span.links?.map(link => ({
-    traceId: link.traceId,
-    spanId: link.spanId,
-    attributes: Object.fromEntries(
-      Object.entries(link.attributes).map(([key, text]) => [
-        key,
-        scrubPlain(text, `link.${key}`, scrubber, limits, tally),
-      ]),
-    ),
-  }))
+  const links = validSpanLinks(span.links).map(link => ({traceId: link.traceId, spanId: link.spanId}))
+  // A fixed marker: it names no id and no value.
+  if (links.length < (span.links?.length ?? 0)) tally.omitted.push('links:invalid-id')
 
   if (tally.redactions > 0) attributes[MARKER.redactions] = tally.redactions
   if (tally.truncated.length > 0) attributes[MARKER.truncated] = tally.truncated
@@ -1522,6 +1526,6 @@ export function scrubSpan(
     attributes,
     status: statusMessage === undefined ? {code: span.status.code} : {code: span.status.code, message: statusMessage},
     events,
-    ...(links === undefined ? {} : {links}),
+    ...(links.length === 0 ? {} : {links}),
   }
 }

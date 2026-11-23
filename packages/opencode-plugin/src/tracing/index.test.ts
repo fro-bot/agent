@@ -175,6 +175,22 @@ describe('startTracing', () => {
     expect(request?.text).not.toContain('fro_bot.repository')
     expect(request?.text).not.toContain('sk-never-exported')
     expect(lines).toEqual(['tracing stopped, exported 2 spans, dropped 0'])
+
+    // #and the sender is named as the plugin, on the resource and on the instrumentation scope
+    const exported = (
+      request?.body as {
+        resourceSpans: {
+          resource: {attributes: {key: string; value: {stringValue?: string}}[]}
+          scopeSpans: {scope: {name: string}}[]
+        }[]
+      }
+    ).resourceSpans
+    expect(exported.map(resource => resource.resource.attributes)).toEqual([
+      [{key: 'service.name', value: {stringValue: 'fro-bot-opencode-plugin'}}],
+    ])
+    expect(exported.flatMap(resource => resource.scopeSpans.map(scope => scope.scope.name))).toEqual([
+      'fro-bot-opencode-plugin',
+    ])
   })
 
   it('says how many values the safety net withheld, as a number, and exports none of them', async () => {

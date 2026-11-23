@@ -51,7 +51,7 @@ interface Decoded {
   readonly attributes: {key: string; value: Record<string, unknown>}[]
   readonly status?: {code?: number; message?: string}
   readonly events?: {name: string; timeUnixNano: string; attributes?: {key: string; value: unknown}[]}[]
-  readonly links?: {traceId: string; spanId: string; attributes?: {key: string; value: Record<string, unknown>}[]}[]
+  readonly links?: Record<string, unknown>[]
 }
 
 /** Every span in a decoded OTLP JSON request. */
@@ -128,27 +128,27 @@ describe('what the exporter sends', () => {
     expect(request?.contentType).toBe('application/json')
   })
 
-  it('serializes a span’s links with hex trace and span ids, and its attributes', async () => {
-    // #given a span that links to a span in another trace
+  it('serializes a span’s links as hex trace and span ids and nothing else, and drops a malformed link', async () => {
+    // #given a span that links to a span in another trace, beside a malformed link, and a span with no links
     const target = await sink()
     const exporter = exporterFor({url: target.url})
-    const linked = {traceId: hex(0xdef, 32), spanId: hex(0x42, 16), attributes: {'fro_bot.link.kind': 'run'}}
-    exporter.export(span({links: [linked]}))
+    const linked = {traceId: hex(0xdef, 32), spanId: hex(0x42, 16)}
+    const malformed = {traceId: 'not-hex', spanId: hex(0x43, 16)}
+    exporter.export(span({links: [malformed, linked]}))
     exporter.export(span())
 
     // #when it is received
     await exporter.close(3_000)
 
-    // #then the link carries the ids as lowercase hex, the way OTLP JSON writes them, and its attribute
+    // #then both spans exported; the one link is the ids as lowercase hex, the way OTLP JSON writes them, with no attributes
     const [request] = target.accepted()
     const [withLink, without] = spansOf(request as SinkRequest)
     expect(withLink?.links).toHaveLength(1)
     const [link] = withLink?.links ?? []
-    expect(link?.traceId).toBe(hex(0xdef, 32))
-    expect(link?.spanId).toBe(hex(0x42, 16))
-    expect(link?.traceId).toMatch(/^[0-9a-f]{32}$/)
-    expect(link?.spanId).toMatch(/^[0-9a-f]{16}$/)
-    expect(link?.attributes).toEqual([{key: 'fro_bot.link.kind', value: {stringValue: 'run'}}])
+    expect(link).toMatchObject({traceId: hex(0xdef, 32), spanId: hex(0x42, 16), attributes: []})
+    expect(String(link?.traceId)).toMatch(/^[0-9a-f]{32}$/)
+    expect(String(link?.spanId)).toMatch(/^[0-9a-f]{16}$/)
+    expect((request as SinkRequest).text).not.toContain('not-hex')
     // #and a span without links carries none
     expect(without?.links ?? []).toEqual([])
   })

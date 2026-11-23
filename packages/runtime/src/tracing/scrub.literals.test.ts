@@ -130,18 +130,48 @@ describe('literals added after creation', () => {
 })
 
 describe('span links', () => {
-  it('keeps a link’s ids as given and scrubs its attributes', () => {
-    // #given a span with a link whose attribute carries a late-registered secret
+  it('keeps a link as its two ids and nothing else, so no text can ride on it', () => {
+    // #given a span with a link, and a caller that tries to hang text (a registered secret) on it anyway
     const scrubber = createScrubber()
     scrubber.addLiterals?.([LATE])
-    const link = {traceId: 'c'.repeat(32), spanId: 'd'.repeat(16), attributes: {'fro_bot.link.note': `to ${LATE}`}}
+    const link = {traceId: 'c'.repeat(32), spanId: 'd'.repeat(16)}
+    const forged = {...link, attributes: {[LATE]: LATE}} as typeof link
 
     // #when it is scrubbed
-    const exported = scrubSpan(pending({links: [link]}), scrubber)
+    const exported = scrubSpan(pending({links: [forged]}), scrubber)
 
-    // #then the ids are untouched and the attribute is redacted
-    expect(exported.links).toEqual([{...link, attributes: {'fro_bot.link.note': `to ${REDACTION}`}}])
-    expect(exported.attributes[MARKER.redactions]).toBe(1)
+    // #then only the ids survive: no attributes, and the secret is nowhere in the span
+    expect(exported.links).toEqual([link])
+    expect(JSON.stringify(exported)).not.toContain(LATE)
+    expect(MARKER.omitted in exported.attributes).toBe(false)
+  })
+
+  it.each([
+    ['a short trace id', {traceId: 'c'.repeat(31), spanId: 'd'.repeat(16)}],
+    ['a long span id', {traceId: 'c'.repeat(32), spanId: 'd'.repeat(17)}],
+    ['an all-zero trace id', {traceId: '0'.repeat(32), spanId: 'd'.repeat(16)}],
+    ['an all-zero span id', {traceId: 'c'.repeat(32), spanId: '0'.repeat(16)}],
+    ['uppercase hex', {traceId: 'C'.repeat(32), spanId: 'd'.repeat(16)}],
+    ['non-hex text', {traceId: 'c'.repeat(32), spanId: 'not-a-span-id!!!!'}],
+  ])('drops a link with %s and keeps the span, marked with a fixed reason', (_label, bad) => {
+    // #given a span with one good link and one bad one
+    const good = {traceId: 'e'.repeat(32), spanId: 'f'.repeat(16)}
+
+    // #when it is scrubbed
+    const exported = scrubSpan(pending({links: [bad, good]}), createScrubber())
+
+    // #then the span and the good link remain, the bad id appears nowhere, and the marker names no id
+    expect(exported.name).toBe('phase')
+    expect(exported.links).toEqual([good])
+    expect(exported.attributes[MARKER.omitted]).toEqual(['links:invalid-id'])
+  })
+
+  it('omits the links key when every link is invalid', () => {
+    // #given / #when
+    const exported = scrubSpan(pending({links: [{traceId: '0'.repeat(32), spanId: '0'.repeat(16)}]}), createScrubber())
+
+    // #then
+    expect('links' in exported).toBe(false)
   })
 
   it('adds no links key to a span that had none', () => {
