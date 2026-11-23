@@ -1,8 +1,10 @@
 import type {CredentialDisposition, ResponseDelivery, ResponseFilePathCandidates} from '@fro-bot/runtime'
 import type {EnsureOpenCodeResult} from '../../features/agent/types.js'
 import type {SandboxToolPaths} from '../../services/setup/sandbox-preflight.js'
+import type {LifecycleSpan} from '../../shared/lifecycle-tracer.js'
 import type {Logger} from '../../shared/logger.js'
-import type {ActionInputs} from '../../shared/types.js'
+import type {SecretRegistry} from '../../shared/secret-registry.js'
+import type {ActionInputs, TracingInputs} from '../../shared/types.js'
 import * as crypto from 'node:crypto'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
@@ -67,10 +69,26 @@ export interface BootstrapPhaseResult {
   readonly sandbox?: SandboxLifecycle | null
 }
 
-export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPhaseResult | null> {
+/** What the run hands bootstrap beyond its logger. Every field is optional: a caller with none gets the plain behaviour. */
+export interface BootstrapOptions {
+  /** The run's secret registry: every input mask goes through it. */
+  readonly registry?: SecretRegistry
+  /** The trace inputs `run` already read, masked and removed from the environment. Absent: bootstrap reads them. */
+  readonly tracing?: TracingInputs
+  /** The bootstrap span: the installs are its children. */
+  readonly traceSpan?: LifecycleSpan
+}
+
+export async function runBootstrap(
+  bootstrapLogger: Logger,
+  bootstrapOptions: BootstrapOptions = {},
+): Promise<BootstrapPhaseResult | null> {
   // The isolated agent's `PATH` is built from this, read before setup's `core.addPath` prepends the OpenCode directory.
   const runnerPath = process.env.PATH
-  const inputsResult = parseActionInputs()
+  const inputsResult = parseActionInputs({
+    ...(bootstrapOptions.registry === undefined ? {} : {registry: bootstrapOptions.registry}),
+    ...(bootstrapOptions.tracing === undefined ? {} : {tracing: bootstrapOptions.tracing}),
+  })
 
   if (!inputsResult.success) {
     core.setFailed(`Invalid inputs: ${inputsResult.error.message}`)
@@ -148,7 +166,10 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
       systematicConfig: inputs.systematicConfig,
       credential,
     },
-    createRuntimeSetupAdapter({recordGhConfigDir: recordRunGhConfigDir}),
+    createRuntimeSetupAdapter({
+      recordGhConfigDir: recordRunGhConfigDir,
+      ...(bootstrapOptions.traceSpan === undefined ? {} : {traceSpan: bootstrapOptions.traceSpan}),
+    }),
   )
 
   logger.info('OpenCode ready', {version: opencodeResult.version})

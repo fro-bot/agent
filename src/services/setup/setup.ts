@@ -6,6 +6,7 @@ import {getOctokit} from '@actions/github'
 import {FRO_BOT_PLUGIN_VERSION} from '@fro-bot/runtime'
 import {getRunnerOS} from '../../shared/env.js'
 import {toErrorMessage} from '../../shared/errors.js'
+import {NOOP_SPAN, withSpan, type LifecycleSpan} from '../../shared/lifecycle-tracer.js'
 import {createLogger} from '../../shared/logger.js'
 import {createExecAdapter, createToolCacheAdapter} from './adapters.js'
 import {parseAuthJsonInput} from './auth-json.js'
@@ -38,6 +39,8 @@ export interface RunSetupOptions {
    * the post hook a path to remove.
    */
   readonly recordGhConfigDir?: (dir: string | null) => void
+  /** The bootstrap span: the tools cache, the OpenCode install and the plugin install each get a child of it. */
+  readonly traceSpan?: LifecycleSpan
 }
 
 export async function runSetup(
@@ -49,6 +52,7 @@ export async function runSetup(
   const logger = createLogger({component: 'setup'})
   const toolCache = createToolCacheAdapter()
   const execAdapter = createExecAdapter()
+  const traceSpan = options.traceSpan ?? NOOP_SPAN
 
   try {
     logger.info('Starting setup', {version: inputs.opencodeVersion})
@@ -103,23 +107,32 @@ export async function runSetup(
     const runnerOS = getRunnerOS()
     const frobotPluginKey = {frobotPluginVersion: FRO_BOT_PLUGIN_VERSION}
 
-    const toolsCacheResult = await restoreToolsCache({
-      logger,
-      os: runnerOS,
-      opencodeVersion: version,
-      opencodeDigestId: v2Policy.cacheId,
-      systematicVersion,
-      ...frobotPluginKey,
-      toolCachePath,
-      opencodeCachePath,
-    })
+    const toolsCacheResult = await withSpan(
+      traceSpan.startChild('tools cache restore'),
+      async () =>
+        restoreToolsCache({
+          logger,
+          os: runnerOS,
+          opencodeVersion: version,
+          opencodeDigestId: v2Policy.cacheId,
+          systematicVersion,
+          ...frobotPluginKey,
+          toolCachePath,
+          opencodeCachePath,
+        }),
+      restored => ({outcome: 'succeeded', reason: restored.hit ? 'hit' : 'miss'}),
+    )
 
     const toolsCacheStatus: 'hit' | 'miss' = toolsCacheResult.hit ? 'hit' : 'miss'
 
     // Never short-circuits on a tools-cache hit: installOpenCode looks up the digest-bound identity itself.
     let opencodeResult: OpenCodeInstallResult
     try {
-      opencodeResult = await installOpenCode(version, logger, toolCache, execAdapter)
+      opencodeResult = await withSpan(
+        traceSpan.startChild('install opencode'),
+        async () => installOpenCode(version, logger, toolCache, execAdapter),
+        installed => ({outcome: 'succeeded', reason: installed.cached ? 'cached' : 'installed'}),
+      )
     } catch (error) {
       core.setFailed(`Failed to install OpenCode: ${toErrorMessage(error)}`)
       return null
@@ -154,14 +167,21 @@ export async function runSetup(
     let installedNow = false
     if (await arePluginsCachedV2(cacheHome, v2Specs)) {
       logger.info('OpenCode V2 plugins already in the cache', {specs: v2Specs})
+      traceSpan.startChild('install plugins').end({outcome: 'succeeded', reason: 'cached'})
     } else {
-      const installed = await installPluginsV2({
-        logger,
-        execAdapter,
-        opencodeBinaryPath: opencodeBinaryPath(opencodeResult.path),
-        specs: v2Specs,
-        cacheHome,
-      })
+      const installed = await withSpan(
+        traceSpan.startChild('install plugins'),
+        async () =>
+          installPluginsV2({
+            logger,
+            execAdapter,
+            opencodeBinaryPath: opencodeBinaryPath(opencodeResult.path),
+            specs: v2Specs,
+            cacheHome,
+          }),
+        result =>
+          result.success ? {outcome: 'succeeded', reason: 'installed'} : {outcome: 'failed', reason: 'install-failed'},
+      )
       if (!installed.success) {
         core.setFailed(`OpenCode plugin install failed: ${installed.error.message}`)
         return null
@@ -169,16 +189,18 @@ export async function runSetup(
       installedNow = true
     }
     if (installedNow || toolsCacheResult.hit === false) {
-      await saveToolsCache({
-        logger,
-        os: runnerOS,
-        opencodeVersion: version,
-        opencodeDigestId: v2Policy.cacheId,
-        systematicVersion,
-        ...frobotPluginKey,
-        toolCachePath,
-        opencodeCachePath,
-      })
+      await withSpan(traceSpan.startChild('tools cache save'), async () =>
+        saveToolsCache({
+          logger,
+          os: runnerOS,
+          opencodeVersion: version,
+          opencodeDigestId: v2Policy.cacheId,
+          systematicVersion,
+          ...frobotPluginKey,
+          toolCachePath,
+          opencodeCachePath,
+        }),
+      )
     }
 
     core.setOutput('opencode-path', opencodeResult.path)
