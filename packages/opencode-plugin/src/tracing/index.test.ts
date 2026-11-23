@@ -1,8 +1,8 @@
 import type {OnSettings} from './index.js'
 import type {ObserverHost} from './record-observations.js'
 
+import {scrubSafeSessionId} from '@fro-bot/runtime/tracing/session-id'
 import {afterEach, describe, expect, it, vi} from 'vitest'
-
 import {startOtlpSink, type OtlpSink} from '../integration.fixture.js'
 import {createScrubber} from './content.js'
 import {CLEANUP_BOUND_MS, DRAIN_BOUND_MS, startTracing} from './index.js'
@@ -263,27 +263,42 @@ describe('startTracing', () => {
     const attribute = (span: WireSpan, key: string): string | undefined =>
       span.attributes?.find(entry => entry.key === key)?.value.stringValue
 
-    async function exportTurn(settings: OnSettings): Promise<WireSpan[]> {
+    interface Exported {
+      readonly spans: WireSpan[]
+      /** Every request body the sink accepted, as sent. */
+      readonly text: string
+    }
+
+    async function exportTurn(
+      settings: OnSettings,
+      scrubber: ReturnType<typeof createScrubber> | undefined = undefined,
+    ): Promise<Exported> {
       const target = await sink()
       const fake = fakeObserverHost()
       const handle = await startTracing(
         fake.host,
         {...settings, endpoint: target.url},
-        {
-          env: {},
-          log: () => {},
-        },
+        {env: {}, log: () => {}, ...(scrubber === undefined ? {} : {scrubber})},
       )
       textTurn(fake)
       await new Promise(resolve => setTimeout(resolve, 50))
       await handle.stop()
       fake.end()
-      return target.accepted().flatMap(request => wireSpans(request.body))
+      return {
+        spans: target.accepted().flatMap(request => wireSpans(request.body)),
+        text: target
+          .accepted()
+          .map(request => request.text)
+          .join('\n'),
+      }
     }
+
+    const launched = (sessionId: string): OnSettings =>
+      ({...ACTION('http://unused'), rootSpan: ROOT_SPAN, sessionId}) as OnSettings
 
     it('puts the launcher’s session id, the invocation id and a link to the run root on the exported turn', async () => {
       // #given an Action launcher carrying all three fields
-      const spans = await exportTurn({
+      const {spans} = await exportTurn({
         ...ACTION('http://unused'),
         rootSpan: ROOT_SPAN,
         sessionId: SESSION_ID,
@@ -302,7 +317,7 @@ describe('startTracing', () => {
 
     it('exports exactly what it did before when the launcher has none of them', async () => {
       // #given today's Action launcher
-      const spans = await exportTurn(ACTION('http://unused'))
+      const {spans} = await exportTurn(ACTION('http://unused'))
 
       // #then the Langfuse session is the OpenCode session, and no span has a link or an invocation id
       expect(spans.length).toBeGreaterThan(1)
@@ -314,11 +329,61 @@ describe('startTracing', () => {
     })
 
     it('keeps the OpenCode session in a local session', async () => {
-      const spans = await exportTurn(LOCAL('http://unused'))
+      const {spans} = await exportTurn(LOCAL('http://unused'))
+
+      // #then spans arrived (an empty export would pass the loop below), and none has a link
+      expect(spans.length).toBeGreaterThan(1)
       for (const span of spans) {
         expect(attribute(span, 'langfuse.session.id')).toBe(SES)
         expect(span.links ?? []).toEqual([])
       }
+    })
+
+    it('exports two conversations whose ids would redact alike as two sessions, when the ids come from the helper', async () => {
+      // #given two logical keys in a repository the scrubber reads as a name and value, each passed through the shared helper
+      const helperScrubber = createScrubber()
+      const first = scrubSafeSessionId('acme/password-manager:issue-42', helperScrubber)
+      const second = scrubSafeSessionId('acme/password-manager:issue-43', helperScrubber)
+      expect(first).toBeDefined()
+      expect(second).toBeDefined()
+
+      // #when each conversation's turn is exported
+      const one = await exportTurn(launched(first ?? ''))
+      const two = await exportTurn(launched(second ?? ''))
+
+      // #then the sessions are the two distinct ids, exactly as given, and no redaction marker stands in for either
+      expect(one.spans.length).toBeGreaterThan(1)
+      expect(two.spans.length).toBeGreaterThan(1)
+      expect(new Set(one.spans.map(span => attribute(span, 'langfuse.session.id')))).toEqual(new Set([first]))
+      expect(new Set(two.spans.map(span => attribute(span, 'langfuse.session.id')))).toEqual(new Set([second]))
+      expect(first).not.toBe(second)
+      expect(one.text).not.toContain('REDACTED')
+      expect(two.text).not.toContain('REDACTED')
+    })
+
+    it('exports the OpenCode root session, never `[REDACTED]`, for a session id that scrubbing would change', async () => {
+      // #given a launcher that carries the raw id, not the helper's
+      const {spans, text} = await exportTurn(launched('acme/password-manager:issue-42'))
+
+      // #then every span falls back to the OpenCode root session
+      expect(spans.length).toBeGreaterThan(1)
+      for (const span of spans) expect(attribute(span, 'langfuse.session.id')).toBe(SES)
+      expect(text).not.toContain('REDACTED')
+    })
+
+    it('exports the OpenCode root session when a literal added after the run started matches the session id', async () => {
+      // #given a scrubber that learns the id as a secret once the run has begun
+      const scrubber = createScrubber()
+      scrubber.addLiterals?.([SESSION_ID])
+
+      // #when the turn is exported
+      const {spans, text} = await exportTurn(launched(SESSION_ID), scrubber)
+
+      // #then the session is the OpenCode root, and the id itself is nowhere in the payload
+      expect(spans.length).toBeGreaterThan(1)
+      for (const span of spans) expect(attribute(span, 'langfuse.session.id')).toBe(SES)
+      expect(text).not.toContain(SESSION_ID)
+      expect(text).not.toContain('REDACTED')
     })
   })
 

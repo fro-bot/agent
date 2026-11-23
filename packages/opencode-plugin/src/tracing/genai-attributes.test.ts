@@ -677,6 +677,46 @@ describe('the run link', () => {
     }
   })
 
+  it('falls back to the OpenCode root session, never a redacted value, when scrubbing would change the session id', () => {
+    // #given a session id the scrubber reads as a name and value (`password…:`), as the Action could compute for such a repository
+    const raw = 'acme/password-manager:issue-42'
+    expect(scrubber.scrub(raw)).not.toMatchObject({text: raw})
+
+    // #when every kind of span is exported with it
+    for (const record of [chat(), tool(), invoke(), invoke({role: 'child'})]) {
+      const span = toExportSpan(record, {identity: IDENTITY, sessionId: raw}, scrubber)
+
+      // #then the Langfuse session is the OpenCode root, and no `[REDACTED]` stands in for the id
+      expect(span.attributes['langfuse.session.id']).toBe('ses_root')
+      expect(String(span.attributes['langfuse.session.id'])).not.toContain('[REDACTED]')
+    }
+  })
+
+  it('falls back when a literal added after the span was recorded matches the session id', () => {
+    // #given a scrubber that did not know the id when it was built, and a record made before it learns it
+    const late = createScrubber()
+    const record = chat()
+    expect(toExportSpan(record, LINKED, late).attributes['langfuse.session.id']).toBe(SESSION_ID)
+
+    // #when a literal matching it arrives
+    late.addLiterals?.([SESSION_ID])
+
+    // #then the same record exports under the root session, not a redacted id, and the other attributes still scrub
+    const span = toExportSpan(record, LINKED, late)
+    expect(span.attributes['langfuse.session.id']).toBe('ses_root')
+    expect(span.attributes['session.id']).toBe('ses_child')
+  })
+
+  it('exports a session id the scrubber leaves alone verbatim, hashed ids included', () => {
+    // #given an id in the helper's hashed form
+    const hashed = 'sha256:0123456789abcdef0123456789abcdef'
+
+    // #then it is exported as given
+    expect(
+      toExportSpan(chat(), {identity: IDENTITY, sessionId: hashed}, scrubber).attributes['langfuse.session.id'],
+    ).toBe(hashed)
+  })
+
   it('scrubs the session id and the invocation id like every other string attribute', () => {
     // #given ids carrying a secret shape
     const secret = ['ghp_', 'aB3dE5fG7hJ9kL1mN3pQ5rS7tU9vW1xY3zA5'].join('')

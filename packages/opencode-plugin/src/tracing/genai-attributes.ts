@@ -299,12 +299,21 @@ export function toPendingSpan(record: SpanRecord, options: AttributeOptions = {}
   }
 }
 
-/** Record to an exportable span: attributes, then the one scrubbing pass. */
+/**
+ * Record to an exportable span: attributes, then the one scrubbing pass.
+ *
+ * The launcher's session id is the one value exported as given or not at all. The exporter scrubs every string, and a redacted
+ * session id (`acme/password-manager:[REDACTED]`) would merge conversations into one Langfuse session. So when the scrub changed
+ * it, or withheld or cut it, the span is built again with OpenCode's root session in its place. Everything else on the span is
+ * scrubbed as before.
+ */
 export function toExportSpan(
   record: SpanRecord,
   options: AttributeOptions,
   scrubber: Scrubber,
   limits?: ContentLimits,
 ): ScrubbedSpan {
-  return scrubSpan(toPendingSpan(record, options), scrubber, limits)
+  const span = scrubSpan(toPendingSpan(record, options), scrubber, limits)
+  if (options.sessionId === undefined || span.attributes['langfuse.session.id'] === options.sessionId) return span
+  return scrubSpan(toPendingSpan(record, {...options, sessionId: undefined}), scrubber, limits)
 }
