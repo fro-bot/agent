@@ -133,7 +133,7 @@ export function parseActionInputs(options: ParseActionInputsOptions = {}): Resul
   const {registry} = options
   const mask = (value: string): void => {
     if (registry === undefined) core.setSecret(value)
-    else registry.mask(value)
+    else registry.mask(value, 'action-input')
   }
   // Tracing credentials first of everything: read, masked and removed from the environment before any required input can fail
   // and return, so a run that fails early still leaves no header unmasked and no `INPUT_TRACE-*` copy for a child to inherit.

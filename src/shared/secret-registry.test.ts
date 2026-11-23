@@ -56,7 +56,7 @@ describe('createSecretRegistry', () => {
   describe('range', () => {
     it('is exactly the range the scrubber matches', () => {
       // #given each length at and around both edges
-      const lengths = [MIN_LITERAL_CHARS - 1, MIN_LITERAL_CHARS, MAX_LITERAL_CHARS, MAX_LITERAL_CHARS + 1]
+      const lengths = [MIN_LITERAL_CHARS - 1, MIN_LITERAL_CHARS, 4_152, MAX_LITERAL_CHARS, MAX_LITERAL_CHARS + 1]
 
       for (const length of lengths) {
         const value = 'q'.repeat(length)
@@ -314,6 +314,89 @@ describe('createSecretRegistry', () => {
 
       // #then
       expect(registry.literals()).toHaveLength(300)
+    })
+  })
+
+  describe('unmatchable sources', () => {
+    it('is empty while every registered credential is in range, a 4,152-character runner token included', () => {
+      // #given the length a JavaScript action's ACTIONS_RUNTIME_TOKEN has on a hosted runner
+      const {registry} = make()
+
+      // #when
+      registry.addSecretEnv({
+        ACTIONS_RUNTIME_TOKEN: 't'.repeat(4_152),
+        ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'u'.repeat(4_152),
+      })
+
+      // #then
+      expect(registry.matchable()).toBe(true)
+      expect(registry.unmatchable()).toEqual({sources: [], total: 0})
+      expect(registry.literals()).toHaveLength(2)
+    })
+
+    it('names the environment variable of a secret-named value outside the range, with its length and never its value', () => {
+      // #given a short and a too-long value in secret-named variables, and an in-range one
+      const {registry} = make()
+      const tooLong = 'q'.repeat(MAX_LITERAL_CHARS + 1)
+
+      // #when
+      registry.addSecretEnv({FOO_TOKEN: 'abc1234', BAR_SECRET: tooLong, OK_PASSWORD: 'in-range-value', PATH: '/bin'})
+
+      // #then
+      expect(registry.matchable()).toBe(false)
+      expect(registry.unmatchable()).toEqual({
+        sources: [
+          {source: 'env:FOO_TOKEN', length: 7},
+          {source: 'env:BAR_SECRET', length: MAX_LITERAL_CHARS + 1},
+        ],
+        total: 2,
+      })
+      expect(JSON.stringify(registry.unmatchable())).not.toContain('abc1234')
+      expect(JSON.stringify(registry.unmatchable())).not.toContain(tooLong.slice(0, 20))
+    })
+
+    it.each([
+      ['a masked value', 'masked-value', (r: ReturnType<typeof make>['registry']) => r.mask('short')],
+      ['an added value', 'registered-value', (r: ReturnType<typeof make>['registry']) => r.add('short')],
+      ['a named mask', 'cache-restore', (r: ReturnType<typeof make>['registry']) => r.mask('short', 'cache-restore')],
+      [
+        'an auth-json leaf',
+        'auth-json',
+        (r: ReturnType<typeof make>['registry']) => r.addAuthJson('{"anthropic":{"type":"api","key":"short"}}'),
+      ],
+      [
+        'an opencode-config leaf',
+        'opencode-config',
+        (r: ReturnType<typeof make>['registry']) =>
+          r.addOpencodeConfig('{"provider":{"x":{"options":{"apiKey":"short"}}}}'),
+      ],
+      [
+        'a trace credential',
+        'trace-credential',
+        (r: ReturnType<typeof make>['registry']) =>
+          r.addTraceCredential([{name: 'Authorization', value: 'Bearer short'}]),
+      ],
+    ])('labels %s with a fixed category', (_name, label, register) => {
+      // #given / #when
+      const {registry} = make()
+      register(registry)
+
+      // #then the label is the category, with the length of what was registered
+      expect(registry.unmatchable().sources[0]?.source).toBe(label)
+      expect(registry.matchable()).toBe(false)
+    })
+
+    it('reports each source and length once, caps the list, and still counts them all', () => {
+      // #given sixty distinct out-of-range values from one source
+      const {registry} = make()
+      for (let length = 1; length <= 7; length += 1) registry.add('x'.repeat(length), 'repeat')
+      registry.add('x'.repeat(3), 'repeat')
+      for (let index = 0; index < 60; index += 1) registry.add('y'.repeat(MAX_LITERAL_CHARS + 1 + index), 'long')
+
+      // #then duplicates collapse, the list is bounded, and the total is the number of distinct entries
+      const report = registry.unmatchable()
+      expect(report.sources.length).toBeLessThanOrEqual(20)
+      expect(report.total).toBe(67)
     })
   })
 })

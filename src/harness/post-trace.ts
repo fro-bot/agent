@@ -59,7 +59,10 @@ function buildPostTrace(options: StartPostTraceOptions): PostTrace {
 
   // First of everything, before anything that can fail: read the two inputs, mask every form of them, and remove them from
   // the environment. Nothing is validated and nothing is said here, so a run with no trace record stays silent.
-  const raw = takeTraceInputs({getInput: name => core.getInput(name), env}, {mask: value => registry.mask(value)})
+  const raw = takeTraceInputs(
+    {getInput: name => core.getInput(name), env},
+    {mask: value => registry.mask(value, 'trace-input')},
+  )
 
   // The post process's own copies of everything the main step masked. The runner's masking is not what this relies on.
   try {

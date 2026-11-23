@@ -117,7 +117,7 @@ export async function run(): Promise<number> {
       warning: message => core.warning(message),
       notice: message => core.notice(message),
       info: message => core.info(message),
-      mask: value => registry.mask(value),
+      mask: value => registry.mask(value, 'trace-input'),
     },
   )
   const tracer = createLifecycleTracer({

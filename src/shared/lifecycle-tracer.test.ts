@@ -643,7 +643,7 @@ describe('createLifecycleTracer', () => {
 
     it.each([
       ['shorter than 8', 'short'],
-      ['longer than 4,096', 'z'.repeat(4_097)],
+      ['longer than 65,536', 'z'.repeat(65_537)],
     ])('exports categories instead of any free text when a registered value is %s', async (_name, unmatchable) => {
       // #given
       const target = await sink()
@@ -675,6 +675,80 @@ describe('createLifecycleTracer', () => {
       expect(eventAttr(eventsNamed(routing, 'exception')[0] ?? {name: '', timeUnixNano: ''}, 'exception.message')).toBe(
         'TypeError',
       )
+    })
+
+    it('keeps free text, and redacts the token where it appears, for a 4,152-character ACTIONS_RUNTIME_TOKEN', async () => {
+      // #given the token a JavaScript action's process holds on a hosted runner, registered as the run does
+      const token = `eyJ${'AbCd0123'.repeat(520)}`.slice(0, 4_152)
+      expect(token).toHaveLength(4_152)
+      const target = await sink()
+      const {tracer, registry} = harness(target.url)
+      registry.addSecretEnv({ACTIONS_RUNTIME_TOKEN: token})
+      const span = tracer.startSpan('routing')
+      span.setAttribute('fro_bot.ref', freeText('feature/branch', 'ref'))
+      span.setAttribute('fro_bot.url', freeText(`https://pipelines.example/x?t=${token}&keep=1`, 'url'))
+      span.recordException(new Error(`request failed with ${token} in the header`))
+      span.end({outcome: 'failed'})
+      tracer.root.end()
+
+      // #when
+      await tracer.flush()
+
+      // #then free text survives, and the token appears nowhere in what was sent, raw or JSON-escaped
+      const text = target.requests.map(request => request.text).join('\n')
+      expect(registry.matchable()).toBe(true)
+      const routing = named(allSpans(target), 'routing')
+      expect(attr(routing, 'fro_bot.ref')).toBe('feature/branch')
+      expect(String(attr(routing, 'fro_bot.url'))).toContain('keep=1')
+      expect(text).not.toContain(token.slice(0, 64))
+      expect(text).not.toContain(escaped(token).slice(0, 64))
+      expect(
+        eventAttr(eventsNamed(routing, 'exception')[0] ?? {name: '', timeUnixNano: ''}, 'exception.message'),
+      ).toContain('in the header')
+    })
+
+    it('logs one info line naming each out-of-range source and its length, and never a value', async () => {
+      // #given a short value in a secret-named variable and a too-long one in another, and a distinctive value in each
+      const target = await sink()
+      const {tracer, registry, logger} = harness(target.url)
+      const shortValue = 'sh0rtVal'.slice(0, 7)
+      const longValue = `LONGVAL${'z'.repeat(65_540)}`
+      registry.addSecretEnv({FOO_TOKEN: shortValue, BAR_SECRET: longValue})
+      tracer.startSpan('routing').end()
+      tracer.root.end()
+
+      // #when it is flushed twice
+      await tracer.flush()
+      await tracer.flush()
+
+      // #then one info line, with the fixed text and the sources with their lengths
+      const infos = vi
+        .mocked(logger.info)
+        .mock.calls.filter(([message]) => String(message).startsWith('Lifecycle trace carries no free text'))
+      expect(infos).toEqual([
+        [
+          'Lifecycle trace carries no free text: a registered secret is outside 8–65,536 characters',
+          {sources: ['env:FOO_TOKEN (7 characters)', 'env:BAR_SECRET (65547 characters)']},
+        ],
+      ])
+      // #and no value, in any form, reached any log call
+      const logged = serializeLoggerCalls(logger)
+      expect(logged).not.toContain(shortValue)
+      expect(logged).not.toContain('LONGVAL')
+    })
+
+    it('says nothing when every registered value is in range', async () => {
+      // #given
+      const target = await sink()
+      const {tracer, registry, logger} = harness(target.url)
+      registry.addSecretEnv({FOO_TOKEN: 'in-range-token-value'})
+      tracer.root.end()
+
+      // #when
+      await tracer.flush()
+
+      // #then
+      expect(serializeLoggerCalls(logger)).not.toContain('carries no free text')
     })
 
     it('exports free text when every registered value is in range', async () => {

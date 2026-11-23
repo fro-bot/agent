@@ -8,7 +8,7 @@ import {randomBytes} from 'node:crypto'
 import process from 'node:process'
 import {parseTraceRelayConfig} from '@fro-bot/runtime'
 import {createSpanExporter} from '@fro-bot/runtime/tracing/exporter'
-import {createScrubber, scrubSpan} from '@fro-bot/runtime/tracing/scrub'
+import {createScrubber, MAX_LITERAL_CHARS, MIN_LITERAL_CHARS, scrubSpan} from '@fro-bot/runtime/tracing/scrub'
 
 /**
  * The Action's own trace of one invocation: a run-wide recorder (held like `metrics`) that keeps spans, events and outcomes
@@ -52,6 +52,8 @@ export const NODE_DEBUG_WARNING =
 const UNSAFE_CONFIG_WARNING =
   'The trace endpoint and credential were refused by the lifecycle tracer, so lifecycle tracing is off.'
 const EXPORT_FAILED_MESSAGE = 'Lifecycle trace export failed'
+/** One info line when the fail-closed rule trips: the range is the scrubber's own, so the text cannot drift from it. */
+const NO_FREE_TEXT_MESSAGE = `Lifecycle trace carries no free text: a registered secret is outside ${MIN_LITERAL_CHARS}–${MAX_LITERAL_CHARS.toLocaleString('en-US')} characters`
 const EXPORT_FINISHED_MESSAGE = 'Lifecycle trace export finished'
 
 /** The attribute keys this tracer sets itself. The identity keys are the turn spans' own. */
@@ -488,9 +490,20 @@ export function createLifecycleTracer(options: CreateLifecycleTracerOptions): Li
     }
   }
 
+  /** Says once, with sources and lengths only, why this run's spans carry categories instead of free text. */
+  function reportNoFreeText(): void {
+    if (registry.matchable()) return
+    const {sources, total} = registry.unmatchable()
+    logger.info(NO_FREE_TEXT_MESSAGE, {
+      sources: sources.map(item => `${item.source} (${item.length} characters)`),
+      ...(total > sources.length ? {more: total - sources.length} : {}),
+    })
+  }
+
   async function exportAll(boundMs: number): Promise<FlushResult> {
     const spans = records.length
     try {
+      reportNoFreeText()
       // The registry holds everything, so nothing is captured from the environment here, and no cap drops a literal.
       const scrubber = createRegistryScrubber(registry)
       const exporter = (options.createExporter ?? createSpanExporter)({

@@ -421,7 +421,7 @@ describe('the post step’s span', () => {
       [
         'a long opencode-config secret',
         (() => {
-          const long = `L${'x'.repeat(5000)}`
+          const long = `L${'x'.repeat(65_536)}`
           return {env: {'INPUT_OPENCODE-CONFIG': JSON.stringify({apiKey: long})}, canary: long}
         })(),
       ],

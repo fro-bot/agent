@@ -222,7 +222,7 @@ async function startV2Server(
         // lifecycle trace's scrubber learns them here.
         maskSecret: value => {
           if (trace === undefined) core.setSecret(value)
-          else trace.registry.mask(value)
+          else trace.registry.mask(value, 'server-credential')
         },
         sandbox,
         ...(trace === undefined ? {} : {traceSpan: serverSpan}),

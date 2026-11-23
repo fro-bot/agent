@@ -307,7 +307,7 @@ describe('runCacheRestore on OpenCode V2', () => {
       )
 
       // #then the registry saw it, so the scrubber knows it
-      expect(mask).toHaveBeenCalledWith('mid-run-server-password-1')
+      expect(mask).toHaveBeenCalledWith('mid-run-server-password-1', 'server-credential')
       expect(registry.literals()).toContain('mid-run-server-password-1')
     })
 
