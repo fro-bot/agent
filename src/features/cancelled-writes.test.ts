@@ -8,6 +8,7 @@ import {
   removeLabelFromIssueWithOutcome,
 } from '../services/github/api.js'
 import {createMockOctokit} from '../services/github/test-helpers.js'
+import {BOT_COMMENT_MARKER} from '../services/github/types.js'
 import {markRunCancelled, resetRunCancellation} from '../shared/cancellation.js'
 import {createMockLogger} from '../shared/test-helpers.js'
 import {postComment} from './comments/writer.js'
@@ -49,12 +50,58 @@ describe('writes after a cancel', () => {
     const octokit = createMockOctokit({
       updateComment,
       listComments: [
-        {id: 7, body: 'old <!-- fro-bot -->', user: {login: 'fro-bot[bot]'}, created_at: 'x', updated_at: 'x'},
+        {
+          id: 7,
+          body: `old\n${BOT_COMMENT_MARKER}`,
+          user: {login: 'fro-bot[bot]'},
+          author_association: 'NONE',
+          created_at: '2024-01-01T00:00:00Z',
+          updated_at: '2024-01-01T00:00:00Z',
+        },
       ],
+      getIssue: {number: 1, title: 'T', body: 'B', user: {login: 'u'}},
     })
     cancelled()
-    await postComment(octokit, issue, {body: 'hi', updateExisting: true, botLogin: 'fro-bot[bot]'}, logger)
+    expect(
+      await postComment(octokit, issue, {body: 'hi', updateExisting: true, botLogin: 'fro-bot'}, logger),
+    ).toBeNull()
     expect(updateComment).not.toHaveBeenCalled()
+  })
+
+  it('updates no discussion comment', async () => {
+    const graphql = vi.fn(async (query: string) =>
+      query.includes('mutation')
+        ? {updateDiscussionComment: {comment: {id: 'DC_1', url: 'u'}}}
+        : {
+            repository: {
+              discussion: {
+                id: 'D_1',
+                title: 't',
+                body: '',
+                author: {login: 'u'},
+                comments: {
+                  nodes: [
+                    {
+                      id: 'DC_1',
+                      body: `old\n${BOT_COMMENT_MARKER}`,
+                      author: {login: 'fro-bot'},
+                      createdAt: '2024-01-01T00:00:00Z',
+                      updatedAt: '2024-01-01T00:00:00Z',
+                    },
+                  ],
+                  pageInfo: {hasNextPage: false, endCursor: null},
+                },
+              },
+            },
+          },
+    )
+    const octokit = createMockOctokit({graphql})
+    cancelled()
+    expect(
+      await postComment(octokit, discussion, {body: 'hi', updateExisting: true, botLogin: 'fro-bot'}, logger),
+    ).toBeNull()
+    expect(graphql).toHaveBeenCalled()
+    expect(graphql.mock.calls.filter(([query]) => query.includes('mutation'))).toEqual([])
   })
 
   it('posts no discussion comment', async () => {

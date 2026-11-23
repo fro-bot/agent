@@ -419,6 +419,8 @@ describe.skipIf(!hasBun)('a signal to a real process with the signal owner', () 
     // #then the command is gone, the export ran once, and the process ended by the signal
     const childPid = Number(fs.readFileSync(path.join(dir, 'child.pid'), 'utf8').trim())
     expect(alive(childPid)).toBe(false)
+    // Reaped by the owner while the process was still alive (the run saw its command end), not by the exit that followed.
+    expect(result.lines).toContain('child-exit:1')
     expect(result.signal).toBe('SIGINT')
     expect(result.lines.filter(line => line === 'flush-started')).toHaveLength(1)
     expect(sink.accepted()).toHaveLength(1)

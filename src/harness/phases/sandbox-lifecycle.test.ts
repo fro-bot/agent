@@ -1209,18 +1209,22 @@ describe('createSandboxLifecycle', () => {
     })
 
     describe('with the run’s signal owner', () => {
-      const ownerFor = (host: ReturnType<typeof fakeHost>, flush = vi.fn(async () => undefined)) => ({
-        owner: createSignalOwner({
-          logger: createMockLogger(),
-          host,
-          onCancel: vi.fn(),
+      const ownerFor = (host: ReturnType<typeof fakeHost>, flush = vi.fn(async () => undefined)) => {
+        const reapChildren = vi.fn(() => 0)
+        return {
+          owner: createSignalOwner({
+            logger: createMockLogger(),
+            host,
+            onCancel: vi.fn(),
+            flush,
+            reapChildren,
+            holdOwnership: () => () => undefined,
+            flushDeadlineMs: 50,
+          }),
           flush,
-          reapChildren: () => 0,
-          holdOwnership: () => () => undefined,
-          flushDeadlineMs: 50,
-        }),
-        flush,
-      })
+          reapChildren,
+        }
+      }
 
       it('installs no handlers of its own: the owner’s host hears the signal, the lifecycle’s own host never does', async () => {
         // #given a lifecycle given an owner, and a separate (unused) host of its own
@@ -1282,22 +1286,26 @@ describe('createSandboxLifecycle', () => {
         expect(ownerHost.killed).toEqual(['4242:SIGINT'])
       })
 
-      it('unregisters its teardown on a normal release, so a later signal does not run it', async () => {
+      it('unregisters its teardown on a normal release, so a later signal reaps commands instead of running it', async () => {
         // #given a sandbox that was released normally
         const harness = createHarness()
+        const logger = createMockLogger()
         const ownerHost = fakeHost()
-        const {owner} = ownerFor(ownerHost)
-        const lifecycle = create(harness, {signals: fakeHost(), signalOwner: owner})
+        const {owner, reapChildren} = ownerFor(ownerHost)
+        const lifecycle = create(harness, {signals: fakeHost(), signalOwner: owner, logger})
         await lifecycle.prepare(prepareInput)
         await lifecycle.release()
-        const stopsBefore = harness.mocks.stop.mock.calls.length
 
         // #when a signal arrives later in the run
         ownerHost.emitter.emit('SIGINT')
         await owner.drain()
 
-        // #then the sandbox teardown did not run again
-        expect(harness.mocks.stop.mock.calls.length).toBe(stopsBefore)
+        // #then the owner had no teardown to run (it reaped commands), and the sandbox did not start a signal teardown
+        expect(reapChildren).toHaveBeenCalledTimes(1)
+        expect(logger.warning).not.toHaveBeenCalledWith(
+          'Received a termination signal; stopping the sandbox before exiting',
+          expect.anything(),
+        )
         expect(ownerHost.killed).toEqual(['4242:SIGINT'])
       })
     })
