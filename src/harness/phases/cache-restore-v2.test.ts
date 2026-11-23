@@ -5,6 +5,7 @@ import * as path from 'node:path'
 import {ACTION_TRACING_OFF} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMetricsCollector} from '../../features/observability/index.js'
+import {createRecordingTracer, spanNamed} from '../../shared/lifecycle-tracer.testing.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 
 const mocks = vi.hoisted(() => ({
@@ -285,5 +286,77 @@ describe('runCacheRestore on OpenCode V2', () => {
     await runCacheRestore(bootstrap(V2_VERSION, {model: null}), createMetricsCollector(), null, ACTION_TRACING_OFF)
 
     expect(mocks.startActionOpenCodeV2.mock.calls[0]?.[0]).toMatchObject({model: null})
+  })
+
+  describe('with the lifecycle trace', () => {
+    it('masks the server password through the run’s registry, which also tells GitHub', async () => {
+      // #given a traced run's registry, whose masker is core.setSecret
+      const {handle} = v2Handle()
+      mocks.startActionOpenCodeV2.mockResolvedValue({success: true, data: handle})
+      const {tracer, registry} = createRecordingTracer()
+      const {runCacheRestore} = await import('./cache-restore.js')
+      const mask = vi.spyOn(registry, 'mask')
+
+      // #when the start mints and masks a password
+      await runCacheRestore(bootstrap(V2_VERSION), createMetricsCollector(), null, ACTION_TRACING_OFF, {
+        span: tracer.startSpan('cache restore'),
+        registry,
+      })
+      ;(mocks.startActionOpenCodeV2.mock.calls[0]?.[0] as {maskSecret: (value: string) => void}).maskSecret(
+        'mid-run-server-password-1',
+      )
+
+      // #then the registry saw it, so the scrubber knows it
+      expect(mask).toHaveBeenCalledWith('mid-run-server-password-1')
+      expect(registry.literals()).toContain('mid-run-server-password-1')
+    })
+
+    it('hands the restore tiers and the server start their spans, and ends a failed start failed with its error', async () => {
+      // #given a start that fails at the import wait
+      mocks.startActionOpenCodeV2.mockResolvedValue({
+        success: false,
+        error: {stage: 'import-wait', message: 'no progress for 60s'},
+      })
+      const {tracer, registry, exported} = createRecordingTracer()
+      const {runCacheRestore} = await import('./cache-restore.js')
+      const phase = tracer.startSpan('cache restore')
+
+      // #when
+      const result = await runCacheRestore(bootstrap(V2_VERSION), createMetricsCollector(), null, ACTION_TRACING_OFF, {
+        span: phase,
+        registry,
+      })
+      phase.end({outcome: 'failed'})
+      tracer.root.end()
+      await tracer.flush()
+
+      // #then the restore was given the phase span, and the server start is its failed child
+      expect(result).toBeNull()
+      expect(mocks.restoreCache.mock.calls[0]?.[0]).toHaveProperty('traceSpan')
+      expect(mocks.startActionOpenCodeV2.mock.calls[0]?.[0]).toHaveProperty('traceSpan')
+      const server = spanNamed(exported, 'server start')
+      expect(server.parentSpanId).toBe(spanNamed(exported, 'cache restore').spanId)
+      expect(server.attributes['fro_bot.outcome']).toBe('failed')
+      expect(server.attributes['fro_bot.reason']).toBe('import-wait-failed')
+      expect(server.events.find(event => event.name === 'exception')?.attributes['exception.message']).toBe(
+        'no progress for 60s',
+      )
+    })
+
+    it('still masks with GitHub alone and opens no span when the run has no trace', async () => {
+      // #given no trace argument, as every caller before this change
+      const {handle} = v2Handle()
+      mocks.startActionOpenCodeV2.mockResolvedValue({success: true, data: handle})
+      const {runCacheRestore} = await import('./cache-restore.js')
+
+      // #when
+      await runCacheRestore(bootstrap(V2_VERSION), createMetricsCollector(), null, ACTION_TRACING_OFF)
+      ;(mocks.startActionOpenCodeV2.mock.calls[0]?.[0] as {maskSecret: (value: string) => void}).maskSecret('pw-2')
+
+      // #then
+      expect(mocks.setSecret).toHaveBeenCalledWith('pw-2')
+      expect(mocks.restoreCache.mock.calls[0]?.[0]).not.toHaveProperty('traceSpan')
+      expect(mocks.startActionOpenCodeV2.mock.calls[0]?.[0]).not.toHaveProperty('traceSpan')
+    })
   })
 })

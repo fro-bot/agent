@@ -18,6 +18,7 @@ import {ACTION_TRACING_OFF, clearHeldClaims} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi, type Mock} from 'vitest'
 import {pluginCacheDir, resolvePluginSpecsV2} from '../../services/setup/plugin-install-v2.js'
 import {createRepoSkillsStagingRoot} from '../../services/setup/repo-skills.js'
+import {createRecordingTracer, spanNamed} from '../../shared/lifecycle-tracer.testing.js'
 import {createMockLogger, serializeLoggerCalls, unwrapErr, unwrapOk} from '../../shared/test-helpers.js'
 import {ok} from '../../shared/types.js'
 import {startActionOpenCodeV2} from './v2-server.js'
@@ -1693,8 +1694,10 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
     sandbox: SandboxLifecycle | null,
     deps: Partial<StartActionOpenCodeV2Deps>,
     env: NodeJS.ProcessEnv = {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
+    traceSpan?: StartActionOpenCodeV2Options['traceSpan'],
   ) {
     return startActionOpenCodeV2({
+      ...(traceSpan === undefined ? {} : {traceSpan}),
       binaryPath: '/opt/opencode',
       workspacePath: '/workspace',
       authJson: JSON.stringify({anthropic: {type: 'api', key: CANARY}}),
@@ -1753,6 +1756,53 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
     expect(prepared.keyFilePaths).toEqual([])
     expect(vi.mocked(deps.startServer).mock.calls[0]?.[0].sandbox).toEqual(LAUNCH)
     expect(sandbox.release).not.toHaveBeenCalled()
+  })
+
+  it('records the handoff as a span with the trace span passed into prepare, and each gate as an event on the start span', async () => {
+    // #given an isolated run under a recording tracer
+    const server = fakeServer()
+    const deps = depsFor(server)
+    const sandbox = fakeSandbox()
+    const {tracer, exported} = createRecordingTracer()
+    const start = tracer.startSpan('server start')
+
+    // #when started
+    const result = await run(sandbox.sandbox, deps, undefined, start)
+    start.end()
+    tracer.root.end()
+    await tracer.flush()
+
+    // #then
+    expect(result.success).toBe(true)
+    const handoff = spanNamed(exported, 'isolation handoff')
+    expect(handoff.parentSpanId).toBe(spanNamed(exported, 'server start').spanId)
+    expect(handoff.attributes['fro_bot.outcome']).toBe('succeeded')
+    expect(sandbox.prepare.mock.calls[0]?.[0]).toHaveProperty('traceSpan')
+    const gates = spanNamed(exported, 'server start').events.filter(event => event.name === 'gate.decision')
+    expect(gates.map(gate => [gate.attributes.gate, gate.attributes.result])).toEqual([
+      ['permission', 'passed'],
+      ['key-proxy-probe', 'passed'],
+      ['credential', 'passed'],
+      ['import-wait', 'passed'],
+    ])
+  })
+
+  it('ends the handoff span failed when the handoff is refused', async () => {
+    // #given a handoff that fails
+    const server = fakeServer()
+    const sandbox = fakeSandbox(async () => err('no account'))
+    const {tracer, exported} = createRecordingTracer()
+
+    // #when
+    const result = await run(sandbox.sandbox, depsFor(server), undefined, tracer.startSpan('server start'))
+    tracer.root.end()
+    await tracer.flush()
+
+    // #then
+    expect(result.success).toBe(false)
+    const handoff = spanNamed(exported, 'isolation handoff')
+    expect(handoff.attributes['fro_bot.outcome']).toBe('failed')
+    expect(handoff.attributes['fro_bot.reason']).toBe('handoff-failed')
   })
 
   it('does not add a sandbox to the spawn when isolation is off', async () => {

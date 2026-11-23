@@ -18,6 +18,7 @@ import type {
 } from '../../services/setup/sandbox-handoff.js'
 import type {SandboxToolPaths} from '../../services/setup/sandbox-preflight.js'
 import type {ExecAdapter} from '../../services/setup/types.js'
+import type {LifecycleSpan} from '../../shared/lifecycle-tracer.js'
 import type {Logger} from '../../shared/logger.js'
 import {Buffer} from 'node:buffer'
 import * as fsSync from 'node:fs'
@@ -55,6 +56,7 @@ import {
 import {buildSandboxPath} from '../../services/setup/sandbox-toolchain-path.js'
 import {isProcessAlive} from '../../services/setup/sandbox-view-probe.js'
 import {toErrorMessage} from '../../shared/errors.js'
+import {freeText} from '../../shared/lifecycle-tracer.js'
 
 /**
  * The `isolate-agent` lifecycle for one run: create the account, hand over what the sandbox needs, launch spec, then
@@ -86,6 +88,8 @@ export interface SandboxPrepareInput {
   readonly ghConfigDir: string | null
   /** The run-scoped staging root and the admitted skills tree under it, or null. */
   readonly repoSkills: {readonly stagingRoot: string; readonly admittedDir: string | null} | null
+  /** The lifecycle trace's isolation handoff span: a tool location or a PATH directory left out is an event on it. */
+  readonly traceSpan?: LifecycleSpan
 }
 
 export interface SandboxReleaseResult {
@@ -1137,13 +1141,14 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
         ...agentPath.split(path.delimiter),
         ...toolLocations.flatMap(([, resolved]) => (resolved === '' ? [] : [resolved])),
       ])
-      const launchPath = reachablePath(agentPath, reachable)
+      const launchPath = reachablePath(agentPath, reachable, input.traceSpan)
       const passedToolLocations = Object.fromEntries(toolLocations.filter(([, resolved]) => reachable.has(resolved)))
       const droppedToolLocations = toolLocations
         .filter(([, resolved]) => !reachable.has(resolved))
         .map(([name]) => name)
       if (droppedToolLocations.length > 0) {
         logger.info('Tool locations the agent cannot use were not passed to it', {names: droppedToolLocations})
+        input.traceSpan?.addEvent('tool-locations.dropped', {names: droppedToolLocations.join(',')})
       }
 
       const extraEnv: Record<string, string> = {
@@ -1308,10 +1313,17 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     return new Set(result.stdout.split('\n').filter(line => line.length > 0))
   }
 
-  function reachablePath(candidate: string, reachable: ReadonlySet<string>): string {
+  function reachablePath(candidate: string, reachable: ReadonlySet<string>, traceSpan?: LifecycleSpan): string {
     const dirs = candidate.split(path.delimiter)
     const dropped = dirs.filter(dir => !reachable.has(dir))
-    if (dropped.length > 0) logger.info('Sandbox PATH left out directories the agent cannot enter', {dropped})
+    if (dropped.length > 0) {
+      logger.info('Sandbox PATH left out directories the agent cannot enter', {dropped})
+      // The directory names come from the runner's PATH, which is outside input: free text, scrubbed and capped at export.
+      traceSpan?.addEvent('path.dropped', {
+        count: String(dropped.length),
+        entries: freeText(dropped.join(path.delimiter), 'path-entries'),
+      })
+    }
     return dirs.filter(dir => reachable.has(dir)).join(path.delimiter)
   }
 

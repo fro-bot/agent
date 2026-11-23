@@ -1527,6 +1527,30 @@ describe('createSandboxLifecycle', () => {
       })
     })
 
+    it('records the dropped PATH entries as an event on the handoff span, with their count', async () => {
+      // #given the same unreachable directory, and a handoff span
+      const harness = createHarness()
+      const lifecycle = create(harness, {
+        env: baseEnv(),
+        runnerPath: '/opt/hostedtoolcache/node/24/x64/bin:/home/runner/.cargo/unreachable/bin:/usr/bin',
+        signals: fakeHost(),
+      })
+      const {createRecordingTracer, spanNamed} = await import('../../shared/lifecycle-tracer.testing.js')
+      const {tracer, exported} = createRecordingTracer()
+      const span = tracer.startSpan('isolation handoff')
+
+      // #when prepared
+      await lifecycle.prepare({...prepareInput, traceSpan: span})
+      span.end()
+      tracer.root.end()
+      await tracer.flush()
+
+      // #then
+      const event = spanNamed(exported, 'isolation handoff').events.find(item => item.name === 'path.dropped')
+      expect(event?.attributes.count).toBe('1')
+      expect(String(event?.attributes.entries)).toContain('/home/runner/.cargo/unreachable/bin')
+    })
+
     it('passes a caller’s tool install locations the agent can enter, and only those', async () => {
       // #given three tool locations: one the agent can enter, one it can't, and one that isn't absolute
       const harness = createHarness()

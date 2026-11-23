@@ -2,6 +2,8 @@ import type {OpenCodeV2ServerHandle} from '@fro-bot/runtime'
 import type {MetricsCollector} from '../../features/observability/index.js'
 import type {RepoSkillsSource} from '../../services/setup/repo-skills.js'
 import type {ActionTracingSource} from '../../services/setup/tracing.js'
+import type {LifecycleSpan} from '../../shared/lifecycle-tracer.js'
+import type {SecretRegistry} from '../../shared/secret-registry.js'
 import type {CacheResult} from '../../shared/types.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {SandboxLifecycle} from './sandbox-lifecycle.js'
@@ -25,6 +27,7 @@ import {
   getOpenCodeAuthPath,
   getOpenCodeStoragePath,
 } from '../../shared/env.js'
+import {NOOP_SPAN, withSpan} from '../../shared/lifecycle-tracer.js'
 import {createLogger} from '../../shared/logger.js'
 import {normalizeWorkspacePath} from '../../shared/paths.js'
 import {startActionOpenCodeV2} from './v2-server.js'
@@ -44,6 +47,14 @@ export interface CacheRestorePhaseResult {
   readonly sandbox?: SandboxLifecycle | null
 }
 
+/** What the run hands this phase for the lifecycle trace. */
+export interface CacheRestoreTrace {
+  /** The cache restore span: each restore tier, and the server start, are its children. */
+  readonly span: LifecycleSpan
+  /** The run's secret registry: the server password and the key proxy's placeholder are masked through it. */
+  readonly registry: SecretRegistry
+}
+
 export async function runCacheRestore(
   bootstrap: BootstrapPhaseResult,
   metrics: MetricsCollector,
@@ -53,6 +64,7 @@ export async function runCacheRestore(
    * by `run.ts` (the one place that has the routed context and the relay) and required here so a start cannot skip it.
    */
   tracing: ActionTracingSource,
+  trace?: CacheRestoreTrace,
 ): Promise<CacheRestorePhaseResult | null> {
   const cacheComponents = buildCacheKeyComponents()
 
@@ -70,6 +82,7 @@ export async function runCacheRestore(
     projectIdPath,
     storeConfig: bootstrap.inputs.storeConfig,
     skipCache: bootstrap.inputs.skipCache,
+    ...(trace === undefined ? {} : {traceSpan: trace.span}),
   })
 
   let cacheStatus: 'corrupted' | 'hit' | 'miss' = cacheResult.corrupted ? 'corrupted' : cacheResult.hit ? 'hit' : 'miss'
@@ -162,7 +175,7 @@ export async function runCacheRestore(
   }
 
   // The caller owns the live server from here: the execution loop runs on it and cleanup shuts it down.
-  return startV2Server(bootstrap, workspacePath, storagePath, cacheResult, cacheStatus, repoSkills, tracing)
+  return startV2Server(bootstrap, workspacePath, storagePath, cacheResult, cacheStatus, repoSkills, tracing, trace)
 }
 
 async function startV2Server(
@@ -173,36 +186,54 @@ async function startV2Server(
   cacheStatus: 'corrupted' | 'hit' | 'miss',
   repoSkills: RepoSkillsSource | null,
   tracing: ActionTracingSource,
+  trace: CacheRestoreTrace | undefined,
 ): Promise<CacheRestorePhaseResult | null> {
   const serverLogger = createLogger({phase: 'server-bootstrap'})
   const {inputs, opencodeResult} = bootstrap
+  const serverSpan = (trace?.span ?? NOOP_SPAN).startChild('server start')
   // Created by bootstrap, which is what lets the run release it (and read whether it was restored) even when this start
   // fails or throws.
   const sandbox = bootstrap.sandbox ?? null
-  const started = await startActionOpenCodeV2({
-    binaryPath: opencodeResult.path,
-    // Normalized to match what the harness's own session-scoped calls use: the gates and every later request address
-    // the same location the spawn was given.
-    workspacePath: normalizeWorkspacePath(workspacePath),
-    authJson: inputs.authJson,
-    opencodeConfig: inputs.opencodeConfig,
-    systematicVersion: inputs.systematicVersion,
-    model: inputs.model == null ? null : `${inputs.model.providerID}/${inputs.model.modelID}`,
-    dbPath: path.join(path.dirname(storagePath), DB_V2_MAIN_BASENAME),
-    authPath: getOpenCodeAuthPath(),
-    env: process.env,
-    // The disposition `runBootstrap` decided. It decides which caller MCP servers the config keeps: a withheld run is
-    // driven by untrusted text.
-    credential: bootstrap.credential,
-    // Decided after routing (`runRepoSkills`): null unless the input is on and the trust predicate admitted this run.
-    repoSkills,
-    runId: getGitHubRunId(),
-    runAttempt: getGitHubRunAttempt(),
-    tracing,
-    logger: serverLogger,
-    maskSecret: value => core.setSecret(value),
-    sandbox,
-  })
+  const started = await withSpan(
+    serverSpan,
+    async () =>
+      startActionOpenCodeV2({
+        binaryPath: opencodeResult.path,
+        // Normalized to match what the harness's own session-scoped calls use: the gates and every later request address
+        // the same location the spawn was given.
+        workspacePath: normalizeWorkspacePath(workspacePath),
+        authJson: inputs.authJson,
+        opencodeConfig: inputs.opencodeConfig,
+        systematicVersion: inputs.systematicVersion,
+        model: inputs.model == null ? null : `${inputs.model.providerID}/${inputs.model.modelID}`,
+        dbPath: path.join(path.dirname(storagePath), DB_V2_MAIN_BASENAME),
+        authPath: getOpenCodeAuthPath(),
+        env: process.env,
+        // The disposition `runBootstrap` decided. It decides which caller MCP servers the config keeps: a withheld run is
+        // driven by untrusted text.
+        credential: bootstrap.credential,
+        // Decided after routing (`runRepoSkills`): null unless the input is on and the trust predicate admitted this run.
+        repoSkills,
+        runId: getGitHubRunId(),
+        runAttempt: getGitHubRunAttempt(),
+        tracing,
+        logger: serverLogger,
+        // Through the registry when the run has one: the server password and the key proxy's placeholder exist only now, and the
+        // lifecycle trace's scrubber learns them here.
+        maskSecret: value => {
+          if (trace === undefined) core.setSecret(value)
+          else trace.registry.mask(value)
+        },
+        sandbox,
+        ...(trace === undefined ? {} : {traceSpan: serverSpan}),
+      }),
+    result => {
+      if (result.success) return {outcome: 'succeeded'}
+      // The start's own message (scrubbed and capped at export) is the error where it happened.
+      serverSpan.recordException(new Error(result.error.message))
+      return {outcome: 'failed', reason: `${result.error.stage}-failed`}
+    },
+  )
 
   if (!started.success) {
     core.setFailed(`OpenCode V2 start failed (${started.error.stage}): ${started.error.message}`)
