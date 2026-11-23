@@ -342,8 +342,9 @@ async function restoreFromCacheTiers(
 export async function restoreCache(options: RestoreCacheOptions): Promise<CacheResult> {
   const {components, logger, storagePath, authPath} = options
 
-  if (process.env.SKIP_CACHE === 'true') {
-    logger.debug('Skipping cache restore (SKIP_CACHE=true)')
+  // The `skip-cache` input and the `SKIP_CACHE` variable are ORed so callers who set the variable keep their behavior.
+  if (options.skipCache === true || process.env.SKIP_CACHE === 'true') {
+    logger.debug('Skipping cache restore (skip-cache input or SKIP_CACHE=true)')
     await fs.mkdir(storagePath, {recursive: true})
     return {
       hit: false,

@@ -91,6 +91,10 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
     timeoutMs: inputs.timeoutMs,
   })
 
+  if (inputs.skipCache) {
+    core.saveState(STATE_KEYS.SKIP_CACHE, 'true')
+  }
+
   // Fail closed before any setup, credential check or directory creation: an unsupported runner leaves nothing to
   // undo. Skipped entirely (no check, no log) when the input is off.
   let sandboxTools: SandboxToolPaths | null = null

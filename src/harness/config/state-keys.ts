@@ -15,6 +15,11 @@ export const STATE_KEYS = {
    */
   ISOLATED_RUN: 'isolatedRun',
   /**
+   * `'true'` when the `skip-cache` input was set, saved at bootstrap so the post hook, which reads state and not inputs,
+   * never retries a save the run was told to skip. Absent when the input was off.
+   */
+  SKIP_CACHE: 'skipCache',
+  /**
    * The sandbox teardown state (`pending`, `restored` or `unsafe`), written by the sandbox lifecycle: `pending` before
    * the account exists, `restored` only after a confirmed stop and take-back. On an isolated run the post hook reads and
    * uploads nothing from the sandbox-writable log directory unless this is `restored`: missing, `pending` and `unsafe`
