@@ -104,10 +104,12 @@ describe('runRouting', () => {
 
     const result = await runRouting(bootstrap, 100)
 
-    expect(result).toEqual({
+    // The context the router built for the declined event rides along, so the run can still name the conversation.
+    expect(result).toMatchObject({
       skipped: true,
       skipReason: 'unsupported_event',
       skipMessage: 'Unsupported event',
+      context: {eventType: 'unsupported', repo: {owner: 'fro-bot', repo: 'agent'}},
     })
     expect(vi.mocked(setActionOutputs)).not.toHaveBeenCalled()
     expect(vi.mocked(collectAgentContext)).not.toHaveBeenCalled()
@@ -182,10 +184,11 @@ describe('runRouting', () => {
       expect.anything(),
       expect.objectContaining({reviewSkipLabel: 'skip-agent-review'}),
     )
-    expect(result).toEqual({
+    expect(result).toMatchObject({
       skipped: true,
       skipReason: 'review_skip_label',
       skipMessage: "Pull request has the opt-out label 'skip-agent-review'",
+      context: {eventType: 'pull_request'},
     })
     expect(vi.mocked(collectAgentContext)).not.toHaveBeenCalled()
   })
@@ -270,6 +273,7 @@ describe('runRouting', () => {
       skipped: true,
       skipReason: 'unsupported_event',
       skipMessage: 'Unsupported event type: push',
+      context: {},
     })
   })
 })
