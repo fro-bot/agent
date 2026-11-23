@@ -6,7 +6,7 @@
 
 import {describe, expect, it} from 'vitest'
 
-import {contentAttribute, createScrubber, MARKER, REDACTION, scrubSpan, scrubStructured} from './content.js'
+import {contentAttribute, createScrubber, MARKER, REDACTION, scrubSpan, scrubStructured} from './scrub.js'
 
 const scrubber = createScrubber({env: {}})
 const scrub = (text: string): string => {

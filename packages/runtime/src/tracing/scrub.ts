@@ -773,7 +773,7 @@ const afterScheme = (match: RegExpExecArray, text: string): Range => {
 
 /**
  * The text rules. Each is a pure matcher over the original string; the list's order carries no meaning (`scrubWithMatchers`
- * takes the union of every range), and `content.test.ts` runs it in other orders to show that.
+ * takes the union of every range), and `scrub.test.ts` runs it in other orders to show that.
  */
 export const SCRUB_PATTERNS: readonly ScrubMatcher[] = [
   pemMatcher(),

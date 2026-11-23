@@ -20,8 +20,8 @@ import {
   scrubWithMatchers,
   type PendingSpan,
   type ScrubMatcher,
-} from './content.js'
-import {createLegacyScrubber} from './content.legacy.testing.js'
+} from './scrub.js'
+import {createLegacyScrubber} from './scrub.legacy.testing.js'
 
 // Fixture secrets are assembled at run time so no scanner mistakes this file for a leak.
 const join = (...parts: string[]): string => parts.join('')

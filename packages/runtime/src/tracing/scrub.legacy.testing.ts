@@ -1,10 +1,10 @@
 /**
  * FROZEN REFERENCE, test support only. The scrubber as it stood before the range-collecting rewrite (sequential passes, each
- * reading the previous pass's output), kept so `content.test.ts` can show the rewrite changes nothing where the old design was
+ * reading the previous pass's output), kept so `scrub.test.ts` can show the rewrite changes nothing where the old design was
  * already right (inputs with no overlapping matches). Never imported by the plugin; delete it with the differential test.
  */
 
-import {REDACTION} from './content.js'
+import {REDACTION} from './scrub.js'
 
 interface PatternResult {
   readonly text: string
