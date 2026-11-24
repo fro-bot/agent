@@ -20,7 +20,6 @@ import type {SandboxToolPaths} from '../../services/setup/sandbox-preflight.js'
 import type {ExecAdapter} from '../../services/setup/types.js'
 import type {LifecycleSpan} from '../../shared/lifecycle-tracer.js'
 import type {Logger} from '../../shared/logger.js'
-import type {SignalHost, SignalOwner} from '../signal-owner.js'
 import {Buffer} from 'node:buffer'
 import * as fsSync from 'node:fs'
 import * as fs from 'node:fs/promises'
@@ -56,6 +55,7 @@ import {
 } from '../../services/setup/sandbox-tool-roots.js'
 import {buildSandboxPath} from '../../services/setup/sandbox-toolchain-path.js'
 import {isProcessAlive} from '../../services/setup/sandbox-view-probe.js'
+import {markRunCancelled, startCancellationCleanups} from '../../shared/cancellation.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {freeText} from '../../shared/lifecycle-tracer.js'
 
@@ -186,7 +186,26 @@ export interface SandboxLifecycle {
 export const LAUNCH_SETTLE_BUDGET_MS = 30_000
 
 /** The slice of `process` the signal handling uses; injectable so the tests need no real signals. */
-export type {SignalHost}
+export interface SignalHost {
+  readonly pid: number
+  readonly on: (signal: 'SIGINT' | 'SIGTERM', listener: () => void) => unknown
+  readonly off: (signal: 'SIGINT' | 'SIGTERM', listener: () => void) => unknown
+  readonly kill: (pid: number, signal: 'SIGINT' | 'SIGTERM') => unknown
+}
+
+/** The trace's part of a cancellation: the spans still open end as cancelled, and the export starts beside the teardown. */
+export interface SandboxSignalTrace {
+  /** Ends the spans still open as cancelled. Synchronous; a throw is ignored. */
+  readonly onSignal: (signal: 'SIGINT' | 'SIGTERM') => void
+  /** Starts the export with the given bound. Shared with normal completion, so it must be idempotent. Never awaited by the teardown. */
+  readonly flush: (options: {readonly boundMs: number}) => Promise<unknown>
+}
+
+/**
+ * Longest the export runs once a signal arrives. It runs beside the teardown and inside its window: the process is re-raised when
+ * the teardown settles, whether or not the export has, so this only bounds the exporter's own work.
+ */
+export const SIGNAL_TRACE_FLUSH_BOUND_MS = 5_000
 
 /**
  * Longest a cancellation waits for the sandbox to be stopped and taken back before the process ends anyway. GitHub
@@ -236,11 +255,10 @@ export interface SandboxLifecycleOptions {
   /** Defaults to the real `process`. */
   readonly signals?: SignalHost
   /**
-   * The run's signal owner. With one, this lifecycle installs no handlers of its own: it registers its teardown with the owner
-   * (at the points it used to install handlers) and the owner runs it beside the export and re-raises when both have settled.
-   * Without one (the integration harness, the unit tests) it handles signals itself, as it always did.
+   * What the run's lifecycle trace does when a signal reaches this sandbox's handler: the only cancellation that sends a trace.
+   * A run without `isolate-agent` has no handler of this kind, so it ends as it always did and sends no lifecycle trace.
    */
-  readonly signalOwner?: SignalOwner
+  readonly signalTrace?: SandboxSignalTrace
   readonly signalTeardownBudgetMs?: number
   /** Overrides {@link LAUNCH_SETTLE_BUDGET_MS} (tests). */
   readonly launchSettleBudgetMs?: number
@@ -557,16 +575,12 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   // adapter's own once-handlers also fire on the same signal and re-raise it, so this handler runs at most once.
   const signalHost: SignalHost = options.signals ?? process
   const installedSignalListeners: ['SIGINT' | 'SIGTERM', () => void][] = []
-  // With a signal owner: this lifecycle's teardown is registered there instead of handlers being installed here.
-  let unregisterTeardown: (() => void) | null = null
   let signalled = false
   // Held from the first handler until the last is removed: while the sandbox is live this lifecycle decides what a signal
   // does. The exec adapter would otherwise SIGKILL the teardown's own commands on a second signal, and re-raise before the
   // teardown had finished.
   let releaseSignalOwnership: (() => void) | null = null
   const removeSignalHandlers = (): void => {
-    unregisterTeardown?.()
-    unregisterTeardown = null
     releaseSignalOwnership?.()
     releaseSignalOwnership = null
     for (const [signal, listener] of installedSignalListeners.splice(0)) signalHost.off(signal, listener)
@@ -594,20 +608,42 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       // The sandbox's own teardown decides the outcome; an extra stop that failed has nothing to add.
     }
   }
-  /** The sandbox's part of a cancellation: everything but ending the process. Runs at most once. */
-  const runSignalTeardown = async (signal: 'SIGINT' | 'SIGTERM'): Promise<void> => {
+  /** Starts the export one turn of the event loop later, so the teardown's first steps are on their way before its CPU work. */
+  const startTraceExport = async (trace: SandboxSignalTrace): Promise<void> => {
+    try {
+      await new Promise<void>(resolve => {
+        setImmediate(resolve)
+      })
+      await trace.flush({boundMs: SIGNAL_TRACE_FLUSH_BOUND_MS})
+    } catch {
+      // An export never changes how a cancelled run ends.
+    }
+  }
+  const onSignal = async (signal: 'SIGINT' | 'SIGTERM'): Promise<void> => {
     if (signalled) return
     signalled = true
     cancelled = true
+    // The run is cancelled from this line, synchronously: every irreversible write checks the flag at the point of submission.
+    markRunCancelled()
+    try {
+      options.signalTrace?.onSignal(signal)
+    } catch {
+      // Tracing never changes how a cancelled run stops.
+    }
     closeAdmission()
     logger.warning('Received a termination signal; stopping the sandbox before exiting', {signal})
     let timer: ReturnType<typeof setTimeout> | undefined
     const timedOut = new Promise<'timeout'>(resolve => {
       timer = setTimeout(() => resolve('timeout'), options.signalTeardownBudgetMs ?? SIGNAL_TEARDOWN_BUDGET_MS)
     })
-    // The extra stops start now, beside the sandbox teardown, so both fit the one budget.
-    signalStopRuns.push(...signalStops.map(runSignalStop))
-    const outcome = await Promise.race([releaseRef().catch(() => 'failed' as const), timedOut])
+    // The extra stops start now, beside the sandbox teardown, so both fit the one budget. What the run holds that a pending read
+    // could otherwise strand (a review receipt) is given back with them.
+    signalStopRuns.push(...signalStops.map(runSignalStop), ...startCancellationCleanups())
+    const releasing = releaseRef().catch(() => 'failed' as const)
+    // The export starts beside the teardown and is never waited for: the process is re-raised when the teardown settles, exactly
+    // when it always was, and what has not reached the collector by then is lost.
+    if (options.signalTrace !== undefined) startTraceExport(options.signalTrace).catch(() => undefined)
+    const outcome = await Promise.race([releasing, timedOut])
     // Whatever budget is left is theirs too, those registered while the teardown ran included; the sandbox's outcome above
     // is decided without them. With none registered there is nothing to wait for and nothing new on this path.
     if (signalStopRuns.length > 0) await Promise.race([settleSignalStops(), timedOut])
@@ -617,20 +653,11 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       // The post hook must not read a `pending` left behind as "nothing happened": say outright that it is not restored.
       record('unsafe')
     }
-  }
-  const onSignal = async (signal: 'SIGINT' | 'SIGTERM'): Promise<void> => {
-    if (signalled) return
-    await runSignalTeardown(signal)
     removeSignalHandlers()
     // The handlers are gone, so this ends the process with the signal's default action.
     signalHost.kill(signalHost.pid, signal)
   }
   const installSignalHandlers = (): void => {
-    if (options.signalOwner !== undefined) {
-      // The owner holds the handlers and the exec adapter's signal ownership; the teardown is all this lifecycle adds.
-      unregisterTeardown ??= options.signalOwner.registerTeardown(runSignalTeardown)
-      return
-    }
     if (installedSignalListeners.length > 0) return
     releaseSignalOwnership = holdSignalOwnership()
     for (const signal of ['SIGINT', 'SIGTERM'] as const) {
@@ -1003,11 +1030,6 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       if (entryProblem !== null) return err(entryProblem)
       if (cancelled || released !== undefined) return err('isolate-agent setup was cancelled before it started')
     }
-    // Before anything is created, and checked straight after: a signal that already arrived makes the owner run the teardown at
-    // registration, which is before `preparing` exists, so it cannot be left to `prepareInner` (it would go on to create the
-    // account behind a teardown that has already reported). Nothing exists yet, so there is nothing for that teardown to miss.
-    installSignalHandlers()
-    if (cancelled || released !== undefined) return err('isolate-agent setup was cancelled before it started')
     record('pending')
     preparing = prepareInner(input)
     return preparing as Promise<Result<OpenCodeV2SandboxLaunch, string>>
@@ -1047,6 +1069,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
 
   async function prepareInner(input: SandboxPrepareInput): Promise<Result<OpenCodeV2SandboxLaunch, string>> {
     try {
+      installSignalHandlers()
       const created = await deps.createAccount(tools, identityDeps())
       if (!created.success) {
         // A creation that timed out left the account in place; run the teardown so the state is `unsafe`, not `pending`.

@@ -18,7 +18,7 @@ import type {Logger} from '../shared/logger.js'
 import type {SecretRegistry} from '../shared/secret-registry.js'
 import type {TracingInputs} from '../shared/types.js'
 import type {InvocationOutcome, InvocationVerificationFacts} from './outcome.js'
-import type {SandboxLifecycle, SandboxReleaseResult} from './phases/sandbox-lifecycle.js'
+import type {SandboxLifecycle, SandboxReleaseResult, SandboxSignalTrace} from './phases/sandbox-lifecycle.js'
 import process from 'node:process'
 import * as core from '@actions/core'
 import {buildLogicalKey} from '@fro-bot/runtime'
@@ -36,7 +36,7 @@ import {
   relayRequestFromInputs,
   type ActionTracingSource,
 } from '../services/setup/tracing.js'
-import {createRunCancelledError} from '../shared/cancellation.js'
+import {createRunCancelledError, isRunCancelled} from '../shared/cancellation.js'
 import {getGitHubRunAttempt, getInvocationIdentity, getOpenCodeLogPath} from '../shared/env.js'
 import {toErrorMessage} from '../shared/errors.js'
 import {createLifecycleTracer, createRegistryScrubber, freeText, withSpan} from '../shared/lifecycle-tracer.js'
@@ -73,7 +73,6 @@ import {runRouting} from './phases/routing.js'
 import {runSessionPrep} from './phases/session-prep.js'
 import {checkTraceRelayBundle} from './phases/trace-relay-bundle.js'
 import {createTraceRelayLaunch, startTraceRelayProcess, type TraceRelayProcess} from './phases/trace-relay-process.js'
-import {createSignalOwner, type SignalOwner} from './signal-owner.js'
 
 const KEY_PROXY_CRASHED_DECLINE_REASON =
   'the isolate-agent key proxy exited unexpectedly, so the run is incomplete and no session state is saved'
@@ -93,7 +92,8 @@ interface RunTrace {
   readonly registry: SecretRegistry
   /** The trace inputs `run` read first of everything, handed to bootstrap so it never reads them again. */
   readonly traceInputs: TracingInputs
-  readonly signalOwner: SignalOwner
+  /** What the sandbox's signal handler does to the trace. Only an isolated run has such a handler; any other run ends on a signal as it always did. */
+  readonly signalTrace: SandboxSignalTrace
   /** Set by the body as it learns them; the root span ends with whatever is set when the body returns or throws. */
   readonly outcome: {
     rootResult: SpanResult
@@ -140,20 +140,20 @@ export async function run(): Promise<number> {
   const refName = process.env.GITHUB_REF_NAME?.trim() ?? ''
   if (refName !== '') tracer.root.setAttribute('fro_bot.ref', freeText(refName, 'ref'))
 
-  // The one SIGINT/SIGTERM handler of the run, installed here (no await since the tracer was created, so no signal can arrive
-  // unseen) for every run, isolated or not. It takes the exec adapter's signal ownership; the sandbox lifecycle registers its
-  // teardown with it.
-  const signalOwner = createSignalOwner({
-    logger: bootstrapLogger,
-    onCancel: signal => tracer.cancel(signal === 'SIGINT' ? 'sigint' : 'sigterm'),
+  // Cancellation and the trace. A run WITHOUT `isolate-agent` installs no handler of its own and keeps none alive: a signal ends it
+  // as it always did (the exec adapter reaps its commands and re-raises), and it sends no lifecycle trace. An isolated run's
+  // sandbox already handles the signal, to stop and take back the sandbox user; this is what that handler does to the trace: end
+  // the open spans as cancelled and start the export beside the teardown. The export never extends the teardown's window.
+  const signalTrace: SandboxSignalTrace = {
+    onSignal: signal => tracer.cancel(signal === 'SIGINT' ? 'sigint' : 'sigterm'),
     flush: async flushOptions => tracer.flush(flushOptions),
-  })
+  }
 
   const trace: RunTrace = {
     tracer,
     registry,
     traceInputs,
-    signalOwner,
+    signalTrace,
     outcome: {rootResult: {outcome: 'failed', reason: 'exception'}, cacheSaveOutcome: null, exitCode: null},
   }
   try {
@@ -168,15 +168,11 @@ export async function run(): Promise<number> {
     // Normal completion and a signal share this one export (the tracer's flush is idempotent), and `main.ts` ends the process
     // only after `run()` returns, so it never exits before the export has settled or hit its bound.
     await tracer.flush()
-    // A signal that is still being handled (its teardown running beside the finished run) ends the process itself, with the
-    // signal's own exit. Wait for that rather than let `main.ts` exit first with the run's code.
-    await signalOwner.drain()
-    signalOwner.dispose()
   }
 }
 
 async function runWithTrace(trace: RunTrace, startTime: number, bootstrapLogger: Logger): Promise<number> {
-  const {tracer, registry, traceInputs, signalOwner} = trace
+  const {tracer, registry, traceInputs, signalTrace} = trace
   /** A phase of the run: a span from the moment the phase starts to the moment it returns or throws. */
   const phase = async <T>(
     name: string,
@@ -187,7 +183,7 @@ async function runWithTrace(trace: RunTrace, startTime: number, bootstrapLogger:
     // Admission closes with the first signal: no phase starts after it, so nothing new is spawned, sent or created, whichever
     // read the signal interrupted. A teardown phase (a release, a take-back, cleanup, the final report) lets go of what the run
     // owns and is never refused. The throw takes the run to its `finally`, which does exactly that.
-    if (options.teardown !== true && signalOwner.cancelled()) {
+    if (options.teardown !== true && isRunCancelled()) {
       throw createRunCancelledError(`The run was cancelled, so the ${name} phase did not start`)
     }
     return withSpan(tracer.startSpan(name), work, classify)
@@ -443,7 +439,7 @@ async function runWithTrace(trace: RunTrace, startTime: number, bootstrapLogger:
     requestedOutputModeState = resolveRequestedOutputModeState()
     const bootstrap = await phase(
       'bootstrap',
-      async span => runBootstrap(bootstrapLogger, {registry, tracing: traceInputs, traceSpan: span, signalOwner}),
+      async span => runBootstrap(bootstrapLogger, {registry, tracing: traceInputs, traceSpan: span, signalTrace}),
       started => (started == null ? {outcome: 'failed', reason: 'bootstrap-failed'} : {outcome: 'succeeded'}),
     )
     if (bootstrap == null) {

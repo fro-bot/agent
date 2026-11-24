@@ -1,15 +1,16 @@
 /**
- * A real process for `signal-owner.test.ts`: the real signal owner, tracer, exec adapter and (in `isolated` mode) sandbox
- * lifecycle, with the real process signals. What the owner does to a running child, to the export and to a write that was
- * already in flight is observed here, not assumed. Nothing here is imported by product code.
+ * A real process for `signal-cancel.test.ts`: the real lifecycle tracer, exec adapter and (in `isolated` mode) sandbox lifecycle
+ * with its trace hook, with the real process signals. What a signal does to a running child, to the export and to a write that
+ * was already in flight is observed here, not assumed: in `plain` mode (no `isolate-agent`) the process has no handler of its own
+ * and ends as it always did; in `isolated` mode the sandbox's handler runs the teardown and starts the export beside it.
+ * Nothing here is imported by product code.
  *
  * Configured by the environment:
  *  - SIGNAL_FIXTURE_LOG        the file every step appends a line to
  *  - SIGNAL_FIXTURE_TEMP       a scratch directory
  *  - SIGNAL_FIXTURE_COLLECTOR  the trace endpoint, or empty for a run with tracing off
- *  - SIGNAL_FIXTURE_MODE       `plain` (no sandbox) or `isolated` (a sandbox lifecycle registered with the owner)
+ *  - SIGNAL_FIXTURE_MODE       `plain` (no sandbox) or `isolated` (a sandbox lifecycle with the trace hook)
  *  - SIGNAL_FIXTURE_SCENARIO   `child` | `complete` | `read-then-write`
- *  - SIGNAL_FIXTURE_DEADLINE_MS    the export's deadline on a signal
  *  - SIGNAL_FIXTURE_STOP_MS    how long the sandbox's stop step takes
  *  - SIGNAL_FIXTURE_BUDGET_MS  the sandbox teardown's budget
  */
@@ -23,14 +24,12 @@ import {createExecAdapter} from '../services/setup/adapters.js'
 import {createLifecycleTracer} from '../shared/lifecycle-tracer.js'
 import {createSecretRegistry} from '../shared/secret-registry.js'
 import {createSandboxLifecycle} from './phases/sandbox-lifecycle.js'
-import {createSignalOwner} from './signal-owner.js'
 
 const log = process.env.SIGNAL_FIXTURE_LOG ?? ''
 const temp = process.env.SIGNAL_FIXTURE_TEMP ?? '/tmp'
 const collector = process.env.SIGNAL_FIXTURE_COLLECTOR ?? ''
 const mode = process.env.SIGNAL_FIXTURE_MODE ?? 'plain'
 const scenario = process.env.SIGNAL_FIXTURE_SCENARIO ?? 'child'
-const deadlineMs = Number(process.env.SIGNAL_FIXTURE_DEADLINE_MS ?? '2000')
 const stopMs = Number(process.env.SIGNAL_FIXTURE_STOP_MS ?? '1000')
 const budgetMs = Number(process.env.SIGNAL_FIXTURE_BUDGET_MS ?? '10000')
 
@@ -52,20 +51,19 @@ const tracer = createLifecycleTracer({
   env: {},
 })
 
-const owner = createSignalOwner({
-  logger,
-  onCancel: signal => {
+/** What the sandbox's signal handler does to the trace, with a line for each step. */
+const signalTrace = {
+  onSignal: (signal: 'SIGINT' | 'SIGTERM'): void => {
     mark(`cancelled:${signal}`)
     tracer.cancel(signal === 'SIGINT' ? 'sigint' : 'sigterm')
   },
-  flush: async options => {
+  flush: async (options: {readonly boundMs: number}): Promise<unknown> => {
     mark('flush-started')
     const result = await tracer.flush(options)
     mark('flush-settled')
     return result
   },
-  flushDeadlineMs: deadlineMs,
-})
+}
 
 const exec = createExecAdapter()
 
@@ -112,7 +110,7 @@ if (mode === 'isolated') {
       execWithTimeout: async () => 0,
       getExecOutput: async () => ({exitCode: 0, stdout: '', stderr: ''}),
     },
-    signalOwner: owner,
+    signalTrace,
     signalTeardownBudgetMs: budgetMs,
     recordState: state => mark(`state:${state}`),
     deps: {
@@ -150,12 +148,10 @@ if (mode === 'isolated') {
   }
 }
 
-/** The run's own ending, as `run()` has it: the span, the shared flush, the drain, the exit. */
+/** The run's own ending, as `run()` has it: the span, the shared flush, the exit. */
 async function finishLikeRun(exitCode: number): Promise<never> {
   tracer.root.end({outcome: exitCode === 0 ? 'succeeded' : 'failed'})
   await tracer.flush()
-  await owner.drain()
-  owner.dispose()
   mark(`exit:${exitCode}`)
   process.exit(exitCode)
 }
@@ -174,6 +170,8 @@ if (scenario === 'child') {
   await finishLikeRun(1)
 } else if (scenario === 'complete') {
   tracer.startSpan('cleanup').end({outcome: 'succeeded'})
+  // With no command running and no sandbox, nothing of ours listens for a signal: the process ends on one as it always did.
+  mark(`listeners:${process.listenerCount('SIGINT')}:${process.listenerCount('SIGTERM')}`)
   process.stdout.write('READY\n')
   await finishLikeRun(0)
 } else {

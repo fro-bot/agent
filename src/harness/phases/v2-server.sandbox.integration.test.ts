@@ -42,7 +42,7 @@
  */
 import type {SandboxToolPaths} from '../../services/setup/sandbox-preflight.js'
 import type {Logger} from '../../shared/logger.js'
-import type {SandboxLifecycle, SandboxLifecycleDeps, SandboxReleaseResult} from './sandbox-lifecycle.js'
+import type {SandboxLifecycle, SandboxLifecycleDeps, SandboxReleaseResult, SignalHost} from './sandbox-lifecycle.js'
 import type {LaunchNamespaces, Probe, Row, ScriptedProvider, ScriptedTracing} from './v2-server.sandbox.harness.js'
 import {Buffer} from 'node:buffer'
 import {spawn, spawnSync} from 'node:child_process'
@@ -108,7 +108,6 @@ import {createLogger} from '../../shared/logger.js'
 import {createSecretRegistry} from '../../shared/secret-registry.js'
 import {unwrapOk} from '../../shared/test-helpers.js'
 import {parseTraceInputs} from '../config/trace-inputs.js'
-import {createSignalOwner, type SignalHost, type SignalName} from '../signal-owner.js'
 import {startKeyProxyProcess, type KeyProxyProcess} from './key-proxy-process.js'
 import {snapshotLogDirectory} from './log-snapshot.js'
 import {createSandboxLifecycle} from './sandbox-lifecycle.js'
@@ -3700,94 +3699,55 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
 /** The runner cancels a step with SIGINT and, if it is still running 7.5 seconds later, sends SIGTERM. */
 const RUNNER_SIGTERM_DELAY_MS = 7_500
 
-/** A stand-in for `process`: the owner listens on it and re-raises on it, and the test says when each signal arrives. */
+/** A stand-in for `process` for the sandbox's handler: it listens on it and re-raises on it, and the test says when a signal arrives. */
 function fakeSignalHost(): SignalHost & {
-  readonly deliver: (signal: SignalName) => void
-  readonly killed: SignalName[]
+  readonly deliver: (signal: 'SIGINT' | 'SIGTERM') => void
+  readonly killed: {readonly signal: 'SIGINT' | 'SIGTERM'; readonly at: number; readonly spansAtReceiver: number}[]
+  /** Set by the test: how many spans the receiver holds, read at the moment of the re-raise. */
+  spansAtReceiver: () => number
 } {
-  const handlers = new Map<SignalName, (() => void)[]>()
-  const killed: SignalName[] = []
-  return {
+  const handlers = new Map<'SIGINT' | 'SIGTERM', (() => void)[]>()
+  const killed: {signal: 'SIGINT' | 'SIGTERM'; at: number; spansAtReceiver: number}[] = []
+  const host = {
     pid: 4242,
     killed,
-    on: (signal, listener) => {
+    spansAtReceiver: () => 0,
+    on: (signal: 'SIGINT' | 'SIGTERM', listener: () => void) => {
       handlers.set(signal, [...(handlers.get(signal) ?? []), listener])
     },
-    off: (signal, listener) => {
+    off: (signal: 'SIGINT' | 'SIGTERM', listener: () => void) => {
       handlers.set(
         signal,
         (handlers.get(signal) ?? []).filter(item => item !== listener),
       )
     },
-    kill: (_pid, signal) => {
-      killed.push(signal)
+    kill: (_pid: number, signal: 'SIGINT' | 'SIGTERM') => {
+      killed.push({signal, at: Date.now(), spansAtReceiver: host.spansAtReceiver()})
     },
-    deliver: signal => {
+    deliver: (signal: 'SIGINT' | 'SIGTERM') => {
       for (const listener of handlers.get(signal) ?? []) listener()
     },
   }
+  return host
 }
-
-/**
- * What a cancelled run has when the runner's SIGTERM would arrive: the real lifecycle tracer, the real signal owner and a real
- * OTLP receiver. The kernel's signal is the one thing replaced (by `deliver` on the owner's host): a signal handler that
- * re-raises would end the test process, and the real-process rows of `signal-owner.test.ts` already run with real signals.
- */
-async function startCancellableRun(logger: Logger, cleanups: (() => Promise<void> | void)[]) {
-  const sink: OtlpSink = await startOtlpSink()
-  cleanups.push(sink.stop)
-  const tracer = createLifecycleTracer({
-    inputs: {enabled: true, url: sink.url, headers: []},
-    logger,
-    registry: createSecretRegistry(() => undefined),
-    env: {},
-    identity: {repository: 'owner/repo', runId: '4242', attempt: '1', job: 'sandbox-it', trigger: 'workflow_dispatch'},
-  })
-  const host = fakeSignalHost()
-  const owner = createSignalOwner({
-    logger,
-    host,
-    onCancel: signal => tracer.cancel(signal === 'SIGINT' ? 'sigint' : 'sigterm'),
-    flush: async options => tracer.flush(options),
-  })
-  cleanups.push(() => owner.dispose())
-  // The phases the run had reached: bootstrap is done, execution is where the cancel finds it.
-  tracer.startSpan('bootstrap').end({outcome: 'succeeded'})
-  tracer.startSpan('execution')
-  return {sink, tracer, host, owner}
-}
-
-type CancellableRun = Awaited<ReturnType<typeof startCancellableRun>>
 
 interface CancelledOutcome {
-  /** The spans were at the receiver within the runner's window, before the SIGTERM it would send. */
-  readonly deliveredBeforeSigterm: boolean
   readonly spans: ReturnType<typeof decodeSpans>
-  /** The signals the owner re-raised on its host: one, the first. */
-  readonly reRaised: readonly SignalName[]
-}
-
-/** SIGINT now; the SIGTERM the runner would send 7.5 s later; then the owner is waited for, as the process would be. */
-async function cancelAsTheRunnerDoes(run: CancellableRun): Promise<CancelledOutcome> {
-  const sigintAt = Date.now()
-  run.host.deliver('SIGINT')
-  const reached = (): boolean => decodeSpans(run.sink.accepted()).some(span => span.name === 'action.main')
-  let deliveredBeforeSigterm = true
-  try {
-    await waitUntil('the reached spans at the receiver', reached, RUNNER_SIGTERM_DELAY_MS - 500)
-  } catch {
-    deliveredBeforeSigterm = false
-  }
-  await sleep(Math.max(0, sigintAt + RUNNER_SIGTERM_DELAY_MS - Date.now()))
-  run.host.deliver('SIGTERM')
-  await run.owner.drain()
-  return {deliveredBeforeSigterm, spans: decodeSpans(run.sink.accepted()), reRaised: [...run.host.killed]}
+  /** The first re-raise on the host, with when it happened and how many spans the receiver held at that moment. */
+  readonly reRaised: readonly {
+    readonly signal: 'SIGINT' | 'SIGTERM'
+    readonly at: number
+    readonly spansAtReceiver: number
+  }[]
+  /** When the sandbox's state last became `restored` or `unsafe`: the teardown settling. */
+  readonly teardownSettledAt: number | undefined
+  readonly sigintAt: number
 }
 
 const spanByName = (outcome: CancelledOutcome | undefined, name: string) =>
   outcome?.spans.find(span => span.name === name)
 
-describe.skipIf(!gated)('a cancelled isolated run delivers its reached spans before the runner’s SIGTERM', () => {
+describe.skipIf(!gated)('a cancelled isolated run delivers its reached spans inside its teardown window', () => {
   const logger = createLogger({phase: 'sandbox-integration-cancel'})
   const scratch = path.join(runnerTemp, `sandbox-it-cancel-${process.pid}`)
   const xdgRoot = path.join(runnerTemp, `sandbox-it-cancel-xdg-${process.pid}`)
@@ -3796,12 +3756,13 @@ describe.skipIf(!gated)('a cancelled isolated run delivers its reached spans bef
   const env = hostedEnv(workspace, xdgRoot)
   const strayPattern = 'sleep 779[34]'
   const cleanups: (() => Promise<void> | void)[] = []
-  const states: string[] = []
+  const states: {readonly state: string; readonly at: number}[] = []
 
   let provider: ScriptedProvider | undefined
   let lifecycle: SandboxLifecycle | undefined
   let outcome: CancelledOutcome | undefined
   let strays = 'not checked'
+  let sigtermAfterReRaise = 0
 
   beforeAll(async () => {
     const tools = await preflightTools(logger)
@@ -3818,7 +3779,26 @@ describe.skipIf(!gated)('a cancelled isolated run delivers its reached spans bef
           `sleep 0.3; R cancel_setup INFO "$(pgrep -d, -f 'sleep 779')"`,
       },
     ])
-    const run = await startCancellableRun(logger, cleanups)
+    const sink: OtlpSink = await startOtlpSink()
+    cleanups.push(sink.stop)
+    const tracer = createLifecycleTracer({
+      inputs: {enabled: true, url: sink.url, headers: []},
+      logger,
+      registry: createSecretRegistry(() => undefined),
+      env: {},
+      identity: {
+        repository: 'owner/repo',
+        runId: '4242',
+        attempt: '1',
+        job: 'sandbox-it',
+        trigger: 'workflow_dispatch',
+      },
+    })
+    // The phases the run had reached: bootstrap is done, execution is where the cancel finds it.
+    tracer.startSpan('bootstrap').end({outcome: 'succeeded'})
+    tracer.startSpan('execution')
+    const host = fakeSignalHost()
+    host.spansAtReceiver = () => decodeSpans(sink.accepted()).length
     lifecycle = createSandboxLifecycle({
       tools,
       env,
@@ -3828,15 +3808,32 @@ describe.skipIf(!gated)('a cancelled isolated run delivers its reached spans bef
       responseDir,
       logger,
       viewLauncher,
-      signalOwner: run.owner,
-      recordState: state => states.push(state),
+      // The real handler of a real isolated run: its own, on a stand-in for `process`, so the re-raise does not end the test.
+      signals: host,
+      signalTrace: {
+        onSignal: signal => tracer.cancel(signal === 'SIGINT' ? 'sigint' : 'sigterm'),
+        flush: async options => tracer.flush(options),
+      },
+      recordState: state => states.push({state, at: Date.now()}),
     })
     const prepared = await lifecycle.prepare({keyFilePaths: [keyFile], ghConfigDir: null, repoSkills: null})
     if (!prepared.success) throw new Error(prepared.error)
     // The server is up and the agent has run its tool: the run is mid-execution when it is cancelled.
     await startScriptedSession({binary: BINARY ?? '', workspace, env, lifecycle, keyFile, provider, logger})
 
-    outcome = await cancelAsTheRunnerDoes(run)
+    // The runner's SIGINT, then (if the process were still running) its SIGTERM 7.5 s later.
+    const sigintAt = Date.now()
+    host.deliver('SIGINT')
+    await waitUntil('the signal to be re-raised', () => host.killed.length > 0, 30_000)
+    await sleep(Math.max(0, sigintAt + RUNNER_SIGTERM_DELAY_MS - Date.now()))
+    host.deliver('SIGTERM')
+    sigtermAfterReRaise = host.killed.length
+    outcome = {
+      spans: decodeSpans(sink.accepted()),
+      reRaised: [...host.killed],
+      teardownSettledAt: states.findLast(item => item.state === 'restored' || item.state === 'unsafe')?.at,
+      sigintAt,
+    }
     strays = strayProcesses(strayPattern)
   }, 600_000)
 
@@ -3849,10 +3846,10 @@ describe.skipIf(!gated)('a cancelled isolated run delivers its reached spans bef
     fs.rmSync(xdgRoot, {recursive: true, force: true})
   }, 120_000)
 
-  it('delivered the spans it had reached to the receiver before the SIGTERM the runner would have sent', () => {
-    // #given a run cancelled mid-execution, with the SIGTERM 7.5 s behind the SIGINT
-    // #then the receiver had the trace inside that window
-    expect(outcome?.deliveredBeforeSigterm).toBe(true)
+  it('had delivered the spans it reached by the time the teardown settled and the signal was re-raised', () => {
+    // #given a run cancelled mid-execution
+    // #then at the moment of the re-raise the receiver already held the trace: the export ran beside the teardown
+    expect(outcome?.reRaised[0]?.spansAtReceiver).toBeGreaterThan(0)
     expect(spanByName(outcome, 'bootstrap')).toMatchObject({attrs: {'fro_bot.outcome': 'succeeded'}})
     // #and the phase it was in and the root are cancelled, with the signal as the reason, and not errors
     for (const name of ['execution', 'action.main']) {
@@ -3864,65 +3861,85 @@ describe.skipIf(!gated)('a cancelled isolated run delivers its reached spans bef
     }
   })
 
-  it('tore the sandbox down inside the same cancel: restored, no stray process, and the signal re-raised once, after it', () => {
-    // #then the teardown ended restored (the owner re-raises only after it), nothing of the launch is left, and the second
-    // signal changed nothing
-    expect(states.at(-1)).toBe('restored')
+  it('re-raised the signal once, no later than the teardown settling, with nothing left of the launch', () => {
+    // #then the sandbox ended restored, the signal came right after that (the export added no wait), once, and the SIGTERM the
+    // runner would send 7.5 s later found no handler to run again
+    expect(states.at(-1)?.state).toBe('restored')
+    expect(outcome?.reRaised.map(item => item.signal)).toEqual(['SIGINT'])
+    expect((outcome?.reRaised[0]?.at ?? 0) - (outcome?.teardownSettledAt ?? Number.POSITIVE_INFINITY)).toBeLessThan(
+      1_000,
+    )
+    expect(sigtermAfterReRaise).toBe(1)
     expect(strays).toBe('')
-    expect(outcome?.reRaised).toEqual(['SIGINT'])
   })
 })
 
-// Needs no sandbox, so it can also run off a hosted runner when asked:
-// `FRO_BOT_CANCEL_IT=1 bunx vitest run src/harness/phases/v2-server.sandbox.integration.test.ts -t 'without isolation'`.
+/**
+ * A run WITHOUT `isolate-agent`: the real fixture process with real signals (it needs no sandbox, so it can also run off a hosted
+ * runner when asked: `FRO_BOT_CANCEL_IT=1 bunx vitest run <this file> -t 'without isolation'`). Cancellation is what it always
+ * was: the process has no handler of its own, the exec adapter reaps the command it is running and re-raises at once, and no
+ * lifecycle trace is sent.
+ */
 const cancelPlainEnabled = gated || process.env.FRO_BOT_CANCEL_IT === '1'
 
-describe.skipIf(!cancelPlainEnabled)(
-  'a cancelled run without isolation delivers its reached spans before the runner’s SIGTERM',
-  () => {
-    const logger = createLogger({phase: 'sandbox-integration-cancel-plain'})
-    const cleanups: (() => Promise<void> | void)[] = []
-    const strayPattern = 'sleep 7795'
+describe.skipIf(!cancelPlainEnabled)('a cancelled run without isolation ends as it always did', () => {
+  const dir = path.join(os.tmpdir(), `sandbox-it-cancel-plain-${process.pid}`)
+  const cleanups: (() => Promise<void> | void)[] = []
+  let exit:
+    {readonly code: number | null; readonly signal: NodeJS.Signals | null; readonly elapsedMs: number} | undefined
+  let received = -1
+  let commandAlive = true
 
-    let outcome: CancelledOutcome | undefined
-    let commandEnded: 'ended' | 'still running' = 'still running'
-    let strays = 'not checked'
-
-    beforeAll(async () => {
-      const run = await startCancellableRun(logger, cleanups)
-      // A command the run is waiting on, through the exec adapter every setup and server command goes through.
-      const exec = createExecAdapter().execWithTimeout
-      if (exec === undefined) throw new Error('execWithTimeout is not configured')
-      const running = exec('sh', ['-c', `exec ${strayPattern}`], 120_000, {silent: true}).then(() => {
-        commandEnded = 'ended'
+  beforeAll(async () => {
+    fs.mkdirSync(dir, {recursive: true})
+    const sink: OtlpSink = await startOtlpSink()
+    cleanups.push(sink.stop)
+    const child = spawn('bun', [path.join(import.meta.dirname, '..', 'signal-cancel.fixture.ts')], {
+      env: {
+        ...process.env,
+        SIGNAL_FIXTURE_LOG: path.join(dir, 'log.txt'),
+        SIGNAL_FIXTURE_TEMP: dir,
+        SIGNAL_FIXTURE_COLLECTOR: sink.url,
+        SIGNAL_FIXTURE_MODE: 'plain',
+        SIGNAL_FIXTURE_SCENARIO: 'child',
+      },
+      stdio: ['ignore', 'pipe', 'inherit'],
+    })
+    const exited = new Promise<{code: number | null; signal: NodeJS.Signals | null}>(resolve => {
+      child.once('exit', (code, signal) => resolve({code, signal}))
+    })
+    await new Promise<void>(resolve => {
+      child.stdout.on('data', (chunk: Buffer) => {
+        if (chunk.toString('utf8').includes('READY')) resolve()
       })
-      await sleep(500)
-
-      outcome = await cancelAsTheRunnerDoes(run)
-      await running
-      strays = strayProcesses(strayPattern)
-    }, 120_000)
-
-    afterAll(async () => {
-      for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
-      spawnSync('pkill', ['-KILL', '-f', strayPattern])
-    }, 60_000)
-
-    it('delivered the spans it had reached to the receiver before the SIGTERM the runner would have sent', () => {
-      expect(outcome?.deliveredBeforeSigterm).toBe(true)
-      for (const name of ['execution', 'action.main']) {
-        expect(spanByName(outcome, name)?.attrs).toMatchObject({
-          'fro_bot.outcome': 'cancelled',
-          'fro_bot.reason': 'sigint',
-        })
-      }
-      expect(spanByName(outcome, 'bootstrap')).toMatchObject({attrs: {'fro_bot.outcome': 'succeeded'}})
     })
+    await sleep(500)
+    // The runner's SIGINT. A process that kept itself alive for an export would still be running when its SIGTERM came.
+    const sigintAt = Date.now()
+    child.kill('SIGINT')
+    const outcome = await exited
+    exit = {...outcome, elapsedMs: Date.now() - sigintAt}
+    received = sink.received()
+    const pid = Number(fs.readFileSync(path.join(dir, 'child.pid'), 'utf8').trim())
+    try {
+      process.kill(pid, 0)
+    } catch {
+      commandAlive = false
+    }
+  }, 120_000)
 
-    it('stopped the command the run was waiting on, and re-raised the signal once', () => {
-      expect(commandEnded).toBe('ended')
-      expect(strays).toBe('')
-      expect(outcome?.reRaised).toEqual(['SIGINT'])
-    })
-  },
-)
+  afterAll(async () => {
+    for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
+    fs.rmSync(dir, {recursive: true, force: true})
+  }, 60_000)
+
+  it('ended by the signal at once, with no export started and no lifecycle trace at the collector', () => {
+    expect(exit?.signal).toBe('SIGINT')
+    expect(exit?.elapsedMs).toBeLessThan(2_000)
+    expect(received).toBe(0)
+  })
+
+  it('stopped the command the run was waiting on', () => {
+    expect(commandAlive).toBe(false)
+  })
+})

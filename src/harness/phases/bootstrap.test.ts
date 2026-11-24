@@ -686,6 +686,33 @@ describe('runBootstrap isolate-agent preflight', () => {
     expect(mocks.saveState).toHaveBeenCalledWith('sandboxState', 'pending')
   })
 
+  it('hands the sandbox lifecycle the run’s trace hook, and none to a run without isolation', async () => {
+    // #given the hook the run gives bootstrap
+    const signalTrace = {onSignal: vi.fn(), flush: vi.fn(async () => undefined)}
+    const lifecycle = {prepare: vi.fn(), release: vi.fn(), launch: vi.fn()}
+    mocks.createSandboxLifecycle.mockReturnValue(lifecycle)
+    mocks.runSandboxPreflight.mockResolvedValue({ok: true, tools})
+    vi.stubEnv('GITHUB_WORKSPACE', path.join(runnerTempDir, 'repo'))
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when an isolated run bootstraps
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: true})})
+    await runBootstrap(createMockLogger(), {signalTrace})
+
+    // #then the lifecycle's own handler gets it, and nothing else installs a handler
+    const options = mocks.createSandboxLifecycle.mock.calls[0]?.[0] as {signalTrace?: unknown}
+    expect(options.signalTrace).toBe(signalTrace)
+
+    // #when a run without isolation bootstraps with the same hook
+    mocks.createSandboxLifecycle.mockClear()
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: false})})
+    const plain = await runBootstrap(createMockLogger(), {signalTrace})
+
+    // #then it has no sandbox to give the hook to, so a signal reaches nothing of the trace's
+    expect(plain?.sandbox).toBeNull()
+    expect(mocks.createSandboxLifecycle).not.toHaveBeenCalled()
+  })
+
   it('hands the lifecycle the PATH from before setup ran, even though setup prepends the opencode directory', async () => {
     // #given a runner PATH, and a setup that prepends a directory to it, as `core.addPath` does
     const before = '/opt/hostedtoolcache/node/24/x64/bin:/usr/local/bin:/usr/bin:/bin'

@@ -10,7 +10,7 @@ import {buildTracingLauncherValue, TRACING_IDENTITY_FIELD_MAX_CHARS} from '@fro-
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {startOtlpSink} from '../../packages/runtime/src/tracing/otlp-sink.testing.js'
 import {resolveActionTracing} from '../services/setup/tracing.js'
-import {resetRunCancellation} from '../shared/cancellation.js'
+import {markRunCancelled, resetRunCancellation} from '../shared/cancellation.js'
 import {run} from './run.js'
 
 /**
@@ -859,8 +859,8 @@ describe('run with lifecycle tracing', () => {
     })
   })
 
-  describe('the signal owner', () => {
-    it('is installed before bootstrap for every run, handed to bootstrap, and removed when the run ends', async () => {
+  describe('signals', () => {
+    it('installs no signal handler of its own, traced or not: a run without isolation ends on a signal as it always did', async () => {
       // #given the handlers the process has before the run, and a bootstrap that looks at them
       const before = {int: process.listenerCount('SIGINT'), term: process.listenerCount('SIGTERM')}
       const during: {int: number; term: number}[] = []
@@ -871,51 +871,51 @@ describe('run with lifecycle tracing', () => {
         return createBootstrap()
       })
 
-      // #when
+      // #when the traced run completes
       await run()
 
-      // #then one handler per signal was in place by bootstrap, bootstrap was given the owner, and none is left
-      expect(during).toEqual([{int: before.int + 1, term: before.term + 1}])
-      expect(vi.mocked(runBootstrap).mock.calls[0]?.[1]).toHaveProperty('signalOwner')
+      // #then no handler was added at any point, and none is left
+      expect(during).toEqual([before])
       expect({int: process.listenerCount('SIGINT'), term: process.listenerCount('SIGTERM')}).toEqual(before)
     })
 
-    it('is installed on an untraced run too', async () => {
-      // #given no trace inputs
-      inputs.values.clear()
-      const during: number[] = []
+    it('hands bootstrap the trace hook the sandbox’s handler uses: it ends the open spans as cancelled and starts the one export', async () => {
+      // #given a bootstrap that keeps the hook, and a phase that is open when the sandbox's handler calls it
       await arrange({})
       const {runBootstrap} = await import('./phases/bootstrap.js')
-      vi.mocked(runBootstrap).mockImplementation(async () => {
-        during.push(process.listenerCount('SIGTERM'))
+      let hook: {
+        onSignal: (signal: 'SIGINT' | 'SIGTERM') => void
+        flush: (options: {boundMs: number}) => Promise<unknown>
+      }
+      vi.mocked(runBootstrap).mockImplementation(async (_logger, options) => {
+        if (options?.signalTrace === undefined) throw new Error('no signal trace handed to bootstrap')
+        hook = options.signalTrace
         return createBootstrap()
       })
-      const before = process.listenerCount('SIGTERM')
+      const {runRouting} = await import('./phases/routing.js')
+      const routing = vi.mocked(runRouting).getMockImplementation()
+      vi.mocked(runRouting).mockImplementation(async (...args) => {
+        hook.onSignal('SIGTERM')
+        await hook.flush({boundMs: 2_000})
+        return routing?.(...args) ?? Promise.reject(new Error('no routing'))
+      })
 
       // #when
       await run()
 
-      // #then
-      expect(during).toEqual([before + 1])
-      expect(process.listenerCount('SIGTERM')).toBe(before)
-    })
-
-    it('is removed when the run throws', async () => {
-      // #given a cleanup that rejects
-      const before = process.listenerCount('SIGINT')
-      await arrange({cleanup: 'throws'})
-
-      // #when
-      await run().catch(() => undefined)
-
-      // #then
-      expect(process.listenerCount('SIGINT')).toBe(before)
+      // #then the root and the phase that was open end cancelled, with the signal as the reason, in the one export
+      expect(target.accepted()).toHaveLength(1)
+      const spans = allSpans(target)
+      expect(attr(rootOf(spans), 'fro_bot.outcome')).toBe('cancelled')
+      expect(attr(rootOf(spans), 'fro_bot.reason')).toBe('sigterm')
+      expect(attr(byName(spans, 'routing'), 'fro_bot.outcome')).toBe('cancelled')
     })
   })
 
   describe('a cancelled run admits no new work', () => {
-    // The signal arrives inside a phase, as it does when the runner cancels a step: the owner's handlers are the run's real ones,
-    // only the re-raise (which would end the test process) is stubbed.
+    // The signal reaches an isolated run's sandbox handler inside a phase; the handler's first act is to mark the run cancelled
+    // (`markRunCancelled`, synchronously), which is what these rows do. A run without isolation has no such handler and ends on
+    // the signal at once, so it never reaches a refused phase (`signal-cancel.test.ts` runs that with real signals).
     type Phase =
       'bootstrap' | 'routing' | 'dedup' | 'lock' | 'acknowledge' | 'cache restore' | 'session prep' | 'execute'
 
@@ -938,7 +938,7 @@ describe('run with lifecycle tracing', () => {
       const target = vi.mocked(mocks[phase] as unknown as (...args: unknown[]) => Promise<unknown>)
       const original = target.getMockImplementation()
       target.mockImplementation(async (...args: unknown[]) => {
-        process.emit('SIGINT')
+        markRunCancelled()
         return original?.(...args)
       })
     }
@@ -952,11 +952,7 @@ describe('run with lifecycle tracing', () => {
       ['cache restore', 'session prep'],
       ['session prep', 'execute'],
     ] as const)('starts nothing after a signal during %s: not even %s', async (during, next) => {
-      // #given a collector that answers slowly, so the signal's export is still pending while the run tries to go on
-      const slow = await startOtlpSink({respond: () => ({status: 200, body: '{}', delayMs: 700})})
-      sinks.push(slow)
-      inputs.values.set('trace-endpoint', slow.url)
-      const kill = vi.spyOn(process, 'kill').mockImplementation(() => true)
+      // #given a run that is cancelled inside one of its phases
       await arrange({})
       await cancelDuring(during)
 
@@ -972,23 +968,19 @@ describe('run with lifecycle tracing', () => {
       expect(runExecute).not.toHaveBeenCalled()
       expect(runFinalizeWithResult).not.toHaveBeenCalled()
       expect(runReviewReconciliation).not.toHaveBeenCalled()
-      // #and what the run owned was still let go: cleanup ran, and the signal was re-raised once
+      // #and what the run owned was still let go: cleanup ran
       const {runCleanup} = await import('./phases/cleanup.js')
       expect(runCleanup).toHaveBeenCalledTimes(1)
-      expect(kill).toHaveBeenCalledTimes(1)
-      expect(kill).toHaveBeenCalledWith(process.pid, 'SIGINT')
       expect(exitCode).toBe(1)
-      // #and the export carries the phase that was running as cancelled, and no phase that never started
-      const names = allSpans(slow).map(span => span.name)
+      // #and no phase that never started has a span
+      const names = allSpans(target).map(span => span.name)
       expect(names).not.toContain('execution')
       expect(names).not.toContain('finalize')
       expect(names).not.toContain('review reconciliation')
-      expect(attr(rootOf(allSpans(slow)), 'fro_bot.outcome')).toBe('cancelled')
     })
 
     it('releases the server it already started and still runs cleanup, after a signal during session prep', async () => {
       // #given
-      const kill = vi.spyOn(process, 'kill').mockImplementation(() => true)
       await arrange({})
       await cancelDuring('session prep')
 
@@ -1000,7 +992,6 @@ describe('run with lifecycle tracing', () => {
       expect(runReleaseV2).toHaveBeenCalledTimes(1)
       const {runCleanup} = await import('./phases/cleanup.js')
       expect(runCleanup).toHaveBeenCalledTimes(1)
-      expect(kill).toHaveBeenCalledTimes(1)
     })
   })
 

@@ -5,7 +5,6 @@ import type {LifecycleSpan} from '../../shared/lifecycle-tracer.js'
 import type {Logger} from '../../shared/logger.js'
 import type {SecretRegistry} from '../../shared/secret-registry.js'
 import type {ActionInputs, TracingInputs} from '../../shared/types.js'
-import type {SignalOwner} from '../signal-owner.js'
 import * as crypto from 'node:crypto'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
@@ -28,7 +27,7 @@ import {createLogger} from '../../shared/logger.js'
 import {parseActionInputs} from '../config/inputs.js'
 import {STATE_KEYS} from '../config/state-keys.js'
 import {recordRunGhConfigDir} from './gh-config.js'
-import {createSandboxLifecycle, type SandboxLifecycle} from './sandbox-lifecycle.js'
+import {createSandboxLifecycle, type SandboxLifecycle, type SandboxSignalTrace} from './sandbox-lifecycle.js'
 
 export interface BootstrapPhaseResult {
   readonly inputs: ActionInputs
@@ -78,8 +77,8 @@ export interface BootstrapOptions {
   readonly tracing?: TracingInputs
   /** The bootstrap span: the installs are its children. */
   readonly traceSpan?: LifecycleSpan
-  /** The run's signal owner: an isolated run's sandbox lifecycle registers its teardown with it instead of installing handlers. */
-  readonly signalOwner?: SignalOwner
+  /** What the lifecycle trace does when a signal reaches the sandbox's handler. Only an isolated run has one. */
+  readonly signalTrace?: SandboxSignalTrace
 }
 
 export async function runBootstrap(
@@ -205,7 +204,7 @@ export async function runBootstrap(
       // `opencodeResult.path` is the executable setup resolved; the agent's `PATH` wants its directory.
       path.isAbsolute(opencodeResult.path) ? path.dirname(opencodeResult.path) : null,
       inputs.agentStateHome,
-      bootstrapOptions.signalOwner,
+      bootstrapOptions.signalTrace,
     ),
   }
 }
@@ -217,7 +216,7 @@ function createRunSandbox(
   runnerPath: string | undefined,
   opencodeDirectory: string | null,
   agentStateHome: string | null,
-  signalOwner: SignalOwner | undefined,
+  signalTrace: SandboxSignalTrace | undefined,
 ): SandboxLifecycle | null {
   if (tools === null) return null
   const runnerTemp = process.env.RUNNER_TEMP?.trim() ?? ''
@@ -235,7 +234,7 @@ function createRunSandbox(
         : buildAttachmentDir({runnerTemp, runId: getGitHubRunId(), runAttempt: getGitHubRunAttempt()}),
     logger: createLogger({phase: 'sandbox'}),
     recordState: state => core.saveState(STATE_KEYS.SANDBOX_STATE, state),
-    ...(signalOwner === undefined ? {} : {signalOwner}),
+    ...(signalTrace === undefined ? {} : {signalTrace}),
   })
 }
 
