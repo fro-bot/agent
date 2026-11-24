@@ -677,6 +677,38 @@ describe('createLifecycleTracer', () => {
       )
     })
 
+    it('exports a fixed category, never the error name, when a registered value the scrubber cannot match is the name', async () => {
+      // #given a registered 7-character credential (outside the scrubber's range) that a thrown error carries as its name
+      const target = await sink()
+      const {tracer, registry} = harness(target.url)
+      const secret = 'Zq9x4t7'
+      registry.add(secret)
+      const span = tracer.startSpan('routing')
+      span.recordException(Object.assign(new Error(`failed for ${secret}`), {name: secret}))
+      span.end({outcome: 'failed'})
+      const typed = tracer.startSpan('dedup')
+      typed.recordException(new TypeError(`bad value ${secret}`))
+      typed.end({outcome: 'failed'})
+      tracer.root.end()
+
+      // #when
+      await tracer.flush()
+
+      // #then the credential is in no byte of the export, and the name became the category `Error`, in every place it is written
+      const text = target.requests.map(request => request.text).join('\n')
+      expect(text).not.toContain(secret)
+      const routing = named(allSpans(target), 'routing')
+      const exception = eventsNamed(routing, 'exception')[0] ?? {name: '', timeUnixNano: ''}
+      expect(eventAttr(exception, 'exception.type')).toBe('Error')
+      expect(eventAttr(exception, 'exception.message')).toBe('Error')
+      expect(attr(routing, 'error.type')).toBe('Error')
+      expect(routing.status?.message).toBe('Error')
+      // #and a built-in name is kept: it is one of a fixed set, not text the run supplied
+      expect(
+        eventAttr(eventsNamed(named(allSpans(target), 'dedup'), 'exception')[0] ?? exception, 'exception.type'),
+      ).toBe('TypeError')
+    })
+
     it('keeps free text, and redacts the token where it appears, for a 4,152-character ACTIONS_RUNTIME_TOKEN', async () => {
       // #given the token a JavaScript action's process holds on a hosted runner, registered as the run does
       const token = `eyJ${'AbCd0123'.repeat(520)}`.slice(0, 4_152)

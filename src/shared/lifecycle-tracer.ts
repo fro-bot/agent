@@ -291,6 +291,31 @@ interface ExceptionRecord {
   readonly message: string
 }
 
+/** The names a built-in error (or a `typeof`) carries: the only error types exported when the registry cannot match a secret. */
+const FIXED_EXCEPTION_TYPES: ReadonlySet<string> = new Set([
+  'Error',
+  'TypeError',
+  'RangeError',
+  'SyntaxError',
+  'ReferenceError',
+  'EvalError',
+  'URIError',
+  'AggregateError',
+  'bigint',
+  'boolean',
+  'function',
+  'number',
+  'object',
+  'string',
+  'symbol',
+  'undefined',
+])
+
+/** A name from the fixed set, or `Error`. */
+function exceptionCategory(type: string): string {
+  return FIXED_EXCEPTION_TYPES.has(type) ? type : 'Error'
+}
+
 function describeError(error: unknown): ExceptionRecord {
   try {
     if (error instanceof Error) return {type: error.name, message: error.message}
@@ -456,10 +481,15 @@ export function createLifecycleTracer(options: CreateLifecycleTracerOptions): Li
 
     let status: PendingSpan['status'] = {code: 'unset'}
     if (record.exception !== undefined) {
-      const type = scrubThenCap(scrubber, record.exception.type, EXCEPTION_TYPE_MAX_CHARS)
+      // `Error.name` is a mutable string the run (or something it called) can set to anything, including a credential the
+      // scrubber cannot match. So when the registry is not matchable the type is one of a fixed set of names, never the text.
+      const matchable = registry.matchable()
+      const type = matchable
+        ? scrubThenCap(scrubber, record.exception.type, EXCEPTION_TYPE_MAX_CHARS)
+        : {text: exceptionCategory(record.exception.type), omitted: undefined}
       if (type.omitted !== undefined) omitted.push(`exception.type:${type.omitted}`)
       let message = type.text
-      if (registry.matchable()) {
+      if (matchable) {
         const bounded = scrubThenCap(scrubber, record.exception.message, EXCEPTION_MESSAGE_MAX_CHARS)
         if (bounded.omitted !== undefined) omitted.push(`exception.message:${bounded.omitted}`)
         message = bounded.text
