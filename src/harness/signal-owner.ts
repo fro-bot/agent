@@ -15,9 +15,10 @@ import {markRunCancelled} from '../shared/cancellation.js'
  *  1. sets the cancelled flag, synchronously (`shared/cancellation.ts`): every irreversible write checks it at the point of
  *     submission, so nothing is sent after this line;
  *  2. calls `onCancel`, synchronously: the tracer ends the spans still open as `cancelled`;
- *  3. starts the export, with its own deadline, short of the runner's SIGTERM;
- *  4. runs the registered teardown (the sandbox's: stop the sandbox user's processes, take its files back, inside its own
+ *  3. starts the registered teardown (the sandbox's: stop the sandbox user's processes, take its files back, inside its own
  *     10 s budget), or, with none registered, reaps the commands the exec adapter is running;
+ *  4. starts the export, with its own deadline, short of the runner's SIGTERM, one turn of the event loop later: its local
+ *     preparation (the scrubber, the serialization) is CPU work, and the teardown's first steps go first;
  *  5. when both have settled, removes its handlers and re-raises the signal, so the process ends with the signal's default
  *     action and the runner sees the exit it always saw.
  *
@@ -98,14 +99,25 @@ export function createSignalOwner(options: SignalOwnerOptions): SignalOwner {
     }
   }
 
-  /** The export, bounded: the exporter has its own bound, and this timer is the backstop for one that ignores it. */
+  /**
+   * The export, bounded: the exporter has its own bound, and this timer is the backstop for one that ignores it. The timer starts
+   * with the signal, so the deadline covers the export's own preparation (the scrubber, the serialization) too, and the export
+   * starts one turn of the event loop later: the teardown's first steps (the stop signals, the reaping) are already on their way
+   * when that work occupies the thread.
+   */
   const runFlush = async (): Promise<void> => {
     let timer: ReturnType<typeof setTimeout> | undefined
     const deadline = new Promise<void>(resolve => {
       timer = setTimeout(resolve, deadlineMs)
     })
     try {
-      await Promise.race([Promise.resolve(options.flush({boundMs: deadlineMs})).then(() => undefined), deadline])
+      const exported = (async () => {
+        await new Promise<void>(resolve => {
+          setImmediate(resolve)
+        })
+        await options.flush({boundMs: deadlineMs})
+      })()
+      await Promise.race([exported, deadline])
     } catch {
       // An export never changes how a cancelled run ends.
     } finally {
@@ -137,14 +149,14 @@ export function createSignalOwner(options: SignalOwnerOptions): SignalOwner {
       // Tracing never changes how a cancelled run stops.
     }
     logger.warning('Received a termination signal; stopping the run', {signal})
-    // 3 and 4, side by side: the export and the teardown share the runner's window.
-    runs.push(runFlush())
+    // 3 and 4, side by side: the export and the teardown share the runner's window. The teardown starts first.
     if (teardowns.size === 0) {
       const reaped = reapChildren()
       if (reaped > 0) logger.info('Stopped the commands the run was waiting on', {count: reaped})
     } else {
       for (const teardown of teardowns) runs.push(runTeardown(teardown, signal))
     }
+    runs.push(runFlush())
     await settleRuns()
     // 5. The handlers are gone, so this ends the process with the signal's default action.
     dispose()

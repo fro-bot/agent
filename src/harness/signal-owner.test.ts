@@ -101,18 +101,51 @@ describe('createSignalOwner', () => {
     expect(events).toEqual(['ownership-held'])
   })
 
-  it('sets the cancelled flag and calls onCancel synchronously, before the export starts', async () => {
+  it('sets the cancelled flag and calls onCancel synchronously, before anything else starts', async () => {
     // #given
     const {deliver, events, owner} = setup()
 
     // #when the signal is delivered, with nothing awaited yet
     deliver('SIGINT')
 
-    // #then the flag, the span ending and the export start happened in that order, all inside the handler
+    // #then the flag, the span ending and the command reaping happened in that order, all inside the handler
     expect(isRunCancelled()).toBe(true)
     expect(owner.cancelled()).toBe(true)
-    expect(events.slice(0, 3)).toEqual(['ownership-held', 'on-cancel(cancelled=true)', 'flush'])
+    expect(events).toEqual(['ownership-held', 'on-cancel(cancelled=true)', 'reap'])
     await owner.drain()
+  })
+
+  it('starts the teardown before the export builds its scrubber and serializes the spans', async () => {
+    // #given a teardown and an export, each noting when it starts
+    const {deliver, events, owner, flush} = setup()
+    owner.registerTeardown(async () => {
+      events.push('teardown')
+    })
+
+    // #when the signal is delivered
+    deliver('SIGTERM')
+    await owner.drain()
+
+    // #then the teardown was under way before the export's own preparation began
+    expect(events.slice(1, 4)).toEqual(['on-cancel(cancelled=true)', 'teardown', 'flush'])
+    expect(flush).toHaveBeenCalledTimes(1)
+  })
+
+  it('still bounds the export from the moment of the signal, preparation included', async () => {
+    // #given an export that never answers and a 40 ms deadline
+    const {deliver, kills, owner} = setup({
+      flushDeadlineMs: 40,
+      flush: vi.fn(async () => new Promise<void>(() => undefined)),
+    })
+
+    // #when
+    const started = Date.now()
+    deliver('SIGINT')
+    await owner.drain()
+
+    // #then the process was released at about the deadline, not later
+    expect(Date.now() - started).toBeLessThan(1_000)
+    expect(kills).toEqual([[4242, 'SIGINT']])
   })
 
   it('starts the export with the deadline it was given', async () => {
