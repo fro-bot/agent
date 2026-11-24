@@ -47,7 +47,7 @@ The earlier run-tracing requirements listed spans for the Action's own phases as
 - R8. Decisions that are not their own span are events on the phase span where they happen: the dedup result, gate decisions and dropped PATH entries.
 - R9. An error is an exception event on the span where it happened. It carries the error's type and a scrubbed message capped in length, with no cause chain or stack.
 - R10. The root span carries the main step's final outcome: the invocation outcome, the cache save result and the exit code.
-- R11. A run that ends early has spans for every phase it reached, then cleanup. This covers a skip, an error, an execution timeout and a cancellation. The span where it ended carries the reason.
+- R11. A run that ends early has spans for every phase it reached, then cleanup. This covers a skip, an error and an execution timeout, and a cancellation of a run with `isolate-agent`. The span where it ended carries the reason. A cancelled run without `isolate-agent` sends no lifecycle trace: it ends on the signal exactly as it does today.
 - R12. When the post step runs, it adds a span to the same trace, after the root has ended. Its outcome is a retried save, a skip or a safety skip. When it retries the save, its result is the run's final save result.
 
 **Content**
@@ -71,7 +71,7 @@ The earlier run-tracing requirements listed spans for the Action's own phases as
 
 **Delivery**
 
-- R22. The Action waits for its spans to be sent before it exits, on success, an error or a cancellation the process can handle. The wait is bounded, so an unreachable collector cannot stall the run's end. Spans not sent by then are counted in the run log.
+- R22. The Action waits for its spans to be sent before it exits, on success or an error. On a cancellation of a run with `isolate-agent`, the export starts at once beside the sandbox teardown and never extends it: the signal is re-raised when the teardown settles, and spans not delivered by then are lost. The wait is bounded, so an unreachable collector cannot stall the run's end.
 - R23. The Action sends lifecycle spans itself, not through the agent's relay. With isolation on, the agent cannot read the trace credential. An agent can still post spans of its own through the relay, so lifecycle traces help the operator diagnose a run but are not proof of what the Action did.
 - R24. The post step reads the trace inputs again in its own process. It masks and removes them before anything that can fail, and never writes them to Action state. Only the trace's identity passes from the main step to the post step.
 
@@ -87,7 +87,7 @@ The earlier run-tracing requirements listed spans for the Action's own phases as
 - AE1. **Covers R1.** Given a caller with no `trace-endpoint`, when a run completes, nothing is sent and the run's log has no tracing lines beyond what it has today.
 - AE2. **Covers R2, R22.** Given a caller whose collector refuses every request, when a run completes, its outcome and exit code are the same as with tracing off. Its end is delayed at most by the bounded wait, and the run log counts the spans not sent.
 - AE3. **Covers R5, R7, R11.** Given an `issue_comment` run that routing skips, when the trace arrives, it has bootstrap, routing and cleanup spans. The routing span and the root carry outcome skipped with the skip reason. There is no span between routing and cleanup.
-- AE4. **Covers R11, R22.** Given a run cancelled during execution that the process handles, when the trace arrives, it has spans for the phases before execution and an execution span with outcome cancelled. The root carries the cancellation.
+- AE4. **Covers R11, R22.** Given a run with `isolate-agent` cancelled during execution, when the trace arrives within the teardown window, it has spans for the phases before execution and an execution span with outcome cancelled. The root carries the cancellation. Given the same run without `isolate-agent`, it ends on the signal as today and no lifecycle trace is sent.
 - AE5. **Covers R6, R7.** Given a run that misses the Actions cache and restores from S3, when the trace arrives, the cache restore span has a child span per tier tried. The first carries a miss and the S3 span a hit.
 - AE6. **Covers R18.** Given an issue conversation over three runs, where the second was skipped by a gate and the third started a new OpenCode session after a cache miss, when the operator opens the Langfuse session, all three lifecycle traces appear in order, each beside the turns its run produced.
 - AE7. **Covers R14, R15.** Given a run whose error message contains the GitHub token, a provider key from `auth-json` and an MCP header token from `opencode-config`, when the trace arrives, the exception event's message has all three redacted.
@@ -140,7 +140,7 @@ The earlier run-tracing requirements listed spans for the Action's own phases as
 ### Deferred to Planning
 
 - [Affects R14][Technical] Reuse the plugin's value scrubber or build an Action-side one. The Action's logger redacts by field name only.
-- [Affects R22][Technical] The final wait's bound, and how a cancellation reaches the export on runs without isolation, which install no signal handler today.
+- [Affects R22][Resolved] A cancellation reaches the export only through the sandbox's own signal handler. Runs without isolation install no handler and send no lifecycle trace on a cancel: keeping such a process alive for an export let in-flight work resume after the signal.
 - [Affects R12][Technical] How the post span is placed after the root: as its child, or beside it in the same trace.
 - [Affects R18][Technical] How spans that end before routing get the logical key, or whether the session is set once on the trace.
 - [Affects R20][Technical] How the plugin receives the run's root span context, the logical key and the invocation id through the launcher setting, whose parser rejects unknown keys today.

@@ -379,7 +379,7 @@ This trace carries what the run log shows for those phases: the repository, ref,
 
 It shares the session with the run's turn traces, and each turn's root span links to `action.main`. In Langfuse, a session shows every run of a conversation in order, each run's lifecycle trace beside its turns. In Tempo, the link leads from a turn to its run.
 
-A run that ends early has spans for every phase it reached, then cleanup and report. A cancelled run marks the phase it was in and the root `cancelled`, and sends its spans within 5 seconds of the cancel signal. A runner that is killed outright, including at a job timeout, sends nothing more. If a trace input is invalid, or `NODE_DEBUG` is set, the run is untraced.
+A run that ends early has spans for every phase it reached, then cleanup and report. A cancelled run with `isolate-agent` marks the phase it was in and the root `cancelled`, and sends the spans it reached within its sandbox teardown window; whatever is not delivered by then is lost. A cancelled run without `isolate-agent` sends no lifecycle trace and ends as it always did. A runner that is killed outright, including at a job timeout, sends nothing more. If a trace input is invalid, or `NODE_DEBUG` is set, the run is untraced.
 
 ### What a trace leaves out
 

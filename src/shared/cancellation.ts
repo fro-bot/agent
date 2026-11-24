@@ -3,7 +3,7 @@
  *
  * A cancelled run must not start another irreversible write (a comment, a review, an approval, a reaction, a label, a branch
  * or a push): the runner is about to kill the process, and a write that lands after the cancel is one the operator asked to
- * stop. The signal owner (`harness/signal-owner.ts`) sets the flag synchronously, in the signal handler, before anything else
+ * stop. The sandbox lifecycle's signal handler (`harness/phases/sandbox-lifecycle.ts`, the only handler of an isolated run) sets the flag synchronously, before anything else
  * runs. Every writer asks at the point of submission, after its last await and right before the request goes out, because
  * a read that was already in flight when the signal arrived may finish after it.
  *
@@ -16,12 +16,12 @@ let cancelled = false
 /**
  * Work that must run at once when the signal arrives, not when its owner next looks at the flag: giving back something the run
  * holds that would otherwise outlive it (a review-receipt reservation, while a read the run is waiting on may never answer).
- * Registered while the run holds the thing, unregistered when it no longer does. The signal owner starts every registered cleanup
+ * Registered while the run holds the thing, unregistered when it no longer does. That handler starts every registered cleanup
  * in the handler and waits for them beside the teardown and the export.
  */
 const cleanups = new Set<() => Promise<unknown>>()
 
-/** Called by the signal owner, synchronously, on the first SIGINT or SIGTERM. */
+/** Called by the sandbox lifecycle's signal handler, synchronously, on the first SIGINT or SIGTERM. */
 export function markRunCancelled(): void {
   cancelled = true
 }
@@ -44,7 +44,7 @@ export function registerCancellationCleanup(cleanup: () => Promise<unknown>): ()
   }
 }
 
-/** Starts every registered cleanup, once, and returns what is running. Never rejects. Called by the signal owner only. */
+/** Starts every registered cleanup, once, and returns what is running. Never rejects. Called by the sandbox lifecycle's signal handler only. */
 export function startCancellationCleanups(): Promise<void>[] {
   const started = [...cleanups].map(async cleanup => {
     try {

@@ -388,7 +388,7 @@ Opt-in OpenTelemetry tracing of a run. `@fro.bot/opencode-plugin` (`packages/ope
 - Only the operator turns tracing on or picks the destination: Action inputs, or a user-owned settings file for a local session. Plugin options, project config and repository content never do.
 - The server gets only the relay's loopback address and the run identity (`packages/runtime/src/agent/tracing-launcher.ts`), never the credential or collector host.
 - Fail-soft: tracing never joins the abort signal, the sandbox outcome or the persistence decision.
-- One signal owner (`src/harness/signal-owner.ts`) handles cancellation; writes check its flag before submitting.
+- Cancellation goes through the sandbox's own signal handler only: it marks the run cancelled (writes check the flag before submitting), ends the open spans and starts the trace export beside the teardown. A run without `isolate-agent` has no handler and ends on a signal as it always did.
 
 > See also: [Setup and Configuration](docs/wiki/Setup%20and%20Configuration.md#tracing-a-run)
 
