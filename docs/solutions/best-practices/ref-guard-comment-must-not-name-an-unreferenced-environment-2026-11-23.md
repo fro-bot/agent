@@ -26,15 +26,15 @@ tags:
 
 `.github/workflows/prepare-release-pr.yaml` runs on a schedule and on `workflow_dispatch`. Its `prepare-release` job (`:23-43`) mints a GitHub App installation token from `secrets.APPLICATION_PRIVATE_KEY` with `permission-contents: write`, `permission-pull-requests: write` and `permission-workflows: write` (`:41-43`), then uses it to push the `next` branch and to open, update, close and merge the release pull request.
 
-The job carries a ref guard and a comment about it (`:24-26`):
+The job carries a ref guard. Its comment and the docblock of `scripts/prepare-release-pr-workflow.test.ts` (`:14-16`) once called the enforced boundary "a deployment environment restricted to the default branch". The job has no `environment:` key, no workflow under `.github/workflows/` in this repository references an environment, and the only gate in the file is the `if:`. Both now say what the guard does (`:24-26`):
 
 ```yaml
-    # Defense in depth: a dispatched ref supplies its own copy of this file, so the enforced
-    # boundary is a deployment environment restricted to the default branch.
+    # Keeps scheduled and dispatched runs on the default branch. This is not a security boundary:
+    # a dispatched ref supplies its own copy of this file, and no environment gates the App key.
     if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
 ```
 
-The comment names a deployment environment as the enforced boundary. The job has no `environment:` key, and no workflow under `.github/workflows/` in this repository references an environment. The only gate in the file is the `if:`. The docblock of `scripts/prepare-release-pr-workflow.test.ts` (`:14-16`) repeats the same claim, and the test beside it (`:67-73`) pins the text of the `if:`, not any environment.
+The test beside the docblock (`:67-73`) pins the text of the `if:`, not any environment.
 
 ## Guidance
 
@@ -58,13 +58,13 @@ The comment names a deployment environment as the enforced boundary. The job has
 
 What this repository's git history can and cannot show:
 
-- Git shows the job has no `environment:` key and that the comment and the test docblock claim one.
+- Git shows the job has no `environment:` key.
 - Git cannot show whether a matching environment exists in repository Settings, what its deployment-branch policy is, or whether `APPLICATION_PRIVATE_KEY` is a repository-level or environment-level secret. Checking that needs repository admin access to Settings or the environments API. Even if an environment named in Settings exists, a job that does not reference it is not gated by it.
 - Not verified: that a deployment-branch policy is enforced against a `workflow_dispatch` started from another ref. Confirm that with a live dispatch from a non-default branch before relying on it.
 
 ## Why This Matters
 
-The job holds a token that can write workflow files (`permission-workflows: write`) and merge to the release branch. A branch-supplied copy of the workflow that reaches the mint step gets that token. Whether the repository is exposed to this depends on settings that git cannot show, so the file's own comment is the only assurance a reviewer sees, and that comment is wrong about what the file does.
+The job holds a token that can write workflow files (`permission-workflows: write`) and merge to the release branch. A branch-supplied copy of the workflow that reaches the mint step gets that token. Whether the repository is exposed to this depends on settings that git cannot show, so the file's own comment is the only assurance a reviewer sees. A comment that names a boundary the file does not have is wrong about what the file does.
 
 A guard described as a boundary is worse than no guard, because it stops the next reviewer from asking where the boundary is.
 
@@ -76,10 +76,10 @@ A guard described as a boundary is worse than no guard, because it stops the nex
 
 ## Examples
 
-Fix options for `prepare-release-pr.yaml`. This learning does not apply either one:
+Fix options for `prepare-release-pr.yaml`. The comment correction is applied; the boundary is not:
 
 - **Add the boundary.** Either give `prepare-release` a dedicated least-privilege credential held only in an environment restricted to the default branch, with `environment:` on the job, or migrate every consumer of the shared App key in one coordinated change. Both need the branch policy, and the protected key must not remain a repository secret.
-- **Correct the comment.** Reword `:24-25` to say the `if:` is defense in depth that skips the job for an accidental dispatch from another ref, and drop the claim of an enforced environment boundary. Update the test docblock to match.
+- **Correct the comment (applied).** `:24-25` and the test docblock say the `if:` keeps normal runs on the default branch and is not a security boundary, and drop the claim of an enforced environment boundary.
 
 ## Related
 
