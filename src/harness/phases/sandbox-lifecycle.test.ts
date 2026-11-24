@@ -4,6 +4,7 @@ import type {ToolRootResult} from '../../services/setup/sandbox-tool-roots.js'
 import type {ExecAdapter, ExecOptions} from '../../services/setup/types.js'
 import type {SandboxLifecycleDeps, SandboxPrepareInput, SignalHost} from './sandbox-lifecycle.js'
 import {Buffer} from 'node:buffer'
+import {execFile} from 'node:child_process'
 import {EventEmitter} from 'node:events'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
@@ -14,6 +15,8 @@ import {admitLaunch, createSandboxAccount} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi, type Mock} from 'vitest'
 import {isSignalOwned} from '../../services/setup/adapters.js'
 import {isRunCancelled, registerCancellationCleanup, resetRunCancellation} from '../../shared/cancellation.js'
+import {createLifecycleTracer, freeText, type FlushResult} from '../../shared/lifecycle-tracer.js'
+import {createSecretRegistry} from '../../shared/secret-registry.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {
   createPrivilegedRun,
@@ -198,6 +201,52 @@ function fakeHost(): SignalHost & {readonly emitter: EventEmitter; readonly kill
       killed.push(`${pid}:${signal}`)
     },
   }
+}
+
+/**
+ * The largest trace there is: a big registry (some literals near the scrubber's 64 KiB ceiling) and a span at every cap, so
+ * that preparing it for export is a great deal of local work. The tracer is the real one; only its exporter is a recorder.
+ */
+function heavyTrace(prepareBudgetMs: number) {
+  const registry = createSecretRegistry(() => undefined)
+  for (let index = 0; index < 1_000; index += 1) registry.add(`secret-${String(index).padStart(12, '0')}`)
+  for (let index = 0; index < 16; index += 1) registry.add(`${String(index).padStart(2, '0')}${'L'.repeat(65_534)}`)
+  const exported: unknown[] = []
+  let droppedByExporter = 0
+  const tracer = createLifecycleTracer({
+    inputs: {enabled: true, url: 'http://127.0.0.1:9/v1/traces', headers: []},
+    logger: createMockLogger(),
+    registry,
+    env: {},
+    cancelledPrepareBudgetMs: prepareBudgetMs,
+    createExporter: () => ({
+      export: span => {
+        exported.push(span)
+      },
+      counts: () => ({exported: exported.length, dropped: droppedByExporter}),
+      drop: (spans = 1) => {
+        droppedByExporter += spans
+      },
+      close: async () => ({exported: exported.length, dropped: droppedByExporter}),
+    }),
+  })
+  const text = 'x'.repeat(5_000)
+  for (let index = 0; index < 399; index += 1) {
+    const span = tracer.startSpan(`span-${index}`)
+    for (let attribute = 0; attribute < 3; attribute += 1)
+      span.setAttribute(`attr.${attribute}`, freeText(text, 'text'))
+    for (let event = 0; event < 8; event += 1)
+      span.addEvent(`event-${event}`, {note: freeText(text.slice(0, 500), 'text')})
+    span.end({outcome: 'succeeded'})
+  }
+  let flushed: FlushResult | undefined
+  const trace = {
+    onSignal: (signal: 'SIGINT' | 'SIGTERM') => tracer.cancel(signal === 'SIGINT' ? 'sigint' : 'sigterm'),
+    flush: async (options: {readonly boundMs: number}) => {
+      flushed = await tracer.flush(options)
+    },
+  }
+  return {trace, exported, dropped: () => droppedByExporter, flushed: () => flushed}
 }
 
 function deferred<T>(): {readonly promise: Promise<T>; readonly resolve: (value: T) => void} {
@@ -1213,6 +1262,28 @@ describe('createSandboxLifecycle', () => {
       expect(owned).toEqual([false])
     })
 
+    /** A signal on a sandbox whose stop waits for a real subprocess to report back, as the namespace cleanup does. */
+    async function signalDuringStop(trace: ReturnType<typeof heavyTrace>['trace']) {
+      const harness = createHarness()
+      harness.mocks.stop.mockImplementation(async () => {
+        await new Promise<void>(resolve => {
+          execFile('sleep', ['0.05'], () => resolve())
+        })
+        return 'stopped'
+      })
+      const host = fakeHost()
+      await create(harness, {signals: host, signalTrace: trace}).prepare(prepareInput)
+      const startedAt = performance.now()
+      host.emitter.emit('SIGTERM')
+      await vi.waitFor(
+        () => {
+          expect(host.killed).toEqual(['4242:SIGTERM'])
+        },
+        {timeout: 10_000, interval: 5},
+      )
+      return {reRaisedAfterMs: performance.now() - startedAt, takeBack: harness.mocks.takeBack}
+    }
+
     describe('with the lifecycle trace’s signal hook', () => {
       /** A trace hook that records when it is called, relative to the sandbox teardown's own steps. */
       const hookFor = (events: string[], flush: (options: {readonly boundMs: number}) => Promise<unknown>) => ({
@@ -1275,6 +1346,47 @@ describe('createSandboxLifecycle', () => {
         })
         expect(trace.flush).toHaveBeenCalledTimes(1)
       })
+
+      it('lets a stop that waits on a subprocess result advance, and re-raises within the budget, while the export prepares a very large trace', async () => {
+        // #given a trace that takes over a second to prepare, with a budget that would let it
+        const heavy = heavyTrace(60_000)
+
+        // #when the signal arrives during a stop that waits for a subprocess
+        const {reRaisedAfterMs, takeBack} = await signalDuringStop(heavy.trace)
+
+        // #then the subprocess's result was handled between spans: the teardown ran to its end and the process was re-raised
+        // long before preparing every span could have finished (it would be first in line behind the whole synchronous batch)
+        expect(takeBack).toHaveBeenCalledTimes(1)
+        expect(reRaisedAfterMs).toBeLessThan(500)
+        await vi.waitFor(
+          () => {
+            expect(heavy.flushed()).toBeDefined()
+          },
+          {timeout: 60_000, interval: 20},
+        )
+        expect(heavy.flushed()?.undelivered).toBe(0)
+      }, 120_000)
+
+      it('drops, and counts, the spans the export has no time to prepare, rather than delaying anything', async () => {
+        // #given the same trace and a small preparation budget
+        const heavy = heavyTrace(150)
+
+        // #when
+        const {reRaisedAfterMs} = await signalDuringStop(heavy.trace)
+
+        // #then the process was re-raised in the teardown's own time, and the export gave up on the rest, counting it
+        expect(reRaisedAfterMs).toBeLessThan(500)
+        await vi.waitFor(
+          () => {
+            expect(heavy.flushed()).toBeDefined()
+          },
+          {timeout: 10_000, interval: 20},
+        )
+        const unprepared = heavy.flushed()?.unprepared ?? 0
+        expect(unprepared).toBeGreaterThan(0)
+        expect(heavy.exported.length + unprepared).toBe(400)
+        expect(heavy.dropped()).toBe(unprepared)
+      }, 60_000)
 
       it('lets nothing in the hook change how the run is stopped', async () => {
         // #given a hook whose span end and export both throw

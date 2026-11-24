@@ -23,6 +23,14 @@ import {createScrubber, MAX_LITERAL_CHARS, MIN_LITERAL_CHARS, scrubSpan} from '@
  * comes from outside (exception messages, ref names). Event names and attribute KEYS are not scrubbed: they are this
  * module's and its callers' fixed vocabulary, never data.
  *
+ * Preparing the export never holds up a teardown. Scrubbing and serializing a batch is CPU work, and after a signal it runs beside
+ * the sandbox teardown, whose timers and subprocess results wait behind whatever runs here. So it is bounded by construction (a cap
+ * on every string, on the text of every span and on the attributes of an event; over a cap a value is replaced whole, because a cut
+ * before the scrub could keep half a secret), it yields to the event loop between spans and between slices of the registry, and
+ * from `cancel` it stops after `CANCELLED_PREPARE_BUDGET_MS`: the spans not prepared by then are dropped and counted. The
+ * normal-completion flush is the same code with no budget; it runs after the run's phases, when no teardown is waiting, and where
+ * a signal arrives first, `cancel` has already started the budget whichever caller flushes.
+ *
  * It fails closed. If the registry holds a credential the scrubber cannot match (see `secret-registry.ts`), no free text is
  * exported at all: exception messages and `freeText` values become their category.
  */
@@ -45,6 +53,41 @@ const EXCEPTION_TYPE_MAX_CHARS = 128
 const MAX_SPANS = 400
 const MAX_EVENTS_PER_SPAN = 64
 const MAX_ATTRIBUTES_PER_SPAN = 64
+/** The most attributes one event keeps; the rest are left out. */
+export const MAX_EVENT_ATTRIBUTES = 16
+
+/**
+ * What bounds the work of preparing a span for export (scrubbing is linear in the text, and every string is also searched for
+ * every registered secret), by construction. A string longer than `INPUT_MAX_CHARS`, or past the span's `SPAN_TEXT_BUDGET_CHARS`
+ * of text, is replaced WHOLE (the fixed marker, or a free text's category) and never cut: a cut before the scrub could leave the
+ * front half of a secret that the scrubber no longer matches. The per-string cap is the scrubber's own bound on a plain string
+ * (`plainStringChars`), far above what a phase records (ids, outcomes, a ref name, an exception message that is cut to 1,024
+ * characters on export anyway).
+ */
+export const INPUT_MAX_CHARS = 8_192
+/**
+ * A plain string (not marked `freeText`) is an identifier, a code or a name this module's callers build: a logical key, a list of
+ * tool names, a span name. It has a tighter cap of its own, and is replaced whole over it.
+ */
+export const PLAIN_MAX_CHARS = 1_024
+export const SPAN_TEXT_BUDGET_CHARS = 16_384
+/** Every string also costs a search for each registered secret, whatever its length: it is charged this much on top of its characters. */
+export const STRING_OVERHEAD_CHARS = 64
+/** The identity strings go on every span, so each is held to what a repository or job name can be. */
+const IDENTITY_MAX_CHARS = 256
+/** Notes of what a span left out: enough to say why, bounded so a span full of long strings does not carry a long list. */
+const MAX_OMISSION_NOTES = 16
+
+/**
+ * How long after a cancellation the export may keep preparing spans (scrubbing and serializing them) before it drops the rest.
+ * Preparation is local CPU work that runs beside the sandbox teardown and must never be what the teardown waits for: it yields to
+ * the event loop between spans, and past this it stops.
+ */
+export const CANCELLED_PREPARE_BUDGET_MS = 1_000
+
+/** Literals added to the scrubber per turn of the event loop: the fewer of these two limits. */
+const SCRUBBER_SLICE_LITERALS = 64
+const SCRUBBER_SLICE_CHARS = 512 * 1024
 
 /** Fixed text, so no part of it can hold a value. */
 export const NODE_DEBUG_WARNING =
@@ -140,6 +183,8 @@ export interface FlushResult {
   readonly spans: number
   /** Spans in batches the collector did not acknowledge, plus spans that never fit. Not a count of spans it did not ingest. */
   readonly undelivered: number
+  /** Spans dropped, already counted in `undelivered`, because the local preparation budget after a cancellation ran out. Absent when none. */
+  readonly unprepared?: number
 }
 
 export interface LifecycleTracer {
@@ -155,6 +200,9 @@ export interface LifecycleTracer {
    * A signal arrived: ends every span still open as `cancelled` with `reason` (a fixed word such as the signal's name), the
    * root last, so the trace says where the run was when it stopped. Synchronous. Spans that end later (the phase unwinding as
    * its child is reaped) change nothing: the first end wins. Does nothing to a span that already ended.
+   *
+   * Also starts the clock of the export's local preparation budget (`CANCELLED_PREPARE_BUDGET_MS`), whoever calls `flush` and
+   * whether or not the export is already under way: spans not prepared by then are dropped and counted, never truncated.
    */
   readonly cancel: (reason: string) => void
   /**
@@ -234,6 +282,10 @@ export interface CreateLifecycleTracerOptions {
   /** Milliseconds since the epoch; fractions allowed. Default: the monotonic clock anchored to the epoch. */
   readonly now?: () => number
   readonly flushBoundMs?: number
+  /** How long after `cancel` the export keeps preparing spans. Default `CANCELLED_PREPARE_BUDGET_MS`. */
+  readonly cancelledPrepareBudgetMs?: number
+  /** Milliseconds on a clock that only moves forward, for the preparation budget. Default `performance.now`. */
+  readonly monotonicNow?: () => number
   readonly exporterLimits?: Partial<ExporterLimits>
   /** Test seam: the exporter is built at flush, never before. */
   readonly createExporter?: (options: SpanExporterOptions) => SpanExporter
@@ -337,6 +389,63 @@ interface SpanRecord {
   readonly events: {readonly name: string; readonly timeMs: number; readonly attributes: EventAttributes}[]
 }
 
+/** What one export holds, taken at the instant `flush` is called: the registry and session as they were, not as they become. */
+interface Preparation {
+  readonly scrubber: Scrubber
+  readonly matchable: boolean
+  /** The session id when it is exportable whole (see `toPending`), else undefined. */
+  readonly session: string | undefined
+  readonly endFallbackMs: number
+}
+
+/** What one span may still spend on text, and what it left out. */
+interface SpanText {
+  left: number
+  readonly omitted: string[]
+}
+
+function note(spanText: SpanText, label: string, reason: string): void {
+  if (spanText.omitted.length < MAX_OMISSION_NOTES) spanText.omitted.push(`${label}:${reason}`)
+}
+
+/** Spends the span's text budget on one string of `chars`. False, with a note, when it does not fit: the entry is then left out. */
+function charge(spanText: SpanText, label: string, chars: number): boolean {
+  const cost = chars + STRING_OVERHEAD_CHARS
+  if (cost > spanText.left) {
+    note(spanText, label, 'over-span-budget')
+    return false
+  }
+  spanText.left -= cost
+  return true
+}
+
+/**
+ * The string to export for `value`, or undefined when the span has no budget left for it (the entry is left out, and the span
+ * says so). A string over `INPUT_MAX_CHARS` is replaced whole: by the marker, or by a free text's category.
+ */
+function resolveText(
+  preparation: Preparation,
+  spanText: SpanText,
+  value: string | FreeText,
+  label: string,
+): string | undefined {
+  if (typeof value === 'string') {
+    const oversize = value.length > PLAIN_MAX_CHARS
+    if (oversize) note(spanText, label, 'over-input-cap')
+    const used = oversize ? OMITTED_TEXT : value
+    return charge(spanText, label, used.length) ? used : undefined
+  }
+  const oversize = value.text.length > INPUT_MAX_CHARS
+  if (oversize) note(spanText, label, 'over-input-cap')
+  // The category is what the text becomes when it cannot be trusted to a scrub: the registry cannot match a secret, or the text is over the cap.
+  if (!preparation.matchable || oversize)
+    return charge(spanText, label, value.category.length) ? value.category : undefined
+  if (!charge(spanText, label, value.text.length)) return undefined
+  const bounded = scrubThenCap(preparation.scrubber, value.text, FREE_TEXT_MAX_CHARS)
+  if (bounded.omitted !== undefined) note(spanText, label, bounded.omitted)
+  return bounded.text
+}
+
 export function createLifecycleTracer(options: CreateLifecycleTracerOptions): LifecycleTracer {
   const {inputs, logger, registry} = options
   if (!inputs.enabled) return createNoopTracer()
@@ -364,6 +473,10 @@ export function createLifecycleTracer(options: CreateLifecycleTracerOptions): Li
   let closed = false
   let overflow = 0
   let flushed: Promise<FlushResult> | undefined
+  const monotonicNow = options.monotonicNow ?? (() => performance.now())
+  /** Set by `cancel`: after this the export stops preparing spans. */
+  let cancelDeadlineMs: number | undefined
+  const preparationExpired = (): boolean => cancelDeadlineMs !== undefined && monotonicNow() > cancelDeadlineMs
 
   function handleFor(record: SpanRecord): LifecycleSpan {
     const open = (): boolean => !closed && record.endMs === undefined
@@ -374,7 +487,13 @@ export function createLifecycleTracer(options: CreateLifecycleTracerOptions): Li
           record.attributes.set(name, value)
       },
       addEvent: (name, attributes = {}) => {
-        if (open() && record.events.length < MAX_EVENTS_PER_SPAN) record.events.push({name, timeMs: now(), attributes})
+        if (open() && record.events.length < MAX_EVENTS_PER_SPAN)
+          record.events.push({
+            name,
+            timeMs: now(),
+            // Past the cap the rest are left out: an event is a few fixed keys, never a bag of text to scrub.
+            attributes: Object.fromEntries(Object.entries(attributes).slice(0, MAX_EVENT_ATTRIBUTES)),
+          })
       },
       recordException: error => {
         if (open() && record.exception === undefined) record.exception = describeError(error)
@@ -399,7 +518,8 @@ export function createLifecycleTracer(options: CreateLifecycleTracerOptions): Li
       spanId: hex(8),
       // A parent that is not recorded (the no-op span, after the cap) leaves the child under the root.
       parentSpanId: parentId === undefined || parentId === '' ? ids.rootSpanId : parentId,
-      name,
+      // A name is a fixed word; one that is not is replaced whole, never cut.
+      name: name.length > PLAIN_MAX_CHARS ? OMITTED_TEXT : name,
       startMs: now(),
       endMs: undefined,
       result: undefined,
@@ -441,41 +561,42 @@ export function createLifecycleTracer(options: CreateLifecycleTracerOptions): Li
   ] as const
   for (const [field, key] of identityKeys) {
     const value = identity[field]
-    if (value === undefined) continue
+    if (value === undefined || value.length > IDENTITY_MAX_CHARS) continue
     identityAttributes[`fro_bot.${key}`] = value
     identityAttributes[`langfuse.trace.metadata.${key.replace('.', '_')}`] = value
   }
 
-  function resolveText(scrubber: Scrubber, value: string | FreeText, omitted: string[], label: string): string {
-    if (typeof value === 'string') return value
-    if (!registry.matchable()) return value.category
-    const bounded = scrubThenCap(scrubber, value.text, FREE_TEXT_MAX_CHARS)
-    if (bounded.omitted !== undefined) omitted.push(`${label}:${bounded.omitted}`)
-    return bounded.text
-  }
-
-  function toPending(record: SpanRecord, scrubber: Scrubber, endFallbackMs: number): PendingSpan {
-    const omitted: string[] = []
+  function toPending(record: SpanRecord, preparation: Preparation): PendingSpan {
+    const {scrubber, endFallbackMs} = preparation
+    const spanText: SpanText = {left: SPAN_TEXT_BUDGET_CHARS, omitted: []}
+    const omitted = spanText.omitted
     const attributes: Record<string, string | number | boolean> = {...identityAttributes}
+    // The reason first: it is what says how the span ended, so it is the last thing to lose its place in the budget.
+    const reason =
+      record.result?.reason === undefined
+        ? undefined
+        : resolveText(preparation, spanText, record.result.reason, LIFECYCLE_ATTRIBUTE.reason)
     for (const [name, value] of record.attributes) {
-      attributes[name] = typeof value === 'object' ? resolveText(scrubber, value, omitted, name) : value
+      if (typeof value === 'number' || typeof value === 'boolean') {
+        attributes[name] = value
+        continue
+      }
+      const text = resolveText(preparation, spanText, value, name)
+      if (text !== undefined) attributes[name] = text
     }
     if (record.result?.outcome !== undefined) attributes[LIFECYCLE_ATTRIBUTE.outcome] = record.result.outcome
-    if (record.result?.reason !== undefined) attributes[LIFECYCLE_ATTRIBUTE.reason] = record.result.reason
+    if (reason !== undefined) attributes[LIFECYCLE_ATTRIBUTE.reason] = reason
     else if (record.endMs === undefined) attributes[LIFECYCLE_ATTRIBUTE.reason] = 'unfinished'
-    // Never a redacted session id: a value the scrubber would change (a name like `acme/password-manager:issue-42` trips its
-    // name/value rule) would collapse every conversation of that repository into one session. It is exported whole or not at all.
-    if (sessionId !== undefined && scrubsUnchanged(scrubber, sessionId))
-      attributes[LIFECYCLE_ATTRIBUTE.session] = sessionId
+    if (preparation.session !== undefined) attributes[LIFECYCLE_ATTRIBUTE.session] = preparation.session
 
     const events = record.events.map(event => ({
       name: event.name,
       timeMs: event.timeMs,
       attributes: Object.fromEntries(
-        Object.entries(event.attributes).map(([key, value]) => [
-          key,
-          resolveText(scrubber, value, omitted, `event.${key}`),
-        ]),
+        Object.entries(event.attributes).flatMap(([key, value]) => {
+          const text = resolveText(preparation, spanText, value, `event.${key}`)
+          return text === undefined ? [] : [[key, text] as const]
+        }),
       ),
     }))
 
@@ -483,14 +604,29 @@ export function createLifecycleTracer(options: CreateLifecycleTracerOptions): Li
     if (record.exception !== undefined) {
       // `Error.name` is a mutable string the run (or something it called) can set to anything, including a credential the
       // scrubber cannot match. So when the registry is not matchable the type is one of a fixed set of names, never the text.
-      const matchable = registry.matchable()
-      const type = matchable
+      // Two strings, always: the exception is the one thing a failed span must say, so it is charged but never left out. When
+      // the budget does not hold it, or it is over the input cap, it is the fixed type name and the marker.
+      const {matchable} = preparation
+      const fits =
+        matchable &&
+        record.exception.type.length <= INPUT_MAX_CHARS &&
+        charge(spanText, 'exception.type', record.exception.type.length)
+      const type = fits
         ? scrubThenCap(scrubber, record.exception.type, EXCEPTION_TYPE_MAX_CHARS)
         : {text: exceptionCategory(record.exception.type), omitted: undefined}
+      if (matchable && !fits && record.exception.type.length > INPUT_MAX_CHARS)
+        note(spanText, 'exception.type', 'over-input-cap')
       if (type.omitted !== undefined) omitted.push(`exception.type:${type.omitted}`)
       let message = type.text
       if (matchable) {
-        const bounded = scrubThenCap(scrubber, record.exception.message, EXCEPTION_MESSAGE_MAX_CHARS)
+        const messageFits =
+          record.exception.message.length <= INPUT_MAX_CHARS &&
+          charge(spanText, 'exception.message', record.exception.message.length)
+        if (!messageFits && record.exception.message.length > INPUT_MAX_CHARS)
+          note(spanText, 'exception.message', 'over-input-cap')
+        const bounded = messageFits
+          ? scrubThenCap(scrubber, record.exception.message, EXCEPTION_MESSAGE_MAX_CHARS)
+          : {text: OMITTED_TEXT, omitted: undefined}
         if (bounded.omitted !== undefined) omitted.push(`exception.message:${bounded.omitted}`)
         message = bounded.text
       }
@@ -502,7 +638,7 @@ export function createLifecycleTracer(options: CreateLifecycleTracerOptions): Li
       })
       status = {code: 'error', message}
     } else if (record.result?.outcome === 'failed') {
-      status = {code: 'error', message: record.result.reason ?? 'failed'}
+      status = {code: 'error', message: reason ?? 'failed'}
     }
 
     return {
@@ -530,12 +666,45 @@ export function createLifecycleTracer(options: CreateLifecycleTracerOptions): Li
     })
   }
 
+  /** Lets the event loop run: the teardown's timers and subprocess results are waiting behind whatever runs here. */
+  const yieldTurn = async (): Promise<void> =>
+    new Promise<void>(resolve => {
+      setImmediate(resolve)
+    })
+
+  /**
+   * A scrubber that knows `literals`, built a slice at a time with a turn of the event loop after each. Undefined when the
+   * preparation budget ran out meanwhile.
+   */
+  async function buildScrubber(literals: readonly string[]): Promise<Scrubber | undefined> {
+    const scrubber = createScrubber({env: {}})
+    for (let from = 0; from < literals.length;) {
+      let chars = 0
+      let to = from
+      while (to < literals.length && to - from < SCRUBBER_SLICE_LITERALS && chars < SCRUBBER_SLICE_CHARS) {
+        chars += literals[to]?.length ?? 0
+        to += 1
+      }
+      scrubber.addLiterals?.(literals.slice(from, to))
+      from = to
+      await yieldTurn()
+      if (preparationExpired()) return undefined
+    }
+    return scrubber
+  }
+
+  /**
+   * Prepares and hands over every span, a turn of the event loop between spans, and stops once the cancellation's budget is
+   * spent: the spans left are dropped and counted, never sent cut. Never rejects.
+   */
   async function exportAll(boundMs: number): Promise<FlushResult> {
     const spans = records.length
     try {
       reportNoFreeText()
-      // The registry holds everything, so nothing is captured from the environment here, and no cap drops a literal.
-      const scrubber = createRegistryScrubber(registry)
+      // Taken now, before anything yields: what the registry and the session were when the export was asked for.
+      const literals = registry.literals()
+      const matchable = registry.matchable()
+      const sessionCandidate = sessionId
       const exporter = (options.createExporter ?? createSpanExporter)({
         url,
         serviceName: LIFECYCLE_SERVICE_NAME,
@@ -543,17 +712,36 @@ export function createLifecycleTracer(options: CreateLifecycleTracerOptions): Li
         reportCounts: false,
         ...(options.exporterLimits === undefined ? {} : {limits: options.exporterLimits}),
       })
-      const endMs = now()
-      for (const record of records) {
-        try {
-          exporter.export(scrubSpan(toPending(record, scrubber, endMs), scrubber))
-        } catch {
-          exporter.drop()
+      const endFallbackMs = now()
+      // The registry holds everything, so nothing is captured from the environment here, and no cap drops a literal.
+      const scrubber = await buildScrubber(literals)
+      let prepared = 0
+      if (scrubber !== undefined) {
+        // Never a redacted session id: a value the scrubber would change (a name like `acme/password-manager:issue-42` trips its
+        // name/value rule) would collapse every conversation of that repository into one session. It is exported whole or not at all.
+        const session =
+          sessionCandidate !== undefined &&
+          sessionCandidate.length <= PLAIN_MAX_CHARS &&
+          scrubsUnchanged(scrubber, sessionCandidate)
+            ? sessionCandidate
+            : undefined
+        const preparation: Preparation = {scrubber, matchable, session, endFallbackMs}
+        for (const record of records) {
+          if (preparationExpired()) break
+          try {
+            exporter.export(scrubSpan(toPending(record, preparation), scrubber))
+          } catch {
+            exporter.drop()
+          }
+          prepared += 1
+          await yieldTurn()
         }
       }
+      const unprepared = spans - prepared
+      if (unprepared > 0) exporter.drop(unprepared)
       const counts = await exporter.close(boundMs)
       const undelivered = counts.dropped + overflow
-      const context = {spans: spans + overflow, undelivered}
+      const context = {spans: spans + overflow, undelivered, ...(unprepared > 0 ? {unprepared} : {})}
       if (undelivered > 0) logger.warning(EXPORT_FINISHED_MESSAGE, context)
       else logger.info(EXPORT_FINISHED_MESSAGE, context)
       return context
@@ -574,6 +762,8 @@ export function createLifecycleTracer(options: CreateLifecycleTracerOptions): Li
       if (id.length > 0) sessionId = id
     },
     cancel: reason => {
+      // The budget runs from the first signal, even if the export is already under way and nothing here is left to end.
+      cancelDeadlineMs ??= monotonicNow() + (options.cancelledPrepareBudgetMs ?? CANCELLED_PREPARE_BUDGET_MS)
       if (closed) return
       const stoppedAt = now()
       // Children before the root: the order a unwinding run would end them in.

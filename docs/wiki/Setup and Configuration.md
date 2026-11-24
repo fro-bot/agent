@@ -379,7 +379,7 @@ This trace carries what the run log shows for those phases: the repository, ref,
 
 It shares the session with the run's turn traces, and each turn's root span links to `action.main`. In Langfuse, a session shows every run of a conversation in order, each run's lifecycle trace beside its turns. In Tempo, the link leads from a turn to its run.
 
-A run that ends early has spans for every phase it reached, then cleanup and report. A cancelled run with `isolate-agent` marks the phase it was in and the root `cancelled`, and sends the spans it reached within its sandbox teardown window; whatever is not delivered by then is lost. A cancelled run without `isolate-agent` sends no lifecycle trace and ends as it always did. A runner that is killed outright, including at a job timeout, sends nothing more. If a trace input is invalid, or `NODE_DEBUG` is set, the run is untraced.
+A run that ends early has spans for every phase it reached, then cleanup and report. A cancelled run with `isolate-agent` marks the phase it was in and the root `cancelled`, and sends the spans it reached within its sandbox teardown window; whatever is not delivered by then is lost. The export prepares spans between turns of the event loop and, one second after the signal, drops the spans it has not prepared rather than delay the teardown. A cancelled run without `isolate-agent` sends no lifecycle trace and ends as it always did. A runner that is killed outright, including at a job timeout, sends nothing more. If a trace input is invalid, or `NODE_DEBUG` is set, the run is untraced.
 
 ### What a trace leaves out
 
@@ -423,7 +423,7 @@ Tracing never fails or delays a run's result. The log has these lines, with coun
 - `Trace relay started`.
 - `Trace relay stopped`, with the batches the collector acknowledged, the batches to retry and the batches dropped, and the span totals the plugin reported with its last batch. `countIncomplete` means the server or the relay was killed before the counts were final.
 - A warning when the relay could not start or exited early. The run continues untraced.
-- `Lifecycle trace export finished`, with the run's span count and the spans in batches the collector did not acknowledge. It is a warning when that count is above zero. `Lifecycle trace export failed` means nothing could be sent.
+- `Lifecycle trace export finished`, with the run's span count and the spans in batches the collector did not acknowledge. It is a warning when that count is above zero, and the line adds `unprepared` when a cancelled run dropped spans it had no time to prepare. A string over its size cap is exported as `[omitted]` (or, for free text, as its category) with a reason in `fro_bot.content.omitted`, never cut. `Lifecycle trace export failed` means nothing could be sent.
 - A warning when `NODE_DEBUG` is set or the endpoint and credential were refused, saying lifecycle tracing is off.
 
 An acknowledged batch is the collector's HTTP answer. It is not proof that every span in it was stored. The span total the plugin reports is the count when its last batch started, so it leaves out the spans in that last batch.

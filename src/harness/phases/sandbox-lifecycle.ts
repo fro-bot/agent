@@ -608,7 +608,11 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       // The sandbox's own teardown decides the outcome; an extra stop that failed has nothing to add.
     }
   }
-  /** Starts the export one turn of the event loop later, so the teardown's first steps are on their way before its CPU work. */
+  /**
+   * Starts the export one turn of the event loop later, so the teardown's first steps are on their way before its CPU work. What
+   * the export does after that is the tracer's: it prepares a span per turn of the event loop and, from the signal, only for a
+   * fixed budget (`cancel` starts it), so the teardown's timers and subprocess results are never queued behind a batch.
+   */
   const startTraceExport = async (trace: SandboxSignalTrace): Promise<void> => {
     try {
       await new Promise<void>(resolve => {

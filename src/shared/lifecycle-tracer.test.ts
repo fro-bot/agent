@@ -638,7 +638,8 @@ describe('createLifecycleTracer', () => {
       expect(
         eventAttr(eventsNamed(execution, 'exception')[0] ?? {name: '', timeUnixNano: ''}, 'exception.message'),
       ).toBe('[omitted]')
-      expect(JSON.stringify(attr(execution, 'fro_bot.content.omitted'))).toContain('over-input-ceiling')
+      // the tracer's own input cap refuses it long before the scrubber's ceiling is reached
+      expect(JSON.stringify(attr(execution, 'fro_bot.content.omitted'))).toContain('over-input-cap')
     })
 
     it.each([
