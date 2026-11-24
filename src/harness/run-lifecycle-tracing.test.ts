@@ -828,6 +828,37 @@ describe('run with lifecycle tracing', () => {
     })
   })
 
+  describe('the root’s outcome and the final report writes', () => {
+    it('ends the root failed, with exit code 1, when a final write throws, and lets the error go on', async () => {
+      // #given a run that succeeds all the way to its last writes, one of which (the outputs) throws
+      await arrange({cacheSaveOutcome: 'persisted'})
+      const {setInvocationOutcomeOutput} = await import('./config/outputs.js')
+      vi.mocked(setInvocationOutcomeOutput).mockImplementationOnce(() => {
+        throw new Error('outputs file is gone')
+      })
+
+      // #when
+      await expect(run()).rejects.toThrow('outputs file is gone')
+
+      // #then the root does not say succeeded for a run that is about to fail: failed, with the exit code the process ends with
+      const root = rootOf(allSpans(target))
+      expect(attr(root, 'fro_bot.outcome')).toBe('failed')
+      expect(attr(root, 'fro_bot.reason')).toBe('report-failed')
+      expect(attr(root, 'fro_bot.exit_code')).toBe(1)
+      expect(byName(allSpans(target), 'report').status?.code).toBe(2)
+    })
+
+    it('still ends the root with the run’s own outcome and exit code when the final writes succeed', async () => {
+      // #given / #when
+      const {exitCode, spans} = await execute({cacheSaveOutcome: 'persisted'})
+
+      // #then
+      expect(exitCode).toBe(0)
+      expect(attr(rootOf(spans), 'fro_bot.outcome')).toBe('succeeded')
+      expect(attr(rootOf(spans), 'fro_bot.exit_code')).toBe(0)
+    })
+  })
+
   describe('the signal owner', () => {
     it('is installed before bootstrap for every run, handed to bootstrap, and removed when the run ends', async () => {
       // #given the handlers the process has before the run, and a bootstrap that looks at them
@@ -1011,6 +1042,24 @@ describe('run with lifecycle tracing', () => {
       for (const canary of [target.url, 'ghp_stateCanary1234567890', 'sk-state-canary-0987654321']) {
         expect(saved).not.toContain(canary)
       }
+    })
+
+    it('loses only the post step’s link, never the run, when the identity record cannot be saved', async () => {
+      // #given Action state that refuses exactly the identity record
+      const core = await import('@actions/core')
+      vi.mocked(core.saveState).mockImplementation((name: string) => {
+        if (name === 'lifecycleTrace') throw new Error('state file is read-only')
+      })
+
+      // #when
+      const {exitCode, spans} = await execute().finally(() => {
+        vi.mocked(core.saveState).mockReset()
+      })
+
+      // #then the run went all the way through, its trace was exported, and nothing was failed or logged as a failure
+      expect(exitCode).toBe(0)
+      expect(phaseNames(spans)).toEqual(FULL_RUN)
+      expect(vi.mocked(core.setFailed)).not.toHaveBeenCalled()
     })
 
     it('saves the session id for the post step once routing has named the conversation, and not before', async () => {

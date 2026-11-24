@@ -129,7 +129,14 @@ export async function run(): Promise<number> {
   })
   // The identity record: the one thing the post step needs to join this trace, saved once and before routing. Ids only; no
   // input, credential or span content ever goes into Action state.
-  if (tracer.ids !== null) core.saveState(STATE_KEYS.LIFECYCLE_TRACE, JSON.stringify(tracer.ids))
+  // Best-effort: a state file that cannot be written costs the post step its link to this trace, never the run.
+  if (tracer.ids !== null) {
+    try {
+      core.saveState(STATE_KEYS.LIFECYCLE_TRACE, JSON.stringify(tracer.ids))
+    } catch {
+      // Nothing to report with: the error may name the state file, and the run is unaffected.
+    }
+  }
   const refName = process.env.GITHUB_REF_NAME?.trim() ?? ''
   if (refName !== '') tracer.root.setAttribute('fro_bot.ref', freeText(refName, 'ref'))
 
@@ -1061,9 +1068,9 @@ async function runWithTrace(trace: RunTrace, startTime: number, bootstrapLogger:
     }
 
     // The code this run returns: an early `return` fixed its own before the `finally` blocks ran and left `exitCode` alone, so
-    // it is read from the fact each early return set.
-    trace.outcome.exitCode = deliveryOutcome === 'failed' ? 1 : deliveryOutcome === 'skipped' ? 0 : exitCode
-    trace.outcome.rootResult =
+    // it is read from the fact each early return set. Recorded on the trace only after the final writes below have succeeded.
+    const finalExitCode = deliveryOutcome === 'failed' ? 1 : deliveryOutcome === 'skipped' ? 0 : exitCode
+    const finalRootResult: SpanResult =
       finalOutcome === 'skipped'
         ? {outcome: 'skipped', reason: traceSkipReason ?? 'skipped'}
         : finalIncompleteReasons.length > 0
@@ -1131,7 +1138,15 @@ async function runWithTrace(trace: RunTrace, startTime: number, bootstrapLogger:
       },
       undefined,
       {teardown: true},
-    )
+    ).catch((reportError: unknown) => {
+      // A final write that throws after everything else succeeded: the root says so, instead of a success and an exit code 0 the
+      // run is not going to return. The error itself goes on, unchanged.
+      trace.outcome.exitCode = 1
+      trace.outcome.rootResult = {outcome: 'failed', reason: 'report-failed'}
+      throw reportError
+    })
+    trace.outcome.exitCode = finalExitCode
+    trace.outcome.rootResult = finalRootResult
   }
 
   return exitCode
