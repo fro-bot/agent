@@ -39,7 +39,7 @@ The comment names a deployment environment as the enforced boundary. The job has
 ## Guidance
 
 1. **Treat a ref `if:` in a dispatchable workflow as defense in depth, not as the boundary.** `workflow_dispatch` runs the workflow file of whichever ref the dispatcher selects. A user with write access can push a branch whose copy of the file omits the `if:` line, or adds steps that use the minted token, and dispatch that branch. The guard skips the job for an accidental dispatch from the wrong ref; it does not stop a deliberate one.
-2. **Put the boundary in a GitHub environment that gates the credential.** The environment needs a deployment-branch policy limited to the default branch, and the job must reference it:
+2. **Put the boundary in a GitHub environment that holds the credential.** The environment needs a deployment-branch policy limited to the default branch, and the job must reference it:
 
    ```yaml
    jobs:
@@ -48,8 +48,13 @@ The comment names a deployment environment as the enforced boundary. The job has
          name: release # proposed; deployment-branch policy: default branch only
    ```
 
-   Setting the policy requires an environment configured in repository Settings. The workflow file alone cannot create the boundary. To keep a dispatched branch from reading the credential at all, move `APPLICATION_ID` and `APPLICATION_PRIVATE_KEY` from repository-level secrets into that environment; repository-level secrets stay readable by any job in any workflow.
-3. **A comment that names a boundary the job does not reference is a false assurance.** Either make the claim true by adding the `environment:` key, or reword the comment so it says what the `if:` does and no more. The next reviewer reads "the enforced boundary is a deployment environment" and stops looking for one.
+   Adding `environment:` to the job is not enough by itself. A deployment-branch policy only gates secrets that live in the environment. A key that is also a repository-level secret stays readable by any job in any workflow, including a dispatched branch's modified copy of this file, so the protected key must not remain available as a repository secret. The environment and its policy are configured in repository Settings; the workflow file alone cannot create the boundary.
+
+   `APPLICATION_PRIVATE_KEY` is shared. `auto-release.yaml:35`, `ci.yaml:1260`, `fro-bot.yaml:396`, `prepare-release-pr.yaml:35`, `renovate.yaml:54` and `update-repo-settings.yaml:20` all read it, and none of those jobs references an environment. Moving the shared key into an environment used only by `prepare-release` breaks every other consumer. Two shapes keep the boundary and the consumers working:
+
+   - **A dedicated, least-privilege credential for `prepare-release`.** Create a separate App (or key) that holds only the permissions this job needs, store it only in the environment, and leave the shared key where the other consumers read it. The dedicated credential must not also exist as a repository secret.
+   - **A coordinated migration of every consumer.** Move the shared key into environments and give each consumer's job an `environment:` with a default-branch policy that fits that job, in one change set, so no job is left reading a secret that moved. The shared key must not remain a repository secret afterwards.
+3. **A comment that names a boundary the job does not reference is a false assurance.** Either make the claim true (a referenced environment with a default-branch policy that holds a credential no other path can read), or reword the comment so it says what the `if:` does and no more. The next reviewer reads "the enforced boundary is a deployment environment" and stops looking for one.
 
 What this repository's git history can and cannot show:
 
@@ -73,7 +78,7 @@ A guard described as a boundary is worse than no guard, because it stops the nex
 
 Fix options for `prepare-release-pr.yaml`. This learning does not apply either one:
 
-- **Add the boundary.** Create an environment restricted to the default branch in repository Settings, add `environment:` to the `prepare-release` job, and move the App credentials into the environment.
+- **Add the boundary.** Either give `prepare-release` a dedicated least-privilege credential held only in an environment restricted to the default branch, with `environment:` on the job, or migrate every consumer of the shared App key in one coordinated change. Both need the branch policy, and the protected key must not remain a repository secret.
 - **Correct the comment.** Reword `:24-25` to say the `if:` is defense in depth that skips the job for an accidental dispatch from another ref, and drop the claim of an enforced environment boundary. Update the test docblock to match.
 
 ## Related

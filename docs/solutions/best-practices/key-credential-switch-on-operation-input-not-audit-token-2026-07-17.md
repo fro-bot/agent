@@ -56,17 +56,33 @@ that can be set independently.
 #       operation, so an audit label never selects its credential.
 # Direct autonomous schedule/dispatch and release-tag narration use
 # github.token. Reusable callers and all other triggers retain the PAT.
+# This expression selects the CHECKOUT token only.
 token: ${{ github.event.inputs.release-tag != '' && github.token || ((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.workflow_ref == format('{0}/.github/workflows/fro-bot.yaml@{1}', github.repository, github.ref) && github.token) || secrets.FRO_BOT_PAT }}
 ```
 
-The first arm is the operation switch. The second arm gives direct `schedule` and
+This expression selects the **checkout** token only. The token passed to the
+agent action is a separate expression (`fro-bot.yaml:514`):
+
+```yaml
+github-token: ${{ steps.mint-app-token.outputs.github-token || (github.event.inputs.release-tag != '' && github.token) || secrets.FRO_BOT_PAT }}
+```
+
+The two paths are independent:
+
+- **Checkout token** (`fro-bot.yaml:376`): `release-tag` set → `github.token`; direct `schedule`/`workflow_dispatch` of `fro-bot.yaml` → `github.token`; everything else → PAT.
+- **Action token** (`fro-bot.yaml:514`): the minted owner-wide App token when the mint step ran → else `github.token` when `release-tag` is set → else PAT. The mint step runs for direct `schedule`/`workflow_dispatch` runs with `release-tag` empty (`fro-bot.yaml:385-397`).
+
+A direct dispatch that carries `correlation-id` without `release-tag` therefore skips the apply job but still receives the minted owner-wide App token in the action, which carries write permissions (`contents`, `pull_requests`, `issues`: write). The read-only guarantee holds for a dispatch with `release-tag` set and `correlation-id` absent: the apply job is skipped, the mint step is skipped, and both the checkout and the action get `github.token`. It does not hold for a dispatch that sets only `correlation-id`.
+
+The first arm of the checkout expression is the operation switch. The second arm gives direct `schedule` and
 `workflow_dispatch` runs of `fro-bot.yaml` itself the workflow token too; the
 `workflow_ref` comparison excludes reusable callers, whose `workflow_ref` names the
 caller's workflow. `secrets.FRO_BOT_PAT` remains the fallback for reusable callers
 and the other triggers.
 
-The mutating apply job requires **both** inputs, so a half-specified manual dispatch
-degrades to a harmless read-only generate run with no apply:
+The mutating apply job requires **both** inputs, so a manual dispatch with
+`release-tag` set and `correlation-id` absent degrades to a read-only generate run
+with no apply (a dispatch with only `correlation-id` is covered above):
 
 ```yaml
 # Both inputs required: the artifact name needs correlation-id, and a
@@ -92,7 +108,7 @@ read-only token — the coercion behavior is load-bearing.
 generation agent the write-capable PAT while it processes prompt-injectable,
 contributor-authored PR bodies. Keying on the operation input decouples the
 write credential from a non-security field that an attacker or a misdispatch can
-set on its own. The credential now tracks the operation, not a diagnostic label.
+set on its own. The checkout credential, and the action credential on release-narration runs, track the operation, not a diagnostic label.
 
 **Stale callers are not misclassified.** `@semantic-release/exec` runs its
 `successCmd` from the checkout of the **released tag**, not from `main`, so an
