@@ -12,8 +12,8 @@ import {parse} from 'yaml'
  * 1. The token request must name its permissions and repository. Without `permission-*` inputs
  *    the token inherits everything the installation holds.
  * 2. The job must run only for the default branch. `workflow_dispatch` can target any ref, and
- *    a ref supplies its own copy of the workflow file, so this guard is defense in depth; the
- *    enforced boundary is a deployment environment restricted to the default branch.
+ *    a ref supplies its own copy of the workflow file, so this guard keeps normal runs on the
+ *    default branch but is not a security boundary: no environment gates the App key.
  */
 
 interface WorkflowStep {
