@@ -10,6 +10,7 @@ import {buildTracingLauncherValue, TRACING_IDENTITY_FIELD_MAX_CHARS} from '@fro-
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {startOtlpSink} from '../../packages/runtime/src/tracing/otlp-sink.testing.js'
 import {resolveActionTracing} from '../services/setup/tracing.js'
+import {resetRunCancellation} from '../shared/cancellation.js'
 import {run} from './run.js'
 
 /**
@@ -464,6 +465,8 @@ describe('run with lifecycle tracing', () => {
   })
 
   afterEach(async () => {
+    resetRunCancellation()
+    vi.restoreAllMocks()
     vi.unstubAllEnvs()
     await Promise.all(sinks.splice(0).map(async sink => sink.stop()))
   })
@@ -876,6 +879,97 @@ describe('run with lifecycle tracing', () => {
 
       // #then
       expect(process.listenerCount('SIGINT')).toBe(before)
+    })
+  })
+
+  describe('a cancelled run admits no new work', () => {
+    // The signal arrives inside a phase, as it does when the runner cancels a step: the owner's handlers are the run's real ones,
+    // only the re-raise (which would end the test process) is stubbed.
+    type Phase =
+      'bootstrap' | 'routing' | 'dedup' | 'lock' | 'acknowledge' | 'cache restore' | 'session prep' | 'execute'
+
+    async function phaseMocks() {
+      return {
+        bootstrap: (await import('./phases/bootstrap.js')).runBootstrap,
+        routing: (await import('./phases/routing.js')).runRouting,
+        dedup: (await import('./phases/dedup.js')).runDedup,
+        lock: (await import('./phases/acquire-lock.js')).runAcquireLock,
+        acknowledge: (await import('./phases/acknowledge.js')).runAcknowledge,
+        'cache restore': (await import('./phases/cache-restore.js')).runCacheRestore,
+        'session prep': (await import('./phases/session-prep.js')).runSessionPrep,
+        execute: (await import('./phases/execute.js')).runExecute,
+      } as const
+    }
+
+    /** Makes `phase` raise SIGINT while it runs, then return what it returned before. */
+    async function cancelDuring(phase: Phase): Promise<void> {
+      const mocks = await phaseMocks()
+      const target = vi.mocked(mocks[phase] as unknown as (...args: unknown[]) => Promise<unknown>)
+      const original = target.getMockImplementation()
+      target.mockImplementation(async (...args: unknown[]) => {
+        process.emit('SIGINT')
+        return original?.(...args)
+      })
+    }
+
+    it.each([
+      ['bootstrap', 'routing'],
+      ['routing', 'dedup'],
+      ['dedup', 'lock'],
+      ['lock', 'acknowledge'],
+      ['acknowledge', 'cache restore'],
+      ['cache restore', 'session prep'],
+      ['session prep', 'execute'],
+    ] as const)('starts nothing after a signal during %s: not even %s', async (during, next) => {
+      // #given a collector that answers slowly, so the signal's export is still pending while the run tries to go on
+      const slow = await startOtlpSink({respond: () => ({status: 200, body: '{}', delayMs: 700})})
+      sinks.push(slow)
+      inputs.values.set('trace-endpoint', slow.url)
+      const kill = vi.spyOn(process, 'kill').mockImplementation(() => true)
+      await arrange({})
+      await cancelDuring(during)
+
+      // #when
+      const exitCode = await run()
+
+      // #then the next phase never ran, nor anything after it that sends or spawns
+      const mocks = await phaseMocks()
+      expect(vi.mocked(mocks[next] as unknown as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled()
+      const {runExecute} = await import('./phases/execute.js')
+      const {runFinalizeWithResult} = await import('./phases/finalize.js')
+      const {runReviewReconciliation} = await import('./phases/review-reconciliation.js')
+      expect(runExecute).not.toHaveBeenCalled()
+      expect(runFinalizeWithResult).not.toHaveBeenCalled()
+      expect(runReviewReconciliation).not.toHaveBeenCalled()
+      // #and what the run owned was still let go: cleanup ran, and the signal was re-raised once
+      const {runCleanup} = await import('./phases/cleanup.js')
+      expect(runCleanup).toHaveBeenCalledTimes(1)
+      expect(kill).toHaveBeenCalledTimes(1)
+      expect(kill).toHaveBeenCalledWith(process.pid, 'SIGINT')
+      expect(exitCode).toBe(1)
+      // #and the export carries the phase that was running as cancelled, and no phase that never started
+      const names = allSpans(slow).map(span => span.name)
+      expect(names).not.toContain('execution')
+      expect(names).not.toContain('finalize')
+      expect(names).not.toContain('review reconciliation')
+      expect(attr(rootOf(allSpans(slow)), 'fro_bot.outcome')).toBe('cancelled')
+    })
+
+    it('releases the server it already started and still runs cleanup, after a signal during session prep', async () => {
+      // #given
+      const kill = vi.spyOn(process, 'kill').mockImplementation(() => true)
+      await arrange({})
+      await cancelDuring('session prep')
+
+      // #when
+      await run()
+
+      // #then the server the run started is released (a teardown phase is not refused) and cleanup runs
+      const {runReleaseV2} = await import('./phases/release-v2.js')
+      expect(runReleaseV2).toHaveBeenCalledTimes(1)
+      const {runCleanup} = await import('./phases/cleanup.js')
+      expect(runCleanup).toHaveBeenCalledTimes(1)
+      expect(kill).toHaveBeenCalledTimes(1)
     })
   })
 

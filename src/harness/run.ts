@@ -36,6 +36,7 @@ import {
   relayRequestFromInputs,
   type ActionTracingSource,
 } from '../services/setup/tracing.js'
+import {createRunCancelledError} from '../shared/cancellation.js'
 import {getGitHubRunAttempt, getInvocationIdentity, getOpenCodeLogPath} from '../shared/env.js'
 import {toErrorMessage} from '../shared/errors.js'
 import {createLifecycleTracer, createRegistryScrubber, freeText, withSpan} from '../shared/lifecycle-tracer.js'
@@ -174,7 +175,16 @@ async function runWithTrace(trace: RunTrace, startTime: number, bootstrapLogger:
     name: string,
     work: (span: LifecycleSpan) => Promise<T>,
     classify?: (value: T) => SpanResult,
-  ): Promise<T> => withSpan(tracer.startSpan(name), work, classify)
+    options: {readonly teardown?: boolean} = {},
+  ): Promise<T> => {
+    // Admission closes with the first signal: no phase starts after it, so nothing new is spawned, sent or created, whichever
+    // read the signal interrupted. A teardown phase (a release, a take-back, cleanup, the final report) lets go of what the run
+    // owns and is never refused. The throw takes the run to its `finally`, which does exactly that.
+    if (options.teardown !== true && signalOwner.cancelled()) {
+      throw createRunCancelledError(`The run was cancelled, so the ${name} phase did not start`)
+    }
+    return withSpan(tracer.startSpan(name), work, classify)
+  }
   /**
    * The one session id of the conversation, computed once right after routing (a skipped event included) and never again:
    * the lifecycle tracer's `langfuse.session.id`, the post step's, and the launcher's `sessionId` (so the turn spans) all take
@@ -897,6 +907,7 @@ async function runWithTrace(trace: RunTrace, startTime: number, bootstrapLogger:
               liveObservation,
             }),
           released => ({outcome: 'failed', reason: released.drain.expired ? 'drain-expired' : 'run-aborted'}),
+          {teardown: true},
         )
         if (release.persistenceDeclineReason !== undefined) {
           skipSessionPersistence = true
@@ -924,6 +935,7 @@ async function runWithTrace(trace: RunTrace, startTime: number, bootstrapLogger:
             released.restore === 'restored'
               ? {outcome: 'succeeded', reason: 'restored'}
               : {outcome: 'failed', reason: 'not-restored'},
+          {teardown: true},
         )
         recordSandboxRelease(sandboxOutcome)
         if (sandboxOutcome.restore === 'restored') {
@@ -1060,61 +1072,66 @@ async function runWithTrace(trace: RunTrace, startTime: number, bootstrapLogger:
 
     // The final writes (the dedup marker, the terminal reaction, outputs, the job summary, the blocked-label clear) run after
     // cleanup, so they are their own span after it rather than part of finalize.
-    await phase('report', async () => {
-      // Dedup marker, written only after cleanup has had its say -- moved here (was: right
-      // after finalize, before cleanup ran) per the same reasoning that moved the terminal
-      // reaction below. A lock-contention skip reaches this point with both `dedupEntity` and
-      // `triggerContext` already populated (set before the lock is even acquired), so the
-      // outcome check is what stops a contended run, which delivered nothing, from marking
-      // itself deduplicated anyway.
-      //
-      // No exception for an incomplete invocation that already delivered a review: that used
-      // to be a deliberate carve-out here (writing the marker anyway, to discourage a rerun
-      // that could not recognize the earlier review and would submit a second one). It is
-      // removed now that `services/github/review-delivery-receipt.ts` independently protects
-      // every irreversible review submission with its own at-most-once reservation -- keeping
-      // this carve-out would only obscure that receipt as the actual authority, while this
-      // ordinary marker returns to its ordinary purpose: recording routine completion, not
-      // standing in for review idempotency.
-      const deduplicatable = finalOutcome === 'succeeded'
-      if (deduplicatable && dedupEntity != null && triggerContext != null) {
-        await saveDedupMarker(triggerContext, dedupEntity, repo)
-      }
+    await phase(
+      'report',
+      async () => {
+        // Dedup marker, written only after cleanup has had its say -- moved here (was: right
+        // after finalize, before cleanup ran) per the same reasoning that moved the terminal
+        // reaction below. A lock-contention skip reaches this point with both `dedupEntity` and
+        // `triggerContext` already populated (set before the lock is even acquired), so the
+        // outcome check is what stops a contended run, which delivered nothing, from marking
+        // itself deduplicated anyway.
+        //
+        // No exception for an incomplete invocation that already delivered a review: that used
+        // to be a deliberate carve-out here (writing the marker anyway, to discourage a rerun
+        // that could not recognize the earlier review and would submit a second one). It is
+        // removed now that `services/github/review-delivery-receipt.ts` independently protects
+        // every irreversible review submission with its own at-most-once reservation -- keeping
+        // this carve-out would only obscure that receipt as the actual authority, while this
+        // ordinary marker returns to its ordinary purpose: recording routine completion, not
+        // standing in for review idempotency.
+        const deduplicatable = finalOutcome === 'succeeded'
+        if (deduplicatable && dedupEntity != null && triggerContext != null) {
+          await saveDedupMarker(triggerContext, dedupEntity, repo)
+        }
 
-      // Terminal reaction: a distinct three-way projection (succeeded/incomplete/failed), not
-      // the boolean success/failure `completeAcknowledgment` used to receive -- moved here,
-      // strictly after cleanup, because passing a boolean derived from `exitCode` before
-      // teardown's own facts were known could select the success reaction for an invocation
-      // this assessment now calls incomplete. `reactionCtx` is structurally always null on a
-      // 'skipped' run (acknowledgment happens after every skip's early return), so the
-      // `finalOutcome !== 'skipped'` guard here is belt-and-suspenders, not load-bearing --
-      // added because `applyTerminalReaction` is not typed to accept a fourth outcome value.
-      if (reactionCtx != null && githubClient != null && finalOutcome !== 'skipped') {
-        await applyTerminalReaction(githubClient, reactionCtx, finalOutcome, bootstrapLogger)
-      }
+        // Terminal reaction: a distinct three-way projection (succeeded/incomplete/failed), not
+        // the boolean success/failure `completeAcknowledgment` used to receive -- moved here,
+        // strictly after cleanup, because passing a boolean derived from `exitCode` before
+        // teardown's own facts were known could select the success reaction for an invocation
+        // this assessment now calls incomplete. `reactionCtx` is structurally always null on a
+        // 'skipped' run (acknowledgment happens after every skip's early return), so the
+        // `finalOutcome !== 'skipped'` guard here is belt-and-suspenders, not load-bearing --
+        // added because `applyTerminalReaction` is not typed to accept a fourth outcome value.
+        if (reactionCtx != null && githubClient != null && finalOutcome !== 'skipped') {
+          await applyTerminalReaction(githubClient, reactionCtx, finalOutcome, bootstrapLogger)
+        }
 
-      setInvocationOutcomeOutput(finalOutcome)
-      await writeInvocationOutcomeSummary(
-        finalOutcome,
-        finalIncompleteReasons,
-        bootstrapLogger,
-        skipDetail ?? undefined,
-      )
+        setInvocationOutcomeOutput(finalOutcome)
+        await writeInvocationOutcomeSummary(
+          finalOutcome,
+          finalIncompleteReasons,
+          bootstrapLogger,
+          skipDetail ?? undefined,
+        )
 
-      // A succeeded run clears the `agent: blocked` label a PRIOR run's coordination decline left on this item.
-      // Last, after every output/summary is written: best-effort, deadline-bounded, never throws. The phase itself
-      // no-ops for any other outcome (including this run's own declined/errored lock), response-mode none, and
-      // non-issue/PR targets.
-      if (githubClient != null && triggerContext != null && responseMode != null) {
-        await runBlockedLabelClear({
-          githubClient,
-          triggerContext,
-          outcome: finalOutcome,
-          responseMode,
-          logger: bootstrapLogger,
-        })
-      }
-    })
+        // A succeeded run clears the `agent: blocked` label a PRIOR run's coordination decline left on this item.
+        // Last, after every output/summary is written: best-effort, deadline-bounded, never throws. The phase itself
+        // no-ops for any other outcome (including this run's own declined/errored lock), response-mode none, and
+        // non-issue/PR targets.
+        if (githubClient != null && triggerContext != null && responseMode != null) {
+          await runBlockedLabelClear({
+            githubClient,
+            triggerContext,
+            outcome: finalOutcome,
+            responseMode,
+            logger: bootstrapLogger,
+          })
+        }
+      },
+      undefined,
+      {teardown: true},
+    )
   }
 
   return exitCode

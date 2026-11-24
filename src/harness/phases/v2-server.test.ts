@@ -18,6 +18,7 @@ import {ACTION_TRACING_OFF, clearHeldClaims} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi, type Mock} from 'vitest'
 import {pluginCacheDir, resolvePluginSpecsV2} from '../../services/setup/plugin-install-v2.js'
 import {createRepoSkillsStagingRoot} from '../../services/setup/repo-skills.js'
+import {markRunCancelled, resetRunCancellation} from '../../shared/cancellation.js'
 import {createRecordingTracer, spanNamed} from '../../shared/lifecycle-tracer.testing.js'
 import {createMockLogger, serializeLoggerCalls, unwrapErr, unwrapOk} from '../../shared/test-helpers.js'
 import {ok} from '../../shared/types.js'
@@ -215,6 +216,50 @@ describe('startActionOpenCodeV2', () => {
       ...overrides,
     }
   }
+
+  describe('a cancelled run', () => {
+    afterEach(() => {
+      resetRunCancellation()
+    })
+
+    it('writes no credential, installs nothing and spawns nothing when the signal came first', async () => {
+      // #given a run that was cancelled before the server's start began
+      const server = fakeServer()
+      const deps = recordingDeps(server)
+      markRunCancelled()
+
+      // #when
+      const result = await startActionOpenCodeV2(options({deps}))
+
+      // #then it refused, and touched neither the disk nor the process table
+      expect(unwrapErr(result).message).toContain('cancelled')
+      expect(deps.startServer).not.toHaveBeenCalled()
+      expect(deps.installPlugins).not.toHaveBeenCalled()
+      expect(fs.readdirSync(runnerTemp)).toEqual([])
+      expect(fs.existsSync(authPath)).toBe(false)
+    })
+
+    it('does not spawn when the signal arrives during the plugin install, the last wait before the spawn', async () => {
+      // #given a plugin install during which the signal arrives (a cold cache)
+      fs.rmSync(cacheHome, {recursive: true, force: true})
+      const server = fakeServer()
+      const deps = recordingDeps(server, {
+        installPlugins: vi.fn<InstallPlugins>(async () => {
+          markRunCancelled()
+          populatePluginCache(cacheHome)
+          return ok(undefined)
+        }),
+      })
+
+      // #when
+      const result = await startActionOpenCodeV2(options({deps}))
+
+      // #then the start was refused at the spawn, and nothing was spawned
+      expect(unwrapErr(result).stage).toBe('spawn')
+      expect(deps.installPlugins).toHaveBeenCalledTimes(1)
+      expect(deps.startServer).not.toHaveBeenCalled()
+    })
+  })
 
   it('writes the key to a 0600 file, references it from the config and spawns with both plugins expected', async () => {
     // #given

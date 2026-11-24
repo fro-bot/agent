@@ -14,6 +14,7 @@ import {
   createLLMFetchError,
   isLlmFetchError,
 } from '@fro-bot/runtime'
+import {assertRunNotCancelled} from '../../shared/cancellation.js'
 import {DEFAULT_MODEL, DEFAULT_TIMEOUT_MS} from '../../shared/constants.js'
 import {
   getGitHubRunAttempt,
@@ -229,6 +230,8 @@ export async function executeOpenCodeV2(
   }
 
   try {
+    // A run cancelled while the phase before this one was still reading starts no turn: no session is created and no prompt sent.
+    assertRunNotCancelled('the OpenCode session request')
     const model = config?.model ?? DEFAULT_MODEL
     const modelRef = {providerID: model.providerID, modelID: model.modelID}
 
@@ -335,6 +338,8 @@ export async function executeOpenCodeV2(
         stoppingCause = 'deadline'
         return await timeoutResult()
       }
+      // After every await since the session was made (the file writes, a retry delay): the last point before the POST.
+      assertRunNotCancelled('the prompt')
       const retryDelay = RETRY_DELAYS_MS[Math.min(attempt - 1, RETRY_DELAYS_MS.length - 1)] ?? RETRY_DELAYS_MS[0]
       const result: AttemptResultV2 = await (async (): Promise<AttemptResultV2> => {
         try {

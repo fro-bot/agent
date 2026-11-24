@@ -37,7 +37,12 @@ export const RUN_CANCELLED_ERROR_NAME = 'RunCancelledError'
  */
 export function assertRunNotCancelled(what: string): void {
   if (!cancelled) return
-  const error = new Error(`The run was cancelled, so ${what} was not sent`)
+  throw createRunCancelledError(`The run was cancelled, so ${what} was not sent`)
+}
+
+/** The named error a cancelled run stops with, for a caller that decides cancellation from state of its own (`run.ts`). */
+export function createRunCancelledError(message: string): Error {
+  const error = new Error(message)
   error.name = RUN_CANCELLED_ERROR_NAME
-  throw error
+  return error
 }

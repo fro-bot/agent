@@ -50,6 +50,7 @@ import {
 } from '../../services/setup/plugin-install-v2.js'
 import {admitRepoSkills, discardRepoSkillsStaging} from '../../services/setup/repo-skills.js'
 import {resolveActionTracing} from '../../services/setup/tracing.js'
+import {isRunCancelled} from '../../shared/cancellation.js'
 import {toErrorMessage} from '../../shared/errors.js'
 import {NOOP_SPAN, withSpan} from '../../shared/lifecycle-tracer.js'
 import {logDefaultModelNotice, suppliedProviderIds, verifyDefaultModelProvider} from './default-model.js'
@@ -87,6 +88,9 @@ import {readV1DatabaseFacts, waitForV1Import} from './v1-import-wait.js'
  * Any failure after the spawn shuts the server down before returning, so a failed start leaves no process behind. The
  * caller decides what a failure means for persistence (it means no save).
  */
+
+/** Fixed text: the stage is `spawn` because that is the one thing a cancelled run must not do. */
+const CANCELLED_START_MESSAGE = 'The run was cancelled, so the OpenCode server was not started'
 
 export type V2StartStage =
   | 'config'
@@ -276,6 +280,9 @@ export async function startActionOpenCodeV2(
   const {logger} = options
   const deps = {...defaultDeps, ...options.deps}
   const stageError = (stage: V2StartStage, message: string): Result<never, V2StartError> => err({stage, message})
+  // A cancelled run starts no server: nothing is written, installed or spawned after the first signal.
+  const cancelledStart = (): Result<never, V2StartError> => stageError('spawn', CANCELLED_START_MESSAGE)
+  if (isRunCancelled()) return cancelledStart()
   // No `model` input: the session is created on `DEFAULT_MODEL` (`executeOpenCodeV2`), whatever the credentials and the
   // config say. Decided once here; the notice and the provider check below both read it.
   const usesDefaultModel = options.model == null
@@ -583,6 +590,9 @@ export async function startActionOpenCodeV2(
     // After the test seam's spread, so the decision is always the one the spawn applies.
     tracingHost: decideTracing,
   })
+
+  // After every await of the preparation above (installs, the import wait, the gates): the last point before the spawn.
+  if (isRunCancelled()) return cancelledStart()
 
   let started: Awaited<ReturnType<typeof deps.startServer>>
   try {
