@@ -1003,6 +1003,11 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       if (entryProblem !== null) return err(entryProblem)
       if (cancelled || released !== undefined) return err('isolate-agent setup was cancelled before it started')
     }
+    // Before anything is created, and checked straight after: a signal that already arrived makes the owner run the teardown at
+    // registration, which is before `preparing` exists, so it cannot be left to `prepareInner` (it would go on to create the
+    // account behind a teardown that has already reported). Nothing exists yet, so there is nothing for that teardown to miss.
+    installSignalHandlers()
+    if (cancelled || released !== undefined) return err('isolate-agent setup was cancelled before it started')
     record('pending')
     preparing = prepareInner(input)
     return preparing as Promise<Result<OpenCodeV2SandboxLaunch, string>>
@@ -1042,7 +1047,6 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
 
   async function prepareInner(input: SandboxPrepareInput): Promise<Result<OpenCodeV2SandboxLaunch, string>> {
     try {
-      installSignalHandlers()
       const created = await deps.createAccount(tools, identityDeps())
       if (!created.success) {
         // A creation that timed out left the account in place; run the teardown so the state is `unsafe`, not `pending`.

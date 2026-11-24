@@ -1286,6 +1286,61 @@ describe('createSandboxLifecycle', () => {
         expect(ownerHost.killed).toEqual(['4242:SIGINT'])
       })
 
+      it('creates no account when the owner was already cancelled at registration, and leaves nothing pending', async () => {
+        // #given a signal that arrived before this lifecycle was prepared (the owner reaped commands, having no teardown)
+        const harness = createHarness()
+        const records: string[] = []
+        const ownerHost = fakeHost()
+        const {owner} = ownerFor(ownerHost)
+        ownerHost.emitter.emit('SIGINT')
+        const lifecycle = create(harness, {
+          signals: fakeHost(),
+          signalOwner: owner,
+          recordState: state => records.push(state),
+        })
+
+        // #when the sandbox is prepared after it (late registration runs the teardown at once, before `preparing` exists)
+        const prepared = await lifecycle.prepare(prepareInput)
+        await owner.drain()
+
+        // #then no account, no handoff, and a refusal the caller reads as cancelled
+        expect(prepared.success).toBe(false)
+        expect(harness.mocks.createAccount).not.toHaveBeenCalled()
+        expect(harness.mocks.stop).not.toHaveBeenCalled()
+        expect(records).not.toContain('pending')
+      })
+
+      it('sees the account when the signal arrives while it is being created, and takes it back', async () => {
+        // #given an account creation still in flight
+        const harness = createHarness()
+        let finishCreate: () => void = () => undefined
+        const real = harness.mocks.createAccount.getMockImplementation()
+        harness.mocks.createAccount.mockImplementation(async (...args: Parameters<NonNullable<typeof real>>) => {
+          await new Promise<void>(resolve => {
+            finishCreate = resolve
+          })
+          return real?.(...args) ?? err({kind: 'create-failed', message: 'no default'})
+        })
+        const ownerHost = fakeHost()
+        const {owner} = ownerFor(ownerHost)
+        const lifecycle = create(harness, {signals: fakeHost(), signalOwner: owner})
+        const preparing = lifecycle.prepare(prepareInput)
+        await vi.waitFor(() => {
+          expect(harness.mocks.createAccount).toHaveBeenCalledTimes(1)
+        })
+
+        // #when the signal arrives mid-creation, then the creation finishes
+        ownerHost.emitter.emit('SIGTERM')
+        finishCreate()
+        const prepared = await preparing
+        await owner.drain()
+
+        // #then the teardown saw the account: its processes were stopped and the account removed, and the setup was refused
+        expect(prepared.success).toBe(false)
+        expect(harness.mocks.stop).toHaveBeenCalledTimes(1)
+        expect(harness.mocks.deleteAccount).toHaveBeenCalledTimes(1)
+      })
+
       it('unregisters its teardown on a normal release, so a later signal reaps commands instead of running it', async () => {
         // #given a sandbox that was released normally
         const harness = createHarness()
