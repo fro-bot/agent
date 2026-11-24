@@ -138,6 +138,7 @@ import {
   describeReconstruction,
   failuresFor,
   findPaths,
+  launcherLinkProbe,
   matrixDirectories,
   matrixSentinels,
   mountNamespaceIds,
@@ -3166,29 +3167,6 @@ function tracingOffEnvProbe(expectedLauncherLine: string, collectorAddress: stri
       `o=$(printf %s "$env" | grep -c '^OTEL_'); e=$(printf %s "$env" | grep -cF -- ${q(collectorAddress)}); ` +
       `[ "$l" = 1 ] && [ "$v" = 1 ] && [ "$o" = 0 ] && [ "$e" = 0 ] && s=BLOCKED || s=OPEN; ` +
       `R tracing_off_env $s "launcher_off=$l launcher_vars=$v otel=$o endpoint=$e"`,
-  }
-}
-
-/**
- * What the server was told about the run, read from its own environment (the tool shell's parent): the launcher variable holds
- * the lifecycle trace's ids and the session, each once. The credential's absence from the same variable is the canary search's
- * `environ` group, which reads this environment too.
- */
-function launcherLinkProbe(
-  ids: {readonly traceId: string; readonly rootSpanId: string; readonly invocationId: string} | null,
-  session: string | undefined,
-): Probe {
-  const count = (needle: string): string => `$(printf %s "$doc" | grep -cF -- ${q(needle)})`
-  return {
-    id: 'launcher_link',
-    category: 'works',
-    cmd:
-      `doc=$(tr '\0' '\n' < /proc/$PPID/environ 2>/dev/null | grep '^OPENCODE_FROBOT_TRACING='); ` +
-      `[ -n "$doc" ] || { R launcher_link FAILED "the launcher variable could not be read"; exit 0; }; ` +
-      `t=${count(ids?.traceId ?? 'absent')}; s=${count(ids?.rootSpanId ?? 'absent')}; ` +
-      `n=${count(session ?? 'absent')}; i=${count(ids?.invocationId ?? 'absent')}; ` +
-      `[ "$t" = 1 ] && [ "$s" = 1 ] && [ "$n" = 1 ] && [ "$i" = 1 ] && st=WORKS || st=FAILED; ` +
-      `R launcher_link $st "trace=$t span=$s session=$n invocation=$i"`,
   }
 }
 

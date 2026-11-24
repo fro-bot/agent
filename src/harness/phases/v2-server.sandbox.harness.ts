@@ -694,3 +694,27 @@ export function newLaunchNamespaces(
 export function runnerFirstLine(command: string, run?: InspectionRunner): string {
   return inspectOutput('sh', ['-c', command], `running ${command}`, run).split('\n')[0]?.trim() ?? ''
 }
+
+/**
+ * What the server was told about the run, read from its own environment (the tool shell's parent): the launcher variable holds
+ * the lifecycle trace's ids and the session, each once. The credential's absence from the same variable is the canary search's
+ * `environ` group, which reads this environment too. `environFile` is the server's `/proc/<pid>/environ`; a test names a file.
+ */
+export function launcherLinkProbe(
+  ids: {readonly traceId: string; readonly rootSpanId: string; readonly invocationId: string} | null,
+  session: string | undefined,
+  environFile = '/proc/$PPID/environ',
+): Probe {
+  const count = (needle: string): string => `$(printf %s "$doc" | grep -cF -- ${q(needle)})`
+  return {
+    id: 'launcher_link',
+    category: 'works',
+    // `String.raw`: the `\0` and `\n` are the characters `tr` is given, not a NUL and a newline inside the command text.
+    cmd:
+      `${String.raw`doc=$(tr '\0' '\n' < ${environFile} 2>/dev/null | grep '^OPENCODE_FROBOT_TRACING='); `}[ -n "$doc" ] || { R launcher_link FAILED "the launcher variable could not be read"; exit 0; }; ` +
+      `t=${count(ids?.traceId ?? 'absent')}; s=${count(ids?.rootSpanId ?? 'absent')}; ` +
+      `n=${count(session ?? 'absent')}; i=${count(ids?.invocationId ?? 'absent')}; ` +
+      `[ "$t" = 1 ] && [ "$s" = 1 ] && [ "$n" = 1 ] && [ "$i" = 1 ] && st=WORKS || st=FAILED; ` +
+      `R launcher_link $st "trace=$t span=$s session=$n invocation=$i"`,
+  }
+}
