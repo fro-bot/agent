@@ -6,6 +6,7 @@ import type {AttemptResultV2} from './live-observation-v2.js'
 import type {RunPromptAttemptV2Options} from './retry-v2.js'
 import type {FormAskedResponderV2, PermissionAskedResponderV2} from './streaming-v2.js'
 import {createAgentError, createLLMFetchError} from '@fro-bot/runtime'
+import {assertRunNotCancelled} from '../../shared/cancellation.js'
 import {shouldRetryFromOutcome} from './attempt-outcome.js'
 import {createDeadlineExceededError} from './execution-deadline.js'
 import {runPromptAttemptV2} from './retry-v2.js'
@@ -115,6 +116,9 @@ export async function sendPromptToSessionV2(options: SendPromptV2Options): Promi
     }
 
     const startPrompt = async (): Promise<(AttemptResult & {readonly sendUncertain?: boolean}) | null> => {
+      // The last point before the POST: after the event subscription and the wait for its `server.connected` frame, both of which
+      // can take a while and end after a signal. Throws when the run was cancelled, and nothing is sent.
+      assertRunNotCancelled('the prompt')
       const prompted = await client.prompt({
         sessionId,
         text: promptText,

@@ -338,7 +338,8 @@ export async function executeOpenCodeV2(
         stoppingCause = 'deadline'
         return await timeoutResult()
       }
-      // After every await since the session was made (the file writes, a retry delay): the last point before the POST.
+      // After every await since the session was made (the file writes, a retry delay): an early exit that spares the event
+      // subscription. The check that decides is at the POST itself (`sendPromptToSessionV2`), after the stream's waits.
       assertRunNotCancelled('the prompt')
       const retryDelay = RETRY_DELAYS_MS[Math.min(attempt - 1, RETRY_DELAYS_MS.length - 1)] ?? RETRY_DELAYS_MS[0]
       const result: AttemptResultV2 = await (async (): Promise<AttemptResultV2> => {
