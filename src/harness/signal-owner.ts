@@ -1,7 +1,7 @@
 import type {Logger} from '../shared/logger.js'
 import process from 'node:process'
 import {holdSignalOwnership, killRunningExecChildren} from '../services/setup/adapters.js'
-import {markRunCancelled} from '../shared/cancellation.js'
+import {markRunCancelled, startCancellationCleanups} from '../shared/cancellation.js'
 
 /**
  * The one SIGINT/SIGTERM handler of a run.
@@ -156,6 +156,8 @@ export function createSignalOwner(options: SignalOwnerOptions): SignalOwner {
     } else {
       for (const teardown of teardowns) runs.push(runTeardown(teardown, signal))
     }
+    // What the run holds that a pending read could otherwise strand (a review receipt) is given back at once, beside both.
+    runs.push(...startCancellationCleanups())
     runs.push(runFlush())
     await settleRuns()
     // 5. The handlers are gone, so this ends the process with the signal's default action.

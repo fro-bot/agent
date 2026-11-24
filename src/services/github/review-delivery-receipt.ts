@@ -58,6 +58,7 @@ import type {ObjectStoreAdapter, ObjectStoreConfig} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
 
 import {buildObjectStoreKey, createS3Adapter} from '@fro-bot/runtime'
+import {assertRunNotCancelled} from '../../shared/cancellation.js'
 
 /**
  * Fixed operation segment embedded in every receipt key. Never a variable: this receipt
@@ -329,6 +330,9 @@ export function createReviewDeliveryReceiptOperations(
         attempt,
         reservedAt: new Date().toISOString(),
       }
+      // The read above may have been in flight when a signal arrived: a cancelled run takes no reservation for a review it will
+      // not send, so nothing is created that would then need releasing.
+      assertRunNotCancelled('the review receipt')
       const put = await adapter.conditionalPut(key.data, JSON.stringify(record), {ifNoneMatch: '*'})
       if (put.success === false) {
         logger.warning('Review delivery receipt: reservation conflict, blocking submission', {

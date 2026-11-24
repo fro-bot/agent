@@ -13,6 +13,14 @@
 
 let cancelled = false
 
+/**
+ * Work that must run at once when the signal arrives, not when its owner next looks at the flag: giving back something the run
+ * holds that would otherwise outlive it (a review-receipt reservation, while a read the run is waiting on may never answer).
+ * Registered while the run holds the thing, unregistered when it no longer does. The signal owner starts every registered cleanup
+ * in the handler and waits for them beside the teardown and the export.
+ */
+const cleanups = new Set<() => Promise<unknown>>()
+
 /** Called by the signal owner, synchronously, on the first SIGINT or SIGTERM. */
 export function markRunCancelled(): void {
   cancelled = true
@@ -25,6 +33,28 @@ export function isRunCancelled(): boolean {
 /** Tests only: a real run never un-cancels. */
 export function resetRunCancellation(): void {
   cancelled = false
+  cleanups.clear()
+}
+
+/** Registers a cleanup. Returns the function that unregisters it. Call it only while the run is not cancelled. */
+export function registerCancellationCleanup(cleanup: () => Promise<unknown>): () => void {
+  cleanups.add(cleanup)
+  return () => {
+    cleanups.delete(cleanup)
+  }
+}
+
+/** Starts every registered cleanup, once, and returns what is running. Never rejects. Called by the signal owner only. */
+export function startCancellationCleanups(): Promise<void>[] {
+  const started = [...cleanups].map(async cleanup => {
+    try {
+      await cleanup()
+    } catch {
+      // A cleanup is best-effort: the run is ending either way.
+    }
+  })
+  cleanups.clear()
+  return started
 }
 
 /** The error a writer stops with. Named, so a caller that cares can tell it from a failed request. */

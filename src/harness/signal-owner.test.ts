@@ -9,7 +9,7 @@ import * as path from 'node:path'
 import process from 'node:process'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {startOtlpSink} from '../../packages/runtime/src/tracing/otlp-sink.testing.js'
-import {isRunCancelled, resetRunCancellation} from '../shared/cancellation.js'
+import {isRunCancelled, registerCancellationCleanup, resetRunCancellation} from '../shared/cancellation.js'
 import {createSignalOwner, SIGNAL_FLUSH_DEADLINE_MS} from './signal-owner.js'
 
 vi.setConfig({testTimeout: 60_000})
@@ -146,6 +146,44 @@ describe('createSignalOwner', () => {
     // #then the process was released at about the deadline, not later
     expect(Date.now() - started).toBeLessThan(1_000)
     expect(kills).toEqual([[4242, 'SIGINT']])
+  })
+
+  it('starts what the run registered to give back on a signal, beside the teardown, and waits for it before it re-raises', async () => {
+    // #given a cleanup that takes a while
+    const {deliver, kills, owner} = setup()
+    let finish: () => void = () => undefined
+    const cleanup = vi.fn(
+      async () =>
+        new Promise<void>(resolve => {
+          finish = resolve
+        }),
+    )
+    registerCancellationCleanup(cleanup)
+
+    // #when the signal arrives
+    deliver('SIGTERM')
+    await tick(30)
+
+    // #then the cleanup started at once, the owner has not re-raised, and it does when the cleanup is done
+    expect(cleanup).toHaveBeenCalledTimes(1)
+    expect(kills).toEqual([])
+    finish()
+    await owner.drain()
+    expect(kills).toEqual([[4242, 'SIGTERM']])
+  })
+
+  it('does not run a cleanup its owner unregistered', async () => {
+    // #given a cleanup registered and then unregistered (the run no longer holds the thing)
+    const {deliver, owner} = setup()
+    const cleanup = vi.fn(async () => undefined)
+    registerCancellationCleanup(cleanup)()
+
+    // #when
+    deliver('SIGINT')
+    await owner.drain()
+
+    // #then
+    expect(cleanup).not.toHaveBeenCalled()
   })
 
   it('starts the export with the deadline it was given', async () => {

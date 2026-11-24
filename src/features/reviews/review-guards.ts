@@ -15,7 +15,7 @@ import type {
 import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
 import type {ReviewEvent, ReviewResult} from './types.js'
-import {assertRunNotCancelled, isRunCancelled} from '../../shared/cancellation.js'
+import {assertRunNotCancelled, isRunCancelled, registerCancellationCleanup} from '../../shared/cancellation.js'
 import {submitReview} from './reviewer.js'
 
 export interface ForkOrSelfGuardParams {
@@ -149,6 +149,9 @@ export interface SubmitReviewWithHeadGuardBlocked {
   readonly receiptReason?: ReviewDeliveryReservationBlockedReason
 }
 
+/** Longest the guard waits for the store to take a reservation back before it lets the run go on without it. */
+const RECEIPT_RELEASE_BOUND_MS = 3_000
+
 export interface SubmitReviewWithHeadGuardSubmitted {
   readonly submitted: true
   readonly review: ReviewResult
@@ -210,11 +213,49 @@ export async function submitReviewWithHeadGuard(
       })
       return {submitted: false, reason: 'receipt-blocked', receiptReason: reservation.reason}
     }
+    if (reservation.kind === 'reserved-configured') reservationEtag = reservation.etag
+  }
 
+  // From here the run HOLDS a reservation and has not started the POST (the `try` below ends where the POST begins, and its `finally`
+  // unregisters the cleanup, so nothing in this block can give back a receipt once the POST has been sent). Whatever ends the guard before the POST (a move of the
+  // head, a failed lookup, a signal) gives the slot back, so a rerun of the same run id can still deliver the review; once the
+  // POST has started the receipt stays whatever happens, because the outcome is then unknown and a second review is worse.
+  const held =
+    receipt != null && reservationEtag != null
+      ? {ops: receipt.ops, identity: receipt.identity, etag: reservationEtag}
+      : null
+  let released: Promise<void> | undefined
+  /** Gives the reservation back, once, within a bound: the store may be the very thing that is not answering. */
+  const releaseHeld = async (): Promise<void> => {
+    if (held == null) return
+    released ??= (async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        await Promise.race([
+          held.ops.release(held.identity, held.etag),
+          new Promise<void>(resolve => {
+            timer = setTimeout(resolve, RECEIPT_RELEASE_BOUND_MS)
+          }),
+        ])
+      } catch {
+        // Best-effort, as `release` itself is: a reservation that stays is the accepted stuck-reserved trade-off.
+      } finally {
+        if (timer !== undefined) clearTimeout(timer)
+      }
+    })()
+    await released
+  }
+  // No await between the reserve returning and this registration, so a signal cannot fall between them: either the run is
+  // already cancelled here (checked next) or the owner finds this cleanup and runs it the moment the signal arrives, even while
+  // a read below is still pending.
+  const unregisterRelease = held == null ? () => undefined : registerCancellationCleanup(releaseHeld)
+
+  try {
     // Close the race window the reservation call itself opens: `reserve` above was an
     // awaited round trip, during which the head could have moved. Re-check now, with the
-    // reservation already held.
-    //
+    // reservation already held. A signal that arrived during the round trip is acted on first, before another read.
+    if (isRunCancelled()) assertRunNotCancelled('the review')
+
     // Gated on the reservation's own PROVENANCE (`reserved-configured` vs
     // `reserved-unconfigured`), never on what its etag spells: an unconfigured store's
     // `reserve` (review-delivery-receipt.ts) returns synchronously without any await on a
@@ -222,9 +263,7 @@ export async function submitReviewWithHeadGuard(
     // here to close -- this re-check would be a wasted authenticated API call on every review
     // submitted under the default (`s3-backup: 'false'`) configuration. The pre-reservation
     // head check above still applies unconditionally on every path.
-    if (reservation.kind === 'reserved-configured') {
-      reservationEtag = reservation.etag
-
+    if (held != null) {
       const postReservationPrResponse = await octokit.rest.pulls.get({owner, repo, pull_number: prNumber})
       const postReservationHeadSha: string = postReservationPrResponse.data.head.sha
       if (postReservationHeadSha !== reviewedHeadSha) {
@@ -233,20 +272,22 @@ export async function submitReviewWithHeadGuard(
           reviewedHead: reviewedHeadSha,
           freshHead: postReservationHeadSha,
         })
-        await receipt.ops.release(receipt.identity, reservationEtag)
+        await releaseHeld()
         return {submitted: false, reason: 'head-moved-before-submit'}
       }
     }
-  }
 
-  // The reservation was an awaited round trip: a signal may have arrived during it. The slot is released (the review will
-  // not be sent), so a rerun can still deliver it.
-  if (isRunCancelled()) {
-    if (receipt != null && reservationEtag != null) await receipt.ops.release(receipt.identity, reservationEtag)
+    // The reservation and the lookup were awaited round trips: a signal may have arrived during them. The slot is released (the
+    // review will not be sent), so a rerun can still deliver it.
     assertRunNotCancelled('the review')
-  }
 
-  logger.info('Review guard: submitting review', {prNumber, event, reviewedHeadSha})
+    logger.info('Review guard: submitting review', {prNumber, event, reviewedHeadSha})
+  } catch (error) {
+    await releaseHeld()
+    throw error
+  } finally {
+    unregisterRelease()
+  }
 
   const review = await submitReview(
     octokit,
@@ -262,8 +303,8 @@ export async function submitReviewWithHeadGuard(
     logger,
   )
 
-  if (receipt != null && reservationEtag != null) {
-    await receipt.ops.recordDelivered(receipt.identity, reservationEtag, receipt.attempt, review.reviewId)
+  if (held != null && receipt != null) {
+    await held.ops.recordDelivered(held.identity, held.etag, receipt.attempt, review.reviewId)
   }
 
   return {submitted: true, review, commitSha: reviewedHeadSha}
