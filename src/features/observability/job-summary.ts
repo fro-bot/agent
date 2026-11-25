@@ -21,6 +21,7 @@ const CACHE_SAVE_RESULT_LABELS: Record<CacheSaveStateValue, string> = {
   skipped: '⏭️ skipped',
   'declined-for-safety': '🔒 declined (safety)',
   'not-persisted': '❌ not persisted',
+  interrupted: '⛔ interrupted',
 }
 
 function formatCacheSaveResult(value: CacheSaveStateValue): string {

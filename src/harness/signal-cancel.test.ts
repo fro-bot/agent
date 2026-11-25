@@ -244,6 +244,36 @@ describe.skipIf(!hasBun)('a signal to a real process', () => {
       expect(attr(execution ?? {attributes: []}, 'fro_bot.reason')).toBe('sigterm')
     })
 
+    it('records the interruption before the teardown settles and the signal is re-raised', async () => {
+      // #given an isolated run
+      // #when SIGTERM arrives
+      const result = await runFixture({
+        scenario: 'child',
+        mode: 'isolated',
+        signals: [{afterMs: 400, signal: 'SIGTERM'}],
+      })
+
+      // #then the cancellation was recorded once, ahead of the restore the post hook reads, and the exit was the signal's
+      expect(result.lines.filter(line => line === 'interrupted')).toHaveLength(1)
+      expect(result.lines.indexOf('interrupted')).toBeLessThan(result.lines.indexOf('state:restored'))
+      expect(result.signal).toBe('SIGTERM')
+    })
+
+    it('still tears down and ends by the signal when recording the interruption throws', async () => {
+      // #given a state write that fails
+      // #when SIGTERM arrives
+      const result = await runFixture({
+        scenario: 'child',
+        mode: 'isolated',
+        signals: [{afterMs: 400, signal: 'SIGTERM'}],
+        env: {SIGNAL_FIXTURE_CANCEL_THROWS: 'true'},
+      })
+
+      // #then the failure changed nothing about the teardown or the exit
+      expect(teardownOrder(result.lines)).toEqual(RESTORED)
+      expect(result.signal).toBe('SIGTERM')
+    })
+
     it('re-raises when the teardown settles, even though the collector never answers', async () => {
       // #given a collector that holds every connection, and a one-second stop step
       sink = await startOtlpSink({respond: () => ({status: 200, hold: true})})

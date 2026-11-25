@@ -1262,6 +1262,76 @@ describe('createSandboxLifecycle', () => {
       expect(owned).toEqual([false])
     })
 
+    describe('recording that the run was cancelled', () => {
+      it('records it once, before the signal is re-raised, and not for a second signal', async () => {
+        // #given a prepared lifecycle whose hook notes when the signal was re-raised
+        const harness = createHarness()
+        const host = fakeHost()
+        const events: string[] = []
+        const raising = {
+          ...host,
+          kill: (pid: number, signal: 'SIGINT' | 'SIGTERM') => {
+            events.push('re-raise')
+            host.kill(pid, signal)
+          },
+        }
+        const lifecycle = create(harness, {signals: raising, recordCancelled: () => events.push('cancelled')})
+        await lifecycle.prepare(prepareInput)
+
+        // #when two signals arrive
+        host.emitter.emit('SIGTERM')
+        host.emitter.emit('SIGINT')
+        await vi.waitFor(() => {
+          expect(host.killed).toEqual(['4242:SIGTERM'])
+        })
+
+        // #then the interruption was recorded exactly once, ahead of the re-raise
+        expect(events).toEqual(['cancelled', 're-raise'])
+      })
+
+      it('records nothing when the run ends without a signal', async () => {
+        // #given a prepared lifecycle
+        const harness = createHarness()
+        const recordCancelled = vi.fn()
+        const lifecycle = create(harness, {signals: fakeHost(), recordCancelled})
+        await lifecycle.prepare(prepareInput)
+
+        // #when it is released normally
+        await lifecycle.release()
+
+        // #then no interruption was recorded
+        expect(recordCancelled).not.toHaveBeenCalled()
+      })
+
+      it('still tears down and re-raises the signal when recording throws', async () => {
+        // #given a hook that throws, as a failed state write would
+        const harness = createHarness()
+        const host = fakeHost()
+        const logger = createMockLogger()
+        const lifecycle = create(harness, {
+          signals: host,
+          logger,
+          recordCancelled: () => {
+            throw new Error('state file is gone')
+          },
+        })
+        await lifecycle.prepare(prepareInput)
+
+        // #when SIGTERM arrives
+        host.emitter.emit('SIGTERM')
+        await vi.waitFor(() => {
+          expect(host.killed).toEqual(['4242:SIGTERM'])
+        })
+
+        // #then the sandbox was still taken back and the failure was only logged
+        expect(harness.mocks.takeBack).toHaveBeenCalledTimes(1)
+        expect(logger.warning).toHaveBeenCalledWith(
+          'Recording that the run was cancelled failed',
+          expect.objectContaining({error: 'state file is gone'}),
+        )
+      })
+    })
+
     /** A signal on a sandbox whose stop waits for a real subprocess to report back, as the namespace cleanup does. */
     async function signalDuringStop(trace: ReturnType<typeof heavyTrace>['trace']) {
       const harness = createHarness()

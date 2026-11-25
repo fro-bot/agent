@@ -287,6 +287,26 @@ async function persistRunState(logger: Logger, span: LifecycleSpan, outcome: Pos
       'post-skip-safety',
       logger,
     )
+  } else if (cacheSaved === 'interrupted') {
+    // A signal cancelled an `isolate-agent` run: the sandbox lifecycle's handler took the sandbox back and re-raised without
+    // reaching cleanup, so nothing was saved. The session is still not saved -- the killed server may have left a torn database
+    // (#2168) -- but the reason is the cancellation, not an unconfirmed sandbox. Only the teardown's own state can say whether the
+    // restore was confirmed, so the wording follows it.
+    if (sandboxState === 'restored') {
+      logger.info('Skipping post-action save: the run was cancelled, so its session was not saved', {cacheSaved})
+    } else {
+      logger.warning(
+        'Skipping post-action save: the run was cancelled and the sandbox was not confirmed stopped and restored',
+        {cacheSaved, sandboxState},
+      )
+    }
+    decide(span, outcome, 'safety-skip', {outcome: 'skipped', reason: 'run-cancelled'})
+    await writeCacheSaveResultSummary(
+      {cachePersisted: false, storePersisted: false, outcome: 'ownership-declined'},
+      'post-skip-safety',
+      logger,
+      'The run was cancelled before it could save its session.',
+    )
   } else if (isolatedRun) {
     // `isolate-agent`: the sandbox user wrote this state. The main step's `finally` stops its processes, takes the files
     // back and only then persists, so reaching here with `not-persisted` means that did not complete or was skipped for

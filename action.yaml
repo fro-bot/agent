@@ -221,8 +221,10 @@ outputs:
       cache write did not), skipped (`skip-cache` is `true`, or the legacy `SKIP_CACHE=true` environment
       variable is set; a main-step safety decline still reports declined-for-safety),
       declined-for-safety (the save was deliberately refused because persistence safety could not be
-      confirmed -- a live writer may still exist; this run will not retry it), or
-      not-persisted (nothing durable happened -- a rejected write, a declined
+      confirmed -- a live writer may still exist; this run will not retry it),
+      interrupted (a signal cancelled an isolated run before cleanup; recorded
+      for the post-action hook, which will not retry it, so a cancelled run never
+      reaches this output), or not-persisted (nothing durable happened -- a rejected write, a declined
       checkpoint, or no cacheable content found; the job summary names which --
       this one IS retried from the post-action hook). Reports a result, not proof
       of durability. Only set from the main step; a value set from the post-action hook
