@@ -205,7 +205,7 @@ export function parseTraceInputs(
       io.warning(lines.message)
       return OFF
     }
-    // Dropped, not refused: the run goes on exactly as if the header had not been given (the no-credential notice below).
+    // Dropped, not refused: the run goes on exactly as if the header had not been given (with no credential).
     if (lines.droppedCredentiallessAuthorization) io.warning(TRACE_INPUT_MESSAGES.headerWithoutCredential)
 
     if (url.data.protocol === 'http:' && lines.headers.length > 0) {
@@ -225,7 +225,10 @@ export function parseTraceInputs(
       return OFF
     }
 
-    if (lines.headers.length === 0) io.notice(TRACE_INPUT_MESSAGES.noCredential)
+    // After a drop the warning above has already said so.
+    if (lines.headers.length === 0 && !lines.droppedCredentiallessAuthorization) {
+      io.notice(TRACE_INPUT_MESSAGES.noCredential)
+    }
     return {enabled: true, url: endpoint, headers: lines.headers}
   } catch {
     // Never fails the run. The message is fixed text: whatever threw may hold a value.

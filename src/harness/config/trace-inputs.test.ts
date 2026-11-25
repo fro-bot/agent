@@ -106,15 +106,26 @@ describe('parseTraceInputs', () => {
       // #given an Authorization header whose secret was empty
       const {result, warning, notice, info} = parse(ENDPOINT, header)
 
-      // #then the header is dropped, tracing stays on, and the no-credential notice applies
+      // #then the header is dropped and tracing stays on with no credential, with the warning as the only message
       expect(result).toEqual({enabled: true, url: ENDPOINT, headers: []})
       expect(warning).toHaveBeenCalledTimes(1)
       expect(warning).toHaveBeenCalledWith(TRACE_INPUT_MESSAGES.headerWithoutCredential)
       expect(warning).toHaveBeenCalledWith(
         'trace-headers has an Authorization header with no credential (is the secret set?); it was dropped',
       )
-      expect(notice).toHaveBeenCalledWith(TRACE_INPUT_MESSAGES.noCredential)
+      expect(notice).not.toHaveBeenCalled()
       expect(info).not.toHaveBeenCalled()
+    })
+
+    it('logs the no-credential notice when trace-headers really is empty, but not after a drop', () => {
+      // #given the same endpoint, once with no headers and once with a dropped header
+      const empty = parse(ENDPOINT, '')
+      const dropped = parse(ENDPOINT, 'Authorization: Bearer')
+
+      // #then only the empty input says it has no credential
+      expect(empty.notice).toHaveBeenCalledWith(TRACE_INPUT_MESSAGES.noCredential)
+      expect(dropped.notice).not.toHaveBeenCalled()
+      expect(dropped.result).toEqual(empty.result)
     })
 
     it('keeps the other headers when it drops one', () => {
