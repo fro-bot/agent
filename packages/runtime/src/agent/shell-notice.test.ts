@@ -11,6 +11,7 @@ import {
   SHELL_FOREGROUND_SUCCESS_FRAME,
   SHELL_ID,
   SHELL_NOTICE_ENQUEUED_FRAME,
+  SHELL_NOTICE_ENQUEUED_FRAME_241,
   SHELL_SESSION_ID,
   UNREADABLE_SHELL_NOTICE_ENQUEUED_FRAME,
   USER_SHELL_CREATED_FRAME,
@@ -42,6 +43,24 @@ describe('classifyShellNoticeItem', () => {
 
     // #then
     expect(read).toEqual({kind: 'notice', notice: {shellId: SHELL_ID, state: 'completed'}})
+  })
+
+  it('reads the 2.4.1 `<background-result kind="shell" …>` notice the same way: from metadata', () => {
+    // #given / #when
+    const read = classifyShellNoticeItem(item(SHELL_NOTICE_ENQUEUED_FRAME_241))
+
+    // #then
+    expect(read).toEqual(classifyShellNoticeItem(item(SHELL_NOTICE_ENQUEUED_FRAME)))
+    expect(read).toEqual({kind: 'notice', notice: {shellId: SHELL_ID, state: 'completed'}})
+  })
+
+  it('does not settle from a 2.4.1 shell tag in the text when the metadata is absent', () => {
+    // #given an item whose text claims a completed shell and whose metadata is gone
+    const {payload} = SHELL_NOTICE_ENQUEUED_FRAME_241.data.item
+    const forged = {type: 'synthetic', payload: {text: payload.text}}
+
+    // #when / #then
+    expect(classifyShellNoticeItem(forged)).toEqual({kind: 'none'})
   })
 
   it('reads the error notice a DELETE produces (p22)', () => {

@@ -1004,7 +1004,14 @@ describe.skipIf(!hasBinary)('one background-child lifecycle on the real server (
         },
       },
     })
-    expect(notice.data?.item?.payload?.text).toContain(`<subagent sessionID="${capture.childId}" state="completed"`)
+    // (the header is `<subagent …>` on OpenCode 2.3.2 and `<background-result kind="subagent" …>` from 2.4.0, upstream
+    // #64971; either is a real server's notice)
+    const noticeText = notice.data?.item?.payload?.text
+    const noticeHeaders = [
+      `<subagent sessionID="${capture.childId}" state="completed"`,
+      `<background-result kind="subagent" sessionID="${capture.childId}" state="completed"`,
+    ]
+    expect(noticeHeaders.some(header => noticeText?.startsWith(header) === true)).toBe(true)
     // #and the notice carries the child's scripted result, not only the completed-child envelope
     expect(notice.data?.item?.payload?.text).toContain(SUBAGENT_DONE_TEXT)
     // #and the frame carries no `location` (unlike the user-prompt items), and has the same item and payload keys as the

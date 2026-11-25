@@ -3,6 +3,7 @@ import type {ChatRecord, InvokeRecord, SpanRecord, ToolRecord, TurnModelLimits} 
 
 import {describe, expect, it} from 'vitest'
 
+import {observeEvent} from './record-observations.js'
 import {recordedFixtures} from './turn-model.fixtures.js'
 import {DEFAULT_LIMITS} from './turn-model.js'
 import {renderTrees, replay} from './turn-model.testing.js'
@@ -768,6 +769,75 @@ describe('turn model on constructed orderings', () => {
     expect(afterInterim.model.stats().openTraces).toBe(1)
     expect(roots(afterFinal.records)).toHaveLength(1)
   })
+
+  it.each([
+    ['2.3.2', (state: string) => `<subagent sessionID="kid" state="${state}" description="d">\nreport\n</subagent>`],
+    [
+      '2.4.1',
+      (state: string) =>
+        `<background-result kind="subagent" sessionID="kid" state="${state}" description="d">\nreport\n</background-result>`,
+    ],
+  ])(
+    'reads %s wire notices: an interim report keeps the trace and the subagent span open, the final one closes them',
+    (_version, wrap) => {
+      // #given the notices as the server sends them: the header carries the state, and the metadata says `completed` on both
+      const notice = (inboxId: string, headerState: string, at: number): Observation => {
+        const observed = observeEvent({
+          id: `evt_${inboxId}`,
+          created: at,
+          type: 'session.inbox.enqueued',
+          data: {
+            sessionID: 'p',
+            inboxID: inboxId,
+            item: {
+              type: 'synthetic',
+              payload: {
+                text: wrap(headerState),
+                metadata: {source: 'subagent', childID: 'kid', agent: 'General', state: 'completed'},
+              },
+            },
+          },
+        })
+        if (observed === undefined) throw new Error('the notice was not observed')
+        return observed
+      }
+      const s = script()
+      s.prompt('p', 'mp')
+      s.enqueued('p', 'mp', 'user')
+      s.started('p')
+      s.delivered('p', 'mp')
+      s.request('p')
+      s.stepStarted('p', 'sp')
+      s.toolBefore('p', 'c1', 'subagent')
+      s.toolAfter('p', 'c1', 'subagent', 'kid')
+      s.stepEnded('p', 'sp')
+      s.ended('p')
+      const feed = (inboxId: string, headerState: string): void => {
+        const at = lastAt(s.out) + 1
+        s.out.push(notice(inboxId, headerState, at))
+        s.at(at)
+        s.started('p')
+        s.delivered('p', inboxId)
+        s.ended('p')
+      }
+
+      // #when the interim report (header `running`) arrives and is delivered, then replayed
+      feed('mr1', 'running')
+      const afterInterim = replay(s.out, {flush: false})
+      // #and the terminal report follows
+      feed('mr2', 'completed')
+      const afterFinal = replay(s.out, {flush: false})
+
+      // #then the interim report closed neither the root nor the subagent's span, and left the trace open
+      expect(roots(afterInterim.records)).toHaveLength(0)
+      expect(tools(afterInterim.records).filter(record => record.tool === 'subagent')).toHaveLength(0)
+      expect(afterInterim.model.stats().openTraces).toBe(1)
+      // #and the terminal report closed the trace, with the subagent's span in it
+      expect(roots(afterFinal.records)).toHaveLength(1)
+      expect(tools(afterFinal.records).filter(record => record.tool === 'subagent')).toHaveLength(1)
+      expect(afterFinal.model.stats().openTraces).toBe(0)
+    },
+  )
 
   it('opening a trace past the open-trace bound closes the least recently active one, marked incomplete', () => {
     // #given three sessions with open turns and a bound of two

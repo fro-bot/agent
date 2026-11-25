@@ -3,7 +3,7 @@ import type {Logger} from '../../shared/logger.js'
 import {isShellLedgerKey} from '@fro-bot/runtime'
 
 /**
- * Diagnostic log of the `<subagent>` notices a V2 run observes, so a run that ends with its parent "awaiting the
+ * Diagnostic log of the subagent notices (`<subagent>` or `<background-result kind="subagent">`) a V2 run observes, so a run that ends with its parent "awaiting the
  * remaining reviewers" can be explained from the log: which notices arrived, what each said in the tag and in
  * `metadata.state`, and whether the Action counted the child settled because of it.
  *
