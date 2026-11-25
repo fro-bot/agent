@@ -253,7 +253,9 @@ describe('cleanup + post integration: the object-store boundary is touched at mo
       'Skipping post-action save: the sandbox was restored but the main step recorded no durable session save, so post does not retry it',
       expect.any(Object),
     )
-    const messages = [...logger.info.mock.calls, ...logger.warning.mock.calls].map(call => String(call[0]))
+    const messages = [...vi.mocked(logger.info).mock.calls, ...vi.mocked(logger.warning).mock.calls].map(call =>
+      String(call[0]),
+    )
     expect(messages.filter(message => /cancel|ended before|failed/i.test(message))).toEqual([])
   })
 })
