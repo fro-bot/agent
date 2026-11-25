@@ -167,7 +167,6 @@ const ALL_STATE_VALUES = {
   skipped: true,
   'declined-for-safety': true,
   'not-persisted': true,
-  interrupted: true,
 } as const satisfies Record<CacheSaveStateValue, true>
 
 describe('parseCacheSaveStateValue', () => {

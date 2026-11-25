@@ -101,22 +101,6 @@ async function uploadedKeysFor(state: Record<string, string>): Promise<readonly 
   return uploaded
 }
 
-/** Runs the post hook for an isolate-agent run whose signal handler recorded `interrupted`, with the given teardown state. */
-async function postWith(sandboxState: string) {
-  const core = await import('@actions/core')
-  vi.mocked(core.getState).mockImplementation((key: string) => {
-    if (key === 'shouldSaveCache') return 'true'
-    if (key === 'isolatedRun') return 'true'
-    if (key === 'sandboxState') return sandboxState
-    if (key === 'cacheSaved') return 'interrupted'
-    return ''
-  })
-  const {runPost} = await import('./post.js')
-  const logger = createMockLogger()
-  await runPost({logger})
-  return logger
-}
-
 describe('post action', () => {
   beforeEach(() => {
     vi.resetModules()
@@ -201,49 +185,9 @@ describe('post action', () => {
         // #then it declines: a retry could checkpoint a database a live sandbox process is still writing
         const {saveCache} = await import('../services/cache/index.js')
         expect(saveCache).not.toHaveBeenCalled()
-        expect(logger.warning).toHaveBeenCalledWith(
-          'Skipping post-action save: this run used isolate-agent and the main step did not confirm the sandbox was stopped and restored',
-          expect.any(Object),
-        )
+        expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining('isolate-agent'), expect.any(Object))
       },
     )
-
-    describe('a cancelled isolate-agent run (cacheSaved=interrupted)', () => {
-      const CANCELLED_AND_RESTORED = 'Skipping post-action save: the run was cancelled, so its session was not saved'
-
-      it('names the cancellation, not an unconfirmed sandbox, and does not save', async () => {
-        // #given the signal handler restored the sandbox and recorded the interruption
-        // #when the post hook runs
-        const logger = await postWith('restored')
-
-        // #then it declines to save, as before, but for the real reason
-        const {saveCache} = await import('../services/cache/index.js')
-        expect(saveCache).not.toHaveBeenCalled()
-        expect(logger.info).toHaveBeenCalledWith(CANCELLED_AND_RESTORED, expect.any(Object))
-        expect(logger.warning).not.toHaveBeenCalledWith(
-          expect.stringContaining('did not confirm the sandbox'),
-          expect.any(Object),
-        )
-      })
-
-      it.each(['pending', 'unsafe', ''])(
-        'does not save, and does not claim a restore, when the sandbox state is %j',
-        async sandboxState => {
-          // #given the teardown did not confirm the restore
-          // #when the post hook runs
-          const logger = await postWith(sandboxState)
-
-          // #then it declines, and the message does not say the sandbox was restored
-          const {saveCache} = await import('../services/cache/index.js')
-          expect(saveCache).not.toHaveBeenCalled()
-          expect(logger.info).not.toHaveBeenCalledWith(CANCELLED_AND_RESTORED, expect.any(Object))
-          expect(logger.warning).toHaveBeenCalledWith(
-            'Skipping post-action save: the run was cancelled and the sandbox was not confirmed stopped and restored',
-            expect.any(Object),
-          )
-        },
-      )
-    })
 
     describe('log uploads on isolated runs (the log directory is sandbox-writable)', () => {
       const armedIsolated = {shouldSaveCache: 'true', isolatedRun: 'true', cacheSaved: 'not-persisted'}

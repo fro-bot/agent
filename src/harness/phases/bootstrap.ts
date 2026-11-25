@@ -1,7 +1,6 @@
 import type {CredentialDisposition, ResponseDelivery, ResponseFilePathCandidates} from '@fro-bot/runtime'
 import type {EnsureOpenCodeResult} from '../../features/agent/types.js'
 import type {SandboxToolPaths} from '../../services/setup/sandbox-preflight.js'
-import type {CacheSaveStateValue} from '../../shared/cache-save-result.js'
 import type {LifecycleSpan} from '../../shared/lifecycle-tracer.js'
 import type {Logger} from '../../shared/logger.js'
 import type {SecretRegistry} from '../../shared/secret-registry.js'
@@ -235,9 +234,6 @@ function createRunSandbox(
         : buildAttachmentDir({runnerTemp, runId: getGitHubRunId(), runAttempt: getGitHubRunAttempt()}),
     logger: createLogger({phase: 'sandbox'}),
     recordState: state => core.saveState(STATE_KEYS.SANDBOX_STATE, state),
-    // A signal re-raises without cleanup, so CACHE_SAVED would keep the `not-persisted` run.ts seeded. `saveState` appends to the
-    // state file synchronously, so the value is written before the re-raise.
-    recordCancelled: () => core.saveState(STATE_KEYS.CACHE_SAVED, 'interrupted' satisfies CacheSaveStateValue),
     ...(signalTrace === undefined ? {} : {signalTrace}),
   })
 }

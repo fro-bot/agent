@@ -264,11 +264,6 @@ export interface SandboxLifecycleOptions {
   readonly launchSettleBudgetMs?: number
   /** Called synchronously with each state change. Must not throw. */
   readonly recordState?: (state: SandboxRunState) => void
-  /**
-   * Called synchronously, once, when the first SIGINT or SIGTERM begins the teardown, before the signal is re-raised. The run
-   * is ending without cleanup, so this is where it says it was interrupted. Best-effort: a throw is logged and changes nothing.
-   */
-  readonly recordCancelled?: () => void
   /** The Node and the builder bundle that build the read-only view. Defaults to the Action's own Node and `sandbox-view.js`. */
   readonly viewLauncher?: {readonly nodePath: string; readonly builderPath: string}
 }
@@ -575,14 +570,6 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     }
   }
 
-  const recordCancelled = (): void => {
-    try {
-      options.recordCancelled?.()
-    } catch (error) {
-      logger.warning('Recording that the run was cancelled failed', {error: toErrorMessage(error)})
-    }
-  }
-
   // SIGINT/SIGTERM: stop the sandbox user's processes (which aborts the server and every tool under it) and take its files
   // back before the process ends. Installed before the account exists and removed once release has finished. The exec
   // adapter's own once-handlers also fire on the same signal and re-raise it, so this handler runs at most once.
@@ -642,8 +629,6 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     cancelled = true
     // The run is cancelled from this line, synchronously: every irreversible write checks the flag at the point of submission.
     markRunCancelled()
-    // Cleanup never runs on this path, so nothing else will say why this run did not save its session.
-    recordCancelled()
     try {
       options.signalTrace?.onSignal(signal)
     } catch {

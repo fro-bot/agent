@@ -13,7 +13,6 @@
  *  - SIGNAL_FIXTURE_SCENARIO   `child` | `complete` | `read-then-write`
  *  - SIGNAL_FIXTURE_STOP_MS    how long the sandbox's stop step takes
  *  - SIGNAL_FIXTURE_BUDGET_MS  the sandbox teardown's budget
- *  - SIGNAL_FIXTURE_CANCEL_THROWS  `true` makes the hook that records the cancellation throw
  */
 import * as fs from 'node:fs'
 import * as path from 'node:path'
@@ -114,10 +113,6 @@ if (mode === 'isolated') {
     signalTrace,
     signalTeardownBudgetMs: budgetMs,
     recordState: state => mark(`state:${state}`),
-    recordCancelled: () => {
-      mark('interrupted')
-      if (process.env.SIGNAL_FIXTURE_CANCEL_THROWS === 'true') throw new Error('the state file is gone')
-    },
     deps: {
       createAccount: async () => ok(account),
       handOff: async () =>

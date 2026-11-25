@@ -678,16 +678,12 @@ describe('runBootstrap isolate-agent preflight', () => {
       tools: unknown
       workspacePath: string
       recordState: (state: string) => void
-      recordCancelled: () => void
     }
     expect(options.tools).toBe(tools)
     expect(options.workspacePath).toBe(path.join(runnerTempDir, 'repo'))
     // #and its state changes are written for the post hook
     options.recordState('pending')
     expect(mocks.saveState).toHaveBeenCalledWith('sandboxState', 'pending')
-    // #and a signal's cancellation is written as an explicit interrupted save state, not left as the initial not-persisted
-    options.recordCancelled()
-    expect(mocks.saveState).toHaveBeenCalledWith('cacheSaved', 'interrupted')
   })
 
   it('hands the sandbox lifecycle the run’s trace hook, and none to a run without isolation', async () => {

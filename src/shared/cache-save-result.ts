@@ -89,12 +89,6 @@ export interface CacheSaveResult {
  *   because this value is only ever written deliberately by `runCleanup`, never inferred
  *   from an absent or garbled state string (see `parseCacheSaveStateValue` below, which
  *   still maps those to `not-persisted`).
- * - `interrupted`: a signal cancelled an `isolate-agent` run, so cleanup never ran and nothing was
- *   saved. Like `declined-for-safety` it is only ever written deliberately (by the sandbox
- *   lifecycle's signal handler, before it re-raises), never derived from a `CacheSaveResult`, and
- *   the post hook must NOT retry it: the killed server may have left a torn session database
- *   (#2168). It exists so the post hook can name the real reason instead of reporting the
- *   `not-persisted` an interrupted run would otherwise leave behind.
  * - `not-persisted`: nothing durable happened (checkpoint declined, no cacheable content
  *   existed, cache rejected/errored with no store persistence) — or the state value was
  *   absent or unrecognized. The post hook must retry here: an absent/garbled value must
@@ -104,8 +98,7 @@ export interface CacheSaveResult {
  *   not a configuration constant — a repeated attempt re-runs the checkpoint before
  *   re-checking content, a small cost against losing a session.
  */
-export type CacheSaveStateValue =
-  'durable' | 'store-only' | 'skipped' | 'declined-for-safety' | 'not-persisted' | 'interrupted'
+export type CacheSaveStateValue = 'durable' | 'store-only' | 'skipped' | 'declined-for-safety' | 'not-persisted'
 
 /** Every valid `CacheSaveStateValue`, used to validate a state string read back from `core.getState`. */
 export const CACHE_SAVE_STATE_VALUES: readonly CacheSaveStateValue[] = [
@@ -114,7 +107,6 @@ export const CACHE_SAVE_STATE_VALUES: readonly CacheSaveStateValue[] = [
   'skipped',
   'declined-for-safety',
   'not-persisted',
-  'interrupted',
 ]
 
 type CacheSaveStateMapper = (result: CacheSaveResult) => CacheSaveStateValue

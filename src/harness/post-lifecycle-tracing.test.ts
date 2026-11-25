@@ -169,7 +169,6 @@ describe('the post step’s span', () => {
       {state: {cacheSaved: 'skipped'}, action: 'skip', reason: 'main-skipped'},
       {state: {cacheSaved: 'declined-for-safety'}, action: 'safety-skip', reason: 'persistence-declined'},
       {state: {isolatedRun: 'true'}, action: 'safety-skip', reason: 'sandbox-unconfirmed'},
-      {state: {isolatedRun: 'true', cacheSaved: 'interrupted'}, action: 'safety-skip', reason: 'run-cancelled'},
       {state: {skipCache: 'true'}, action: 'skip', reason: 'skip-cache'},
     ])('records $action ($reason) as a skipped post span, with no error status', async ({state, action, reason}) => {
       // #given a main step that left this state
