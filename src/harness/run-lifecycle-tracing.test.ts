@@ -438,9 +438,6 @@ async function execute(plan: RunPlan = {}): Promise<{exitCode: number; spans: De
   return {exitCode, spans: allSpans(target)}
 }
 
-const anyNumber: unknown = expect.any(Number)
-const anyString: unknown = expect.any(String)
-
 const FULL_RUN = [
   'bootstrap',
   'routing',
@@ -1205,7 +1202,9 @@ describe('run with lifecycle tracing', () => {
       'langfuse.observation.level',
       'langfuse.observation.status_message',
     ]
-    const parsed = (span: Decoded, key: string): unknown => JSON.parse(String(attr(span, key)))
+    const markdown = (span: Decoded, key: string): string => String(attr(span, key))
+    const metadata = (span: Decoded): string[] =>
+      span.attributes.filter(item => item.key.startsWith('langfuse.observation.metadata.')).map(item => item.key)
 
     it('says what the run is and how it ended, on the root alone', async () => {
       // #given a full run of an issue comment on main
@@ -1214,23 +1213,24 @@ describe('run with lifecycle tracing', () => {
 
       // #then
       const root = rootOf(spans)
-      expect(parsed(root, 'langfuse.observation.input')).toEqual({
-        trigger: 'issue_comment',
-        event: 'issue_comment.created',
-        repository: 'fro-bot/agent',
-        ref: 'main',
-        isolateAgent: false,
-      })
-      expect(parsed(root, 'langfuse.observation.output')).toEqual({
-        outcome: 'succeeded',
-        durationMs: anyNumber,
-        phases: FULL_RUN.map(name => ({name, outcome: anyString, ms: anyNumber})),
-      })
+      expect(markdown(root, 'langfuse.observation.input')).toBe(
+        '`issue_comment.created` on `fro-bot/agent` @ `main`, not isolated',
+      )
+      const output = markdown(root, 'langfuse.observation.output')
+      expect(output.split('\n')[0]).toMatch(
+        new RegExp(String.raw`^\*\*succeeded\*\* in \S+, ${FULL_RUN.length} phases$`),
+      )
+      expect(output.split('\n\n')[1]?.split('\n').slice(2)).toEqual(
+        FULL_RUN.map((name): unknown => expect.stringMatching(new RegExp(String.raw`^\| ${name} \| \w+ \| \S+ \|$`))),
+      )
       expect(attr(root, 'langfuse.observation.level')).toBe('DEFAULT')
       // a run that went well has no reason to give
       expect(attr(root, 'langfuse.observation.status_message')).toBeUndefined()
-      for (const span of spans.filter(item => item !== root))
+      expect(metadata(root)).toContain('langfuse.observation.metadata.phase_count')
+      for (const span of spans.filter(item => item !== root)) {
         for (const key of summaryKeys) expect(attr(span, key)).toBeUndefined()
+        expect(metadata(span)).toEqual([])
+      }
     })
 
     it('records that the run asked for isolation', async () => {
@@ -1241,7 +1241,7 @@ describe('run with lifecycle tracing', () => {
       const {spans} = await execute({})
 
       // #then
-      expect(parsed(rootOf(spans), 'langfuse.observation.input')).toMatchObject({isolateAgent: true})
+      expect(markdown(rootOf(spans), 'langfuse.observation.input')).toMatch(/, isolated$/)
     })
 
     it('keeps the input and the skip reason for a run that routing skipped', async () => {
@@ -1250,10 +1250,12 @@ describe('run with lifecycle tracing', () => {
 
       // #then the event is known even though the run stopped there
       const root = rootOf(spans)
-      expect(parsed(root, 'langfuse.observation.input')).toMatchObject({event: 'issue_comment.created'})
+      expect(markdown(root, 'langfuse.observation.input')).toMatch(/^`issue_comment\.created`/)
       expect(attr(root, 'langfuse.observation.level')).toBe('WARNING')
       expect(attr(root, 'langfuse.observation.status_message')).toBe('no_mention')
-      expect(parsed(root, 'langfuse.observation.output')).toMatchObject({outcome: 'skipped', reason: 'no_mention'})
+      expect(markdown(root, 'langfuse.observation.output').split('\n')[0]).toMatch(
+        /^\*\*skipped\*\* in \S+, \d+ phases? — no_mention$/,
+      )
     })
 
     it('marks a failed run as an error', async () => {
@@ -1263,10 +1265,13 @@ describe('run with lifecycle tracing', () => {
       // #then
       const root = rootOf(spans)
       expect(attr(root, 'langfuse.observation.level')).toBe('ERROR')
-      expect(parsed(root, 'langfuse.observation.output')).toMatchObject({
-        outcome: 'failed',
-        phases: [{name: 'bootstrap', outcome: 'failed'}, {name: 'cleanup'}, {name: 'report'}],
-      })
+      const output = markdown(root, 'langfuse.observation.output')
+      expect(output.split('\n')[0]).toMatch(/^\*\*failed\*\* in \S+, 3 phases/)
+      expect(output.split('\n\n')[1]?.split('\n').slice(2)).toEqual([
+        expect.stringMatching(/^\| bootstrap \| failed \| \S+ \|$/),
+        expect.stringMatching(/^\| cleanup \| \w+ \| \S+ \|$/),
+        expect.stringMatching(/^\| report \| \w+ \| \S+ \|$/),
+      ])
     })
 
     it('says cancelled, as a warning, for a run a signal ended', async () => {
@@ -1297,14 +1302,12 @@ describe('run with lifecycle tracing', () => {
       const root = rootOf(allSpans(target))
       expect(attr(root, 'langfuse.observation.level')).toBe('WARNING')
       expect(attr(root, 'langfuse.observation.status_message')).toBe('sigint')
-      expect(parsed(root, 'langfuse.observation.output')).toMatchObject({
-        outcome: 'cancelled',
-        reason: 'sigint',
-        phases: [
-          {name: 'bootstrap', outcome: 'succeeded'},
-          {name: 'routing', outcome: 'cancelled'},
-        ],
-      })
+      const output = markdown(root, 'langfuse.observation.output')
+      expect(output.split('\n')[0]).toMatch(/^\*\*cancelled\*\* in \S+, 2 phases — sigint$/)
+      expect(output.split('\n\n')[1]?.split('\n').slice(2)).toEqual([
+        expect.stringMatching(/^\| bootstrap \| succeeded \| \S+ \|$/),
+        expect.stringMatching(/^\| routing \| cancelled \| \S+ \|$/),
+      ])
     })
   })
 })

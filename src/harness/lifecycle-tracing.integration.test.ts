@@ -28,7 +28,7 @@ interface WireSpan {
   readonly endTimeUnixNano: string
   readonly attributes: {
     readonly key: string
-    readonly value: {readonly stringValue?: string; readonly intValue?: string}
+    readonly value: {readonly stringValue?: string; readonly intValue?: string; readonly boolValue?: boolean}
   }[]
   readonly status?: {readonly code?: number}
   readonly links?: readonly unknown[]
@@ -213,29 +213,47 @@ describe('the lifecycle trace at a real OTLP receiver', () => {
 
     // #then
     const root = spans.find(span => span.name === 'action.main') as WireSpan
-    expect(JSON.parse(attr(root, 'langfuse.observation.input') ?? '')).toEqual({
-      trigger: 'issue_comment',
-      event: 'issue_comment.created',
-      repository: 'fro-bot/agent',
-      ref: 'main',
-      isolateAgent: false,
-    })
+    expect(attr(root, 'langfuse.observation.input')).toBe(
+      '`issue_comment.created` on `fro-bot/agent` @ `main`, not isolated',
+    )
     // the phases are the root's direct children: `server start` is the execution phase's, so it is not one
-    expect(JSON.parse(attr(root, 'langfuse.observation.output') ?? '')).toEqual({
-      outcome: 'failed',
-      reason: 'exception',
-      durationMs: anyNumber,
-      phases: [
-        {name: 'bootstrap', outcome: 'succeeded', ms: anyNumber},
-        {name: 'routing', outcome: 'skipped', ms: anyNumber},
-        {name: 'execution', outcome: 'succeeded', ms: anyNumber},
-        {name: 'cleanup', outcome: 'failed', ms: anyNumber},
-      ],
-    })
+    const output = attr(root, 'langfuse.observation.output') ?? ''
+    expect(output.split('\n')[0]).toMatch(/^\*\*failed\*\* in \S+, 4 phases — exception$/)
+    expect(output.split('\n\n')[1]?.split('\n')).toEqual([
+      '| phase | outcome | time |',
+      '| --- | --- | --- |',
+      expect.stringMatching(/^\| bootstrap \| succeeded \| \S+ \|$/),
+      expect.stringMatching(/^\| routing \| skipped \| \S+ \|$/),
+      expect.stringMatching(/^\| execution \| succeeded \| \S+ \|$/),
+      expect.stringMatching(/^\| cleanup \| failed \| \S+ \|$/),
+    ])
+    // the structured fields arrive as typed metadata: a number as an int on the wire, a boolean as a bool
+    const metadata = (key: string): unknown => {
+      const value = root.attributes.find(item => item.key === `langfuse.observation.metadata.${key}`)?.value
+      return (
+        value?.stringValue ?? value?.boolValue ?? (value?.intValue === undefined ? undefined : Number(value.intValue))
+      )
+    }
+    expect(
+      [
+        'trigger',
+        'event',
+        'repository',
+        'ref',
+        'isolate_agent',
+        'outcome',
+        'reason',
+        'phase_count',
+        'failed_phases',
+      ].map(key => metadata(key)),
+    ).toEqual(['issue_comment', 'issue_comment.created', 'fro-bot/agent', 'main', false, 'failed', 'exception', 4, 2])
+    expect(metadata('duration_ms')).toEqual(anyNumber)
     expect(attr(root, 'langfuse.observation.level')).toBe('ERROR')
     expect(attr(root, 'langfuse.observation.status_message')).toBe('exception')
-    for (const span of spans.filter(item => item.name !== 'action.main'))
+    for (const span of spans.filter(item => item.name !== 'action.main')) {
       for (const key of summary) expect(attr(span, key)).toBeUndefined()
+      expect(span.attributes.filter(item => item.key.startsWith('langfuse.observation.metadata.'))).toEqual([])
+    }
   })
 
   it('exports the link a turn trace would use: the root span ids are those the launcher is given', async () => {

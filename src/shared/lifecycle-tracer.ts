@@ -121,8 +121,17 @@ export const SUMMARY_ATTRIBUTE = {
 } as const
 
 /**
- * Each of the root's input and output strings is at most this many UTF-8 bytes, measured on the JSON that is sent. The output
- * cuts its phase list at a whole entry; a summary still over the cap, or one the scrubber would change at all, is left out.
+ * The prefix of the root's structured fields. Langfuse's OpenTelemetry ingestion (`extractPrefixedMetadataAttributes` in
+ * langfuse/langfuse `OtelIngestionProcessor.ts`) reads each `langfuse.observation.metadata.<key>` attribute into the observation's
+ * metadata under `<key>`, as sent: a number stays a number, a boolean a boolean, and a string is not JSON-decoded (that applies
+ * only to its own SDKs). On a root span the same keys also reach the trace's metadata. Metadata is filterable, which the input
+ * and output, being text for a reader, are not.
+ */
+export const SUMMARY_METADATA_PREFIX = 'langfuse.observation.metadata'
+
+/**
+ * Each of the root's input and output strings is at most this many UTF-8 bytes, measured on the Markdown that is sent. The output
+ * cuts its table at a whole row; a summary still over the cap, or one the scrubber would change at all, is left out.
  */
 export const SUMMARY_MAX_BYTES = 4_096
 
@@ -384,22 +393,65 @@ interface PhaseSummary {
 }
 
 /**
- * The root's output as JSON of at most `SUMMARY_MAX_BYTES`: the phases that fit, in order, cut at a whole entry, with
- * `truncatedPhases` counting the rest. The part before the phases (an outcome, a reason of at most `FREE_TEXT_MAX_CHARS`
- * characters and a number) is far under the cap, so a cut always leaves a valid summary. Every text in it is already scrubbed,
- * so the bytes counted here are the bytes sent.
+ * A duration for a reader: whole milliseconds under a second, then seconds with a tenth (`12.3s`), then minutes and whole seconds
+ * (`1m 48s`). Rounded once, to the unit that is shown, so `59.95 s` is `1m 0s` and never `60.0s`.
  */
-function boundedOutput(base: Readonly<Record<string, unknown>>, phases: readonly PhaseSummary[]): string {
+function formatDuration(ms: number): string {
+  if (ms < 1_000) return `${ms}ms`
+  const tenths = Math.round(ms / 100)
+  if (tenths < 600) return `${(tenths / 10).toFixed(1)}s`
+  const seconds = Math.round(ms / 1_000)
+  return `${Math.floor(seconds / 60)}m ${seconds % 60}s`
+}
+
+const LINE_BREAKS = /[\n\r\u0085\u2028\u2029]+/g
+
+/**
+ * A value as the text of a table cell or of the output's first line: a line break is a space, and a backslash, a pipe and a
+ * backtick are escaped, so the value cannot add a cell or a row, or open a code span. The backslash goes first, so it cannot
+ * escape the escape of the next.
+ */
+function escapeMarkdown(text: string): string {
+  return text
+    .replaceAll(LINE_BREAKS, ' ')
+    .replaceAll('\\', '\\\\')
+    .replaceAll('|', String.raw`\|`)
+    .replaceAll('`', '\\`')
+}
+
+/**
+ * A value as a code span. A backslash escapes nothing inside one, so a backtick cannot be escaped there and is an apostrophe
+ * instead, and a line break is a space. The exact value is in the metadata.
+ */
+function codeSpan(text: string): string {
+  return `\`${text.replaceAll(LINE_BREAKS, ' ').replaceAll('`', "'")}\``
+}
+
+const TABLE_HEAD = ['| phase | outcome | time |', '| --- | --- | --- |'] as const
+
+/**
+ * The root's output as Markdown of at most `SUMMARY_MAX_BYTES`: the first line, a blank line and a table with a row for each phase
+ * in order. Over the cap the table is cut at a whole row and ends with a row that counts the rest. The first line (an outcome, a
+ * reason of at most `FREE_TEXT_MAX_CHARS` characters and a duration) is far under the cap, so a cut always leaves a valid summary.
+ * Every text in it is already scrubbed and escaped, so the bytes counted here are the bytes sent.
+ */
+function boundedOutput(head: string, phases: readonly PhaseSummary[]): string {
+  if (phases.length === 0) return head
+  const rows = phases.map(
+    phase => `| ${escapeMarkdown(phase.name)} | ${escapeMarkdown(phase.outcome)} | ${formatDuration(phase.ms)} |`,
+  )
   const render = (count: number): string =>
-    JSON.stringify({
-      ...base,
-      phases: phases.slice(0, count),
-      ...(count < phases.length ? {truncatedPhases: phases.length - count} : {}),
-    })
-  const whole = render(phases.length)
+    [
+      head,
+      '',
+      ...TABLE_HEAD,
+      ...rows.slice(0, count),
+      ...(count < rows.length ? [`| … | ${rows.length - count} more | |`] : []),
+    ].join('\n')
+  const whole = render(rows.length)
   if (utf8Bytes(whole) <= SUMMARY_MAX_BYTES) return whole
   let count = 0
-  while (count < phases.length && utf8Bytes(render(count + 1)) <= SUMMARY_MAX_BYTES) count += 1
+  while (count < rows.length && utf8Bytes(render(count + 1)) <= SUMMARY_MAX_BYTES) count += 1
   return render(count)
 }
 
@@ -668,54 +720,78 @@ export function createLifecycleTracer(options: CreateLifecycleTracerOptions): Li
   }
 
   /**
-   * The last check on a summary's JSON, on the exact text that would be sent: within `SUMMARY_MAX_BYTES` of UTF-8, and left
+   * The last check on a summary's Markdown, on the exact text that would be sent: within `SUMMARY_MAX_BYTES` of UTF-8, and left
    * exactly as it is by the scrubber, with no registered literal in it. The fields were scrubbed one by one, so this finds nothing
-   * in a summary of ordinary values. When it does (a registered literal made of the JSON's own keys and punctuation, say), the
-   * attribute is left out: a redaction here would rewrite JSON syntax, or grow the text past the cap after it was checked.
+   * in a summary of ordinary values. When it does (a registered literal made of the summary's own words and punctuation, say), the
+   * attribute is left out: a redaction here would rewrite the table's syntax, or grow the text past the cap after it was checked.
    */
-  function admitSummary(preparation: Preparation, spanText: SpanText, label: string, json: string): string | undefined {
-    if (utf8Bytes(json) <= SUMMARY_MAX_BYTES && scrubsUnchanged(preparation.scrubber, json)) return json
+  function admitSummary(preparation: Preparation, spanText: SpanText, label: string, text: string): string | undefined {
+    if (utf8Bytes(text) <= SUMMARY_MAX_BYTES && scrubsUnchanged(preparation.scrubber, text)) return text
     note(spanText, label, 'unsafe-summary')
     return undefined
   }
 
-  /** The root's input: what the run is, with whatever is known. Undefined when nothing is. */
-  function summarizeInput(preparation: Preparation, spanText: SpanText): string | undefined {
-    const {trigger, repository} = identity
+  /**
+   * What the run is, each field scrubbed on its own, once: the input and the metadata are built from these. An unknown field, or
+   * an empty one, is left out. The repository and the ref come from outside, so neither is here when no scrub can be trusted
+   * with it (the registry cannot match a secret).
+   */
+  function scrubbedRunFields(
+    preparation: Preparation,
+    spanText: SpanText,
+  ): Readonly<Record<string, string | undefined>> {
     const fixed = (label: string, text: string | undefined): string | undefined =>
-      text === undefined || text.length > IDENTITY_MAX_CHARS
+      text === undefined || text.length === 0 || text.length > IDENTITY_MAX_CHARS
         ? undefined
         : scrubField(preparation, spanText, label, text).text
-    const summary = {
-      trigger: fixed('summary.trigger', trigger),
+    const free = (label: string, text: string | undefined): string | undefined =>
+      text === undefined || text.length === 0 ? undefined : freeSummaryText(preparation, spanText, label, text)
+    return {
+      trigger: fixed('summary.trigger', identity.trigger),
       event: fixed('summary.event', runInput.event),
-      // Free text: a repository and a ref name come from outside, so neither is exported when no scrub can be trusted with it.
-      repository:
-        repository === undefined ? undefined : freeSummaryText(preparation, spanText, 'summary.repository', repository),
-      ref: runInput.ref === undefined ? undefined : freeSummaryText(preparation, spanText, 'summary.ref', runInput.ref),
-      isolateAgent: runInput.isolateAgent,
+      repository: free('summary.repository', identity.repository),
+      ref: free('summary.ref', runInput.ref),
     }
-    const known = Object.fromEntries(Object.entries(summary).filter(([, value]) => value !== undefined))
-    return Object.keys(known).length === 0
-      ? undefined
-      : admitSummary(preparation, spanText, 'summary.input', JSON.stringify(known))
+  }
+
+  /**
+   * The root's input as one line of Markdown: `` `event` on `repository` @ `ref`, isolated ``. The event, which says more than
+   * the trigger, stands for both; the trigger is there when the event is not known. A part that is not known is left out.
+   */
+  function summarizeInput(
+    fields: Readonly<Record<string, string | undefined>>,
+    preparation: Preparation,
+    spanText: SpanText,
+  ): string | undefined {
+    const what = fields.event ?? fields.trigger
+    const parts = [
+      what === undefined ? undefined : codeSpan(what),
+      fields.repository === undefined ? undefined : `on ${codeSpan(fields.repository)}`,
+      fields.ref === undefined ? undefined : `@ ${codeSpan(fields.ref)}`,
+    ].filter(part => part !== undefined)
+    const isolation =
+      runInput.isolateAgent === undefined ? undefined : runInput.isolateAgent ? 'isolated' : 'not isolated'
+    const line = [parts.join(' '), isolation].filter(part => part !== undefined && part !== '').join(', ')
+    return line === '' ? undefined : admitSummary(preparation, spanText, 'summary.input', line)
   }
 
   /**
    * The root's Langfuse summary, built at export from the spans the tracer holds: the input, the output (how the run ended and
-   * each direct child of the root as a phase), the level and the status message. Order of work: every text field is scrubbed
-   * alone; the object is built from the scrubbed fields; its JSON is cut to the byte cap at a whole phase; and the finished JSON
-   * is checked once more (`admitSummary`), and left out rather than rewritten if that check finds anything.
+   * each direct child of the root as a phase), the level, the status message and the structured fields as metadata. Order of
+   * work: every text field is scrubbed alone, then escaped for Markdown; the output is built from the scrubbed fields and cut to
+   * the byte cap at a whole table row; and the finished text is checked once more (`admitSummary`), and left out rather than
+   * rewritten if that check finds anything. The metadata strings are the scrubbed fields themselves, not escaped.
    */
   function summarizeRoot(
     record: SpanRecord,
     preparation: Preparation,
     spanText: SpanText,
     reason: string | undefined,
-  ): Record<string, string> {
+  ): Record<string, string | number | boolean> {
     const {endFallbackMs} = preparation
-    const attributes: Record<string, string> = {}
-    const input = summarizeInput(preparation, spanText)
+    const attributes: Record<string, string | number | boolean> = {}
+    const fields = scrubbedRunFields(preparation, spanText)
+    const input = summarizeInput(fields, preparation, spanText)
     if (input !== undefined) attributes[SUMMARY_ATTRIBUTE.input] = input
     const spent = (span: SpanRecord): number => Math.max(0, Math.round((span.endMs ?? endFallbackMs) - span.startMs))
     const outcomeOf = (span: SpanRecord): string =>
@@ -728,19 +804,25 @@ export function createLifecycleTracer(options: CreateLifecycleTracerOptions): Li
         ms: spent(span),
       }))
     const outcome = outcomeOf(record)
+    const duration = spent(record)
     const bounded = reason === undefined ? undefined : scrubField(preparation, spanText, 'summary.reason', reason)
-    const output = admitSummary(
-      preparation,
-      spanText,
-      'summary.output',
-      boundedOutput(
-        {outcome, ...(bounded === undefined ? {} : {reason: bounded.text}), durationMs: spent(record)},
-        phases,
-      ),
-    )
+    const head = `**${escapeMarkdown(outcome)}** in ${formatDuration(duration)}, ${phases.length} ${phases.length === 1 ? 'phase' : 'phases'}${bounded === undefined ? '' : ` — ${escapeMarkdown(bounded.text)}`}`
+    const output = admitSummary(preparation, spanText, 'summary.output', boundedOutput(head, phases))
     if (output !== undefined) attributes[SUMMARY_ATTRIBUTE.output] = output
     attributes[SUMMARY_ATTRIBUTE.level] = levelOf(outcome)
     if (bounded !== undefined) attributes[SUMMARY_ATTRIBUTE.statusMessage] = bounded.text
+
+    const metadata: Record<string, string | number | boolean | undefined> = {
+      ...fields,
+      isolate_agent: runInput.isolateAgent,
+      outcome,
+      reason: bounded?.text,
+      duration_ms: duration,
+      phase_count: phases.length,
+      failed_phases: phases.filter(phase => phase.outcome !== 'succeeded').length,
+    }
+    for (const [key, value] of Object.entries(metadata))
+      if (value !== undefined) attributes[`${SUMMARY_METADATA_PREFIX}.${key}`] = value
     return attributes
   }
 
