@@ -1,12 +1,9 @@
 import type {Socket} from 'node:net'
-import type {ScrubbedSpan} from './content.js'
 import type {SpanExporter, SpanExporterOptions} from './exporter.js'
+import type {ScrubbedSpan} from './scrub.js'
 import {Buffer} from 'node:buffer'
 import {createServer as createHttpServer} from 'node:http'
 import {afterEach, describe, expect, it, vi} from 'vitest'
-
-import {opensslAvailable, startOtlpSink, startTlsSink, type OtlpSink, type SinkRequest} from '../integration.fixture.js'
-import {scrubbedBrand} from './content.js'
 import {
   COLLECTOR_BODY_LIMIT_BYTES,
   createSpanExporter,
@@ -15,6 +12,8 @@ import {
   SDK_SPAN_LIMITS,
   TRACE_COUNTS_HEADER,
 } from './exporter.js'
+import {opensslAvailable, startOtlpSink, startTlsSink, type OtlpSink, type SinkRequest} from './otlp-sink.testing.js'
+import {scrubbedBrand} from './scrub.js'
 
 const FAST = {batchIntervalMs: 15, requestTimeoutMs: 2_500, maxConsecutiveFailures: 3}
 const sleep = async (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
@@ -52,6 +51,7 @@ interface Decoded {
   readonly attributes: {key: string; value: Record<string, unknown>}[]
   readonly status?: {code?: number; message?: string}
   readonly events?: {name: string; timeUnixNano: string; attributes?: {key: string; value: unknown}[]}[]
+  readonly links?: Record<string, unknown>[]
 }
 
 /** Every span in a decoded OTLP JSON request. */
@@ -75,7 +75,13 @@ const sink = async (...args: Parameters<typeof startOtlpSink>): Promise<OtlpSink
   return started
 }
 function exporterFor(options: Partial<SpanExporterOptions> & Pick<SpanExporterOptions, 'url'>): SpanExporter {
-  const made = createSpanExporter({headers: {}, reportCounts: false, limits: FAST, ...options})
+  const made = createSpanExporter({
+    serviceName: 'fro-bot-opencode-plugin',
+    headers: {},
+    reportCounts: false,
+    limits: FAST,
+    ...options,
+  })
   exporters.push(made)
   return made
 }
@@ -120,6 +126,82 @@ describe('what the exporter sends', () => {
     expect(second?.status).toMatchObject({code: 2, message: 'boom'})
     expect(second?.events?.[0]).toMatchObject({name: 'exception', timeUnixNano: '1700000004999000000'})
     expect(request?.contentType).toBe('application/json')
+  })
+
+  it('serializes a span’s links as hex trace and span ids and nothing else, and drops a malformed link', async () => {
+    // #given a span that links to a span in another trace, beside a malformed link, and a span with no links
+    const target = await sink()
+    const exporter = exporterFor({url: target.url})
+    const SENTINEL = 'LINK-ATTRIBUTE-SENTINEL'
+    // A caller (or a stale build) that still hangs an attribute on a link: the type forbids it, so the test casts, and the payload must not carry it.
+    const linked = {
+      traceId: hex(0xdef, 32),
+      spanId: hex(0x42, 16),
+      attributes: {[SENTINEL]: SENTINEL},
+    } as unknown as {traceId: string; spanId: string}
+    const malformed = {traceId: 'not-hex', spanId: hex(0x43, 16)}
+    exporter.export(span({links: [malformed, linked]}))
+    exporter.export(span())
+
+    // #when it is received
+    await exporter.close(3_000)
+
+    // #then both spans exported; the one link is the ids as lowercase hex, the way OTLP JSON writes them, with no attributes
+    const [request] = target.accepted()
+    const [withLink, without] = spansOf(request as SinkRequest)
+    expect(withLink?.links).toHaveLength(1)
+    const [link] = withLink?.links ?? []
+    expect(link).toMatchObject({traceId: hex(0xdef, 32), spanId: hex(0x42, 16), attributes: []})
+    expect(String(link?.traceId)).toMatch(/^[0-9a-f]{32}$/)
+    expect(String(link?.spanId)).toMatch(/^[0-9a-f]{16}$/)
+    expect((request as SinkRequest).text).not.toContain('not-hex')
+    // #and the attribute a caller tried to put on the link is nowhere in the payload
+    expect((request as SinkRequest).text).not.toContain(SENTINEL)
+    // #and a span without links carries none
+    expect(without?.links ?? []).toEqual([])
+  })
+
+  it('keeps a span and drops a link whose id is not a string, even when it reads as valid hex', async () => {
+    // #given a link whose ids are an array and an object that stringify to valid ids (`RegExp.test` coerces), beside a valid link
+    const target = await sink()
+    const exporter = exporterFor({url: target.url})
+    const valid = {traceId: hex(0xdef, 32), spanId: hex(0x42, 16)}
+    const asArray = {traceId: [hex(0xaaa, 32)], spanId: hex(0x44, 16)} as unknown as typeof valid
+    const asObject = {traceId: hex(0xbbb, 32), spanId: {toString: () => hex(0x45, 16)}} as unknown as typeof valid
+    exporter.export(span({links: [asArray, asObject, valid]}))
+
+    // #when it is received
+    await exporter.close(3_000)
+
+    // #then the span is exported with only the valid link
+    const [request] = target.accepted()
+    const [exported] = spansOf(request as SinkRequest)
+    expect(exported?.links).toHaveLength(1)
+    expect(exported?.links?.[0]).toMatchObject(valid)
+    expect((request as SinkRequest).text).not.toContain(hex(0xaaa, 32))
+    expect((request as SinkRequest).text).not.toContain(hex(0xbbb, 32))
+  })
+
+  it('names the sender with the service name it was given, on the resource and the scope', async () => {
+    // #given an exporter for another sender
+    const target = await sink()
+    const exporter = exporterFor({url: target.url, serviceName: 'fro-bot-action'})
+    exporter.export(span())
+
+    // #when it is received
+    await exporter.close(3_000)
+
+    // #then
+    const body = (target.accepted()[0] as SinkRequest).body as {
+      resourceSpans: {
+        resource: {attributes: {key: string; value: {stringValue?: string}}[]}
+        scopeSpans: {scope: {name: string}}[]
+      }[]
+    }
+    expect(body.resourceSpans[0]?.resource.attributes).toEqual([
+      {key: 'service.name', value: {stringValue: 'fro-bot-action'}},
+    ])
+    expect(body.resourceSpans[0]?.scopeSpans[0]?.scope.name).toBe('fro-bot-action')
   })
 
   it('carries a hand-built resource with no process arguments, host name or environment', async () => {

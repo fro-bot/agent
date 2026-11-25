@@ -42,6 +42,10 @@ afterEach(() => {
 
 const IDENTITY = {repository: 'fro-bot/agent', runId: '123456', attempt: '1', job: 'fro-bot', trigger: 'issue_comment'}
 const RELAY = 'http://127.0.0.1:43211/v1/traces'
+const ROOT_SPAN = {traceId: '0af7651916cd43dd8448eb211c80319c', spanId: 'b7ad6b7169203331'}
+const SESSION_ID = 'fro-bot/agent:issue-42'
+const INVOCATION_ID = '3f2a9c1e-7b4d-4e8a-9d6c-1a2b3c4d5e6f'
+const RUN_LINK = {rootSpan: ROOT_SPAN, sessionId: SESSION_ID, invocationId: INVOCATION_ID}
 
 function launcher(overrides: Record<string, unknown> = {}): string {
   return JSON.stringify({version: 1, host: 'action', tracing: 'on', relay: RELAY, identity: IDENTITY, ...overrides})
@@ -105,6 +109,40 @@ describe('Action host', () => {
     expect(lines).toEqual([])
   })
 
+  it('carries the root span context, the session id and the invocation id when the launcher has them, verbatim', () => {
+    // #given an Action launcher with all three optional fields
+    // #when settings resolve
+    const settings = resolve({[TRACING_LAUNCHER_ENV]: launcher(RUN_LINK)})
+
+    // #then they are on the settings as given
+    expect(settings).toEqual({mode: 'on', host: 'action', endpoint: RELAY, identity: IDENTITY, ...RUN_LINK})
+    expect(lines).toEqual([])
+  })
+
+  it.each([
+    ['the root span alone', {rootSpan: ROOT_SPAN}],
+    ['the session id alone', {sessionId: SESSION_ID}],
+    ['the invocation id alone', {invocationId: INVOCATION_ID}],
+    ['a session id of exactly 200 characters', {sessionId: 's'.repeat(200)}],
+    ['an all-zero-but-one trace id', {rootSpan: {...ROOT_SPAN, traceId: `${'0'.repeat(31)}1`}}],
+  ])('accepts %s', (_label, fields) => {
+    expect(resolve({[TRACING_LAUNCHER_ENV]: launcher(fields)})).toEqual({
+      mode: 'on',
+      host: 'action',
+      endpoint: RELAY,
+      identity: IDENTITY,
+      ...fields,
+    })
+  })
+
+  it('carries none of the run link fields when the launcher has none, as before', () => {
+    // #given the launcher the Action sends today
+    const settings = resolve({[TRACING_LAUNCHER_ENV]: launcher()})
+
+    // #then no key for them exists at all
+    expect(Object.keys(settings)).toEqual(['mode', 'host', 'endpoint', 'identity'])
+  })
+
   it('uses only what the launcher carries: a valid user file changes nothing', () => {
     // #given a valid user file and a launcher that says off
     writeSettings()
@@ -147,6 +185,13 @@ describe('Action host', () => {
     ['an unknown host', launcher({host: 'gateway-SENTINEL'}), 'launcher-unsupported'],
     ['an unknown tracing state', launcher({tracing: 'maybe-SENTINEL'}), 'launcher-malformed'],
     ['an extra key', launcher({extra: 'SENTINEL'}), 'launcher-malformed'],
+    ['an extra key beside the run link', launcher({...RUN_LINK, extra: 'SENTINEL'}), 'launcher-malformed'],
+    [
+      'a missing relay',
+      JSON.stringify({version: 1, host: 'action', tracing: 'on', identity: IDENTITY}),
+      'launcher-malformed',
+    ],
+    ['a run link on an off document', launcher({tracing: 'off', ...RUN_LINK}), 'action-off'],
     ['a public relay address', launcher({relay: 'http://203.0.113.9:4318/v1/traces'}), 'launcher-relay-invalid'],
     ['a relay named localhost', launcher({relay: 'http://localhost:4318/v1/traces'}), 'launcher-relay-invalid'],
     ['an https relay', launcher({relay: 'https://127.0.0.1:4318/v1/traces'}), 'launcher-relay-invalid'],
@@ -180,6 +225,38 @@ describe('Action host', () => {
       launcher({identity: {...IDENTITY, job: 'a\nb'}}),
       'launcher-identity-invalid',
     ],
+    ['a root span that is not an object', launcher({rootSpan: 'SENTINEL'}), 'launcher-run-invalid'],
+    ['a root span with an extra key', launcher({rootSpan: {...ROOT_SPAN, extra: 'SENTINEL'}}), 'launcher-run-invalid'],
+    ['a root span missing its span id', launcher({rootSpan: {traceId: ROOT_SPAN.traceId}}), 'launcher-run-invalid'],
+    [
+      'a trace id of the wrong length',
+      launcher({rootSpan: {...ROOT_SPAN, traceId: ROOT_SPAN.traceId.slice(1)}}),
+      'launcher-run-invalid',
+    ],
+    [
+      'an upper-case trace id',
+      launcher({rootSpan: {...ROOT_SPAN, traceId: ROOT_SPAN.traceId.toUpperCase()}}),
+      'launcher-run-invalid',
+    ],
+    ['an all-zero trace id', launcher({rootSpan: {...ROOT_SPAN, traceId: '0'.repeat(32)}}), 'launcher-run-invalid'],
+    [
+      'a span id of the wrong length',
+      launcher({rootSpan: {...ROOT_SPAN, spanId: `${ROOT_SPAN.spanId}0`}}),
+      'launcher-run-invalid',
+    ],
+    [
+      'an upper-case span id',
+      launcher({rootSpan: {...ROOT_SPAN, spanId: ROOT_SPAN.spanId.toUpperCase()}}),
+      'launcher-run-invalid',
+    ],
+    ['an all-zero span id', launcher({rootSpan: {...ROOT_SPAN, spanId: '0'.repeat(16)}}), 'launcher-run-invalid'],
+    ['a non-hex span id', launcher({rootSpan: {...ROOT_SPAN, spanId: 'z'.repeat(16)}}), 'launcher-run-invalid'],
+    ['an empty session id', launcher({sessionId: ''}), 'launcher-run-invalid'],
+    ['a session id that is not a string', launcher({sessionId: 42}), 'launcher-run-invalid'],
+    ['a session id over 200 characters', launcher({sessionId: 's'.repeat(201)}), 'launcher-run-invalid'],
+    ['a session id with a control character', launcher({sessionId: 'a/b:c\nd'}), 'launcher-run-invalid'],
+    ['an empty invocation id', launcher({invocationId: ''}), 'launcher-run-invalid'],
+    ['an invocation id over 200 characters', launcher({invocationId: 'i'.repeat(201)}), 'launcher-run-invalid'],
   ] as const)('resolves %s to off, logging a fixed reason and no value', (_label, value, reason) => {
     // #given a refused launcher value and a valid user file that must not rescue it
     writeSettings()
@@ -187,9 +264,9 @@ describe('Action host', () => {
     // #when settings resolve
     const settings = resolve({[TRACING_LAUNCHER_ENV]: value})
 
-    // #then off, and the one log line is the fixed reason
+    // #then off, and the one log line is the fixed reason (a deliberate off stays silent)
     expect(settings).toEqual({mode: 'off', reason})
-    expect(lines).toEqual([`tracing off (${reason})`])
+    expect(lines).toEqual(reason === 'action-off' ? [] : [`tracing off (${reason})`])
     expect(lines.join('\n')).not.toMatch(/SENTINEL|hunter2|203\.0\.113/)
   })
 

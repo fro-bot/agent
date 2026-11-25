@@ -4,6 +4,7 @@ import type {ToolRootResult} from '../../services/setup/sandbox-tool-roots.js'
 import type {ExecAdapter, ExecOptions} from '../../services/setup/types.js'
 import type {SandboxLifecycleDeps, SandboxPrepareInput, SignalHost} from './sandbox-lifecycle.js'
 import {Buffer} from 'node:buffer'
+import {execFile} from 'node:child_process'
 import {EventEmitter} from 'node:events'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
@@ -13,8 +14,16 @@ import {err, ok} from '@bfra.me/es/result'
 import {admitLaunch, createSandboxAccount} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi, type Mock} from 'vitest'
 import {isSignalOwned} from '../../services/setup/adapters.js'
+import {isRunCancelled, registerCancellationCleanup, resetRunCancellation} from '../../shared/cancellation.js'
+import {createLifecycleTracer, freeText, type FlushResult} from '../../shared/lifecycle-tracer.js'
+import {createSecretRegistry} from '../../shared/secret-registry.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
-import {createPrivilegedRun, createSandboxLifecycle, DEFAULT_PRIVILEGED_TIMEOUT_MS} from './sandbox-lifecycle.js'
+import {
+  createPrivilegedRun,
+  createSandboxLifecycle,
+  DEFAULT_PRIVILEGED_TIMEOUT_MS,
+  SIGNAL_TRACE_FLUSH_BOUND_MS,
+} from './sandbox-lifecycle.js'
 import {createTraceRelayLaunch, startTraceRelayProcess} from './trace-relay-process.js'
 
 const TOOLS = Object.fromEntries(
@@ -192,6 +201,52 @@ function fakeHost(): SignalHost & {readonly emitter: EventEmitter; readonly kill
       killed.push(`${pid}:${signal}`)
     },
   }
+}
+
+/**
+ * The largest trace there is: a big registry (some literals near the scrubber's 64 KiB ceiling) and a span at every cap, so
+ * that preparing it for export is a great deal of local work. The tracer is the real one; only its exporter is a recorder.
+ */
+function heavyTrace(prepareBudgetMs: number) {
+  const registry = createSecretRegistry(() => undefined)
+  for (let index = 0; index < 1_000; index += 1) registry.add(`secret-${String(index).padStart(12, '0')}`)
+  for (let index = 0; index < 16; index += 1) registry.add(`${String(index).padStart(2, '0')}${'L'.repeat(65_534)}`)
+  const exported: unknown[] = []
+  let droppedByExporter = 0
+  const tracer = createLifecycleTracer({
+    inputs: {enabled: true, url: 'http://127.0.0.1:9/v1/traces', headers: []},
+    logger: createMockLogger(),
+    registry,
+    env: {},
+    cancelledPrepareBudgetMs: prepareBudgetMs,
+    createExporter: () => ({
+      export: span => {
+        exported.push(span)
+      },
+      counts: () => ({exported: exported.length, dropped: droppedByExporter}),
+      drop: (spans = 1) => {
+        droppedByExporter += spans
+      },
+      close: async () => ({exported: exported.length, dropped: droppedByExporter}),
+    }),
+  })
+  const text = 'x'.repeat(5_000)
+  for (let index = 0; index < 399; index += 1) {
+    const span = tracer.startSpan(`span-${index}`)
+    for (let attribute = 0; attribute < 3; attribute += 1)
+      span.setAttribute(`attr.${attribute}`, freeText(text, 'text'))
+    for (let event = 0; event < 8; event += 1)
+      span.addEvent(`event-${event}`, {note: freeText(text.slice(0, 500), 'text')})
+    span.end({outcome: 'succeeded'})
+  }
+  let flushed: FlushResult | undefined
+  const trace = {
+    onSignal: (signal: 'SIGINT' | 'SIGTERM') => tracer.cancel(signal === 'SIGINT' ? 'sigint' : 'sigterm'),
+    flush: async (options: {readonly boundMs: number}) => {
+      flushed = await tracer.flush(options)
+    },
+  }
+  return {trace, exported, dropped: () => droppedByExporter, flushed: () => flushed}
 }
 
 function deferred<T>(): {readonly promise: Promise<T>; readonly resolve: (value: T) => void} {
@@ -1207,6 +1262,214 @@ describe('createSandboxLifecycle', () => {
       expect(owned).toEqual([false])
     })
 
+    /** A signal on a sandbox whose stop waits for a real subprocess to report back, as the namespace cleanup does. */
+    async function signalDuringStop(trace: ReturnType<typeof heavyTrace>['trace']) {
+      const harness = createHarness()
+      harness.mocks.stop.mockImplementation(async () => {
+        await new Promise<void>(resolve => {
+          execFile('sleep', ['0.05'], () => resolve())
+        })
+        return 'stopped'
+      })
+      const host = fakeHost()
+      await create(harness, {signals: host, signalTrace: trace}).prepare(prepareInput)
+      const startedAt = performance.now()
+      host.emitter.emit('SIGTERM')
+      await vi.waitFor(
+        () => {
+          expect(host.killed).toEqual(['4242:SIGTERM'])
+        },
+        {timeout: 10_000, interval: 5},
+      )
+      return {reRaisedAfterMs: performance.now() - startedAt, takeBack: harness.mocks.takeBack}
+    }
+
+    describe('with the lifecycle trace’s signal hook', () => {
+      /** A trace hook that records when it is called, relative to the sandbox teardown's own steps. */
+      const hookFor = (events: string[], flush: (options: {readonly boundMs: number}) => Promise<unknown>) => ({
+        onSignal: vi.fn((signal: 'SIGINT' | 'SIGTERM') => {
+          events.push(`on-signal(${signal},cancelled=${String(isRunCancelled())})`)
+        }),
+        flush: vi.fn(async (options: {readonly boundMs: number}) => {
+          events.push('flush')
+          return flush(options)
+        }),
+      })
+
+      beforeEach(() => {
+        resetRunCancellation()
+      })
+      afterEach(() => {
+        resetRunCancellation()
+      })
+
+      it('cancels the run and ends the open spans synchronously, then starts the export beside the teardown, and re-raises after the teardown', async () => {
+        // #given a prepared sandbox with the hook
+        const harness = createHarness()
+        const events: string[] = []
+        harness.mocks.stop.mockImplementation(async () => {
+          events.push('stop')
+          return 'stopped'
+        })
+        const trace = hookFor(events, async () => undefined)
+        const host = fakeHost()
+        const lifecycle = create(harness, {signals: host, signalTrace: trace})
+        await lifecycle.prepare(prepareInput)
+
+        // #when the signal arrives
+        host.emitter.emit('SIGTERM')
+        expect(events).toEqual(['on-signal(SIGTERM,cancelled=true)'])
+        await vi.waitFor(() => {
+          expect(host.killed).toEqual(['4242:SIGTERM'])
+        })
+
+        // #then the span hook ran inside the handler, the teardown's stop started before the export, and the signal was re-raised
+        expect(events.slice(0, 3)).toEqual(['on-signal(SIGTERM,cancelled=true)', 'stop', 'flush'])
+        expect(trace.flush).toHaveBeenCalledExactlyOnceWith({boundMs: SIGNAL_TRACE_FLUSH_BOUND_MS})
+        expect(harness.mocks.takeBack).toHaveBeenCalledTimes(1)
+      })
+
+      it('re-raises when the teardown settles, not when a collector that never answers does', async () => {
+        // #given an export that never settles
+        const harness = createHarness()
+        const trace = hookFor([], async () => new Promise(() => undefined))
+        const host = fakeHost()
+        const lifecycle = create(harness, {signals: host, signalTrace: trace})
+        await lifecycle.prepare(prepareInput)
+
+        // #when
+        host.emitter.emit('SIGINT')
+
+        // #then the signal is re-raised at once after the (instant) teardown: the export is not waited for
+        await vi.waitFor(() => {
+          expect(host.killed).toEqual(['4242:SIGINT'])
+        })
+        expect(trace.flush).toHaveBeenCalledTimes(1)
+      })
+
+      it('lets a stop that waits on a subprocess result advance, and re-raises within the budget, while the export prepares a very large trace', async () => {
+        // #given a trace that takes over a second to prepare, with a budget that would let it
+        const heavy = heavyTrace(60_000)
+
+        // #when the signal arrives during a stop that waits for a subprocess
+        const {reRaisedAfterMs, takeBack} = await signalDuringStop(heavy.trace)
+
+        // #then the subprocess's result was handled between spans: the teardown ran to its end and the process was re-raised
+        // long before preparing every span could have finished (it would be first in line behind the whole synchronous batch)
+        expect(takeBack).toHaveBeenCalledTimes(1)
+        expect(reRaisedAfterMs).toBeLessThan(500)
+        await vi.waitFor(
+          () => {
+            expect(heavy.flushed()).toBeDefined()
+          },
+          {timeout: 60_000, interval: 20},
+        )
+        expect(heavy.flushed()?.undelivered).toBe(0)
+      }, 120_000)
+
+      it('drops, and counts, the spans the export has no time to prepare, rather than delaying anything', async () => {
+        // #given the same trace and a small preparation budget
+        const heavy = heavyTrace(150)
+
+        // #when
+        const {reRaisedAfterMs} = await signalDuringStop(heavy.trace)
+
+        // #then the process was re-raised in the teardown's own time, and the export gave up on the rest, counting it
+        expect(reRaisedAfterMs).toBeLessThan(500)
+        await vi.waitFor(
+          () => {
+            expect(heavy.flushed()).toBeDefined()
+          },
+          {timeout: 10_000, interval: 20},
+        )
+        const unprepared = heavy.flushed()?.unprepared ?? 0
+        expect(unprepared).toBeGreaterThan(0)
+        expect(heavy.exported.length + unprepared).toBe(400)
+        expect(heavy.dropped()).toBe(unprepared)
+      }, 60_000)
+
+      it('lets nothing in the hook change how the run is stopped', async () => {
+        // #given a hook whose span end and export both throw
+        const harness = createHarness()
+        const trace = {
+          onSignal: vi.fn(() => {
+            throw new Error('span trouble')
+          }),
+          flush: vi.fn(async () => {
+            throw new Error('export trouble')
+          }),
+        }
+        const host = fakeHost()
+        const lifecycle = create(harness, {signals: host, signalTrace: trace})
+        await lifecycle.prepare(prepareInput)
+
+        // #when
+        host.emitter.emit('SIGTERM')
+
+        // #then the teardown ran in full and the signal was re-raised
+        await vi.waitFor(() => {
+          expect(host.killed).toEqual(['4242:SIGTERM'])
+        })
+        expect(harness.mocks.takeBack).toHaveBeenCalledTimes(1)
+        expect(isRunCancelled()).toBe(true)
+      })
+
+      it('starts no export for a second signal, and without a hook starts none at all', async () => {
+        // #given one sandbox with the hook and one without
+        const withHook = createHarness()
+        const trace = hookFor([], async () => undefined)
+        const hostA = fakeHost()
+        await create(withHook, {signals: hostA, signalTrace: trace}).prepare(prepareInput)
+        const without = createHarness()
+        const hostB = fakeHost()
+        await create(without, {signals: hostB}).prepare(prepareInput)
+
+        // #when each gets two signals
+        hostA.emitter.emit('SIGINT')
+        hostA.emitter.emit('SIGTERM')
+        hostB.emitter.emit('SIGINT')
+        hostB.emitter.emit('SIGTERM')
+        await vi.waitFor(() => {
+          expect(hostA.killed).toHaveLength(1)
+          expect(hostB.killed).toHaveLength(1)
+        })
+
+        // #then the first signal's handling is the only one: one export, and a teardown exactly as it always was
+        expect(trace.flush).toHaveBeenCalledTimes(1)
+        expect(hostA.killed).toEqual(['4242:SIGINT'])
+        expect(without.mocks.takeBack).toHaveBeenCalledTimes(1)
+      })
+
+      it('gives back what the run holds (a review receipt) beside the teardown, and waits for it inside the teardown budget', async () => {
+        // #given a cleanup the run registered while it held a receipt
+        const harness = createHarness()
+        let finish: () => void = () => undefined
+        const cleanup = vi.fn(
+          async () =>
+            new Promise<void>(resolve => {
+              finish = resolve
+            }),
+        )
+        registerCancellationCleanup(cleanup)
+        const host = fakeHost()
+        const lifecycle = create(harness, {signals: host})
+        await lifecycle.prepare(prepareInput)
+
+        // #when the signal arrives
+        host.emitter.emit('SIGTERM')
+        await vi.waitFor(() => {
+          expect(cleanup).toHaveBeenCalledTimes(1)
+        })
+
+        // #then the process is held until the cleanup is done, and then re-raised
+        expect(host.killed).toEqual([])
+        finish()
+        await vi.waitFor(() => {
+          expect(host.killed).toEqual(['4242:SIGTERM'])
+        })
+      })
+    })
+
     it('does not own signal handling when preparation fails before any handler is needed', async () => {
       // #given a lifecycle whose account creation fails
       const harness = createHarness()
@@ -1525,6 +1788,30 @@ describe('createSandboxLifecycle', () => {
       expect(logger.info).toHaveBeenCalledWith('Sandbox PATH left out directories the agent cannot enter', {
         dropped: ['/home/runner/.cargo/unreachable/bin'],
       })
+    })
+
+    it('records the dropped PATH entries as an event on the handoff span, with their count', async () => {
+      // #given the same unreachable directory, and a handoff span
+      const harness = createHarness()
+      const lifecycle = create(harness, {
+        env: baseEnv(),
+        runnerPath: '/opt/hostedtoolcache/node/24/x64/bin:/home/runner/.cargo/unreachable/bin:/usr/bin',
+        signals: fakeHost(),
+      })
+      const {createRecordingTracer, spanNamed} = await import('../../shared/lifecycle-tracer.testing.js')
+      const {tracer, exported} = createRecordingTracer()
+      const span = tracer.startSpan('isolation handoff')
+
+      // #when prepared
+      await lifecycle.prepare({...prepareInput, traceSpan: span})
+      span.end()
+      tracer.root.end()
+      await tracer.flush()
+
+      // #then
+      const event = spanNamed(exported, 'isolation handoff').events.find(item => item.name === 'path.dropped')
+      expect(event?.attributes.count).toBe('1')
+      expect(String(event?.attributes.entries)).toContain('/home/runner/.cargo/unreachable/bin')
     })
 
     it('passes a caller’s tool install locations the agent can enter, and only those', async () => {

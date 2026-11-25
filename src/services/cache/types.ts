@@ -1,4 +1,5 @@
 import type {ObjectStoreAdapter, ObjectStoreConfig} from '@fro-bot/runtime'
+import type {LifecycleSpan} from '../../shared/lifecycle-tracer.js'
 import type {Logger} from '../../shared/logger.js'
 import type {CacheKeyComponents} from './cache-key.js'
 import * as cache from '@actions/cache'
@@ -28,6 +29,8 @@ export interface RestoreCacheOptions {
   readonly cacheAdapter?: CacheAdapter
   /** The `skip-cache` input. Skips the restore entirely, like the `SKIP_CACHE=true` environment variable. */
   readonly skipCache?: boolean
+  /** The cache restore span of the lifecycle trace: each tier tried (an object store generation, the Actions cache) is its child. */
+  readonly traceSpan?: LifecycleSpan
 }
 
 /**

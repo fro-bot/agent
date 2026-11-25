@@ -10,6 +10,7 @@ import type {
   SkippedReviewComment,
   SubmitReviewOptions,
 } from './types.js'
+import {assertRunNotCancelled} from '../../shared/cancellation.js'
 import {getPRDiff} from './diff.js'
 
 /**
@@ -94,6 +95,8 @@ export async function submitReview(
     skippedCount = prepared.skipped.length
   }
 
+  // After the diff read above, which may have been in flight when a signal arrived: the last thing before the review goes out.
+  assertRunNotCancelled('the review')
   const {data} = await octokit.rest.pulls.createReview({
     owner,
     repo,
@@ -149,6 +152,7 @@ export async function postReviewComment(
     line: comment.line,
   })
 
+  assertRunNotCancelled('the review comment')
   const {data} = await octokit.rest.pulls.createReviewComment({
     owner,
     repo,
@@ -213,6 +217,7 @@ export async function replyToReviewComment(
 ): Promise<number> {
   logger.debug('Replying to review comment', {prNumber, commentId})
 
+  assertRunNotCancelled('the review reply')
   const {data} = await octokit.rest.pulls.createReplyForReviewComment({
     owner,
     repo,

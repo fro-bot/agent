@@ -1,5 +1,6 @@
 import type {Logger} from '../../shared/logger.js'
 import type {Octokit} from './types.js'
+import {assertRunNotCancelled} from '../../shared/cancellation.js'
 import {toErrorMessage} from '../../shared/errors.js'
 
 type ReactionContent = '+1' | '-1' | 'laugh' | 'confused' | 'heart' | 'hooray' | 'rocket' | 'eyes'
@@ -32,6 +33,7 @@ export async function createCommentReaction(
 ): Promise<{id: number} | null> {
   try {
     const {owner, repo} = parseRepoString(repoString)
+    assertRunNotCancelled('the reaction')
     const {data} = await client.rest.reactions.createForIssueComment({
       owner,
       repo,
@@ -93,6 +95,7 @@ export async function deleteCommentReaction(
 ): Promise<boolean> {
   try {
     const {owner, repo} = parseRepoString(repoString)
+    assertRunNotCancelled('the reaction removal')
     await client.rest.reactions.deleteForIssueComment({
       owner,
       repo,
@@ -126,6 +129,7 @@ export async function ensureLabelExists(
   const {owner, repo} = parseRepoString(repoString)
 
   try {
+    assertRunNotCancelled('the label')
     await client.rest.issues.createLabel({
       owner,
       repo,
@@ -162,6 +166,7 @@ export async function addLabelsToIssue(
 ): Promise<boolean> {
   try {
     const {owner, repo} = parseRepoString(repoString)
+    assertRunNotCancelled('the label')
     await client.rest.issues.addLabels({
       owner,
       repo,
@@ -202,6 +207,7 @@ export async function removeLabelFromIssueWithOutcome(
 ): Promise<RemoveLabelOutcome> {
   try {
     const {owner, repo} = parseRepoString(repoString)
+    assertRunNotCancelled('the label removal')
     await client.rest.issues.removeLabel({
       owner,
       repo,

@@ -12,27 +12,40 @@ import type {InvocationSkipDetail} from '../features/observability/index.js'
 import type {TriggerContext} from '../features/triggers/types.js'
 import type {DeduplicationEntity} from '../services/cache/dedup.js'
 import type {Octokit} from '../services/github/types.js'
+import type {CacheSaveOutcome} from '../shared/cache-save-result.js'
+import type {LifecycleSpan, LifecycleTracer, SpanResult} from '../shared/lifecycle-tracer.js'
+import type {Logger} from '../shared/logger.js'
+import type {SecretRegistry} from '../shared/secret-registry.js'
+import type {TracingInputs} from '../shared/types.js'
 import type {InvocationOutcome, InvocationVerificationFacts} from './outcome.js'
-import type {SandboxLifecycle, SandboxReleaseResult} from './phases/sandbox-lifecycle.js'
+import type {SandboxLifecycle, SandboxReleaseResult, SandboxSignalTrace} from './phases/sandbox-lifecycle.js'
 import process from 'node:process'
 import * as core from '@actions/core'
+import {buildLogicalKey} from '@fro-bot/runtime'
 import {applyTerminalReaction} from '../features/agent/index.js'
 import {createMetricsCollector, writeInvocationOutcomeSummary} from '../features/observability/index.js'
 import {resolveReviewedHeadSha} from '../features/reviews/reviewed-head.js'
 import {createReviewDeliveryReceiptOperations} from '../services/github/review-delivery-receipt.js'
 import {
   buildActionTracingHost,
+  buildTraceSessionId,
   buildTracingRunIdentity,
+  buildTracingRunLink,
   liveActionTracingHost,
+  readLifecycleRunIdentity,
   relayRequestFromInputs,
   type ActionTracingSource,
 } from '../services/setup/tracing.js'
+import {createRunCancelledError, isRunCancelled} from '../shared/cancellation.js'
 import {getGitHubRunAttempt, getInvocationIdentity, getOpenCodeLogPath} from '../shared/env.js'
 import {toErrorMessage} from '../shared/errors.js'
+import {createLifecycleTracer, createRegistryScrubber, freeText, withSpan} from '../shared/lifecycle-tracer.js'
 import {createLogger} from '../shared/logger.js'
+import {createSecretRegistry} from '../shared/secret-registry.js'
 import {isIsolationRequested} from './config/inputs.js'
 import {setActionOutputs, setInvocationOutcomeOutput} from './config/outputs.js'
 import {STATE_KEYS} from './config/state-keys.js'
+import {readTraceInputs} from './config/trace-inputs.js'
 import {assessInvocationOutcome} from './outcome.js'
 import {runAcknowledge} from './phases/acknowledge.js'
 import {runAcquireLock, type LeaseController} from './phases/acquire-lock.js'
@@ -73,9 +86,137 @@ const TRACE_IDENTITY_WARNING =
 const TRACE_EXPOSURE_WARNING =
   'Tracing is on without isolate-agent: the agent can read the collector credential and the content of every span'
 
+/** What the run's trace needs from the run's body: the tracer and registry in, the facts the root span ends with out. */
+interface RunTrace {
+  readonly tracer: LifecycleTracer
+  readonly registry: SecretRegistry
+  /** The trace inputs `run` read first of everything, handed to bootstrap so it never reads them again. */
+  readonly traceInputs: TracingInputs
+  /** What the sandbox's signal handler does to the trace. Only an isolated run has such a handler; any other run ends on a signal as it always did. */
+  readonly signalTrace: SandboxSignalTrace
+  /** Set by the body as it learns them; the root span ends with whatever is set when the body returns or throws. */
+  readonly outcome: {
+    rootResult: SpanResult
+    cacheSaveOutcome: CacheSaveOutcome | null
+    exitCode: number | null
+  }
+}
+
 export async function run(): Promise<number> {
   const startTime = Date.now()
   const bootstrapLogger = createLogger({phase: 'bootstrap'})
+
+  // First of everything, before bootstrap and before any input is validated: the secret registry (every mask site below goes
+  // through it, so the lifecycle tracer's scrubber knows what GitHub was told to mask and what only the Action knows), then
+  // the trace inputs, read, masked and removed from the environment, then the tracer. Bootstrap receives the inputs' result
+  // and never reads them again. A run whose trace inputs are missing or refused is untraced from the start.
+  const registry = createSecretRegistry(value => core.setSecret(value))
+  registry.addSecretEnv(process.env)
+  const traceInputs = readTraceInputs(
+    {getInput: name => core.getInput(name)},
+    {
+      warning: message => core.warning(message),
+      notice: message => core.notice(message),
+      info: message => core.info(message),
+      mask: value => registry.mask(value, 'trace-input'),
+    },
+  )
+  const tracer = createLifecycleTracer({
+    inputs: traceInputs,
+    logger: bootstrapLogger,
+    registry,
+    identity: readLifecycleRunIdentity(process.env, getInvocationIdentity()),
+  })
+  // The identity record: the one thing the post step needs to join this trace, saved once and before routing. Ids only; no
+  // input, credential or span content ever goes into Action state.
+  // Best-effort: a state file that cannot be written costs the post step its link to this trace, never the run.
+  if (tracer.ids !== null) {
+    try {
+      core.saveState(STATE_KEYS.LIFECYCLE_TRACE, JSON.stringify(tracer.ids))
+    } catch {
+      // Nothing to report with: the error may name the state file, and the run is unaffected.
+    }
+  }
+  const refName = process.env.GITHUB_REF_NAME?.trim() ?? ''
+  if (refName !== '') tracer.root.setAttribute('fro_bot.ref', freeText(refName, 'ref'))
+
+  // Cancellation and the trace. A run WITHOUT `isolate-agent` installs no handler of its own and keeps none alive: a signal ends it
+  // as it always did (the exec adapter reaps its commands and re-raises), and it sends no lifecycle trace. An isolated run's
+  // sandbox already handles the signal, to stop and take back the sandbox user; this is what that handler does to the trace: end
+  // the open spans as cancelled and start the export beside the teardown. The export never extends the teardown's window.
+  const signalTrace: SandboxSignalTrace = {
+    onSignal: signal => tracer.cancel(signal === 'SIGINT' ? 'sigint' : 'sigterm'),
+    flush: async flushOptions => tracer.flush(flushOptions),
+  }
+
+  const trace: RunTrace = {
+    tracer,
+    registry,
+    traceInputs,
+    signalTrace,
+    outcome: {rootResult: {outcome: 'failed', reason: 'exception'}, cacheSaveOutcome: null, exitCode: null},
+  }
+  try {
+    return await runWithTrace(trace, startTime, bootstrapLogger)
+  } finally {
+    // The trace's last word, after everything else, so a throw from cleanup or from the final writes still sends what was
+    // reached and changes neither the error nor the exit code. The root carries the run's final outcome, the cache save
+    // result and the exit code the run returns. A flush never rejects.
+    if (trace.outcome.exitCode !== null) tracer.root.setAttribute('fro_bot.exit_code', trace.outcome.exitCode)
+    tracer.root.setAttribute('fro_bot.cache.save_result', trace.outcome.cacheSaveOutcome ?? 'not-run')
+    tracer.root.end(trace.outcome.rootResult)
+    // Normal completion and a signal share this one export (the tracer's flush is idempotent), and `main.ts` ends the process
+    // only after `run()` returns, so it never exits before the export has settled or hit its bound.
+    await tracer.flush()
+  }
+}
+
+async function runWithTrace(trace: RunTrace, startTime: number, bootstrapLogger: Logger): Promise<number> {
+  const {tracer, registry, traceInputs, signalTrace} = trace
+  /** A phase of the run: a span from the moment the phase starts to the moment it returns or throws. */
+  const phase = async <T>(
+    name: string,
+    work: (span: LifecycleSpan) => Promise<T>,
+    classify?: (value: T) => SpanResult,
+    options: {readonly teardown?: boolean} = {},
+  ): Promise<T> => {
+    // Admission closes with the first signal: no phase starts after it, so nothing new is spawned, sent or created, whichever
+    // read the signal interrupted. A teardown phase (a release, a take-back, cleanup, the final report) lets go of what the run
+    // owns and is never refused. The throw takes the run to its `finally`, which does exactly that.
+    if (options.teardown !== true && isRunCancelled()) {
+      throw createRunCancelledError(`The run was cancelled, so the ${name} phase did not start`)
+    }
+    return withSpan(tracer.startSpan(name), work, classify)
+  }
+  /**
+   * The one session id of the conversation, computed once right after routing (a skipped event included) and never again:
+   * the lifecycle tracer's `langfuse.session.id`, the post step's, and the launcher's `sessionId` (so the turn spans) all take
+   * this value. Undefined until routing has named the conversation, and for good when no scrub-safe id exists; neither trace
+   * then sends a session.
+   */
+  let traceSessionId: string | undefined
+  const bindTraceSession = (context: TriggerContext | undefined): void => {
+    if (!tracer.enabled || context === undefined) return
+    try {
+      const logicalKey = buildLogicalKey(context, getInvocationIdentity())
+      if (logicalKey == null) return
+      tracer.root.setAttribute('fro_bot.logical_key', logicalKey.key)
+      const sessionId = buildTraceSessionId(
+        context.repo.owner,
+        context.repo.repo,
+        logicalKey.key,
+        createRegistryScrubber(registry),
+      )
+      if (sessionId === undefined) return
+      traceSessionId = sessionId
+      tracer.setSessionId(sessionId)
+      // For the post step's span. Saved here, once: routing is the first point the conversation is known.
+      core.saveState(STATE_KEYS.LIFECYCLE_SESSION, sessionId)
+    } catch {
+      // Tracing never changes a run.
+    }
+  }
+
   const metrics = createMetricsCollector()
   metrics.start()
 
@@ -211,6 +352,8 @@ export async function run(): Promise<number> {
   let deliveryOutcome: 'pending' | 'failed' | 'skipped' = 'pending'
   // Why routing declined the event; stays null for the dedup and lock-contention skips, which have no routing reason.
   let skipDetail: InvocationSkipDetail | null = null
+  // The same fact for the lifecycle trace, which also covers the dedup and lock skips: a stable code, never free text.
+  let traceSkipReason: string | null = null
 
   const createUnavailableOutputModeMigration = (): OutputModeMigrationState => ({
     requested: requestedOutputModeState,
@@ -294,7 +437,11 @@ export async function run(): Promise<number> {
     bootstrapLogger.info('Starting Fro Bot Agent')
 
     requestedOutputModeState = resolveRequestedOutputModeState()
-    const bootstrap = await runBootstrap(bootstrapLogger)
+    const bootstrap = await phase(
+      'bootstrap',
+      async span => runBootstrap(bootstrapLogger, {registry, tracing: traceInputs, traceSpan: span, signalTrace}),
+      started => (started == null ? {outcome: 'failed', reason: 'bootstrap-failed'} : {outcome: 'succeeded'}),
+    )
     if (bootstrap == null) {
       deliveryOutcome = 'failed'
       setUnavailableActionOutputs(Date.now() - startTime)
@@ -307,10 +454,19 @@ export async function run(): Promise<number> {
     sessionRetention = bootstrap.inputs.sessionRetention
     responseMode = bootstrap.inputs.responseMode
 
-    const routing = await runRouting(bootstrap, startTime)
+    const routing = await phase(
+      'routing',
+      async () => runRouting(bootstrap, startTime),
+      routed =>
+        'skipped' in routed
+          ? {outcome: 'skipped', reason: routed.skipReason}
+          : {outcome: 'succeeded', reason: 'routed'},
+    )
+    bindTraceSession('skipped' in routing ? routing.context : routing.triggerResult.context)
     if ('skipped' in routing) {
       deliveryOutcome = 'skipped'
       skipDetail = {reason: routing.skipReason, message: routing.skipMessage}
+      traceSkipReason = routing.skipReason
       setUnavailableActionOutputs(Date.now() - startTime)
       return 0
     }
@@ -328,21 +484,50 @@ export async function run(): Promise<number> {
       createLogger({phase: 'review-delivery-receipt'}),
     )
     const runAttempt = getGitHubRunAttempt()
-    const dedup = await runDedup(bootstrap.inputs.dedupWindow, routing.triggerResult.context, repo, startTime)
+    const dedup = await phase(
+      'dedup',
+      async span => {
+        const checked = await runDedup(bootstrap.inputs.dedupWindow, routing.triggerResult.context, repo, startTime)
+        span.addEvent('dedup.result', {'fro_bot.result': checked.shouldProceed ? 'proceed' : 'duplicate'})
+        return checked
+      },
+      checked =>
+        checked.shouldProceed ? {outcome: 'succeeded', reason: 'proceed'} : {outcome: 'skipped', reason: 'duplicate'},
+    )
     if (!dedup.shouldProceed) {
       deliveryOutcome = 'skipped'
+      traceSkipReason = 'duplicate'
       setUnavailableActionOutputs(Date.now() - startTime)
       return 0
     }
     dedupEntity = dedup.entity
 
-    const lockResult = await runAcquireLock({
-      storeConfig,
-      repo,
-      runId,
-      runAttempt: getGitHubRunAttempt(),
-      jobIdentity: getInvocationIdentity(),
-    })
+    const lockResult = await phase(
+      'coordination lock',
+      async span => {
+        const acquired = await runAcquireLock({
+          storeConfig,
+          repo,
+          runId,
+          runAttempt: getGitHubRunAttempt(),
+          jobIdentity: getInvocationIdentity(),
+        })
+        span.addEvent('lock.result', {'fro_bot.result': acquired.outcome})
+        if (acquired.outcome === 'error') span.recordException(acquired.error)
+        return acquired
+      },
+      acquired => {
+        switch (acquired.outcome) {
+          case 'held-by-other':
+            return {outcome: 'skipped', reason: acquired.outcome}
+          case 'error':
+            return {outcome: 'failed', reason: acquired.outcome}
+          case 'acquired':
+          case 's3-disabled':
+            return {outcome: 'succeeded', reason: acquired.outcome}
+        }
+      },
+    )
     switch (lockResult.outcome) {
       case 'acquired':
         lockEtag = lockResult.lockEtag
@@ -354,6 +539,7 @@ export async function run(): Promise<number> {
           surface: lockResult.holder?.surface ?? null,
         })
         deliveryOutcome = 'skipped'
+        traceSkipReason = 'held-by-other'
         setUnavailableActionOutputs(Date.now() - startTime)
         // Nothing below this decline may write session state: cleanup declines its save and the post hook skips.
         skipSessionPersistence = true
@@ -383,11 +569,15 @@ export async function run(): Promise<number> {
         break
     }
 
-    reactionCtx = await runAcknowledge(routing, bootstrap.logger)
+    reactionCtx = await phase('acknowledge', async () => runAcknowledge(routing, bootstrap.logger))
 
     // After routing so a skipped event never pays for a trust lookup or a git fetch (fro-bot/agent#2129). Null unless
     // `repo-skills` is on, the run is V2 and the trust predicate admitted it.
-    const repoSkills = await runRepoSkills(bootstrap, routing)
+    const repoSkills = await phase(
+      'repo skills',
+      async () => runRepoSkills(bootstrap, routing),
+      staged => (staged === null ? {outcome: 'skipped', reason: 'not-used'} : {outcome: 'succeeded', reason: 'staged'}),
+    )
     repoSkillsStagingRoot = repoSkills?.stagingRoot ?? null
 
     // Tracing: the operator's `trace-endpoint` and `trace-headers` (already parsed, masked and removed from the environment by
@@ -397,41 +587,59 @@ export async function run(): Promise<number> {
     // supervisor and the run goes on untraced.
     let tracingHost: ActionTracingSource = buildActionTracingHost(null, null)
     const relayRequest = relayRequestFromInputs(bootstrap.inputs.tracing)
-    if (relayRequest !== null) {
-      // Each field from where it is authoritative: the routed context for the repository, run and trigger (never the payload
-      // or `github.context`), the Action's own environment for the attempt (`GITHUB_RUN_ATTEMPT` is not admitted to the agent,
-      // so it travels in the launcher document) and the invocation identity for the job (the lock's `holder_job`).
-      const identity = buildTracingRunIdentity({
-        repository: repo,
-        runId,
-        attempt: runAttempt,
-        job: getInvocationIdentity(),
-        trigger: routing.triggerResult.context.eventName,
-      })
-      if (identity.success) {
-        // The signal teardown owns the launch from before the spawn: a cancellation while the child is still starting aborts the
-        // start and reaps it, one that arrives when it is ready stops it, inside the teardown's own budget. Registering installs
-        // the lifecycle's signal handlers, which at this point (before the server, the key proxy and the account) nothing else
-        // has. The server is being killed on a signal, so a relay stopped that way cannot have a complete count.
-        const launch = createTraceRelayLaunch(startTraceRelayProcess)
-        sandboxLifecycle?.registerSignalStop(async () => launch.stop())
-        const started = await launch.start({
-          config: relayRequest,
-          logger: createLogger({phase: 'trace-relay'}),
-          // The relay bundle is optional, so only a run that traces looks at it (the supervisor asks, before it spawns).
-          bundleCheck: async () => checkTraceRelayBundle({isolated: isolationRequested}),
+    await phase(
+      'trace relay start',
+      async (): Promise<SpanResult> => {
+        if (relayRequest === null) return {outcome: 'skipped', reason: 'tracing-off'}
+        // Each field from where it is authoritative: the routed context for the repository, run and trigger (never the payload
+        // or `github.context`), the Action's own environment for the attempt (`GITHUB_RUN_ATTEMPT` is not admitted to the agent,
+        // so it travels in the launcher document) and the invocation identity for the job (the lock's `holder_job`).
+        const identity = buildTracingRunIdentity({
+          repository: repo,
+          runId,
+          attempt: runAttempt,
+          job: getInvocationIdentity(),
+          trigger: routing.triggerResult.context.eventName,
         })
-        if (started.success) {
-          traceRelay = started.data
-          tracingHost = liveActionTracingHost(started.data, identity.data)
-          if (sandboxLifecycle === null && !isolationRequested) bootstrapLogger.warning(TRACE_EXPOSURE_WARNING)
+        if (identity.success) {
+          // The signal teardown owns the launch from before the spawn: a cancellation while the child is still starting aborts the
+          // start and reaps it, one that arrives when it is ready stops it, inside the teardown's own budget. Registering installs
+          // the lifecycle's signal handlers, which at this point (before the server, the key proxy and the account) nothing else
+          // has. The server is being killed on a signal, so a relay stopped that way cannot have a complete count.
+          const launch = createTraceRelayLaunch(startTraceRelayProcess)
+          sandboxLifecycle?.registerSignalStop(async () => launch.stop())
+          const started = await launch.start({
+            config: relayRequest,
+            logger: createLogger({phase: 'trace-relay'}),
+            // The relay bundle is optional, so only a run that traces looks at it (the supervisor asks, before it spawns).
+            bundleCheck: async () => checkTraceRelayBundle({isolated: isolationRequested}),
+          })
+          if (started.success) {
+            traceRelay = started.data
+            tracingHost = liveActionTracingHost(
+              started.data,
+              identity.data,
+              buildTracingRunLink(tracer.ids, traceSessionId),
+            )
+            if (sandboxLifecycle === null && !isolationRequested) bootstrapLogger.warning(TRACE_EXPOSURE_WARNING)
+            return {outcome: 'succeeded', reason: 'started'}
+          }
+          return {outcome: 'failed', reason: 'relay-start-failed'}
         }
-      } else {
         bootstrapLogger.warning(TRACE_IDENTITY_WARNING)
-      }
-    }
+        return {outcome: 'skipped', reason: 'identity-incomplete'}
+      },
+      result => result,
+    )
 
-    const cacheRestore = await runCacheRestore(bootstrap, metrics, repoSkills, tracingHost)
+    const cacheRestore = await phase(
+      'cache restore',
+      async span => runCacheRestore(bootstrap, metrics, repoSkills, tracingHost, {span, registry}),
+      restored =>
+        restored == null
+          ? {outcome: 'failed', reason: 'server-start-failed'}
+          : {outcome: 'succeeded', reason: restored.cacheStatus},
+    )
     if (cacheRestore == null) {
       deliveryOutcome = 'failed'
       setUnavailableActionOutputs(Date.now() - startTime)
@@ -448,14 +656,31 @@ export async function run(): Promise<number> {
     // Armed here and nowhere earlier: the post hook retries a save only for a run that got this far.
     core.saveState(STATE_KEYS.SHOULD_SAVE_CACHE, 'true')
 
-    const sessionPrep = await runSessionPrep(bootstrap, routing, cacheRestore, metrics)
+    const sessionPrep = await phase('session prep', async () =>
+      runSessionPrep(bootstrap, routing, cacheRestore, metrics),
+    )
     attachmentResult = sessionPrep.attachmentResult
 
     // The pre-run brokered-push decision, made once. It only gates the prompt bullet telling the agent the Action
     // pushes its changes; finalize keeps its own, deliberately wider, decision so a failure to push stays loud.
     const brokeredPushPlan = resolveBrokeredPushPlan(bootstrap, routing)
 
-    let execution = await runExecute(bootstrap, routing, cacheRestore, sessionPrep, metrics, brokeredPushPlan)
+    let execution = await phase(
+      'execution',
+      async span => {
+        const executed = await runExecute(bootstrap, routing, cacheRestore, sessionPrep, metrics, brokeredPushPlan)
+        // The agent's own failure text, as the error where it happened: scrubbed and capped at export, never the prompt or output.
+        if (!executed.success && executed.error != null) span.recordException(new Error(executed.error))
+        return executed
+      },
+      executed =>
+        executed.success
+          ? {outcome: 'succeeded'}
+          : {
+              outcome: 'failed',
+              reason: /execution deadline/i.test(executed.error ?? '') ? 'timeout' : 'agent-failed',
+            },
+    )
     ownershipLedger = execution.ownershipLedger
     liveObservation = execution.liveObservation
     // Sticky, invocation-scoped facts -- feed the invocation-outcome assessment
@@ -467,14 +692,22 @@ export async function run(): Promise<number> {
     // drain a succeeded run, stop anything else, confirm the directory quiet, then shut the server down. A run that
     // cannot be confirmed quiet must not be saved, whatever the ledger says.
     const drainLogger = createLogger({phase: 'drain'})
-    const release = await runReleaseV2(
-      releaseOptionsFromExecution(execution, {
-        serverHandle: cacheRestore.serverHandle,
-        runStartedAt: startTime,
-        deadlineMs: computeDrainDeadlineMs(bootstrap.inputs.timeoutMs, execution.executionDurationMs),
-        sessionRetention,
-        logger: drainLogger,
-      }),
+    const release = await phase(
+      'release',
+      async () =>
+        runReleaseV2(
+          releaseOptionsFromExecution(execution, {
+            serverHandle: cacheRestore.serverHandle,
+            runStartedAt: startTime,
+            deadlineMs: computeDrainDeadlineMs(bootstrap.inputs.timeoutMs, execution.executionDurationMs),
+            sessionRetention,
+            logger: drainLogger,
+          }),
+        ),
+      released =>
+        released.drain.expired
+          ? {outcome: 'incomplete', reason: 'drain-expired'}
+          : {outcome: 'succeeded', reason: 'drained'},
     )
     serverReleasedV2 = true
     const drainResult = release.drain
@@ -486,7 +719,28 @@ export async function run(): Promise<number> {
     // the database), kill and verify every process of the sandbox user and take its files back. An unconfirmed stop or an
     // unsafe restore fails the run here: no response is read, nothing is pushed, nothing is checkpointed or saved.
     if (sandboxLifecycle !== null) {
-      const sandboxOutcome = await sandboxLifecycle.release()
+      const takeBack = sandboxLifecycle
+      const takeBackSpan = tracer.startSpan('isolation take-back')
+      const sandboxOutcome = await withSpan(
+        takeBackSpan,
+        async () => takeBack.release(),
+        released => {
+          // The run throws on both of these right below, so the error is recorded here, on the span where it happened.
+          if (released.restore !== 'restored') {
+            takeBackSpan.recordException(
+              new Error(
+                `isolate-agent: the sandbox was not confirmed stopped and restored: ${released.reason ?? 'unknown reason'}`,
+              ),
+            )
+            return {outcome: 'failed', reason: 'not-restored'}
+          }
+          if (released.proxy === 'crashed') {
+            takeBackSpan.recordException(new Error('isolate-agent: the key proxy exited unexpectedly during the run'))
+            return {outcome: 'failed', reason: 'proxy-crashed'}
+          }
+          return {outcome: 'succeeded', reason: 'restored'}
+        },
+      )
       sandboxSettled = true
       recordSandboxRelease(sandboxOutcome)
       if (sandboxOutcome.restore !== 'restored') {
@@ -570,36 +824,42 @@ export async function run(): Promise<number> {
       reconciliationTriggerContext.target != null && reconciliationTriggerContext.target.kind === 'pr'
         ? reconciliationTriggerContext.target.number
         : null
-    await runReviewReconciliation(
-      {
-        octokit: routing.githubClient,
-        botLogin: routing.botLogin,
-        owner: reconciliationTriggerContext.repo.owner,
-        repo: reconciliationTriggerContext.repo.repo,
-        prNumber,
-        isPullRequestReviewTrigger,
-        responseModeIsGithub: bootstrap.inputs.responseMode === 'github',
-        agentSucceeded: execution.success,
-        reviewedHeadSha: resolveReviewedHeadSha(routing.agentContext, reconciliationTriggerContext),
-        runStartMs: startTime,
-        isFileConventionDelivery: bootstrap.delivery === 'file-convention',
-        knownExecutionVeto,
-        receipt: {ops: reviewDeliveryReceiptOps, runId, runAttempt},
-      },
-      reconciliationLogger,
-    )
+    await phase('review reconciliation', async span => {
+      span.addEvent('gate.decision', {
+        'fro_bot.gate': 'execution-veto',
+        'fro_bot.result': knownExecutionVeto ? 'vetoed' : 'clear',
+      })
+      await runReviewReconciliation(
+        {
+          octokit: routing.githubClient,
+          botLogin: routing.botLogin,
+          owner: reconciliationTriggerContext.repo.owner,
+          repo: reconciliationTriggerContext.repo.repo,
+          prNumber,
+          isPullRequestReviewTrigger,
+          responseModeIsGithub: bootstrap.inputs.responseMode === 'github',
+          agentSucceeded: execution.success,
+          reviewedHeadSha: resolveReviewedHeadSha(routing.agentContext, reconciliationTriggerContext),
+          runStartMs: startTime,
+          isFileConventionDelivery: bootstrap.delivery === 'file-convention',
+          knownExecutionVeto,
+          receipt: {ops: reviewDeliveryReceiptOps, runId, runAttempt},
+        },
+        reconciliationLogger,
+      )
+    })
 
     metrics.end()
     finalizationStarted = true
-    const finalization = await runFinalizeWithResult(
-      bootstrap,
-      routing,
-      cacheRestore,
-      execution,
-      metrics,
-      startTime,
-      bootstrap.logger,
-      {knownExecutionVeto, reviewDeliveryReceiptOps},
+    const finalization = await phase(
+      'finalize',
+      async span =>
+        runFinalizeWithResult(bootstrap, routing, cacheRestore, execution, metrics, startTime, bootstrap.logger, {
+          knownExecutionVeto,
+          reviewDeliveryReceiptOps,
+          traceSpan: span,
+        }),
+      finalized => (finalized.exitCode === 0 ? {outcome: 'succeeded'} : {outcome: 'failed', reason: 'delivery-failed'}),
     )
     exitCode = finalization.exitCode
 
@@ -634,17 +894,24 @@ export async function run(): Promise<number> {
     // saves anything.
     if (serverHandleV2 !== null && !serverReleasedV2) {
       try {
-        const release = await runReleaseV2({
-          serverHandle: serverHandleV2,
-          executionSucceeded: false,
-          rootSessionId: null,
-          ledger: ownershipLedger,
-          runStartedAt: startTime,
-          deadlineMs: 0,
-          sessionRetention,
-          logger: createLogger({phase: 'drain'}),
-          liveObservation,
-        })
+        const unreleasedServer = serverHandleV2
+        const release = await phase(
+          'release',
+          async () =>
+            runReleaseV2({
+              serverHandle: unreleasedServer,
+              executionSucceeded: false,
+              rootSessionId: null,
+              ledger: ownershipLedger,
+              runStartedAt: startTime,
+              deadlineMs: 0,
+              sessionRetention,
+              logger: createLogger({phase: 'drain'}),
+              liveObservation,
+            }),
+          released => ({outcome: 'failed', reason: released.drain.expired ? 'drain-expired' : 'run-aborted'}),
+          {teardown: true},
+        )
         if (release.persistenceDeclineReason !== undefined) {
           skipSessionPersistence = true
           persistenceDeclineReason = release.persistenceDeclineReason
@@ -663,7 +930,16 @@ export async function run(): Promise<number> {
     // sandbox. Stop and restore it before cleanup checkpoints or saves anything.
     if (sandboxLifecycle !== null && !sandboxSettled) {
       try {
-        const sandboxOutcome = await sandboxLifecycle.release()
+        const unsettledSandbox = sandboxLifecycle
+        const sandboxOutcome = await phase(
+          'isolation take-back',
+          async () => unsettledSandbox.release(),
+          released =>
+            released.restore === 'restored'
+              ? {outcome: 'succeeded', reason: 'restored'}
+              : {outcome: 'failed', reason: 'not-restored'},
+          {teardown: true},
+        )
         recordSandboxRelease(sandboxOutcome)
         if (sandboxOutcome.restore === 'restored') {
           await snapshotSandboxLogs()
@@ -691,7 +967,9 @@ export async function run(): Promise<number> {
       persistenceDeclineReason =
         "the run ended before the OpenCode V2 server started, so the OpenCode data on this runner is not this run's session state and is not saved"
     }
+    const cleanupSpan = tracer.startSpan('cleanup')
     const cleanupResult = await runCleanup({
+      traceSpan: cleanupSpan,
       bootstrapLogger,
       reactionCtx,
       githubClient,
@@ -711,16 +989,36 @@ export async function run(): Promise<number> {
       isolatedRun: isolationRequested || sandboxLifecycle !== null,
       logSnapshotPath,
       ...(persistenceDeclineReason === undefined ? {} : {persistenceDeclineReason}),
-    }).finally(async () => {
-      // runCleanup shuts the V2 server down; only then is the staging root, which the server reads, safe to remove.
-      await removeRepoSkillsStaging(repoSkillsStagingRoot)
-      // The same holds for the `gh` config directory: the server and the sandbox read it, and what runs after this point
-      // uses the Action's Octokit client, never `gh`. Setup recorded the directory when it created it, so this covers a
-      // bootstrap that threw after setup too.
-      await releaseRunGhConfig({sandboxTrusted: !sandboxRestoreUnsafe, logger: bootstrapLogger})
-      // Last, and only for a run that traced: the relay's stop has had the whole cleanup to finish.
-      if (traceRelayStopped !== undefined) await settleTraceRelayStop()
     })
+      .finally(async () => {
+        // runCleanup shuts the V2 server down; only then is the staging root, which the server reads, safe to remove.
+        await removeRepoSkillsStaging(repoSkillsStagingRoot)
+        // The same holds for the `gh` config directory: the server and the sandbox read it, and what runs after this point
+        // uses the Action's Octokit client, never `gh`. Setup recorded the directory when it created it, so this covers a
+        // bootstrap that threw after setup too.
+        await releaseRunGhConfig({sandboxTrusted: !sandboxRestoreUnsafe, logger: bootstrapLogger})
+        // Last, and only for a run that traced: the relay's stop has had the whole cleanup to finish.
+        if (traceRelayStopped !== undefined) await settleTraceRelayStop()
+      })
+      .then(
+        result => {
+          trace.outcome.cacheSaveOutcome = result.cacheSaveOutcome ?? null
+          cleanupSpan.end(
+            result.quiescenceConfirmed && !result.continuityUnverified
+              ? {outcome: 'succeeded'}
+              : {
+                  outcome: 'incomplete',
+                  reason: result.quiescenceConfirmed ? 'lease-continuity-unverified' : 'server-quiescence-unconfirmed',
+                },
+          )
+          return result
+        },
+        (error: unknown) => {
+          cleanupSpan.recordException(error)
+          cleanupSpan.end({outcome: 'failed', reason: 'exception'})
+          throw error
+        },
+      )
 
     // FINAL assessment: the single call to this pure function, made only now that
     // `runCleanup` has returned the real teardown facts. `deliverySucceeded` is derived from
@@ -765,54 +1063,86 @@ export async function run(): Promise<number> {
       }
     }
 
-    // Dedup marker, written only after cleanup has had its say -- moved here (was: right
-    // after finalize, before cleanup ran) per the same reasoning that moved the terminal
-    // reaction below. A lock-contention skip reaches this point with both `dedupEntity` and
-    // `triggerContext` already populated (set before the lock is even acquired), so the
-    // outcome check is what stops a contended run, which delivered nothing, from marking
-    // itself deduplicated anyway.
-    //
-    // No exception for an incomplete invocation that already delivered a review: that used
-    // to be a deliberate carve-out here (writing the marker anyway, to discourage a rerun
-    // that could not recognize the earlier review and would submit a second one). It is
-    // removed now that `services/github/review-delivery-receipt.ts` independently protects
-    // every irreversible review submission with its own at-most-once reservation -- keeping
-    // this carve-out would only obscure that receipt as the actual authority, while this
-    // ordinary marker returns to its ordinary purpose: recording routine completion, not
-    // standing in for review idempotency.
-    const deduplicatable = finalOutcome === 'succeeded'
-    if (deduplicatable && dedupEntity != null && triggerContext != null) {
-      await saveDedupMarker(triggerContext, dedupEntity, repo)
-    }
+    // The code this run returns: an early `return` fixed its own before the `finally` blocks ran and left `exitCode` alone, so
+    // it is read from the fact each early return set. Recorded on the trace only after the final writes below have succeeded.
+    const finalExitCode = deliveryOutcome === 'failed' ? 1 : deliveryOutcome === 'skipped' ? 0 : exitCode
+    const finalRootResult: SpanResult =
+      finalOutcome === 'skipped'
+        ? {outcome: 'skipped', reason: traceSkipReason ?? 'skipped'}
+        : finalIncompleteReasons.length > 0
+          ? {outcome: finalOutcome, reason: finalIncompleteReasons.join(',')}
+          : {outcome: finalOutcome}
 
-    // Terminal reaction: a distinct three-way projection (succeeded/incomplete/failed), not
-    // the boolean success/failure `completeAcknowledgment` used to receive -- moved here,
-    // strictly after cleanup, because passing a boolean derived from `exitCode` before
-    // teardown's own facts were known could select the success reaction for an invocation
-    // this assessment now calls incomplete. `reactionCtx` is structurally always null on a
-    // 'skipped' run (acknowledgment happens after every skip's early return), so the
-    // `finalOutcome !== 'skipped'` guard here is belt-and-suspenders, not load-bearing --
-    // added because `applyTerminalReaction` is not typed to accept a fourth outcome value.
-    if (reactionCtx != null && githubClient != null && finalOutcome !== 'skipped') {
-      await applyTerminalReaction(githubClient, reactionCtx, finalOutcome, bootstrapLogger)
-    }
+    // The final writes (the dedup marker, the terminal reaction, outputs, the job summary, the blocked-label clear) run after
+    // cleanup, so they are their own span after it rather than part of finalize.
+    await phase(
+      'report',
+      async () => {
+        // Dedup marker, written only after cleanup has had its say -- moved here (was: right
+        // after finalize, before cleanup ran) per the same reasoning that moved the terminal
+        // reaction below. A lock-contention skip reaches this point with both `dedupEntity` and
+        // `triggerContext` already populated (set before the lock is even acquired), so the
+        // outcome check is what stops a contended run, which delivered nothing, from marking
+        // itself deduplicated anyway.
+        //
+        // No exception for an incomplete invocation that already delivered a review: that used
+        // to be a deliberate carve-out here (writing the marker anyway, to discourage a rerun
+        // that could not recognize the earlier review and would submit a second one). It is
+        // removed now that `services/github/review-delivery-receipt.ts` independently protects
+        // every irreversible review submission with its own at-most-once reservation -- keeping
+        // this carve-out would only obscure that receipt as the actual authority, while this
+        // ordinary marker returns to its ordinary purpose: recording routine completion, not
+        // standing in for review idempotency.
+        const deduplicatable = finalOutcome === 'succeeded'
+        if (deduplicatable && dedupEntity != null && triggerContext != null) {
+          await saveDedupMarker(triggerContext, dedupEntity, repo)
+        }
 
-    setInvocationOutcomeOutput(finalOutcome)
-    await writeInvocationOutcomeSummary(finalOutcome, finalIncompleteReasons, bootstrapLogger, skipDetail ?? undefined)
+        // Terminal reaction: a distinct three-way projection (succeeded/incomplete/failed), not
+        // the boolean success/failure `completeAcknowledgment` used to receive -- moved here,
+        // strictly after cleanup, because passing a boolean derived from `exitCode` before
+        // teardown's own facts were known could select the success reaction for an invocation
+        // this assessment now calls incomplete. `reactionCtx` is structurally always null on a
+        // 'skipped' run (acknowledgment happens after every skip's early return), so the
+        // `finalOutcome !== 'skipped'` guard here is belt-and-suspenders, not load-bearing --
+        // added because `applyTerminalReaction` is not typed to accept a fourth outcome value.
+        if (reactionCtx != null && githubClient != null && finalOutcome !== 'skipped') {
+          await applyTerminalReaction(githubClient, reactionCtx, finalOutcome, bootstrapLogger)
+        }
 
-    // A succeeded run clears the `agent: blocked` label a PRIOR run's coordination decline left on this item.
-    // Last, after every output/summary is written: best-effort, deadline-bounded, never throws. The phase itself
-    // no-ops for any other outcome (including this run's own declined/errored lock), response-mode none, and
-    // non-issue/PR targets.
-    if (githubClient != null && triggerContext != null && responseMode != null) {
-      await runBlockedLabelClear({
-        githubClient,
-        triggerContext,
-        outcome: finalOutcome,
-        responseMode,
-        logger: bootstrapLogger,
-      })
-    }
+        setInvocationOutcomeOutput(finalOutcome)
+        await writeInvocationOutcomeSummary(
+          finalOutcome,
+          finalIncompleteReasons,
+          bootstrapLogger,
+          skipDetail ?? undefined,
+        )
+
+        // A succeeded run clears the `agent: blocked` label a PRIOR run's coordination decline left on this item.
+        // Last, after every output/summary is written: best-effort, deadline-bounded, never throws. The phase itself
+        // no-ops for any other outcome (including this run's own declined/errored lock), response-mode none, and
+        // non-issue/PR targets.
+        if (githubClient != null && triggerContext != null && responseMode != null) {
+          await runBlockedLabelClear({
+            githubClient,
+            triggerContext,
+            outcome: finalOutcome,
+            responseMode,
+            logger: bootstrapLogger,
+          })
+        }
+      },
+      undefined,
+      {teardown: true},
+    ).catch((reportError: unknown) => {
+      // A final write that throws after everything else succeeded: the root says so, instead of a success and an exit code 0 the
+      // run is not going to return. The error itself goes on, unchanged.
+      trace.outcome.exitCode = 1
+      trace.outcome.rootResult = {outcome: 'failed', reason: 'report-failed'}
+      throw reportError
+    })
+    trace.outcome.exitCode = finalExitCode
+    trace.outcome.rootResult = finalRootResult
   }
 
   return exitCode

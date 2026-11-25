@@ -1,8 +1,8 @@
 import type {OnSettings} from './index.js'
 import type {ObserverHost} from './record-observations.js'
 
+import {scrubSafeSessionId} from '@fro-bot/runtime/tracing/session-id'
 import {afterEach, describe, expect, it, vi} from 'vitest'
-
 import {startOtlpSink, type OtlpSink} from '../integration.fixture.js'
 import {createScrubber} from './content.js'
 import {CLEANUP_BOUND_MS, DRAIN_BOUND_MS, startTracing} from './index.js'
@@ -175,6 +175,22 @@ describe('startTracing', () => {
     expect(request?.text).not.toContain('fro_bot.repository')
     expect(request?.text).not.toContain('sk-never-exported')
     expect(lines).toEqual(['tracing stopped, exported 2 spans, dropped 0'])
+
+    // #and the sender is named as the plugin, on the resource and on the instrumentation scope
+    const exported = (
+      request?.body as {
+        resourceSpans: {
+          resource: {attributes: {key: string; value: {stringValue?: string}}[]}
+          scopeSpans: {scope: {name: string}}[]
+        }[]
+      }
+    ).resourceSpans
+    expect(exported.map(resource => resource.resource.attributes)).toEqual([
+      [{key: 'service.name', value: {stringValue: 'fro-bot-opencode-plugin'}}],
+    ])
+    expect(exported.flatMap(resource => resource.scopeSpans.map(scope => scope.scope.name))).toEqual([
+      'fro-bot-opencode-plugin',
+    ])
   })
 
   it('says how many values the safety net withheld, as a number, and exports none of them', async () => {
@@ -227,6 +243,148 @@ describe('startTracing', () => {
     expect(request?.headers.authorization).toBeUndefined()
     expect(request?.text).toContain('fro_bot.repository')
     expect(request?.text).toContain('fro-bot/agent')
+  })
+
+  describe('the run link from the launcher', () => {
+    const ROOT_SPAN = {traceId: '0af7651916cd43dd8448eb211c80319c', spanId: 'b7ad6b7169203331'}
+    const SESSION_ID = 'fro-bot/agent:issue-42'
+    const INVOCATION_ID = '3f2a9c1e-7b4d-4e8a-9d6c-1a2b3c4d5e6f'
+
+    interface WireSpan {
+      readonly name: string
+      readonly parentSpanId?: string
+      readonly attributes?: readonly {readonly key: string; readonly value: {readonly stringValue?: string}}[]
+      readonly links?: readonly {readonly traceId: string; readonly spanId: string}[]
+    }
+    const wireSpans = (body: unknown): WireSpan[] =>
+      (body as {resourceSpans: {scopeSpans: {spans: WireSpan[]}[]}[]}).resourceSpans.flatMap(resource =>
+        resource.scopeSpans.flatMap(scope => scope.spans),
+      )
+    const attribute = (span: WireSpan, key: string): string | undefined =>
+      span.attributes?.find(entry => entry.key === key)?.value.stringValue
+
+    interface Exported {
+      readonly spans: WireSpan[]
+      /** Every request body the sink accepted, as sent. */
+      readonly text: string
+    }
+
+    async function exportTurn(
+      settings: OnSettings,
+      scrubber: ReturnType<typeof createScrubber> | undefined = undefined,
+    ): Promise<Exported> {
+      const target = await sink()
+      const fake = fakeObserverHost()
+      const handle = await startTracing(
+        fake.host,
+        {...settings, endpoint: target.url},
+        {env: {}, log: () => {}, ...(scrubber === undefined ? {} : {scrubber})},
+      )
+      textTurn(fake)
+      await new Promise(resolve => setTimeout(resolve, 50))
+      await handle.stop()
+      fake.end()
+      return {
+        spans: target.accepted().flatMap(request => wireSpans(request.body)),
+        text: target
+          .accepted()
+          .map(request => request.text)
+          .join('\n'),
+      }
+    }
+
+    const launched = (sessionId: string): OnSettings =>
+      ({...ACTION('http://unused'), rootSpan: ROOT_SPAN, sessionId}) as OnSettings
+
+    it('puts the launcher’s session id, the invocation id and a link to the run root on the exported turn', async () => {
+      // #given an Action launcher carrying all three fields
+      const {spans} = await exportTurn({
+        ...ACTION('http://unused'),
+        rootSpan: ROOT_SPAN,
+        sessionId: SESSION_ID,
+        invocationId: INVOCATION_ID,
+      } as OnSettings)
+
+      // #then the turn's root span links to the run root, and every span has the session and the invocation id
+      const root = spans.find(span => span.name.startsWith('invoke_agent') && span.parentSpanId === undefined)
+      expect(root?.links).toEqual([expect.objectContaining(ROOT_SPAN)])
+      expect(spans.length).toBeGreaterThan(1)
+      for (const span of spans) {
+        expect(attribute(span, 'langfuse.session.id')).toBe(SESSION_ID)
+        expect(attribute(span, 'fro_bot.invocation.id')).toBe(INVOCATION_ID)
+      }
+    })
+
+    it('exports exactly what it did before when the launcher has none of them', async () => {
+      // #given today's Action launcher
+      const {spans} = await exportTurn(ACTION('http://unused'))
+
+      // #then the Langfuse session is the OpenCode session, and no span has a link or an invocation id
+      expect(spans.length).toBeGreaterThan(1)
+      for (const span of spans) {
+        expect(attribute(span, 'langfuse.session.id')).toBe(SES)
+        expect(attribute(span, 'fro_bot.invocation.id')).toBeUndefined()
+        expect(span.links ?? []).toEqual([])
+      }
+    })
+
+    it('keeps the OpenCode session in a local session', async () => {
+      const {spans} = await exportTurn(LOCAL('http://unused'))
+
+      // #then spans arrived (an empty export would pass the loop below), and none has a link
+      expect(spans.length).toBeGreaterThan(1)
+      for (const span of spans) {
+        expect(attribute(span, 'langfuse.session.id')).toBe(SES)
+        expect(span.links ?? []).toEqual([])
+      }
+    })
+
+    it('exports two conversations whose ids would redact alike as two sessions, when the ids come from the helper', async () => {
+      // #given two logical keys in a repository the scrubber reads as a name and value, each passed through the shared helper
+      const helperScrubber = createScrubber()
+      const first = scrubSafeSessionId('acme/password-manager:issue-42', helperScrubber)
+      const second = scrubSafeSessionId('acme/password-manager:issue-43', helperScrubber)
+      expect(first).toBeDefined()
+      expect(second).toBeDefined()
+
+      // #when each conversation's turn is exported
+      const one = await exportTurn(launched(first ?? ''))
+      const two = await exportTurn(launched(second ?? ''))
+
+      // #then the sessions are the two distinct ids, exactly as given, and no redaction marker stands in for either
+      expect(one.spans.length).toBeGreaterThan(1)
+      expect(two.spans.length).toBeGreaterThan(1)
+      expect(new Set(one.spans.map(span => attribute(span, 'langfuse.session.id')))).toEqual(new Set([first]))
+      expect(new Set(two.spans.map(span => attribute(span, 'langfuse.session.id')))).toEqual(new Set([second]))
+      expect(first).not.toBe(second)
+      expect(one.text).not.toContain('REDACTED')
+      expect(two.text).not.toContain('REDACTED')
+    })
+
+    it('exports the OpenCode root session, never `[REDACTED]`, for a session id that scrubbing would change', async () => {
+      // #given a launcher that carries the raw id, not the helper's
+      const {spans, text} = await exportTurn(launched('acme/password-manager:issue-42'))
+
+      // #then every span falls back to the OpenCode root session
+      expect(spans.length).toBeGreaterThan(1)
+      for (const span of spans) expect(attribute(span, 'langfuse.session.id')).toBe(SES)
+      expect(text).not.toContain('REDACTED')
+    })
+
+    it('exports the OpenCode root session when a literal added after the run started matches the session id', async () => {
+      // #given a scrubber that learns the id as a secret once the run has begun
+      const scrubber = createScrubber()
+      scrubber.addLiterals?.([SESSION_ID])
+
+      // #when the turn is exported
+      const {spans, text} = await exportTurn(launched(SESSION_ID), scrubber)
+
+      // #then the session is the OpenCode root, and the id itself is nowhere in the payload
+      expect(spans.length).toBeGreaterThan(1)
+      for (const span of spans) expect(attribute(span, 'langfuse.session.id')).toBe(SES)
+      expect(text).not.toContain(SESSION_ID)
+      expect(text).not.toContain('REDACTED')
+    })
   })
 
   it('closes spans still open at stop as interrupted and incomplete', async () => {
@@ -781,7 +939,7 @@ describe('failure of the parts', () => {
   it('rejects when the SDK exporter cannot be constructed', async () => {
     // #given an exporter module that throws on construction
     vi.resetModules()
-    vi.doMock('./exporter.js', () => ({
+    vi.doMock('@fro-bot/runtime/tracing/exporter', () => ({
       createSpanExporter: () => {
         throw new TypeError('sdk construction failed')
       },
@@ -797,7 +955,7 @@ describe('failure of the parts', () => {
         {env: {}, log: () => {}},
       ),
     ).rejects.toThrow('sdk construction failed')
-    vi.doUnmock('./exporter.js')
+    vi.doUnmock('@fro-bot/runtime/tracing/exporter')
     vi.resetModules()
     fake.end()
   })

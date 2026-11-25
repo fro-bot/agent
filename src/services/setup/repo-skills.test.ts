@@ -1478,6 +1478,27 @@ describe('repo-skills', () => {
       expect(seen.every(env => env?.GIT_DIR === undefined && env?.GIT_WORK_TREE === undefined)).toBe(true)
     })
 
+    it('strips GIT_COMMON_DIR, which would redirect the shared storage of the repository git opens', async () => {
+      // #given an environment with GIT_COMMON_DIR set by an earlier step
+      setUpBareDirectories()
+      const seen: (Record<string, string> | undefined)[] = []
+      const exec: ExecAdapter = {
+        exec: vi.fn(),
+        getExecOutput: vi.fn(),
+        execWithTimeout: async (_command, _args, _timeoutMs, options: ExecOptions | undefined) => {
+          seen.push(options?.env)
+          return 1
+        },
+      }
+
+      // #when staging
+      await stage({exec, env: {...GIT_ENV, GIT_COMMON_DIR: '/evil/.git'}})
+
+      // #then it never reaches git
+      expect(seen.length).toBeGreaterThan(0)
+      expect(seen.every(env => env?.GIT_COMMON_DIR === undefined)).toBe(true)
+    })
+
     describe('source budget, checked before anything is materialized', () => {
       const ran = (commands: string[][], word: string): boolean => commands.some(command => command.includes(word))
 
@@ -2059,7 +2080,12 @@ describe('repo-skills', () => {
         const {exec, calls} = recordingExec()
 
         // #when staging
-        unwrapOk(await stage({exec, env: {...GIT_ENV, GIT_DIR: '/evil/.git', GIT_WORK_TREE: '/evil'}}))
+        unwrapOk(
+          await stage({
+            exec,
+            env: {...GIT_ENV, GIT_DIR: '/evil/.git', GIT_WORK_TREE: '/evil', GIT_COMMON_DIR: '/evil'},
+          }),
+        )
 
         // #then no archive or tar, one cat-file whose stdin is the object ids, and every command was bounded and scrubbed
         expect(calls.some(call => call.args.includes('archive') || call.command === 'tar')).toBe(false)
@@ -2068,7 +2094,14 @@ describe('repo-skills', () => {
         expect(catCalls[0]?.input?.toString('utf8')).toMatch(/^([\da-f]{40}\n)+$/)
         expect(new Set(calls.map(call => call.cwd))).toEqual(new Set([staging]))
         expect(calls.every(call => call.timeoutMs === DEFAULT_REPO_SKILLS_LIMITS.commandTimeoutMs)).toBe(true)
-        expect(calls.every(call => call.env?.GIT_DIR === undefined && call.env?.GIT_WORK_TREE === undefined)).toBe(true)
+        expect(
+          calls.every(
+            call =>
+              call.env?.GIT_DIR === undefined &&
+              call.env?.GIT_WORK_TREE === undefined &&
+              call.env?.GIT_COMMON_DIR === undefined,
+          ),
+        ).toBe(true)
       })
 
       it('writes files 0600 (0700 when executable) and directories 0700', async () => {

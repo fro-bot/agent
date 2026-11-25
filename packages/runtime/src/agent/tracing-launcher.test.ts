@@ -4,8 +4,11 @@ import {TRACE_RELAY_PATH} from './trace-relay-wire.js'
 import {
   ACTION_TRACING_OFF,
   buildTracingLauncherValue,
+  isUsableTracingField,
   isUsableTracingIdentity,
+  isUsableTracingRootSpan,
   TRACING_IDENTITY_FIELD_MAX_CHARS,
+  TRACING_LAUNCHER_MAX_CHARS,
   tracingRelayUrl,
   WORKSPACE_TRACING_HOST,
   type OpenCodeV2TracingHost,
@@ -20,7 +23,19 @@ const IDENTITY: TracingRunIdentity = {
   trigger: 'pull_request',
 }
 
-const on = (overrides: Partial<{relayPort: number; identity: TracingRunIdentity}> = {}): OpenCodeV2TracingHost => ({
+const ROOT_SPAN = {traceId: '0af7651916cd43dd8448eb211c80319c', spanId: 'b7ad6b7169203331'}
+const SESSION_ID = 'fro-bot/agent:issue-42'
+const INVOCATION_ID = '3f2a9c1e-7b4d-4e8a-9d6c-1a2b3c4d5e6f'
+
+const on = (
+  overrides: Partial<{
+    relayPort: number
+    identity: TracingRunIdentity
+    rootSpan: {traceId: string; spanId: string}
+    sessionId: string
+    invocationId: string
+  }> = {},
+): OpenCodeV2TracingHost => ({
   host: 'action',
   tracing: 'on',
   relayPort: 43_210,
@@ -71,6 +86,132 @@ describe('buildTracingLauncherValue', () => {
   it('keeps a field exactly at the plugin limit', () => {
     const identity = {...IDENTITY, job: 'j'.repeat(TRACING_IDENTITY_FIELD_MAX_CHARS)}
     expect(JSON.parse(buildTracingLauncherValue(on({identity}))) as {tracing: string}).toMatchObject({tracing: 'on'})
+  })
+})
+
+describe('the run link fields', () => {
+  it('carries the root span context, the session id and the invocation id, verbatim, when all three are given', () => {
+    // #given / #when
+    const value = buildTracingLauncherValue(
+      on({rootSpan: ROOT_SPAN, sessionId: SESSION_ID, invocationId: INVOCATION_ID}),
+    )
+
+    // #then
+    expect(JSON.parse(value)).toEqual({
+      version: 1,
+      host: 'action',
+      tracing: 'on',
+      relay: 'http://127.0.0.1:43210/v1/traces',
+      identity: IDENTITY,
+      rootSpan: ROOT_SPAN,
+      sessionId: SESSION_ID,
+      invocationId: INVOCATION_ID,
+    })
+  })
+
+  it('writes only the fields it was given', () => {
+    expect(Object.keys(JSON.parse(buildTracingLauncherValue(on({sessionId: SESSION_ID}))) as object)).toEqual([
+      'version',
+      'host',
+      'tracing',
+      'relay',
+      'identity',
+      'sessionId',
+    ])
+  })
+
+  it.each([
+    ['a short trace id', {traceId: 'abc', spanId: ROOT_SPAN.spanId}],
+    ['an upper-case trace id', {traceId: ROOT_SPAN.traceId.toUpperCase(), spanId: ROOT_SPAN.spanId}],
+    ['an all-zero trace id', {traceId: '0'.repeat(32), spanId: ROOT_SPAN.spanId}],
+    ['a long span id', {traceId: ROOT_SPAN.traceId, spanId: `${ROOT_SPAN.spanId}0`}],
+    ['an all-zero span id', {traceId: ROOT_SPAN.traceId, spanId: '0'.repeat(16)}],
+    ['a non-hex span id', {traceId: ROOT_SPAN.traceId, spanId: 'g'.repeat(16)}],
+  ])('says off, never a root span context the plugin would refuse, for %s', (_name, rootSpan) => {
+    expect(buildTracingLauncherValue(on({rootSpan}))).toBe(buildTracingLauncherValue(ACTION_TRACING_OFF))
+  })
+
+  it.each([
+    ['an empty session id', {sessionId: ''}],
+    ['a session id over the limit', {sessionId: 's'.repeat(TRACING_IDENTITY_FIELD_MAX_CHARS + 1)}],
+    ['a session id with a control character', {sessionId: 'a/b:c\nd'}],
+    ['an empty invocation id', {invocationId: ''}],
+    ['an invocation id over the limit', {invocationId: 'i'.repeat(TRACING_IDENTITY_FIELD_MAX_CHARS + 1)}],
+  ])('says off, never a value the plugin would refuse, for %s', (_name, fields) => {
+    expect(buildTracingLauncherValue(on(fields))).toBe(buildTracingLauncherValue(ACTION_TRACING_OFF))
+  })
+
+  it('keeps a session id exactly at the limit', () => {
+    const sessionId = 's'.repeat(TRACING_IDENTITY_FIELD_MAX_CHARS)
+    expect(JSON.parse(buildTracingLauncherValue(on({sessionId}))) as {sessionId: string}).toMatchObject({sessionId})
+  })
+
+  it.each([
+    ['null', null],
+    ['a string', 'abc'],
+    ['a number', 7],
+    ['an array', []],
+  ])('says off, and does not throw, for a root span that is %s (an untyped caller)', (_name, rootSpan) => {
+    expect(buildTracingLauncherValue(on({rootSpan: rootSpan as unknown as {traceId: string; spanId: string}}))).toBe(
+      buildTracingLauncherValue(ACTION_TRACING_OFF),
+    )
+  })
+
+  it('writes only the two ids of a root span, whatever else the caller put on it', () => {
+    const rootSpan = {...ROOT_SPAN, extra: 'SENTINEL'}
+    const value = buildTracingLauncherValue(on({rootSpan}))
+    expect(value).not.toContain('SENTINEL')
+    expect(JSON.parse(value) as {rootSpan: unknown}).toMatchObject({rootSpan: ROOT_SPAN})
+  })
+
+  it('says off when the serialized document is over the plugin’s ceiling, and never writes one the plugin would refuse', () => {
+    // #given a host whose every text field is `n` lone surrogates: control-free, so each field is accepted, but JSON.stringify
+    // writes each lone surrogate as a six-character escape, so the document grows far past its fields' own lengths
+    const lone = (n: number): string => '\uD800'.repeat(n)
+    const host = (n: number): OpenCodeV2TracingHost =>
+      on({
+        identity: {repository: lone(n), runId: lone(n), attempt: lone(n), job: lone(n), trigger: lone(n)},
+        sessionId: lone(n),
+        invocationId: lone(n),
+      })
+
+    // #when the field length grows to its limit
+    const lengths: number[] = []
+    let sawOn = false
+    let sawOff = false
+    for (let n = 1; n <= TRACING_IDENTITY_FIELD_MAX_CHARS; n += 1) {
+      const value = buildTracingLauncherValue(host(n))
+      lengths.push(value.length)
+      if ((JSON.parse(value) as {tracing: string}).tracing === 'on') sawOn = true
+      else sawOff = true
+    }
+
+    // #then no document is over the ceiling, short fields are still on, and the longest are off
+    expect(Math.max(...lengths)).toBeLessThanOrEqual(TRACING_LAUNCHER_MAX_CHARS)
+    expect(sawOn).toBe(true)
+    expect(sawOff).toBe(true)
+    expect(buildTracingLauncherValue(host(TRACING_IDENTITY_FIELD_MAX_CHARS))).toBe(
+      buildTracingLauncherValue(ACTION_TRACING_OFF),
+    )
+  })
+
+  it('does not write the fields for an off host', () => {
+    expect(buildTracingLauncherValue(ACTION_TRACING_OFF)).not.toContain('rootSpan')
+  })
+})
+
+describe('isUsableTracingRootSpan and isUsableTracingField', () => {
+  it('accepts 32 and 16 lower-case hex characters with a non-zero value, and nothing else', () => {
+    expect(isUsableTracingRootSpan(ROOT_SPAN)).toBe(true)
+    expect(isUsableTracingRootSpan({traceId: `${'0'.repeat(31)}1`, spanId: `${'0'.repeat(15)}1`})).toBe(true)
+    expect(isUsableTracingRootSpan({traceId: '0'.repeat(32), spanId: ROOT_SPAN.spanId})).toBe(false)
+    expect(isUsableTracingRootSpan({traceId: ROOT_SPAN.traceId, spanId: undefined as unknown as string})).toBe(false)
+  })
+
+  it('accepts a bounded, non-empty string without control characters', () => {
+    expect(isUsableTracingField('a')).toBe(true)
+    expect(isUsableTracingField('')).toBe(false)
+    expect(isUsableTracingField(7)).toBe(false)
   })
 })
 

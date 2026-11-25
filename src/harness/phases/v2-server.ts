@@ -12,6 +12,7 @@ import type {KeyProxyProviderPlan} from '../../services/setup/key-proxy-provider
 import type {InstallPluginsV2Options, PluginInstallV2Error} from '../../services/setup/plugin-install-v2.js'
 import type {RepoSkillsSource} from '../../services/setup/repo-skills.js'
 import type {ActionTracingSource} from '../../services/setup/tracing.js'
+import type {LifecycleSpan} from '../../shared/lifecycle-tracer.js'
 import type {Logger} from '../../shared/logger.js'
 import type {KeyProxyProcess, KeyProxyStartError, StartKeyProxyProcessOptions} from './key-proxy-process.js'
 import type {SandboxLifecycle} from './sandbox-lifecycle.js'
@@ -49,7 +50,9 @@ import {
 } from '../../services/setup/plugin-install-v2.js'
 import {admitRepoSkills, discardRepoSkillsStaging} from '../../services/setup/repo-skills.js'
 import {resolveActionTracing} from '../../services/setup/tracing.js'
+import {isRunCancelled} from '../../shared/cancellation.js'
 import {toErrorMessage} from '../../shared/errors.js'
+import {NOOP_SPAN, withSpan} from '../../shared/lifecycle-tracer.js'
 import {logDefaultModelNotice, suppliedProviderIds, verifyDefaultModelProvider} from './default-model.js'
 import {probeKeyProxy} from './key-proxy-probe.js'
 import {startKeyProxyProcess} from './key-proxy-process.js'
@@ -85,6 +88,9 @@ import {readV1DatabaseFacts, waitForV1Import} from './v1-import-wait.js'
  * Any failure after the spawn shuts the server down before returning, so a failed start leaves no process behind. The
  * caller decides what a failure means for persistence (it means no save).
  */
+
+/** Fixed text: the stage is `spawn` because that is the one thing a cancelled run must not do. */
+const CANCELLED_START_MESSAGE = 'The run was cancelled, so the OpenCode server was not started'
 
 export type V2StartStage =
   | 'config'
@@ -151,6 +157,11 @@ export interface StartActionOpenCodeV2Options {
   readonly signal?: AbortSignal
   /** Masks the server password in the Action's log (`core.setSecret`). */
   readonly maskSecret?: (value: string) => void
+  /**
+   * The lifecycle trace's server start span: the isolation handoff is its child and every gate decision an event on it.
+   * Names a gate and its result only, never a value.
+   */
+  readonly traceSpan?: LifecycleSpan
   readonly deps?: Partial<StartActionOpenCodeV2Deps>
 }
 
@@ -269,6 +280,9 @@ export async function startActionOpenCodeV2(
   const {logger} = options
   const deps = {...defaultDeps, ...options.deps}
   const stageError = (stage: V2StartStage, message: string): Result<never, V2StartError> => err({stage, message})
+  // A cancelled run starts no server: nothing is written, installed or spawned after the first signal.
+  const cancelledStart = (): Result<never, V2StartError> => stageError('spawn', CANCELLED_START_MESSAGE)
+  if (isRunCancelled()) return cancelledStart()
   // No `model` input: the session is created on `DEFAULT_MODEL` (`executeOpenCodeV2`), whatever the credentials and the
   // config say. Decided once here; the notice and the provider check below both read it.
   const usesDefaultModel = options.model == null
@@ -487,15 +501,22 @@ export async function startActionOpenCodeV2(
       // A `GH_CONFIG_DIR` that is not the provisioned temp dir (an ambient one from an earlier step) is not handed over,
       // so it must not reach the child as a path the sandbox cannot read.
       sandboxEnv = withoutKey(options.env, 'GH_CONFIG_DIR')
-      const prepared = await options.sandbox.prepare({
-        // Nothing to hand over: the keys are in the proxy, not in files.
-        keyFilePaths: Object.values(keyFiles),
-        ghConfigDir,
-        repoSkills:
-          options.repoSkills == null
-            ? null
-            : {stagingRoot: options.repoSkills.stagingRoot, admittedDir: repoSkillsDirectory ?? null},
-      })
+      const sandbox = options.sandbox
+      const prepared = await withSpan(
+        (options.traceSpan ?? NOOP_SPAN).startChild('isolation handoff'),
+        async handoffSpan =>
+          sandbox.prepare({
+            // Nothing to hand over: the keys are in the proxy, not in files.
+            keyFilePaths: Object.values(keyFiles),
+            ghConfigDir,
+            repoSkills:
+              options.repoSkills == null
+                ? null
+                : {stagingRoot: options.repoSkills.stagingRoot, admittedDir: repoSkillsDirectory ?? null},
+            traceSpan: handoffSpan,
+          }),
+        result => (result.success ? {outcome: 'succeeded'} : {outcome: 'failed', reason: 'handoff-failed'}),
+      )
       if (!prepared.success) return stageError('sandbox', `isolate-agent setup failed: ${prepared.error}`)
       if (ghConfigDir !== null) sandboxEnv = {...sandboxEnv, GH_CONFIG_DIR: ghConfigDir}
     }
@@ -570,6 +591,9 @@ export async function startActionOpenCodeV2(
     tracingHost: decideTracing,
   })
 
+  // After every await of the preparation above (installs, the import wait, the gates): the last point before the spawn.
+  if (isRunCancelled()) return cancelledStart()
+
   let started: Awaited<ReturnType<typeof deps.startServer>>
   try {
     if (options.sandbox == null) {
@@ -627,6 +651,11 @@ export async function startActionOpenCodeV2(
     return stageError(stage, message)
   }
 
+  // One event per gate on the server start span, with the gate's name and its result: how a run's start was decided.
+  const gateDecision = (gate: string, result: 'failed' | 'passed' | 'skipped'): void => {
+    options.traceSpan?.addEvent('gate.decision', {'fro_bot.gate': gate, 'fro_bot.result': result})
+  }
+
   const runGates = async (): Promise<Result<OpenCodeV2ServerHandle, V2StartError>> => {
     // --- 6. Permission gate, default model's provider, then credential gate ---------------------------------
     const permissions = await verifyPermissionRules(
@@ -638,6 +667,7 @@ export async function startActionOpenCodeV2(
       built.expectations,
       logger,
     )
+    gateDecision('permission', permissions.success ? 'passed' : 'failed')
     if (!permissions.success) {
       return failAfterSpawn('permission-gate', `OpenCode permission gate failed: ${permissions.error.message}`)
     }
@@ -655,6 +685,7 @@ export async function startActionOpenCodeV2(
         requestTimeoutMs: GATE_REQUEST_TIMEOUT_MS,
         ...(runSignal === undefined ? {} : {signal: runSignal}),
       })
+      gateDecision('default-model-provider', available.success ? 'passed' : 'failed')
       if (!available.success) return failAfterSpawn('config', available.error)
     }
 
@@ -669,6 +700,7 @@ export async function startActionOpenCodeV2(
       const plan =
         modelProvider === undefined ? undefined : proxyPlans.find(entry => entry.providerId === modelProvider)
       if (plan === undefined) {
+        gateDecision('key-proxy-probe', 'skipped')
         logger.info('Key proxy probe skipped: the selected model is not on a provider the key proxy serves', {
           provider: modelProvider ?? null,
         })
@@ -679,7 +711,9 @@ export async function startActionOpenCodeV2(
           logger,
           ...(runSignal === undefined ? {} : {signal: runSignal}),
         })
-        if (probe.status === 'failed' || probe.status === 'aborted') {
+        const probeFailed = probe.status === 'failed' || probe.status === 'aborted'
+        gateDecision('key-proxy-probe', probeFailed ? 'failed' : 'passed')
+        if (probeFailed) {
           return failAfterSpawn('key-proxy', probe.message)
         }
       }
@@ -687,6 +721,7 @@ export async function startActionOpenCodeV2(
 
     const requiredProviders = modelProvider === undefined ? keys.data.map(entry => entry.providerId) : [modelProvider]
     if (requiredProviders.length === 0) {
+      gateDecision('credential', 'skipped')
       logger.info('No model or provider credentials configured, credential gate skipped')
     } else {
       const credentials = await verifyCredentialGate({
@@ -697,6 +732,7 @@ export async function startActionOpenCodeV2(
         configuredAuth: spawnConfig.authenticatedProviders,
         remedy: 'Add an API-key entry for it to the auth-json input.',
       })
+      gateDecision('credential', credentials.success ? 'passed' : 'failed')
       if (!credentials.success) {
         return failAfterSpawn('credential-gate', `OpenCode credential gate failed: ${credentials.error.message}`)
       }
@@ -709,6 +745,7 @@ export async function startActionOpenCodeV2(
       facts: owned.facts,
       ...(runSignal === undefined ? {} : {signal: runSignal}),
     })
+    gateDecision('import-wait', imported.success ? 'passed' : 'failed')
     if (!imported.success) return failAfterSpawn('import-wait', imported.error.message)
 
     logger.info('OpenCode V2 server is started and gated', {

@@ -42,7 +42,7 @@
  */
 import type {SandboxToolPaths} from '../../services/setup/sandbox-preflight.js'
 import type {Logger} from '../../shared/logger.js'
-import type {SandboxLifecycle, SandboxLifecycleDeps, SandboxReleaseResult} from './sandbox-lifecycle.js'
+import type {SandboxLifecycle, SandboxLifecycleDeps, SandboxReleaseResult, SignalHost} from './sandbox-lifecycle.js'
 import type {LaunchNamespaces, Probe, Row, ScriptedProvider, ScriptedTracing} from './v2-server.sandbox.harness.js'
 import {Buffer} from 'node:buffer'
 import {spawn, spawnSync} from 'node:child_process'
@@ -66,12 +66,17 @@ import {
   getSessionDbBasenames,
 } from '@fro-bot/runtime'
 import {afterAll, beforeAll, describe, expect, it} from 'vitest'
-import {waitUntil} from '../../../packages/opencode-plugin/src/tracing/tracing.integration.fixture.js'
+import {
+  decodeSpans,
+  sleep,
+  waitUntil,
+} from '../../../packages/opencode-plugin/src/tracing/tracing.integration.fixture.js'
 import {
   startTlsUpstream,
   type RecordedRequest,
   type TlsUpstream,
 } from '../../../packages/runtime/src/agent/key-proxy-test-kit.js'
+import {startOtlpSink, type OtlpSink} from '../../../packages/runtime/src/tracing/otlp-sink.testing.js'
 import {resolveBrokeredPushCommitMessage} from '../../features/delegated/commit-message.js'
 import {reconstructChanges} from '../../features/delegated/reconstruct-changes.js'
 import {
@@ -89,10 +94,18 @@ import {installPluginsV2} from '../../services/setup/plugin-install-v2.js'
 import {admitRepoSkills, createRepoSkillsStagingRoot} from '../../services/setup/repo-skills.js'
 import {createSandboxPreflightDeps, runSandboxPreflight} from '../../services/setup/sandbox-preflight.js'
 import {createViewProbe} from '../../services/setup/sandbox-view-probe.js'
-import {buildActionTracingHost, buildTracingRunIdentity, relayRequestFromInputs} from '../../services/setup/tracing.js'
+import {
+  buildActionTracingHost,
+  buildTraceSessionId,
+  buildTracingRunIdentity,
+  buildTracingRunLink,
+  relayRequestFromInputs,
+} from '../../services/setup/tracing.js'
 import {STORAGE_VERSION} from '../../shared/constants.js'
 import {getGitHubRunAttempt, getInvocationIdentity} from '../../shared/env.js'
+import {createLifecycleTracer, createRegistryScrubber} from '../../shared/lifecycle-tracer.js'
 import {createLogger} from '../../shared/logger.js'
+import {createSecretRegistry} from '../../shared/secret-registry.js'
 import {unwrapOk} from '../../shared/test-helpers.js'
 import {parseTraceInputs} from '../config/trace-inputs.js'
 import {startKeyProxyProcess, type KeyProxyProcess} from './key-proxy-process.js'
@@ -124,6 +137,7 @@ import {
   describeReconstruction,
   failuresFor,
   findPaths,
+  launcherLinkProbe,
   matrixDirectories,
   matrixSentinels,
   mountNamespaceIds,
@@ -3199,6 +3213,44 @@ function exportedSpanNames(requests: readonly RecordedRequest[]): string[] {
   return exportedSpans(requests.map(request => request.body)).map(span => span.name)
 }
 
+/** The turn root spans (`invoke_agent` with no parent) in the collector's requests, with their string attributes and links. */
+function turnRootSpans(requests: readonly RecordedRequest[]): {
+  readonly attributes: Record<string, string>
+  readonly links: readonly {readonly traceId: string; readonly spanId: string}[]
+}[] {
+  const roots: {attributes: Record<string, string>; links: {traceId: string; spanId: string}[]}[] = []
+  for (const request of requests) {
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(request.body.toString('utf8'))
+    } catch {
+      continue
+    }
+    const resources = (parsed as {resourceSpans?: {scopeSpans?: {spans?: Record<string, unknown>[]}[]}[]} | null)
+      ?.resourceSpans
+    for (const resource of resources ?? []) {
+      for (const scope of resource.scopeSpans ?? []) {
+        for (const span of scope.spans ?? []) {
+          const parent = span.parentSpanId
+          if (typeof span.name !== 'string' || !span.name.startsWith('invoke_agent')) continue
+          if (typeof parent === 'string' && parent !== '') continue
+          const attributes: Record<string, string> = {}
+          for (const item of (span.attributes ?? []) as {key?: unknown; value?: {stringValue?: unknown}}[]) {
+            if (typeof item.key === 'string' && typeof item.value?.stringValue === 'string') {
+              attributes[item.key] = item.value.stringValue
+            }
+          }
+          const links = ((span.links ?? []) as {traceId?: unknown; spanId?: unknown}[])
+            .filter(link => typeof link.traceId === 'string' && typeof link.spanId === 'string')
+            .map(link => ({traceId: link.traceId as string, spanId: link.spanId as string}))
+          roots.push({attributes, links})
+        }
+      }
+    }
+  }
+  return roots
+}
+
 const hasRootSpan = (requests: readonly RecordedRequest[]): boolean =>
   exportedSpanNames(requests).some(name => name.startsWith('invoke_agent'))
 
@@ -3225,6 +3277,19 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
   const relayBundle = path.join(realDist, 'trace-relay.js')
   const pluginSpec = `${FRO_BOT_PLUGIN_PACKAGE}@${FRO_BOT_PLUGIN_VERSION}`
   const cleanups: (() => Promise<void> | void)[] = []
+  // The lifecycle trace of these runs, never exported here: its ids and session are what the Action hands the launcher (so the
+  // server's environment holds them) and keeps in Action state (so a file in the step's directory holds them).
+  const lifecycleRegistry = createSecretRegistry(() => undefined)
+  const lifecycleTracer = createLifecycleTracer({
+    inputs: {enabled: true, url: 'http://127.0.0.1:9/v1/traces', headers: []},
+    logger,
+    registry: lifecycleRegistry,
+    env: {},
+  })
+  const lifecycleSession = buildTraceSessionId('owner', 'repo', 'issue-42', createRegistryScrubber(lifecycleRegistry))
+  const runLink = buildTracingRunLink(lifecycleTracer.ids, lifecycleSession)
+  /** The Action's identity record and session, as `core.saveState` writes them: one `name=value` line each. */
+  const stateText = `lifecycleTrace=${JSON.stringify(lifecycleTracer.ids)}\nlifecycleSession=${lifecycleSession ?? ''}\n`
   const scanSpecFor = (workspace: string): ScanSpec => ({
     canary: TRACE_CANARY,
     ...SCAN_CONTROLS,
@@ -3235,7 +3300,7 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
     runnerTemp,
     checkout: [workspace, responseDir],
     // Opened by exact path as well as walked for: a directory can refuse listing and still allow access to a known child.
-    knownPaths: [path.join(scratch, 'step', 'file_commands.txt')],
+    knownPaths: [path.join(scratch, 'step', 'file_commands.txt'), path.join(scratch, 'step', 'lifecycle_state.txt')],
   })
   let isolated: TracedTurn | undefined
   let plain: TracedTurn | undefined
@@ -3320,13 +3385,16 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
     const tracing: ScriptedTracing = {
       specs: [pluginSpec],
       expectedPluginIds: [FRO_BOT_PLUGIN_ID],
-      host: buildActionTracingHost(relay?.port ?? null, identity),
+      host: buildActionTracingHost(relay?.port ?? null, identity, runLink),
     }
     const scanSpec = scanSpecFor(workspace)
     const offHost = buildActionTracingHost(null, identity)
     const steps: Probe[] =
       options.tracing === 'on'
-        ? [{id: 'canary_scan', category: 'blocked', cmd: `: ${TOOL_ARGUMENT_MARKER}\n${scanCommand(scanSpec)}`}]
+        ? [
+            launcherLinkProbe(lifecycleTracer.ids, lifecycleSession),
+            {id: 'canary_scan', category: 'blocked', cmd: `: ${TOOL_ARGUMENT_MARKER}\n${scanCommand(scanSpec)}`},
+          ]
         : [
             noRelayProcessProbe(),
             ...(sink === null ? [] : [tracingFallbackPlantedProbe(sink.address, machine)]),
@@ -3420,6 +3488,8 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
     const stepDir = path.join(scratch, 'step')
     fs.mkdirSync(stepDir, {recursive: true, mode: 0o700})
     fs.writeFileSync(path.join(stepDir, 'file_commands.txt'), `INPUT_TRACE-HEADERS=${TRACE_HEADERS}\n`, {mode: 0o600})
+    // The Action's state for the run, in the same private directory: the identity record and session, never an input.
+    fs.writeFileSync(path.join(stepDir, 'lifecycle_state.txt'), stateText, {mode: 0o600})
     await startStepStandIn()
     // The runner's detector controls, in the directories the sandbox reaches OpenCode's storage through links to.
     plantScanControls(xdgRoot, scanSpecFor(path.join(scratch, 'ws-isolated')))
@@ -3473,8 +3543,9 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
     for (const group of ['environ', 'cmdline', 'temp', 'checkout', 'home', 'xdg', 'known']) {
       expect(counts.get(`canary.${group}`)).toBe('0')
     }
-    // #and the step file, opened by its exact path, was refused (not absent, which would be a skip) and not read
-    expect(counts.get('denied.known')).toBe('1')
+    // #and the step file and the Action's state file, opened by their exact paths, were refused (not absent, which would be a
+    // skip) and not read
+    expect(counts.get('denied.known')).toBe('2')
     expect(counts.get('read.known')).toBe('0')
     expect(counts.get('skip.known')).toBe('0')
 
@@ -3499,10 +3570,71 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
     const counts = scanCounts(plain)
     expect(Number(counts.get('canary.environ'))).toBeGreaterThanOrEqual(1)
     expect(Number(counts.get('canary.temp'))).toBeGreaterThanOrEqual(1)
-    // #and the step file, opened by its exact path, was read and held it
-    expect(counts.get('read.known')).toBe('1')
+    // #and the step file and the state file, opened by their exact paths, were read, and only the step file held the canary
+    expect(counts.get('read.known')).toBe('2')
     expect(counts.get('canary.known')).toBe('1')
     for (const group of ['cmdline', 'checkout', 'home', 'xdg']) expect(counts.get(`canary.${group}`)).toBe('0')
+  })
+
+  it('tells the server the run’s root span, session and invocation id, and the credential is in none of it', () => {
+    // #given the launcher document the Action builds for these runs
+    const document = buildTracingLauncherValue(
+      buildActionTracingHost(
+        43_210,
+        unwrapOk(
+          buildTracingRunIdentity({
+            repository: 'owner/repo',
+            runId: '4242',
+            attempt: 1,
+            job: 'sandbox-it',
+            trigger: 'workflow_dispatch',
+          }),
+        ),
+        runLink,
+      ),
+    )
+
+    // #then it carries the link, and no form of the credential or the collector
+    expect(JSON.parse(document)).toMatchObject({
+      rootSpan: {traceId: lifecycleTracer.ids?.traceId, spanId: lifecycleTracer.ids?.rootSpanId},
+      sessionId: 'owner/repo:issue-42',
+      invocationId: lifecycleTracer.ids?.invocationId,
+    })
+    expect(canaryForms(Buffer.from(document), TRACE_CANARY)).toEqual([])
+    expect(document).not.toContain('Authorization')
+
+    // #and the isolated agent and the plain one each read that same link from the server's own environment
+    for (const turn of [isolated, plain])
+      expect(failuresFor(turn?.rows ?? new Map(), 'launcher_link', 'WORKS')).toEqual([])
+  })
+
+  it('keeps the credential out of the Action’s state, and the agent user cannot open the state file', () => {
+    // #given the state the Action saves for the run
+    // #then it holds the ids and the session and no form of the credential, the headers or the collector
+    expect(stateText).toContain(lifecycleTracer.ids?.traceId)
+    expect(canaryForms(Buffer.from(stateText), TRACE_CANARY)).toEqual([])
+    expect(stateText).not.toContain('Authorization')
+
+    // #and the isolated agent was refused when it opened the state file by its path (the scan's `denied.known` counts the
+    // step file and this one); the runner's own user read it, and found no canary there
+    expect(scanCounts(isolated).get('denied.known')).toBe('2')
+    expect(scanCounts(plain).get('read.known')).toBe('2')
+    expect(scanCounts(plain).get('canary.known')).toBe('1')
+  })
+
+  it('links each turn root to the lifecycle root span, in the lifecycle trace’s session', () => {
+    for (const turn of [isolated, plain]) {
+      // #given the traced turn's root span as the collector received it
+      const roots = turnRootSpans(turn?.requests ?? [])
+
+      // #then one root, linking to the lifecycle root, with the session and invocation id the launcher carried
+      expect(roots).toHaveLength(1)
+      expect(roots[0]?.links).toEqual([
+        {traceId: lifecycleTracer.ids?.traceId, spanId: lifecycleTracer.ids?.rootSpanId},
+      ])
+      expect(roots[0]?.attributes['langfuse.session.id']).toBe('owner/repo:issue-42')
+      expect(roots[0]?.attributes['fro_bot.invocation.id']).toBe(lifecycleTracer.ids?.invocationId)
+    }
   })
 
   it('exports no span that holds the canary, in any form a span could carry it', () => {
@@ -3559,5 +3691,255 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
     expect(off?.requests).toEqual([])
     expect(off?.relayStop).toBeNull()
     expect(off?.relayLeft).toBe('')
+  })
+})
+
+// --- 15. A cancelled run -----------------------------------------------------------------------------------------------
+
+/** The runner cancels a step with SIGINT and, if it is still running 7.5 seconds later, sends SIGTERM. */
+const RUNNER_SIGTERM_DELAY_MS = 7_500
+
+/** A stand-in for `process` for the sandbox's handler: it listens on it and re-raises on it, and the test says when a signal arrives. */
+function fakeSignalHost(): SignalHost & {
+  readonly deliver: (signal: 'SIGINT' | 'SIGTERM') => void
+  readonly killed: {readonly signal: 'SIGINT' | 'SIGTERM'; readonly at: number; readonly spansAtReceiver: number}[]
+  /** Set by the test: how many spans the receiver holds, read at the moment of the re-raise. */
+  spansAtReceiver: () => number
+} {
+  const handlers = new Map<'SIGINT' | 'SIGTERM', (() => void)[]>()
+  const killed: {signal: 'SIGINT' | 'SIGTERM'; at: number; spansAtReceiver: number}[] = []
+  const host = {
+    pid: 4242,
+    killed,
+    spansAtReceiver: () => 0,
+    on: (signal: 'SIGINT' | 'SIGTERM', listener: () => void) => {
+      handlers.set(signal, [...(handlers.get(signal) ?? []), listener])
+    },
+    off: (signal: 'SIGINT' | 'SIGTERM', listener: () => void) => {
+      handlers.set(
+        signal,
+        (handlers.get(signal) ?? []).filter(item => item !== listener),
+      )
+    },
+    kill: (_pid: number, signal: 'SIGINT' | 'SIGTERM') => {
+      killed.push({signal, at: Date.now(), spansAtReceiver: host.spansAtReceiver()})
+    },
+    deliver: (signal: 'SIGINT' | 'SIGTERM') => {
+      for (const listener of handlers.get(signal) ?? []) listener()
+    },
+  }
+  return host
+}
+
+interface CancelledOutcome {
+  readonly spans: ReturnType<typeof decodeSpans>
+  /** The first re-raise on the host, with when it happened and how many spans the receiver held at that moment. */
+  readonly reRaised: readonly {
+    readonly signal: 'SIGINT' | 'SIGTERM'
+    readonly at: number
+    readonly spansAtReceiver: number
+  }[]
+  /** When the sandbox's state last became `restored` or `unsafe`: the teardown settling. */
+  readonly teardownSettledAt: number | undefined
+  readonly sigintAt: number
+}
+
+const spanByName = (outcome: CancelledOutcome | undefined, name: string) =>
+  outcome?.spans.find(span => span.name === name)
+
+describe.skipIf(!gated)('a cancelled isolated run delivers its reached spans inside its teardown window', () => {
+  const logger = createLogger({phase: 'sandbox-integration-cancel'})
+  const scratch = path.join(runnerTemp, `sandbox-it-cancel-${process.pid}`)
+  const xdgRoot = path.join(runnerTemp, `sandbox-it-cancel-xdg-${process.pid}`)
+  const workspace = path.join(scratch, 'ws')
+  const responseDir = path.join(scratch, 'response')
+  const env = hostedEnv(workspace, xdgRoot)
+  const strayPattern = 'sleep 779[34]'
+  const cleanups: (() => Promise<void> | void)[] = []
+  const states: {readonly state: string; readonly at: number}[] = []
+
+  let provider: ScriptedProvider | undefined
+  let lifecycle: SandboxLifecycle | undefined
+  let outcome: CancelledOutcome | undefined
+  let strays = 'not checked'
+  let sigtermAfterReRaise = 0
+
+  beforeAll(async () => {
+    const tools = await preflightTools(logger)
+    fs.mkdirSync(responseDir, {recursive: true})
+    const keyFile = writeKeyFile(path.join(scratch, 'keys'))
+    initWorkspace(workspace)
+    // A tool that leaves a process that leaves its session and one that ignores SIGTERM: what the teardown must still end.
+    provider = await startScriptedProvider(() => [
+      {
+        id: 'cancel_setup',
+        category: 'info',
+        cmd:
+          `(setsid sleep 7793 >/dev/null 2>&1 &); (trap '' TERM HUP; exec sleep 7794 >/dev/null 2>&1 &); ` +
+          `sleep 0.3; R cancel_setup INFO "$(pgrep -d, -f 'sleep 779')"`,
+      },
+    ])
+    const sink: OtlpSink = await startOtlpSink()
+    cleanups.push(sink.stop)
+    const tracer = createLifecycleTracer({
+      inputs: {enabled: true, url: sink.url, headers: []},
+      logger,
+      registry: createSecretRegistry(() => undefined),
+      env: {},
+      identity: {
+        repository: 'owner/repo',
+        runId: '4242',
+        attempt: '1',
+        job: 'sandbox-it',
+        trigger: 'workflow_dispatch',
+      },
+    })
+    // The phases the run had reached: bootstrap is done, execution is where the cancel finds it.
+    tracer.startSpan('bootstrap').end({outcome: 'succeeded'})
+    tracer.startSpan('execution')
+    const host = fakeSignalHost()
+    host.spansAtReceiver = () => decodeSpans(sink.accepted()).length
+    lifecycle = createSandboxLifecycle({
+      tools,
+      env,
+      runnerPath: env.PATH,
+      runnerHome,
+      workspacePath: workspace,
+      responseDir,
+      logger,
+      viewLauncher,
+      // The real handler of a real isolated run: its own, on a stand-in for `process`, so the re-raise does not end the test.
+      signals: host,
+      signalTrace: {
+        onSignal: signal => tracer.cancel(signal === 'SIGINT' ? 'sigint' : 'sigterm'),
+        flush: async options => tracer.flush(options),
+      },
+      recordState: state => states.push({state, at: Date.now()}),
+    })
+    const prepared = await lifecycle.prepare({keyFilePaths: [keyFile], ghConfigDir: null, repoSkills: null})
+    if (!prepared.success) throw new Error(prepared.error)
+    // The server is up and the agent has run its tool: the run is mid-execution when it is cancelled.
+    await startScriptedSession({binary: BINARY ?? '', workspace, env, lifecycle, keyFile, provider, logger})
+
+    // The runner's SIGINT, then (if the process were still running) its SIGTERM 7.5 s later.
+    const sigintAt = Date.now()
+    host.deliver('SIGINT')
+    await waitUntil('the signal to be re-raised', () => host.killed.length > 0, 30_000)
+    await sleep(Math.max(0, sigintAt + RUNNER_SIGTERM_DELAY_MS - Date.now()))
+    host.deliver('SIGTERM')
+    sigtermAfterReRaise = host.killed.length
+    outcome = {
+      spans: decodeSpans(sink.accepted()),
+      reRaised: [...host.killed],
+      teardownSettledAt: states.findLast(item => item.state === 'restored' || item.state === 'unsafe')?.at,
+      sigintAt,
+    }
+    strays = strayProcesses(strayPattern)
+  }, 600_000)
+
+  afterAll(async () => {
+    await lifecycle?.release()
+    await provider?.close()
+    for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
+    spawnSync('sudo', ['-n', 'pkill', '-KILL', '-f', strayPattern])
+    fs.rmSync(scratch, {recursive: true, force: true})
+    fs.rmSync(xdgRoot, {recursive: true, force: true})
+  }, 120_000)
+
+  it('had delivered the spans it reached by the time the teardown settled and the signal was re-raised', () => {
+    // #given a run cancelled mid-execution
+    // #then at the moment of the re-raise the receiver already held the trace: the export ran beside the teardown
+    expect(outcome?.reRaised[0]?.spansAtReceiver).toBeGreaterThan(0)
+    expect(spanByName(outcome, 'bootstrap')).toMatchObject({attrs: {'fro_bot.outcome': 'succeeded'}})
+    // #and the phase it was in and the root are cancelled, with the signal as the reason, and not errors
+    for (const name of ['execution', 'action.main']) {
+      expect(spanByName(outcome, name)?.attrs).toMatchObject({
+        'fro_bot.outcome': 'cancelled',
+        'fro_bot.reason': 'sigint',
+      })
+      expect(spanByName(outcome, name)?.status.code).not.toBe(2)
+    }
+  })
+
+  it('re-raised the signal once, no later than the teardown settling, with nothing left of the launch', () => {
+    // #then the sandbox ended restored, the signal came right after that (the export added no wait), once, and the SIGTERM the
+    // runner would send 7.5 s later found no handler to run again
+    expect(states.at(-1)?.state).toBe('restored')
+    expect(outcome?.reRaised.map(item => item.signal)).toEqual(['SIGINT'])
+    expect((outcome?.reRaised[0]?.at ?? 0) - (outcome?.teardownSettledAt ?? Number.POSITIVE_INFINITY)).toBeLessThan(
+      1_000,
+    )
+    expect(sigtermAfterReRaise).toBe(1)
+    expect(strays).toBe('')
+  })
+})
+
+/**
+ * A run WITHOUT `isolate-agent`: the real fixture process with real signals (it needs no sandbox, so it can also run off a hosted
+ * runner when asked: `FRO_BOT_CANCEL_IT=1 bunx vitest run <this file> -t 'without isolation'`). Cancellation is what it always
+ * was: the process has no handler of its own, the exec adapter reaps the command it is running and re-raises at once, and no
+ * lifecycle trace is sent.
+ */
+const cancelPlainEnabled = gated || process.env.FRO_BOT_CANCEL_IT === '1'
+
+describe.skipIf(!cancelPlainEnabled)('a cancelled run without isolation ends as it always did', () => {
+  const dir = path.join(os.tmpdir(), `sandbox-it-cancel-plain-${process.pid}`)
+  const cleanups: (() => Promise<void> | void)[] = []
+  let exit:
+    {readonly code: number | null; readonly signal: NodeJS.Signals | null; readonly elapsedMs: number} | undefined
+  let received = -1
+  let commandAlive = true
+
+  beforeAll(async () => {
+    fs.mkdirSync(dir, {recursive: true})
+    const sink: OtlpSink = await startOtlpSink()
+    cleanups.push(sink.stop)
+    const child = spawn('bun', [path.join(import.meta.dirname, '..', 'signal-cancel.fixture.ts')], {
+      env: {
+        ...process.env,
+        SIGNAL_FIXTURE_LOG: path.join(dir, 'log.txt'),
+        SIGNAL_FIXTURE_TEMP: dir,
+        SIGNAL_FIXTURE_COLLECTOR: sink.url,
+        SIGNAL_FIXTURE_MODE: 'plain',
+        SIGNAL_FIXTURE_SCENARIO: 'child',
+      },
+      stdio: ['ignore', 'pipe', 'inherit'],
+    })
+    const exited = new Promise<{code: number | null; signal: NodeJS.Signals | null}>(resolve => {
+      child.once('exit', (code, signal) => resolve({code, signal}))
+    })
+    await new Promise<void>(resolve => {
+      child.stdout.on('data', (chunk: Buffer) => {
+        if (chunk.toString('utf8').includes('READY')) resolve()
+      })
+    })
+    await sleep(500)
+    // The runner's SIGINT. A process that kept itself alive for an export would still be running when its SIGTERM came.
+    const sigintAt = Date.now()
+    child.kill('SIGINT')
+    const outcome = await exited
+    exit = {...outcome, elapsedMs: Date.now() - sigintAt}
+    received = sink.received()
+    const pid = Number(fs.readFileSync(path.join(dir, 'child.pid'), 'utf8').trim())
+    try {
+      process.kill(pid, 0)
+    } catch {
+      commandAlive = false
+    }
+  }, 120_000)
+
+  afterAll(async () => {
+    for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
+    fs.rmSync(dir, {recursive: true, force: true})
+  }, 60_000)
+
+  it('ended by the signal at once, with no export started and no lifecycle trace at the collector', () => {
+    expect(exit?.signal).toBe('SIGINT')
+    expect(exit?.elapsedMs).toBeLessThan(2_000)
+    expect(received).toBe(0)
+  })
+
+  it('stopped the command the run was waiting on', () => {
+    expect(commandAlive).toBe(false)
   })
 })

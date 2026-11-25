@@ -829,7 +829,12 @@ describe('run persistence: only a run that started the V2 server may save sessio
     // #given a skipped event: nothing was restored for it
     const {runRouting} = await import('./phases/routing.js')
     await arrange()
-    vi.mocked(runRouting).mockResolvedValue({skipped: true, skipReason: 'no_mention', skipMessage: 'nothing to do'})
+    vi.mocked(runRouting).mockResolvedValue({
+      skipped: true,
+      skipReason: 'no_mention',
+      skipMessage: 'nothing to do',
+      context: createRouting().triggerResult.context,
+    })
 
     // #when
     await run()

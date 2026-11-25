@@ -14,8 +14,9 @@
  */
 
 import type {ScrubbedSpan, Scrubber} from './content.js'
+import type {AttributeOptions} from './genai-attributes.js'
 import type {Observation} from './observation.js'
-import type {ActionIdentity} from './settings.js'
+import type {ActionIdentity, ActionRunContext} from './settings.js'
 import type {SnapshotLedger} from './snapshot.js'
 import type {IdSource, SpanRecord, TurnModelLimits} from './turn-model.js'
 
@@ -64,7 +65,7 @@ export const DEFAULT_PIPELINE_LIMITS: PipelineLimits = {
   tickMs: 60_000,
 }
 
-export interface TracePipelineOptions {
+export interface TracePipelineOptions extends ActionRunContext {
   readonly sink: SpanSink
   readonly scrubber: Scrubber
   /** Action mode only. */
@@ -218,7 +219,12 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
     ids: options.ids ?? randomIds(),
     ...(options.modelLimits === undefined ? {} : {limits: options.modelLimits}),
   })
-  const attributeOptions = options.identity === undefined ? {} : {identity: options.identity}
+  const attributeOptions: AttributeOptions = {
+    identity: options.identity,
+    rootSpan: options.rootSpan,
+    sessionId: options.sessionId,
+    invocationId: options.invocationId,
+  }
   /** Observations waiting for the model, each with the raw text it holds against `maxInboxChars`. */
   const inbox: {readonly observation: Observation; readonly chars: number}[] = []
   /**

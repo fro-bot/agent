@@ -16,7 +16,7 @@ import {
   scrubSpan,
   type PendingSpan,
   type Scrubber,
-} from './content.js'
+} from './scrub.js'
 import {minCpuMs} from './timing.testing.js'
 
 // Fixture secrets are assembled at run time so no scanner mistakes this file for a leak.

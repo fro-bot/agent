@@ -337,6 +337,7 @@ describe('run', () => {
       skipped: true,
       skipReason: 'unauthorized_author',
       skipMessage: "Author association 'CONTRIBUTOR' is not authorized",
+      context: createRouting().triggerResult.context,
     })
 
     // #when the run reaches the pre-execute routing skip

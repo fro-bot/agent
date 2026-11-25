@@ -1,5 +1,5 @@
 import type {AgentContext} from '../../features/agent/types.js'
-import type {SkipReason, TriggerResultProcess} from '../../features/triggers/types.js'
+import type {SkipReason, TriggerContext, TriggerResultProcess} from '../../features/triggers/types.js'
 import type {Octokit} from '../../services/github/types.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
 import * as core from '@actions/core'
@@ -21,6 +21,11 @@ export interface RoutingPhaseSkip {
   readonly skipped: true
   readonly skipReason: SkipReason
   readonly skipMessage: string
+  /**
+   * The trigger context the router built even for an event it declined, so a skipped run can still compute its logical key
+   * (and so its trace session) like a processed one.
+   */
+  readonly context: TriggerContext
 }
 
 /** Visibility only: one workflow annotation, never a comment or reaction. Best-effort, never throws. */
@@ -71,7 +76,12 @@ export async function runRouting(
       message: triggerResult.skipMessage,
     })
     emitSkipNotice(triggerResult.skipReason, triggerResult.skipMessage)
-    return {skipped: true, skipReason: triggerResult.skipReason, skipMessage: triggerResult.skipMessage}
+    return {
+      skipped: true,
+      skipReason: triggerResult.skipReason,
+      skipMessage: triggerResult.skipMessage,
+      context: triggerResult.context,
+    }
   }
 
   triggerLogger.info('Event routed for processing', {

@@ -5,6 +5,7 @@ import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {RECORDED_V2_PIN} from '../../services/setup/opencode.js'
 import {DEFAULT_OPENCODE_VERSION, DEFAULT_S3_PREFIX, DEFAULT_SYSTEMATIC_VERSION} from '../../shared/constants.js'
+import {createSecretRegistry} from '../../shared/secret-registry.js'
 import {isIsolationRequested, LAST_V1_ACTION_RELEASE, parseActionInputs, parseModelInput} from './inputs.js'
 
 const mocks = vi.hoisted(() => ({
@@ -1779,5 +1780,115 @@ describe('parseActionInputs tracing inputs', () => {
       expect(maskedOnce).toEqual([ENDPOINT])
       expect(mocks.warning).not.toHaveBeenCalled()
     })
+  })
+})
+
+describe('parseActionInputs with the run’s secret registry and trace inputs', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    setGitHubPayload({})
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.unstubAllEnvs()
+  })
+
+  const registryWith = () => {
+    const masker = vi.fn<(value: string) => void>()
+    return {registry: createSecretRegistry(masker), masker}
+  }
+
+  it('masks the GitHub token and the AWS keys through the registry, so the scrubber learns them', () => {
+    // #given
+    vi.stubEnv('AWS_ACCESS_KEY_ID', 'AKIAEXAMPLEKEY123456')
+    vi.stubEnv('AWS_SECRET_ACCESS_KEY', 'aws-secret-example-value-0001')
+    mockInputs({'github-token': 'ghp_registryToken1234567'})
+    const {registry, masker} = registryWith()
+
+    // #when
+    const result = parseActionInputs({registry})
+
+    // #then GitHub was told (through the registry's masker), and the registry remembers every one
+    expect(result.success).toBe(true)
+    for (const value of ['ghp_registryToken1234567', 'AKIAEXAMPLEKEY123456', 'aws-secret-example-value-0001']) {
+      expect(masker).toHaveBeenCalledWith(value)
+      expect(registry.literals()).toContain(value)
+    }
+  })
+
+  it('masks auth-json whole with GitHub alone, and gives the registry each of its leaves', () => {
+    // #given
+    const authJson = '{"anthropic":{"type":"api","key":"sk-ant-registry-leaf-0001"}}'
+    mockInputs({'auth-json': authJson})
+    const {registry, masker} = registryWith()
+
+    // #when
+    parseActionInputs({registry})
+
+    // #then the whole document goes through core.setSecret directly (it may be longer than the scrubber matches)
+    expect(mocks.setSecret).toHaveBeenCalledWith(authJson)
+    expect(masker).not.toHaveBeenCalledWith(authJson)
+    expect(registry.literals()).toContain('sk-ant-registry-leaf-0001')
+    expect(registry.literals()).not.toContain(authJson)
+    expect(registry.matchable()).toBe(true)
+  })
+
+  it('gives the registry the leaves of opencode-config, even when the document is refused afterwards', () => {
+    // #given a config that is valid JSON but not an object
+    const config = '["mcp-header-token-leaf-0001"]'
+    mockInputs({'opencode-config': config})
+    const {registry} = registryWith()
+
+    // #when
+    const result = parseActionInputs({registry})
+
+    // #then
+    expect(result.success).toBe(false)
+    expect(registry.literals()).toContain('mcp-header-token-leaf-0001')
+  })
+
+  it('gives the registry the header token of a valid opencode-config', () => {
+    // #given
+    mockInputs({
+      'opencode-config': JSON.stringify({mcp: {remote: {headers: {Authorization: 'Bearer mcp-header-token-9999'}}}}),
+    })
+    const {registry} = registryWith()
+
+    // #when
+    const result = parseActionInputs({registry})
+
+    // #then
+    expect(result.success).toBe(true)
+    expect(registry.literals()).toContain('Bearer mcp-header-token-9999')
+  })
+
+  it('uses the trace inputs the run already read: it reads and removes nothing, and never reads them again', () => {
+    // #given the run read them first and handed over the result
+    vi.stubEnv('INPUT_TRACE-ENDPOINT', 'left-alone-by-bootstrap')
+    mockInputs({'trace-endpoint': 'https://never-read.example.test/v1/traces'})
+    const handed = {enabled: true, url: 'https://handed.example.test/v1/traces', headers: []} as const
+
+    // #when
+    const result = parseActionInputs({tracing: handed})
+
+    // #then
+    expect(result.success && result.data.tracing).toEqual(handed)
+    expect(mocks.getInput).not.toHaveBeenCalledWith('trace-endpoint')
+    expect(mocks.getInput).not.toHaveBeenCalledWith('trace-headers')
+    expect(process.env['INPUT_TRACE-ENDPOINT']).toBe('left-alone-by-bootstrap')
+  })
+
+  it('reads the trace inputs itself, through the registry, when none were handed over', () => {
+    // #given
+    mockInputs({'trace-endpoint': 'https://collector-self-read.example.test/v1/traces'})
+    const {registry, masker} = registryWith()
+
+    // #when
+    const result = parseActionInputs({registry})
+
+    // #then
+    expect(result.success && result.data.tracing.enabled).toBe(true)
+    expect(masker).toHaveBeenCalledWith('https://collector-self-read.example.test/v1/traces')
   })
 })

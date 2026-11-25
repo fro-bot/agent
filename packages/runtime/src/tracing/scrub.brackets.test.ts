@@ -6,7 +6,7 @@
 
 import {describe, expect, it} from 'vitest'
 
-import {contentAttribute, createScrubber, MARKER, REDACTION, scrubSpan, type PendingSpan} from './content.js'
+import {contentAttribute, createScrubber, MARKER, REDACTION, scrubSpan, type PendingSpan} from './scrub.js'
 
 const VALUE = 'zxq-plain-value-4817'
 const REASON = 'sensitive-value-unbounded'
