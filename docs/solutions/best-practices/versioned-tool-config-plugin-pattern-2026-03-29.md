@@ -48,14 +48,16 @@ The versioned-tool skill itself warns: _"Do not copy installer structure blindly
 
 Instead of a separate installer, the version flows through the existing data pipeline and lands in `OPENCODE_CONFIG_CONTENT`'s `plugins` array.
 
-**Host caveat: the key name depends on the OpenCode line.** OpenCode v1 reads only a singular `plugin` array and silently ignores `plugins`, so a plugin registered under `plugins` never loads on v1 and logs no error. OpenCode v2 reads `plugins`. This repo uses both:
+**Host caveat: the key name depends on the OpenCode line.** OpenCode v1 reads only a singular `plugin` array and silently ignores `plugins`, so a plugin registered under `plugins` never loads on v1 and logs no error. OpenCode v2 reads `plugins`. Both places this repo registers bundled plugins run V2 and emit `plugins`:
 
-| Host | Key | Where |
+| Path | Key | Where |
 | --- | --- | --- |
-| OpenCode v2 (the Action's CI config) | `plugins` | `src/services/setup/ci-config-v2.ts` (`CIConfigV2Inputs.plugins`, `buildCIConfigV2`); `ci-config-v2.test.ts` asserts no `plugin` key |
-| OpenCode v1 (the workspace base image) | `plugin` | `deploy/scripts/merge-config.mjs`, which unions the base and overlay `plugin` arrays |
+| The Action (V2) | `plugins` | `src/services/setup/ci-config-v2.ts` (`buildCIConfigV2`); `ci-config-v2.test.ts` asserts no `plugin` key |
+| The workspace (V2 only: `deploy/workspace.Dockerfile` rejects V1 and harness builds) | `plugins` | `buildWorkspaceConfigV2` in `packages/runtime/src/agent/workspace-config-v2.ts`, called by the supervisor in `apps/workspace-agent/src/opencode-server-v2.ts` with `WORKSPACE_V2_PLUGIN_SPECS` |
+| The workspace overlay merge (not plugin registration) | `plugin` | `deploy/scripts/merge-config.mjs`, run through `provision-agent-config.mjs`: unions the `plugin` arrays of the baked base config (which lists none) and `WORKSPACE_OPENCODE_CONFIG` into the agent's `opencode.json`; the bundled plugins do not pass through it |
+| A legacy v1 host | `plugin` | Not a path this repo ships; write the singular key there |
 
-Everything below describes the v2 path (`plugins`). Applying it to a v1 host means writing `plugin` instead. See [OpenCode plugin config key is singular `plugin`, not `plugins`](https://github.com/marcusrbrown/systematic/blob/main/docs/solutions/documentation-gaps/opencode-plugin-config-key-is-singular-plugin-not-plugins-2026-07-18.md) (`marcusrbrown/systematic`, `docs/solutions/documentation-gaps/opencode-plugin-config-key-is-singular-plugin-not-plugins-2026-07-18.md`) for the v1 schema behavior.
+Everything below describes the `plugins` path. See [OpenCode plugin config key is singular `plugin`, not `plugins`](https://github.com/marcusrbrown/systematic/blob/main/docs/solutions/documentation-gaps/opencode-plugin-config-key-is-singular-plugin-not-plugins-2026-07-18.md) (`marcusrbrown/systematic`, `docs/solutions/documentation-gaps/opencode-plugin-config-key-is-singular-plugin-not-plugins-2026-07-18.md`) for the v1 schema behavior, and [the workspace provisioning learning](./workspace-opencode-provisioning-on-v2-2026-11-17.md) for the workspace routes.
 
 **Data flow:**
 
@@ -134,7 +136,7 @@ systematic-version:
 
 ## Why This Works
 
-OpenCode reads `OPENCODE_CONFIG_CONTENT` as its highest-precedence config. By adding `plugins: ["@fro.bot/systematic@<version>"]` (v2; a v1 host reads `plugin`, see the host caveat above) to this env var during setup, OpenCode resolves the plugin at startup — and, since the setup-time install landed, finds it already present rather than fetching it. The version is pinned via the same constant pattern used by all other tools, with Renovate automating npm version bumps through the `customManagers` regex.
+OpenCode reads `OPENCODE_CONFIG_CONTENT` as its highest-precedence config. By adding `plugins: ["@fro.bot/systematic@<version>"]` (the V2 key; a legacy v1 host reads `plugin`, see the host caveat above) to this env var during setup, OpenCode resolves the plugin at startup — and, since the setup-time install landed, finds it already present rather than fetching it. The version is pinned via the same constant pattern used by all other tools, with Renovate automating npm version bumps through the `customManagers` regex.
 
 ## Prevention
 
@@ -163,7 +165,7 @@ When adding a fifth tool, check the tool's README first. The install mechanism d
 
 ### 3. Dedup array injections
 
-When programmatically injecting into arrays that users can also populate (like `plugins` on v2 and `plugin` on v1), always check for existing entries before appending, and handle the key of the host you target. The v2 setup code (`ci-config-v2.ts`) dedups the `plugins` entries by exact spec string; `merge-config.mjs` dedups the v1 `plugin` entries the same way (`new Set`). If version differences must collapse, match on the package name explicitly.
+When programmatically injecting into arrays that users can also populate (like `plugins`, or `plugin` on a legacy v1 host), always check for existing entries before appending, and handle the key of the host you target. The V2 setup code (`ci-config-v2.ts`) dedups the `plugins` entries by exact spec string, and `buildConfigContentV2` does the same for the workspace (`new Set`); `merge-config.mjs` dedups the overlay's `plugin` entries the same way. If version differences must collapse, match on the package name explicitly.
 
 ### 4. Type safety with `Record<string, unknown>`
 
