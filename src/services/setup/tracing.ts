@@ -1,8 +1,10 @@
 import type {Result} from '@bfra.me/es/result'
-import type {OpenCodeV2ActionTracingHost, TraceRelayHeader, TracingRunIdentity} from '@fro-bot/runtime'
+import type {OpenCodeV2ActionTracingHost, TraceRelayHeader, TracingRunIdentity, TracingRunLink} from '@fro-bot/runtime'
+import type {Scrubber} from '@fro-bot/runtime/tracing/scrub'
 import type {TracingInputs} from '../../shared/types.js'
 import {err, ok} from '@bfra.me/es/result'
 import {ACTION_TRACING_OFF, isUsableTracingIdentity} from '@fro-bot/runtime'
+import {scrubSafeSessionId} from '@fro-bot/runtime/tracing/session-id'
 
 /**
  * Turns the parsed tracing inputs and the facts of a routed run into the two things the rest of the run needs: the relay's
@@ -79,11 +81,12 @@ export interface TraceRelayLiveness {
 export function liveActionTracingHost(
   relay: TraceRelayLiveness,
   identity: TracingRunIdentity,
+  link?: TracingRunLink,
 ): () => OpenCodeV2ActionTracingHost {
   let dead = false
   return () => {
     dead ||= relay.crashed()
-    return buildActionTracingHost(dead ? null : relay.port, identity)
+    return buildActionTracingHost(dead ? null : relay.port, identity, link)
   }
 }
 
@@ -94,7 +97,66 @@ export function liveActionTracingHost(
 export function buildActionTracingHost(
   relayPort: number | null,
   identity: TracingRunIdentity | null,
+  link?: TracingRunLink,
 ): OpenCodeV2ActionTracingHost {
   if (relayPort === null || identity === null) return ACTION_TRACING_OFF
-  return {host: 'action', tracing: 'on', relayPort, identity}
+  return {host: 'action', tracing: 'on', relayPort, identity, ...link}
+}
+
+/**
+ * What ties the turn traces to the lifecycle trace: the run's root span (each turn root links to it), the one session id and the
+ * invocation id. Each is present only when the lifecycle tracer has it; a tracer that is off (no trace ids) gives none of the
+ * ids, and a conversation with no usable session id gives no session, so the turn spans keep OpenCode's own.
+ */
+export function buildTracingRunLink(
+  ids: {readonly traceId: string; readonly rootSpanId: string; readonly invocationId: string} | null,
+  sessionId: string | undefined,
+): TracingRunLink {
+  return {
+    ...(ids === null ? {} : {rootSpan: {traceId: ids.traceId, spanId: ids.rootSpanId}, invocationId: ids.invocationId}),
+    ...(sessionId === undefined ? {} : {sessionId}),
+  }
+}
+
+/**
+ * The one Langfuse session id for a conversation, or undefined when there is none to send. The candidate is the logical key,
+ * which is repository-local (`issue-42`), qualified by the repository (`<owner>/<repo>:<logical key>`) so two repositories'
+ * issue 42 never share a session. `scrubSafeSessionId` then makes it survive export: the candidate itself when the scrubber
+ * leaves it byte-identical and the launcher would accept it (non-empty, at most 200 characters, no control characters), else
+ * `sha256:` and 32 hex characters of its hash (so a repository named `password-manager`, or a key past 200 characters, still
+ * gets a distinct session), else nothing. The lifecycle tracer and the launcher both take this exact value, and neither
+ * derives or alters it, so the two traces cannot disagree about the session.
+ */
+export function buildTraceSessionId(
+  owner: string,
+  repo: string,
+  logicalKey: string,
+  scrubber: Scrubber,
+): string | undefined {
+  return scrubSafeSessionId(`${owner}/${repo}:${logicalKey}`, scrubber)
+}
+
+/**
+ * Whatever of the run identity the runner's environment holds, for the lifecycle trace: it sends what exists, where the turn
+ * trace's launcher document needs all five fields (`buildTracingRunIdentity`).
+ */
+export function readLifecycleRunIdentity(
+  env: Readonly<Record<string, string | undefined>>,
+  job: string | null,
+): Partial<TracingRunIdentity> {
+  const present = (value: string | undefined): string | undefined => {
+    const trimmed = value?.trim() ?? ''
+    return trimmed === '' ? undefined : trimmed
+  }
+  const repository = present(env.GITHUB_REPOSITORY)
+  const runId = present(env.GITHUB_RUN_ID)
+  const attempt = present(env.GITHUB_RUN_ATTEMPT)
+  const trigger = present(env.GITHUB_EVENT_NAME)
+  return {
+    ...(repository === undefined ? {} : {repository}),
+    ...(runId === undefined ? {} : {runId}),
+    ...(attempt === undefined ? {} : {attempt}),
+    ...(job === null ? {} : {job}),
+    ...(trigger === undefined ? {} : {trigger}),
+  }
 }

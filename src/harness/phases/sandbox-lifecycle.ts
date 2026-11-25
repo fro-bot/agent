@@ -18,6 +18,7 @@ import type {
 } from '../../services/setup/sandbox-handoff.js'
 import type {SandboxToolPaths} from '../../services/setup/sandbox-preflight.js'
 import type {ExecAdapter} from '../../services/setup/types.js'
+import type {LifecycleSpan} from '../../shared/lifecycle-tracer.js'
 import type {Logger} from '../../shared/logger.js'
 import {Buffer} from 'node:buffer'
 import * as fsSync from 'node:fs'
@@ -54,7 +55,9 @@ import {
 } from '../../services/setup/sandbox-tool-roots.js'
 import {buildSandboxPath} from '../../services/setup/sandbox-toolchain-path.js'
 import {isProcessAlive} from '../../services/setup/sandbox-view-probe.js'
+import {markRunCancelled, startCancellationCleanups} from '../../shared/cancellation.js'
 import {toErrorMessage} from '../../shared/errors.js'
+import {freeText} from '../../shared/lifecycle-tracer.js'
 
 /**
  * The `isolate-agent` lifecycle for one run: create the account, hand over what the sandbox needs, launch spec, then
@@ -86,6 +89,8 @@ export interface SandboxPrepareInput {
   readonly ghConfigDir: string | null
   /** The run-scoped staging root and the admitted skills tree under it, or null. */
   readonly repoSkills: {readonly stagingRoot: string; readonly admittedDir: string | null} | null
+  /** The lifecycle trace's isolation handoff span: a tool location or a PATH directory left out is an event on it. */
+  readonly traceSpan?: LifecycleSpan
 }
 
 export interface SandboxReleaseResult {
@@ -188,6 +193,20 @@ export interface SignalHost {
   readonly kill: (pid: number, signal: 'SIGINT' | 'SIGTERM') => unknown
 }
 
+/** The trace's part of a cancellation: the spans still open end as cancelled, and the export starts beside the teardown. */
+export interface SandboxSignalTrace {
+  /** Ends the spans still open as cancelled. Synchronous; a throw is ignored. */
+  readonly onSignal: (signal: 'SIGINT' | 'SIGTERM') => void
+  /** Starts the export with the given bound. Shared with normal completion, so it must be idempotent. Never awaited by the teardown. */
+  readonly flush: (options: {readonly boundMs: number}) => Promise<unknown>
+}
+
+/**
+ * Longest the export runs once a signal arrives. It runs beside the teardown and inside its window: the process is re-raised when
+ * the teardown settles, whether or not the export has, so this only bounds the exporter's own work.
+ */
+export const SIGNAL_TRACE_FLUSH_BOUND_MS = 5_000
+
 /**
  * Longest a cancellation waits for the sandbox to be stopped and taken back before the process ends anyway. GitHub
  * escalates a cancelled step from SIGINT to SIGTERM and then SIGKILL within about ten seconds, so a longer wait would be
@@ -235,6 +254,11 @@ export interface SandboxLifecycleOptions {
   readonly deps?: Partial<SandboxLifecycleDeps>
   /** Defaults to the real `process`. */
   readonly signals?: SignalHost
+  /**
+   * What the run's lifecycle trace does when a signal reaches this sandbox's handler: the only cancellation that sends a trace.
+   * A run without `isolate-agent` has no handler of this kind, so it ends as it always did and sends no lifecycle trace.
+   */
+  readonly signalTrace?: SandboxSignalTrace
   readonly signalTeardownBudgetMs?: number
   /** Overrides {@link LAUNCH_SETTLE_BUDGET_MS} (tests). */
   readonly launchSettleBudgetMs?: number
@@ -584,19 +608,46 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       // The sandbox's own teardown decides the outcome; an extra stop that failed has nothing to add.
     }
   }
+  /**
+   * Starts the export one turn of the event loop later, so the teardown's first steps are on their way before its CPU work. What
+   * the export does after that is the tracer's: it prepares a span per turn of the event loop and, from the signal, only for a
+   * fixed budget (`cancel` starts it), so the teardown's timers and subprocess results are never queued behind a batch.
+   */
+  const startTraceExport = async (trace: SandboxSignalTrace): Promise<void> => {
+    try {
+      await new Promise<void>(resolve => {
+        setImmediate(resolve)
+      })
+      await trace.flush({boundMs: SIGNAL_TRACE_FLUSH_BOUND_MS})
+    } catch {
+      // An export never changes how a cancelled run ends.
+    }
+  }
   const onSignal = async (signal: 'SIGINT' | 'SIGTERM'): Promise<void> => {
     if (signalled) return
     signalled = true
     cancelled = true
+    // The run is cancelled from this line, synchronously: every irreversible write checks the flag at the point of submission.
+    markRunCancelled()
+    try {
+      options.signalTrace?.onSignal(signal)
+    } catch {
+      // Tracing never changes how a cancelled run stops.
+    }
     closeAdmission()
     logger.warning('Received a termination signal; stopping the sandbox before exiting', {signal})
     let timer: ReturnType<typeof setTimeout> | undefined
     const timedOut = new Promise<'timeout'>(resolve => {
       timer = setTimeout(() => resolve('timeout'), options.signalTeardownBudgetMs ?? SIGNAL_TEARDOWN_BUDGET_MS)
     })
-    // The extra stops start now, beside the sandbox teardown, so both fit the one budget.
-    signalStopRuns.push(...signalStops.map(runSignalStop))
-    const outcome = await Promise.race([releaseRef().catch(() => 'failed' as const), timedOut])
+    // The extra stops start now, beside the sandbox teardown, so both fit the one budget. What the run holds that a pending read
+    // could otherwise strand (a review receipt) is given back with them.
+    signalStopRuns.push(...signalStops.map(runSignalStop), ...startCancellationCleanups())
+    const releasing = releaseRef().catch(() => 'failed' as const)
+    // The export starts beside the teardown and is never waited for: the process is re-raised when the teardown settles, exactly
+    // when it always was, and what has not reached the collector by then is lost.
+    if (options.signalTrace !== undefined) startTraceExport(options.signalTrace).catch(() => undefined)
+    const outcome = await Promise.race([releasing, timedOut])
     // Whatever budget is left is theirs too, those registered while the teardown ran included; the sandbox's outcome above
     // is decided without them. With none registered there is nothing to wait for and nothing new on this path.
     if (signalStopRuns.length > 0) await Promise.race([settleSignalStops(), timedOut])
@@ -1137,13 +1188,14 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
         ...agentPath.split(path.delimiter),
         ...toolLocations.flatMap(([, resolved]) => (resolved === '' ? [] : [resolved])),
       ])
-      const launchPath = reachablePath(agentPath, reachable)
+      const launchPath = reachablePath(agentPath, reachable, input.traceSpan)
       const passedToolLocations = Object.fromEntries(toolLocations.filter(([, resolved]) => reachable.has(resolved)))
       const droppedToolLocations = toolLocations
         .filter(([, resolved]) => !reachable.has(resolved))
         .map(([name]) => name)
       if (droppedToolLocations.length > 0) {
         logger.info('Tool locations the agent cannot use were not passed to it', {names: droppedToolLocations})
+        input.traceSpan?.addEvent('tool-locations.dropped', {names: droppedToolLocations.join(',')})
       }
 
       const extraEnv: Record<string, string> = {
@@ -1308,10 +1360,17 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
     return new Set(result.stdout.split('\n').filter(line => line.length > 0))
   }
 
-  function reachablePath(candidate: string, reachable: ReadonlySet<string>): string {
+  function reachablePath(candidate: string, reachable: ReadonlySet<string>, traceSpan?: LifecycleSpan): string {
     const dirs = candidate.split(path.delimiter)
     const dropped = dirs.filter(dir => !reachable.has(dir))
-    if (dropped.length > 0) logger.info('Sandbox PATH left out directories the agent cannot enter', {dropped})
+    if (dropped.length > 0) {
+      logger.info('Sandbox PATH left out directories the agent cannot enter', {dropped})
+      // The directory names come from the runner's PATH, which is outside input: free text, scrubbed and capped at export.
+      traceSpan?.addEvent('path.dropped', {
+        count: String(dropped.length),
+        entries: freeText(dropped.join(path.delimiter), 'path-entries'),
+      })
+    }
     return dirs.filter(dir => reachable.has(dir)).join(path.delimiter)
   }
 

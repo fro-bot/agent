@@ -7,6 +7,7 @@
 import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
 import type {BranchResult, CreateBranchOptions} from './types.js'
+import {assertRunNotCancelled} from '../../shared/cancellation.js'
 import {toErrorMessage} from '../../shared/errors.js'
 
 /**
@@ -31,6 +32,7 @@ export async function createBranch(
 
   const baseSha = baseRef.object.sha
 
+  assertRunNotCancelled('the branch')
   try {
     await octokit.rest.git.createRef({
       owner,
@@ -107,6 +109,7 @@ export async function deleteBranch(
 ): Promise<void> {
   logger.info('Deleting branch', {branchName})
 
+  assertRunNotCancelled('the branch removal')
   await octokit.rest.git.deleteRef({
     owner,
     repo,

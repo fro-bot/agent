@@ -1,8 +1,10 @@
 import type {CredentialDisposition, ResponseDelivery, ResponseFilePathCandidates} from '@fro-bot/runtime'
 import type {EnsureOpenCodeResult} from '../../features/agent/types.js'
 import type {SandboxToolPaths} from '../../services/setup/sandbox-preflight.js'
+import type {LifecycleSpan} from '../../shared/lifecycle-tracer.js'
 import type {Logger} from '../../shared/logger.js'
-import type {ActionInputs} from '../../shared/types.js'
+import type {SecretRegistry} from '../../shared/secret-registry.js'
+import type {ActionInputs, TracingInputs} from '../../shared/types.js'
 import * as crypto from 'node:crypto'
 import * as fs from 'node:fs/promises'
 import * as path from 'node:path'
@@ -25,7 +27,7 @@ import {createLogger} from '../../shared/logger.js'
 import {parseActionInputs} from '../config/inputs.js'
 import {STATE_KEYS} from '../config/state-keys.js'
 import {recordRunGhConfigDir} from './gh-config.js'
-import {createSandboxLifecycle, type SandboxLifecycle} from './sandbox-lifecycle.js'
+import {createSandboxLifecycle, type SandboxLifecycle, type SandboxSignalTrace} from './sandbox-lifecycle.js'
 
 export interface BootstrapPhaseResult {
   readonly inputs: ActionInputs
@@ -67,10 +69,28 @@ export interface BootstrapPhaseResult {
   readonly sandbox?: SandboxLifecycle | null
 }
 
-export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPhaseResult | null> {
+/** What the run hands bootstrap beyond its logger. Every field is optional: a caller with none gets the plain behaviour. */
+export interface BootstrapOptions {
+  /** The run's secret registry: every input mask goes through it. */
+  readonly registry?: SecretRegistry
+  /** The trace inputs `run` already read, masked and removed from the environment. Absent: bootstrap reads them. */
+  readonly tracing?: TracingInputs
+  /** The bootstrap span: the installs are its children. */
+  readonly traceSpan?: LifecycleSpan
+  /** What the lifecycle trace does when a signal reaches the sandbox's handler. Only an isolated run has one. */
+  readonly signalTrace?: SandboxSignalTrace
+}
+
+export async function runBootstrap(
+  bootstrapLogger: Logger,
+  bootstrapOptions: BootstrapOptions = {},
+): Promise<BootstrapPhaseResult | null> {
   // The isolated agent's `PATH` is built from this, read before setup's `core.addPath` prepends the OpenCode directory.
   const runnerPath = process.env.PATH
-  const inputsResult = parseActionInputs()
+  const inputsResult = parseActionInputs({
+    ...(bootstrapOptions.registry === undefined ? {} : {registry: bootstrapOptions.registry}),
+    ...(bootstrapOptions.tracing === undefined ? {} : {tracing: bootstrapOptions.tracing}),
+  })
 
   if (!inputsResult.success) {
     core.setFailed(`Invalid inputs: ${inputsResult.error.message}`)
@@ -148,7 +168,10 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
       systematicConfig: inputs.systematicConfig,
       credential,
     },
-    createRuntimeSetupAdapter({recordGhConfigDir: recordRunGhConfigDir}),
+    createRuntimeSetupAdapter({
+      recordGhConfigDir: recordRunGhConfigDir,
+      ...(bootstrapOptions.traceSpan === undefined ? {} : {traceSpan: bootstrapOptions.traceSpan}),
+    }),
   )
 
   logger.info('OpenCode ready', {version: opencodeResult.version})
@@ -181,6 +204,7 @@ export async function runBootstrap(bootstrapLogger: Logger): Promise<BootstrapPh
       // `opencodeResult.path` is the executable setup resolved; the agent's `PATH` wants its directory.
       path.isAbsolute(opencodeResult.path) ? path.dirname(opencodeResult.path) : null,
       inputs.agentStateHome,
+      bootstrapOptions.signalTrace,
     ),
   }
 }
@@ -192,6 +216,7 @@ function createRunSandbox(
   runnerPath: string | undefined,
   opencodeDirectory: string | null,
   agentStateHome: string | null,
+  signalTrace: SandboxSignalTrace | undefined,
 ): SandboxLifecycle | null {
   if (tools === null) return null
   const runnerTemp = process.env.RUNNER_TEMP?.trim() ?? ''
@@ -209,6 +234,7 @@ function createRunSandbox(
         : buildAttachmentDir({runnerTemp, runId: getGitHubRunId(), runAttempt: getGitHubRunAttempt()}),
     logger: createLogger({phase: 'sandbox'}),
     recordState: state => core.saveState(STATE_KEYS.SANDBOX_STATE, state),
+    ...(signalTrace === undefined ? {} : {signalTrace}),
   })
 }
 

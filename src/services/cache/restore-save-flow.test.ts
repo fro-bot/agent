@@ -10,6 +10,7 @@ import {DatabaseSync} from 'node:sqlite'
 import {fileURLToPath} from 'node:url'
 import * as core from '@actions/core'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import {createRecordingTracer} from '../../shared/lifecycle-tracer.testing.js'
 import {err, ok} from '../../shared/types.js'
 import {restoreCache, saveCache, type CacheAdapter, type RestoreCacheOptions, type SaveCacheOptions} from './index.js'
 import {buildCachePathsV1Sqlite} from './paths.js'
@@ -887,5 +888,155 @@ describe('restore/save flow: V2 keys first, V1 as the restore fallback', () => {
       expect(result).toMatchObject({hit: true, source: 'storage'})
       await expect(fs.readFile(dbPath, 'utf8')).resolves.toBe('first-v2-run')
     })
+  })
+})
+
+describe('restore tiers in the lifecycle trace', () => {
+  const v2BranchKey = 'opencode-v2-storage-github-owner-repo-main-'
+  const v1ObjectKey = 'fro-bot-state/github/owner/repo/sessions/opencode.db'
+  let tempDir: string
+  let storagePath: string
+  let authPath: string
+
+  beforeEach(async () => {
+    vi.stubEnv('GITHUB_RUN_ATTEMPT', '1')
+    vi.stubEnv('GITHUB_JOB', '')
+    vi.stubEnv('INPUT_MATRIX-CONTEXT', '')
+    tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'restore-tracing-'))
+    storagePath = path.join(tempDir, 'workspace', 'storage')
+    authPath = path.join(tempDir, 'auth.json')
+  })
+
+  afterEach(async () => {
+    vi.unstubAllEnvs()
+    await fs.rm(tempDir, {recursive: true, force: true})
+  })
+
+  const tiersOf = (
+    exported: readonly {name: string; attributes: Readonly<Record<string, unknown>>}[],
+  ): [string, string, string][] =>
+    exported
+      .filter(span => span.name === 'cache restore tier')
+      .map(span => [
+        String(span.attributes['fro_bot.cache.tier']),
+        String(span.attributes['fro_bot.outcome']),
+        String(span.attributes['fro_bot.reason']),
+      ])
+
+  async function restoreTraced(options: {
+    readonly cache: CacheAdapter
+    readonly store?: ObjectStoreAdapter
+    readonly skipCache?: boolean
+  }) {
+    const {tracer, exported} = createRecordingTracer()
+    const phase = tracer.startSpan('cache restore')
+    const result = await restoreCache({
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      cacheAdapter: options.cache,
+      ...(options.store === undefined ? {} : {storeConfig: testStoreConfig, storeAdapter: options.store}),
+      ...(options.skipCache === true ? {skipCache: true} : {}),
+      traceSpan: phase,
+    })
+    phase.end()
+    tracer.root.end()
+    await tracer.flush()
+    return {
+      tiers: tiersOf(exported),
+      parents: exported.filter(span => span.name === 'cache restore tier').map(span => span.parentSpanId),
+      result,
+    }
+  }
+
+  it('reports miss, miss, hit for S3 V2, S3 V1 and an Actions cache hit, each a child of the restore span', async () => {
+    // #given an empty bucket and an Actions cache that hits
+    const cache = createTieredCacheAdapter({[v2BranchKey]: 'opencode-v2-storage-github-owner-repo-main-Linux-1-1'})
+    await fs.mkdir(storagePath, {recursive: true})
+
+    // #when
+    const {tiers, parents, result} = await restoreTraced({
+      cache: cache.adapter,
+      store: createInMemoryStoreAdapter().adapter,
+    })
+
+    // #then
+    expect(result).toMatchObject({hit: true, source: 'cache'})
+    expect(tiers).toEqual([
+      ['s3-v2', 'succeeded', 'miss'],
+      ['s3-v1', 'succeeded', 'miss'],
+      ['actions-cache', 'succeeded', 'hit'],
+    ])
+    expect(new Set(parents).size).toBe(1)
+    expect(parents[0]).toBeDefined()
+  })
+
+  it('reports one tier for an S3 hit, and never consults the Actions cache', async () => {
+    // #given a V2 object in the bucket
+    const store = createInMemoryStoreAdapter({
+      initialObjects: new Map([['fro-bot-state/github/owner/repo/sessions-v2/opencode.db', Buffer.from('v2-db')]]),
+    })
+    const cache = createTieredCacheAdapter()
+
+    // #when
+    const {tiers} = await restoreTraced({cache: cache.adapter, store: store.adapter})
+
+    // #then
+    expect(tiers).toEqual([['s3-v2', 'succeeded', 'hit']])
+    expect(cache.restoreCache).not.toHaveBeenCalled()
+  })
+
+  it('reports an S3 V1 hit after an S3 V2 miss as two tiers', async () => {
+    // #given only a V1 object
+    const store = createInMemoryStoreAdapter({initialObjects: new Map([[v1ObjectKey, Buffer.from('v1-db')]])})
+
+    // #when
+    const {tiers} = await restoreTraced({cache: createTieredCacheAdapter().adapter, store: store.adapter})
+
+    // #then
+    expect(tiers).toEqual([
+      ['s3-v2', 'succeeded', 'miss'],
+      ['s3-v1', 'succeeded', 'hit'],
+    ])
+  })
+
+  it('has no S3 spans when the object store is disabled', async () => {
+    // #given no object store and a cache miss
+    await fs.mkdir(storagePath, {recursive: true})
+
+    // #when
+    const {tiers} = await restoreTraced({cache: createTieredCacheAdapter().adapter})
+
+    // #then only the Actions cache was a tier
+    expect(tiers).toEqual([['actions-cache', 'succeeded', 'miss']])
+  })
+
+  it('reports a corrupted Actions cache entry as corrupted', async () => {
+    // #given an entry that restores, but leaves no storage directory behind
+    const cache = createTieredCacheAdapter({[v2BranchKey]: 'opencode-v2-storage-github-owner-repo-main-Linux-1-1'})
+
+    // #when
+    const {tiers, result} = await restoreTraced({cache: cache.adapter})
+
+    // #then
+    expect(result).toMatchObject({hit: false, corrupted: true})
+    expect(tiers).toEqual([['actions-cache', 'succeeded', 'corrupted']])
+  })
+
+  it('has no tier spans when the cache is skipped, and none when no span was given', async () => {
+    // #given
+    const skipped = await restoreTraced({cache: createTieredCacheAdapter().adapter, skipCache: true})
+    const untraced = await restoreCache({
+      components: testComponents,
+      logger: createTestLogger(),
+      storagePath,
+      authPath,
+      cacheAdapter: createTieredCacheAdapter().adapter,
+    })
+
+    // #then
+    expect(skipped.tiers).toEqual([])
+    expect(untraced).toMatchObject({hit: false})
   })
 })

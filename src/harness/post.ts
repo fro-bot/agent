@@ -1,4 +1,5 @@
 import type {ObjectStoreConfig} from '@fro-bot/runtime'
+import type {LifecycleSpan, SpanResult} from '../shared/lifecycle-tracer.js'
 import type {Logger} from '../shared/logger.js'
 import * as path from 'node:path'
 import process from 'node:process'
@@ -9,6 +10,7 @@ import {uploadLogArtifact} from '../services/artifact/index.js'
 import {buildCacheKeyComponents, saveCache} from '../services/cache/index.js'
 import {removeGhConfigDir} from '../services/setup/gh-config-dir.js'
 import {parseCacheSaveStateValue} from '../shared/cache-save-result.js'
+import {cacheSaveSpanResult} from '../shared/cache-save-span.js'
 import {
   getGitHubRepository,
   getGitHubRunAttempt,
@@ -24,9 +26,32 @@ import {createLogger} from '../shared/logger.js'
 import {STATE_KEYS} from './config/state-keys.js'
 import {LOCK_RELEASE_TIMEOUT_MS, releaseActionLockIfHeld, runWithDeadline} from './phases/acquire-lock.js'
 import {resolveLogReadPath} from './phases/log-snapshot.js'
+import {startPostTrace} from './post-trace.js'
 
 export interface PostOptions {
   logger?: Logger
+  /** How long the trace export waits for the collector. Default: the tracer's own bound. */
+  flushBoundMs?: number
+}
+
+export interface PostResult {
+  /**
+   * True when this step sent (or tried to send) a span. The collector's retry timer can then outlive the work, so the entry
+   * point ends the process itself once `runPost` returns. False leaves the process to end as it always did.
+   */
+  readonly traced: boolean
+}
+
+/** What post decided, for its span: one of retry-save, skip or safety-skip, and how it ended. */
+interface PostOutcome {
+  result: SpanResult
+}
+
+type PostAction = 'retry-save' | 'safety-skip' | 'skip'
+
+function decide(span: LifecycleSpan, outcome: PostOutcome, action: PostAction, result: SpanResult): void {
+  span.setAttribute('fro_bot.post.action', action)
+  outcome.result = result
 }
 
 function readOptionalState(key: string): string | undefined {
@@ -109,21 +134,40 @@ async function releaseOrphanedLock(logger: Logger): Promise<void> {
   }
 }
 
+/** The post step. Resolves with nothing; `runPostStep` says whether a span was sent, for the entry point. */
 export async function runPost(options: PostOptions = {}): Promise<void> {
+  await runPostStep(options)
+}
+
+export async function runPostStep(options: PostOptions = {}): Promise<PostResult> {
   const logger = options.logger ?? createLogger({phase: 'post'})
+  // First of everything: the trace inputs are read, masked and removed before anything below can fail. A step with no trace
+  // record, or with tracing off, gets a no-op and says nothing.
+  const trace = startPostTrace({
+    logger,
+    ...(options.flushBoundMs === undefined ? {} : {flushBoundMs: options.flushBoundMs}),
+  })
+  // What the span ends with unless a branch below says otherwise: a throw out of the save logic.
+  const outcome: PostOutcome = {result: {outcome: 'failed', reason: 'exception'}}
 
   // The lock is not renewed in this process and may already have expired, so holding it does not protect any
   // write below, which is why the persistence retry never publishes the session to the object store (only the
   // Actions cache). The release only frees a lock this run still owns, and runs after that work finishes or throws.
   try {
-    await persistRunState(logger)
+    await persistRunState(logger, trace.span, outcome)
   } finally {
     try {
       await releaseOrphanedLock(logger)
     } finally {
-      await removeOrphanedGhConfigDir(logger)
+      try {
+        await removeOrphanedGhConfigDir(logger)
+      } finally {
+        // After everything else, so the export is the last thing this step waits for, and a throw above still sends the span.
+        await trace.finish(outcome.result)
+      }
     }
   }
+  return {traced: trace.enabled}
 }
 
 /**
@@ -153,7 +197,7 @@ async function removeOrphanedGhConfigDir(logger: Logger): Promise<void> {
 const SANDBOX_LOGS_SKIPPED =
   'Skipping the log upload: this isolate-agent run has no log snapshot from a confirmed sandbox take-back, so the shared log directory is not read'
 
-async function persistRunState(logger: Logger): Promise<void> {
+async function persistRunState(logger: Logger, span: LifecycleSpan, outcome: PostOutcome): Promise<void> {
   const shouldSaveCache = core.getState(STATE_KEYS.SHOULD_SAVE_CACHE)
   // parseCacheSaveStateValue treats an absent key (main step crashed before cleanup ran)
   // or an unrecognized value (e.g. 'true' from an older action version, or corrupted
@@ -178,6 +222,8 @@ async function persistRunState(logger: Logger): Promise<void> {
     snapshotPath: core.getState(STATE_KEYS.LOG_SNAPSHOT_DIR) || null,
   })
 
+  span.setAttribute('fro_bot.cache.state', cacheSaved)
+
   logger.debug('Post-action state', {
     shouldSaveCache,
     cacheSaved,
@@ -187,6 +233,7 @@ async function persistRunState(logger: Logger): Promise<void> {
 
   if (shouldSaveCache !== 'true') {
     logger.info('Skipping post-action: event was not processed', {shouldSaveCache})
+    decide(span, outcome, 'skip', {outcome: 'skipped', reason: 'event-not-processed'})
     return
   }
 
@@ -210,6 +257,10 @@ async function persistRunState(logger: Logger): Promise<void> {
           ? 'state persisted to the object store by main action'
           : 'main action skipped the save'
     logger.info(`Skipping post-action: ${skipReason}`, {cacheSaved})
+    decide(span, outcome, 'skip', {
+      outcome: 'skipped',
+      reason: cacheSaved === 'skipped' ? 'main-skipped' : `saved-${cacheSaved}`,
+    })
   } else if (cacheSaved === 'declined-for-safety') {
     // runCleanup's persistence safety gate declined the save because it could not confirm
     // no other writer could still be touching this session's state (unresolved background
@@ -230,6 +281,7 @@ async function persistRunState(logger: Logger): Promise<void> {
     logger.info('Skipping post-action: honoring persistence safety decline from main action, not retrying', {
       cacheSaved,
     })
+    decide(span, outcome, 'safety-skip', {outcome: 'skipped', reason: 'persistence-declined'})
     await writeCacheSaveResultSummary(
       {cachePersisted: false, storePersisted: false, outcome: 'ownership-declined'},
       'post-skip-safety',
@@ -245,6 +297,7 @@ async function persistRunState(logger: Logger): Promise<void> {
       'Skipping post-action save: this run used isolate-agent and the main step did not confirm the sandbox was stopped and restored',
       {cacheSaved},
     )
+    decide(span, outcome, 'safety-skip', {outcome: 'skipped', reason: 'sandbox-unconfirmed'})
     await writeCacheSaveResultSummary(
       {cachePersisted: false, storePersisted: false, outcome: 'ownership-declined'},
       'post-skip-safety',
@@ -256,7 +309,10 @@ async function persistRunState(logger: Logger): Promise<void> {
     // that died after arming this hook (before cleanup) leaves them as the only record of the run.
     if (skipCache) {
       logger.info('Skipping post-action session save: skip-cache was set', {cacheSaved})
+      decide(span, outcome, 'skip', {outcome: 'skipped', reason: 'skip-cache'})
     } else {
+      const saveSpan = span.startChild('cache save retry')
+      decide(span, outcome, 'retry-save', {outcome: 'failed', reason: 'save-failed'})
       try {
         // No shutdown()/quiescence wait happens here, unlike cleanup.ts. There is no
         // OpenCodeServerHandle in this process at all -- runPost is the Action's separate
@@ -311,6 +367,10 @@ async function persistRunState(logger: Logger): Promise<void> {
         }
 
         const saveResult = await saveCache(cacheSaveOptions)
+        // The retried save's result is the run's final save result: on the child span, on the post span, and as its own key.
+        saveSpan.end(cacheSaveSpanResult(saveResult))
+        span.setAttribute('fro_bot.cache.save_result', saveResult.outcome)
+        outcome.result = cacheSaveSpanResult(saveResult)
 
         // The post hook cannot set `cache-save-result`: GitHub Actions `runs.post:` steps run
         // after every other step in the job, so no downstream step could ever read it even if
@@ -340,10 +400,13 @@ async function persistRunState(logger: Logger): Promise<void> {
         logger.warning('Post-action cache save failed (non-fatal)', {
           error: toErrorMessage(error),
         })
+        saveSpan.recordException(error)
+        saveSpan.end({outcome: 'failed', reason: 'save-failed'})
       }
     }
 
     if (storeConfig?.enabled === true) {
+      const syncSpan = span.startChild('object store sync')
       try {
         const objectStoreLogger = createLogger({phase: 'post-object-store'})
         const adapter = createS3Adapter(storeConfig, objectStoreLogger)
@@ -375,10 +438,13 @@ async function persistRunState(logger: Logger): Promise<void> {
         } else {
           await syncArtifactsToStore(adapter, storeConfig, 'github', repo, runId, logPath, objectStoreLogger)
         }
+        syncSpan.end({outcome: 'succeeded'})
       } catch (error) {
         logger.warning('Post-action object store sync failed (non-fatal)', {
           error: toErrorMessage(error),
         })
+        syncSpan.recordException(error)
+        syncSpan.end({outcome: 'failed', reason: 'sync-failed'})
       }
     }
   }
@@ -388,6 +454,7 @@ async function persistRunState(logger: Logger): Promise<void> {
   } else if (isOpenCodePromptArtifactEnabled() && logPath !== null) {
     const artifactUploaded = core.getState(STATE_KEYS.ARTIFACT_UPLOADED)
     if (artifactUploaded !== 'true') {
+      const uploadSpan = span.startChild('artifact upload')
       try {
         const artifactLogger = createLogger({phase: 'post-artifact-upload'})
         await uploadLogArtifact({
@@ -397,10 +464,13 @@ async function persistRunState(logger: Logger): Promise<void> {
           invocationIdentity: getInvocationIdentity(),
           logger: artifactLogger,
         })
+        uploadSpan.end({outcome: 'succeeded'})
       } catch (error) {
         logger.warning('Post-action artifact upload failed (non-fatal)', {
           error: toErrorMessage(error),
         })
+        uploadSpan.recordException(error)
+        uploadSpan.end({outcome: 'failed', reason: 'upload-failed'})
       }
     }
   }

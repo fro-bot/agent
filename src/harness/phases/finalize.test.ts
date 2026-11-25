@@ -216,6 +216,61 @@ describe('runFinalize file-convention delivery', () => {
     expect(mocks.setFailed).not.toHaveBeenCalled()
   })
 
+  it('records the response post as a child of the finalize span, failed with the reason when it is not delivered', async () => {
+    // #given a file-convention run whose response post is refused, under a recording tracer
+    const {createRecordingTracer, spanNamed} = await import('../../shared/lifecycle-tracer.testing.js')
+    const {tracer, exported} = createRecordingTracer()
+    const finalizeSpan = tracer.startSpan('finalize')
+    mocks.runResponsePost.mockResolvedValue({delivered: false, reason: 'post-failed'})
+
+    // #when
+    await runFinalizeWithResult(
+      createBootstrap(),
+      createRouting(),
+      cacheRestore,
+      createExecution(),
+      createMetrics(),
+      Date.now(),
+      createMockLogger(),
+      {traceSpan: finalizeSpan},
+    )
+    finalizeSpan.end()
+    tracer.root.end()
+    await tracer.flush()
+
+    // #then
+    const post = spanNamed(exported, 'response post')
+    expect(post.parentSpanId).toBe(spanNamed(exported, 'finalize').spanId)
+    expect(post.attributes['fro_bot.outcome']).toBe('failed')
+    expect(post.attributes['fro_bot.reason']).toBe('post-failed')
+  })
+
+  it('records a delivered response post as succeeded', async () => {
+    // #given
+    const {createRecordingTracer, spanNamed} = await import('../../shared/lifecycle-tracer.testing.js')
+    const {tracer, exported} = createRecordingTracer()
+    const finalizeSpan = tracer.startSpan('finalize')
+    mocks.runResponsePost.mockResolvedValue({delivered: true, kind: 'comment'})
+
+    // #when
+    await runFinalizeWithResult(
+      createBootstrap(),
+      createRouting(),
+      cacheRestore,
+      createExecution(),
+      createMetrics(),
+      Date.now(),
+      createMockLogger(),
+      {traceSpan: finalizeSpan},
+    )
+    finalizeSpan.end()
+    tracer.root.end()
+    await tracer.flush()
+
+    // #then
+    expect(spanNamed(exported, 'response post').attributes['fro_bot.outcome']).toBe('succeeded')
+  })
+
   it('returns the final delivery kind and publishes it for review delivery', async () => {
     // #given a successful file-convention response that was delivered as a review
     const bootstrap = createBootstrap()

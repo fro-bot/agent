@@ -130,7 +130,7 @@ The Action no longer runs V1. A V1 `opencode-version` (a stock 1.x version or a 
 
 `src/services/setup/opencode.ts` verifies stock V2 archives against the asset digests recorded in `packages/runtime/src/shared/opencode-v2-pin.json`. An unrecorded V2 version or missing digest fails closed, as does a mismatched download; V2 does not silently fall back to a V1 binary. Linux uses tar archives and macOS uses zip archives; the workspace image selects the matching Linux musl asset.
 
-V2 installs both Systematic and `@fro.bot/opencode-plugin` (`0.2.0`). The latter supplies the four session-history tools, the subagent-session reuse guard and, when `trace-endpoint` is set, the run's [trace](#tracing-a-run). `plugin-install-v2.ts` performs bounded preparation outside the real session database. `src/harness/phases/v2-server.ts` checks both exact plugin specs before every spawn. A warm plugin cache makes this a cheap check; a missing plugin uses the bounded installer before the shorter server-readiness deadline begins. Failed preparation or an inactive required plugin prevents execution.
+V2 installs both Systematic and `@fro.bot/opencode-plugin` (`0.3.0`). The latter supplies the four session-history tools, the subagent-session reuse guard and, when `trace-endpoint` is set, the run's [trace](#tracing-a-run). `plugin-install-v2.ts` performs bounded preparation outside the real session database. `src/harness/phases/v2-server.ts` checks both exact plugin specs before every spawn. A warm plugin cache makes this a cheap check; a missing plugin uses the bounded installer before the shorter server-readiness deadline begins. Failed preparation or an inactive required plugin prevents execution.
 
 Plugin activation has its own readiness gate in `packages/runtime/src/agent/server-v2.ts`. Since upstream 2.2.7, `/api/agent` can answer successfully while `/api/plugin` is still empty. The harness polls the plugin list for up to 60 seconds until every expected plugin is active; a listed failure stops the gate immediately. An HTTP-ready server is therefore not yet a runnable agent.
 
@@ -363,7 +363,23 @@ The messages of a request include the session's earlier history. So the first tr
 
 A trace can hold private repository content, text written by other people (issue and comment bodies, fetched web pages) and secrets. Treat the collector like a store of CI logs with secrets in them: limit who can read it and how long it keeps data.
 
-Every span also carries the session id, the repository, the run id and attempt, the job and the trigger. For Langfuse, every span repeats the root session's id as `langfuse.session.id`, so a session and its subagents show as one session, and the run identity as `langfuse.trace.metadata.*`. Other backends ignore these.
+Every span also carries the session id, the repository, the run id and attempt, the job, the trigger and the Action step's invocation id. For Langfuse, every span carries `langfuse.session.id` and the run identity as `langfuse.trace.metadata.*`. Other backends ignore these. In an Action run the session is the conversation: `<owner>/<repo>:<key>`, where the key is the issue, pull request or discussion, or the run itself for `schedule` and `workflow_dispatch`. A session id the scrubber would change is sent as `sha256:` and a hash instead. A local session uses the OpenCode root session's id. Turns exported before this release stay in Langfuse under the OpenCode root session id, while new Action turns use the qualified key, so a conversation that spans the upgrade shows as two sessions; every turn span carries `fro_bot.root_session.id`, the OpenCode root session id, to join them.
+
+### The run's own trace
+
+The Action also sends one trace per run of its own work, with service name `fro-bot-action`. Its root span `action.main` covers the main step. Under it are:
+
+- A span for each phase: bootstrap, routing, dedup, coordination lock, acknowledge, repo skills, trace relay start, cache restore, session prep, execution, release, isolation take-back, review reconciliation, finalize, cleanup and report.
+- Child spans for the slow work inside a phase: the OpenCode and plugin installs, each cache tier tried, the server start and isolation handoff, response posting and the cache save.
+- A `post` span from the post step, when it runs.
+
+Every span carries `fro_bot.outcome` (`succeeded`, `incomplete`, `failed`, `skipped` or `cancelled`) and `fro_bot.reason`. Errors set the span's error status and add an `exception` event. Decisions such as the dedup result, the lock result and each start gate are events.
+
+This trace carries what the run log shows for those phases: the repository, ref, run id, job, trigger and conversation key, outcomes, durations, and error messages. Error messages are scrubbed of every secret the Action holds and capped at 1,024 characters. If a known secret is too short or too long to match safely, the trace carries no free text at all. A secret the Action never received, such as a repository secret used by another step, is caught only if it has a recognisable shape. The trace carries no prompt, model output or tool content.
+
+It shares the session with the run's turn traces, and each turn's root span links to `action.main`. In Langfuse, a session shows every run of a conversation in order, each run's lifecycle trace beside its turns. In Tempo, the link leads from a turn to its run.
+
+A run that ends early has spans for every phase it reached, then cleanup and report. A cancelled run with `isolate-agent` marks the phase it was in and the root `cancelled`, and sends the spans it reached within its sandbox teardown window; whatever is not delivered by then is lost. The export prepares spans between turns of the event loop and, one second after the signal, drops the spans it has not prepared rather than delay the teardown. A cancelled run without `isolate-agent` sends no lifecycle trace and ends as it always did. A runner that is killed outright, including at a job timeout, sends nothing more. If a trace input is invalid, or `NODE_DEBUG` is set, the run is untraced.
 
 ### What a trace leaves out
 
@@ -391,6 +407,8 @@ The messages of each model request include the whole history sent to the model. 
 
 The Action starts a small relay process before the agent (`src/harness/phases/trace-relay-process.ts`). The relay holds the collector URL and credential, listens on a loopback port, and forwards trace batches to that one URL. The agent's server gets the relay port and run identity through a launcher-owned setting (`packages/runtime/src/agent/tracing-launcher.ts`), not through inherited workflow configuration. If the relay disappears before spawn, the launcher falls back to a non-tracing start.
 
+The Action itself also holds the credential, and sends its own trace directly from the main and post steps rather than through the relay.
+
 - With `isolate-agent: true`, the agent cannot read the collector credential.
 - Without it, the agent runs as the same user as the Action and can read the credential and every span. The run logs a warning saying so.
 
@@ -405,8 +423,10 @@ Tracing never fails or delays a run's result. The log has these lines, with coun
 - `Trace relay started`.
 - `Trace relay stopped`, with the batches the collector acknowledged, the batches to retry and the batches dropped, and the span totals the plugin reported with its last batch. `countIncomplete` means the server or the relay was killed before the counts were final.
 - A warning when the relay could not start or exited early. The run continues untraced.
+- `Lifecycle trace export finished`, with the run's span count and the spans in batches the collector did not acknowledge. It is a warning when that count is above zero, and the line adds `unprepared` when a cancelled run dropped spans it had no time to prepare. A string over its size cap is exported as `[omitted]` (or, for free text, as its category) with a reason in `fro_bot.content.omitted`, never cut. `Lifecycle trace export failed` means nothing could be sent.
+- A warning when `NODE_DEBUG` is set or the endpoint and credential were refused, saying lifecycle tracing is off.
 
-An acknowledged batch is the collector's HTTP answer. It is not proof that every span in it was stored.
+An acknowledged batch is the collector's HTTP answer. It is not proof that every span in it was stored. The span total the plugin reports is the count when its last batch started, so it leaves out the spans in that last batch.
 
 ### Other things to know
 

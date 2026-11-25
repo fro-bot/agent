@@ -1,0 +1,1 @@
+import{i as e,t}from"./rolldown-runtime-_8HjFqer.js";var n=/* @__PURE__ */ t((t=>{Object.defineProperty(t,"__esModule",{value:!0}),t.execAsync=void 0;let n=e(`child_process`);t.execAsync=e(`util`).promisify(n.exec)}));export{n as t};

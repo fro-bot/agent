@@ -64,6 +64,17 @@ export const STATE_KEYS = {
   LOCK_HOLDER_JOB: 'lockHolderJob',
   /** `acquisition_token` of that lock; the post hook releases only while the record still carries it. */
   LOCK_ACQUISITION_TOKEN: 'lockAcquisitionToken',
+  /**
+   * The lifecycle trace's identity, saved once before routing as JSON `{traceId, rootSpanId, invocationId}`: the three ids the
+   * post step needs to add its span to the main step's trace. Nothing else goes here, and never an input or a credential.
+   * Absent when the run is untraced.
+   */
+  LIFECYCLE_TRACE: 'lifecycleTrace',
+  /**
+   * The conversation's Langfuse session id (`<owner>/<repo>:<logical key>`), saved once after routing so the post step's span
+   * joins the same session. Not a credential. Absent for a run that failed before routing.
+   */
+  LIFECYCLE_SESSION: 'lifecycleSession',
   S3_ENABLED: 'storeConfig.enabled',
   S3_BUCKET: 'storeConfig.bucket',
   S3_REGION: 'storeConfig.region',

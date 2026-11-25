@@ -35,10 +35,12 @@ function exportsUnchanged(text: string, scrubber: Scrubber): boolean {
  *   form byte-identical;
  * - otherwise `undefined`: no session id, and the turn spans keep OpenCode's own session.
  *
- * An empty candidate names no conversation and gives `undefined`.
+ * An empty candidate names no conversation and gives `undefined`. So does an ill-formed one (a lone surrogate): UTF-8 encoding
+ * replaces each with U+FFFD, so `…\uD800` and `…\uD801` would hash to the same id and two conversations would share a session,
+ * and the exporter would write the candidate itself lossily too.
  */
 export function scrubSafeSessionId(candidate: string, scrubber: Scrubber): string | undefined {
-  if (candidate.length === 0) return undefined
+  if (candidate.length === 0 || !candidate.isWellFormed()) return undefined
   if (isUsableTracingField(candidate) && exportsUnchanged(candidate, scrubber)) return candidate
   const hashed = `sha256:${createHash('sha256').update(candidate, 'utf8').digest('hex').slice(0, HASH_HEX_CHARS)}`
   return exportsUnchanged(hashed, scrubber) ? hashed : undefined

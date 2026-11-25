@@ -7,6 +7,7 @@
 import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
 import type {CreatePROptions, GeneratePRBodyOptions, PRResult, UpdatePROptions} from './types.js'
+import {assertRunNotCancelled} from '../../shared/cancellation.js'
 
 /**
  * Create a pull request.
@@ -16,6 +17,7 @@ export async function createPullRequest(octokit: Octokit, options: CreatePROptio
 
   logger.info('Creating pull request', {head, base, draft})
 
+  assertRunNotCancelled('the pull request')
   const {data} = await octokit.rest.pulls.create({
     owner,
     repo,
@@ -88,6 +90,7 @@ export async function updatePullRequest(
     throw new Error('At least one of title or body must be provided for PR update')
   }
 
+  assertRunNotCancelled('the pull request update')
   const {data} = await octokit.rest.pulls.update({
     owner,
     repo,
@@ -119,6 +122,7 @@ export async function addPRLabels(
 ): Promise<void> {
   if (labels.length === 0) return
 
+  assertRunNotCancelled('the labels')
   await octokit.rest.issues.addLabels({
     owner,
     repo,
@@ -144,6 +148,7 @@ export async function requestReviewers(
 ): Promise<void> {
   if (reviewers.length === 0) return
 
+  assertRunNotCancelled('the review request')
   await octokit.rest.pulls.requestReviewers({
     owner,
     repo,

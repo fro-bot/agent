@@ -6,6 +6,7 @@ import process from 'node:process'
 import {createS3Adapter, getSessionDbBasenames, syncSessionsFromStore} from '@fro-bot/runtime'
 import {STORAGE_VERSION} from '../../shared/constants.js'
 import {toErrorMessage} from '../../shared/errors.js'
+import {NOOP_SPAN, withSpan} from '../../shared/lifecycle-tracer.js'
 import {buildPrimaryCacheKey, buildRestoreTiers, classifyRestoreHit, type RestoreTier} from './cache-key.js'
 import {
   buildCachePathsV1Sqlite,
@@ -152,6 +153,14 @@ async function deleteDownloadedObjectStoreWal(
   }
 }
 
+/** The lifecycle trace's name for one restore attempt, and the attribute that says which store it asked. */
+const TIER_SPAN = 'cache restore tier'
+const TIER_ATTRIBUTE = 'fro_bot.cache.tier'
+
+/** The cache status a tier reports: the Action's own `hit`, `miss` and `corrupted`. */
+const tierReason = (result: CacheResult): 'corrupted' | 'hit' | 'miss' =>
+  result.corrupted ? 'corrupted' : result.hit ? 'hit' : 'miss'
+
 async function restoreFromObjectStore(
   options: RestoreCacheOptions,
   generation: SessionGeneration,
@@ -265,7 +274,15 @@ async function restoreFromObjectStoreTiers(options: RestoreCacheOptions): Promis
   let corrupted = false
 
   for (const attempt of attempts) {
-    const result = await restoreFromObjectStore(options, attempt)
+    // A disabled object store has no tier to report: no span, so a run without S3 shows no S3 spans.
+    const tierSpan =
+      options.storeConfig?.enabled === true ? (options.traceSpan ?? NOOP_SPAN).startChild(TIER_SPAN) : NOOP_SPAN
+    tierSpan.setAttribute(TIER_ATTRIBUTE, `s3-${attempt}`)
+    const result = await withSpan(
+      tierSpan,
+      async () => restoreFromObjectStore(options, attempt),
+      restored => ({outcome: 'succeeded', reason: tierReason(restored)}),
+    )
     if (result.hit === true) {
       return result
     }
@@ -340,7 +357,7 @@ async function restoreFromCacheTiers(
 }
 
 export async function restoreCache(options: RestoreCacheOptions): Promise<CacheResult> {
-  const {components, logger, storagePath, authPath} = options
+  const {logger, storagePath} = options
 
   // The `skip-cache` input and the `SKIP_CACHE` variable are ORed so callers who set the variable keep their behavior.
   if (options.skipCache === true || process.env.SKIP_CACHE === 'true') {
@@ -362,6 +379,22 @@ export async function restoreCache(options: RestoreCacheOptions): Promise<CacheR
     return objectStoreResult
   }
 
+  const cacheSpan = (options.traceSpan ?? NOOP_SPAN).startChild(TIER_SPAN)
+  cacheSpan.setAttribute(TIER_ATTRIBUTE, 'actions-cache')
+  return withSpan(
+    cacheSpan,
+    async () => restoreFromActionsCache(options, plan, objectStoreResult),
+    restored => ({outcome: 'succeeded', reason: tierReason(restored)}),
+  )
+}
+
+/** The Actions-cache half of a restore, after the object store missed. Never throws: a failure is the object store's result. */
+async function restoreFromActionsCache(
+  options: RestoreCacheOptions,
+  plan: CacheRestorePlan,
+  objectStoreResult: CacheResult,
+): Promise<CacheResult> {
+  const {components, logger, storagePath, authPath} = options
   try {
     const tierHit = await restoreFromCacheTiers(options, plan)
 

@@ -42,7 +42,7 @@ All 26 origin requirements carry forward. R12 and R24 depend on Unit 1; if it fa
 - Gateway tracing, the job-summary trace link and native OpenCode telemetry stay out, as the origin says.
 - No change to how turn traces are shaped beyond the three launcher fields and the run link.
 - A forced kill, including a job-level timeout, loses spans not yet sent.
-- With tracing off, nothing about a run changes, including how a cancelled run stops, beyond the signal owner in Unit 6.
+- With tracing off, nothing about a run changes, including how a cancelled run stops. A run without `isolate-agent` keeps today's cancellation exactly and sends no lifecycle trace when cancelled; a run with it flushes only inside the sandbox teardown window it already has.
 
 ## Context & Research
 
@@ -162,13 +162,13 @@ All 26 origin requirements carry forward. R12 and R24 depend on Unit 1; if it fa
 - **The SDK serializer, not a hand-written encoder.** The plugin's serializer-plus-own-transport path is already proven against Langfuse and Tempo.
 - **The Action-only lifecycle tracer lives in `src/`.** Only the shared exporter and scrubber go to the runtime package. The tracer is a run-wide recorder held like `metrics`; a no-op tracer is the default.
 - **Trace inputs are read first.** One trace-input reader runs before bootstrap. It reads, masks, removes and validates the two inputs, and both the main and post steps use it. Bootstrap receives its result instead of re-reading the removed variables. A run whose trace inputs are missing or invalid is untraced from the start.
-- **The redaction set grows during the run, and fails closed.** `core.setSecret` can't be read back, and the server password and key-proxy values appear after the start. Every mask site calls one recording mask function that both masks and adds to the tracer's registry. The trace credential and its derived forms (the Bearer token, the Basic pair) are added. The registry is the tracer's own, built the same way in main and post, and doesn't depend on GitHub's log masking. The scrubber only matches literals of 8 to 4,096 characters, so when any registered value falls outside that range, the tracer exports no free text at all: error messages and ref names become their category.
+- **The redaction set grows during the run, and fails closed.** `core.setSecret` can't be read back, and the server password and key-proxy values appear after the start. Every mask site calls one recording mask function that both masks and adds to the tracer's registry. The trace credential and its derived forms (the Bearer token, the Basic pair) are added. The registry is the tracer's own, built the same way in main and post, and doesn't depend on GitHub's log masking. The scrubber matches literals of 8 to 65,536 characters (raised from 4,096 because runner tokens such as `ACTIONS_RUNTIME_TOKEN` are 4,152 characters), so when any registered value falls outside that range, the tracer exports no free text at all: error messages and ref names become their category.
 - **Spans are buffered and exported once.** Normal completion and a signal share one idempotent flush, and `main.ts` waits for it before exiting.
 - **IDs are minted at the start and saved as one state record.** The trace id, root span id and a random invocation id are saved before routing. Partial or invalid state in post means no telemetry. No credential or input ever goes into state.
 - **Outcomes reuse the existing values, plus `cancelled`.** `cancelled` is a tracing-only outcome for a signalled run. The Action's outputs and job summary are unchanged.
 - **The final writes get their own span.** The origin's R5 puts them under finalize, but they run after cleanup, so they become a `report` span after cleanup. The finalize phase span keeps its place before cleanup.
 - **The session is the repository-qualified logical key.** The logical key is repository-local (`issue-42`), so the Langfuse session id is `<owner>/<repo>:<logical key>`, bounded to Langfuse's 200 characters. The Action computes this one canonical session id and passes it to the plugin verbatim; neither exporter derives it. Lifecycle and turn traces use the same value. The OpenCode continuity key is unchanged. The key is computed right after routing; `RoutingPhaseSkip` keeps the trigger context so skipped runs get one too. Spans that ended before routing gain the session attribute at export. Run identity comes from the GitHub environment, so it exists from the first span.
-- **One signal owner for every run, without changing cancellation semantics.** It takes over the exec adapter's signal ownership from the sandbox handler. On a signal it sets a cancelled flag synchronously, and every irreversible write (a comment, review, approval, reaction or push) checks the flag at the point of submission and stops. The export starts at once with its own deadline. The owner re-raises when the sandbox teardown settles, as today, so the teardown keeps its 10 s budget and its safety-state write. The export never extends or shortens that.
+- **Cancellation goes through the sandbox's handler only.** There is no run-wide signal owner: a handler that keeps the process alive after a signal lets in-flight awaits resume (a prompt, a spawn, a receipt write), and each window needed its own patch. A run without `isolate-agent` installs no handler, so the exec adapter reaps its commands and re-raises as it always did, and no lifecycle trace is sent. A run with it uses the sandbox's existing handler, which on a signal marks the run cancelled synchronously (every irreversible write checks the flag at its point of submission), ends the open spans as `cancelled`, starts the export beside the teardown and gives back what the run holds (a review receipt). The signal is re-raised when the teardown settles, exactly when it is today; the export never extends that, and spans not delivered by then are lost.
 - **No launcher version negotiation.** The new plugin accepts the launcher document with or without the new fields. The Action sends them only in the change that pins the new plugin.
 - **Turns link to the root span.** The plugin starts before the execution span exists, and the root span id is known from the start.
 - **The post step rebuilds its own redaction set.** Its environment still holds the GitHub token, `auth-json` and the AWS keys, so it reads them into its set and exports scrubbed error text like main.
@@ -230,7 +230,7 @@ Early-exit span matrix (a trace never invents unreached phases):
 | Cache restore null | through cache restore, failed server start, cleanup, report | 1 |
 | Execution timeout | through execution (outcome `failed`, reason timeout), later phases reached, cleanup, report | 1 |
 | Sandbox not restored | through failed take-back, cleanup, report | 1 |
-| Signal | reached spans; current phase and root `cancelled` | by signal |
+| Signal | isolated: reached spans, current phase and root `cancelled`, inside the teardown window; not isolated: nothing sent | by signal |
 | Uncaught throw | reached spans, exception on its span, cleanup and report if reached | 1 |
 
 ## Implementation Units
@@ -258,7 +258,7 @@ Early-exit span matrix (a trace never invents unreached phases):
 
 - A recorded yes or no for inputs and for state, on both paths.
 
-- [ ] **Unit 2: Move the exporter and scrubber into the shared runtime**
+- [x] **Unit 2: Move the exporter and scrubber into the shared runtime**
 
 **Goal:** One implementation of OTLP export and scrubbing that the plugin and the Action both bundle, with no change to plugin behaviour.
 
@@ -294,7 +294,7 @@ Early-exit span matrix (a trace never invents unreached phases):
 
 - Plugin tests, the release import check and a packed install pass. The Action's `dist/` size delta is measured and recorded.
 
-- [ ] **Unit 3: Plugin launcher fields and the run link**
+- [x] **Unit 3: Plugin launcher fields and the run link**
 
 **Goal:** Turn traces use the session id the Action passes as their Langfuse session, carry the invocation id, and link to the run's root span. Plugin-only, released on its own.
 
@@ -326,7 +326,7 @@ Early-exit span matrix (a trace never invents unreached phases):
 
 - Plugin and runtime tests and the release dry run pass, then the release publishes.
 
-- [ ] **Unit 4: The lifecycle tracer**
+- [x] **Unit 4: The lifecycle tracer**
 
 **Goal:** A run-wide recorder that keeps spans, events and outcomes, scrubs at serialization with a set that grows during the run, and sends directly with a bounded wait.
 
@@ -358,7 +358,7 @@ Early-exit span matrix (a trace never invents unreached phases):
 - Edge case: tracing off produces no request and creates no exporter.
 - Edge case: a long exception message or ref name is scrubbed before it is cut, so a cut can't leave part of a secret.
 - Edge case: more than 128 literals are all redacted, not only the longest.
-- Edge case: a registered value shorter than 8 or longer than 4,096 characters makes the export carry categories instead of any free text.
+- Edge case: a registered value shorter than 8 or longer than 65,536 characters makes the export carry categories instead of any free text.
 - Error path: a canary secret placed in a span name, an attribute value, an event attribute, a status message and an exception message is absent from every position of the request body, raw and JSON-escaped.
 - Error path: a literal registered after spans were recorded is redacted at flush.
 - Error path: the trace credential and its Bearer and Basic forms never appear in a request body or a log line.
@@ -376,7 +376,7 @@ Early-exit span matrix (a trace never invents unreached phases):
 
 - Unit tests pass. Unit 9 confirms the output against a real receiver.
 
-- [ ] **Unit 5: Read trace inputs first and instrument the run**
+- [x] **Unit 5: Read trace inputs first and instrument the run**
 
 **Goal:** The tracer exists before bootstrap, every mask site records into it, every phase and the listed inner work opens and closes spans, and early exits match the matrix.
 
@@ -419,9 +419,9 @@ Early-exit span matrix (a trace never invents unreached phases):
 
 - Focused tests pass, and the whole `run()` suite is unchanged with tracing off.
 
-- [ ] **Unit 6: One signal owner for every run**
+- [x] **Unit 6: Cancellation through the sandbox's handler**
 
-**Goal:** A cancelled run flushes what it reached, isolated or not, without delaying the sandbox teardown.
+**Goal:** A cancelled isolated run flushes what it reached inside its teardown window without delaying it. A cancelled run without isolation is untouched.
 
 **Requirements:** R11, R22.
 
@@ -429,35 +429,34 @@ Early-exit span matrix (a trace never invents unreached phases):
 
 **Files:**
 
-- Create: `src/harness/signal-owner.ts`.
-- Modify: `src/harness/run.ts`, `src/main.ts`, `src/harness/phases/sandbox-lifecycle.ts` (register with the owner instead of installing handlers), `src/services/setup/adapters.ts` (signal ownership moves to the owner), and the submission points in `src/features/comments/writer.ts`, `src/features/reviews/reviewer.ts` and the reaction and label writers.
-- Test: `src/harness/signal-owner.test.ts`; updates to `src/harness/phases/sandbox-signal.test.ts` and `src/harness/phases/sandbox-signal.fixture.ts`.
+- Modify: `src/harness/run.ts`, `src/harness/phases/bootstrap.ts`, `src/harness/phases/sandbox-lifecycle.ts` (the handler marks the run cancelled, ends the spans and starts the export beside the teardown), `src/shared/cancellation.ts`, and the submission points in `src/features/comments/writer.ts`, `src/features/reviews/reviewer.ts` and the reaction and label writers.
+- Test: `src/harness/signal-cancel.test.ts` (real signals, with `signal-cancel.fixture.ts`); `src/harness/phases/sandbox-lifecycle.test.ts`.
 
 **Approach:**
 
-- One SIGINT/SIGTERM handler is installed at the start of `run()` and holds the exec adapter's signal ownership until the final flush. Sandbox teardown and the flush register with it.
-- On a signal, the owner sets the cancelled flag synchronously, ends the current phase span and the root as `cancelled`, and starts the flush with its own deadline before SIGTERM at 7.5 s. It re-raises when the sandbox teardown settles (isolated) or at once after the flush deadline (non-isolated), never earlier than today.
-- Irreversible writes check the flag at the point of submission: comment and review posting, the approval, reactions and labels, and pushes.
-- Normal completion and a signal share the tracer's one flush. `main.ts` waits for it before `process.exit`.
+- No handler is installed for a run without `isolate-agent`. The exec adapter's own signal handling stays as it is on main, and `src/services/setup/adapters.ts` is untouched.
+- The sandbox's existing handler, on a signal: marks the run cancelled synchronously, ends the current phase span and the root as `cancelled`, starts the export one event-loop turn later (so the teardown's first steps go first) and gives back what the run holds. It re-raises when the teardown settles, never later than today. The export is not waited for.
+- Irreversible writes, the server start, the session request and each prompt attempt check the cancelled flag at the point of submission; a refused phase of `run()` unwinds to the teardown phases, which are never refused.
+- Normal completion and a signal share the tracer's one flush.
 - The isolated teardown's 10 s budget and ordering are unchanged.
 
 **Execution note:** Test real signal delivery with the existing sandbox signal fixture.
 
 **Test scenarios:**
 
-- Happy path: SIGINT during a long-running child command on a non-isolated run reaps the child, flushes once with the running phase `cancelled`, and exits by the signal.
-- Happy path: the same on an isolated run also completes the sandbox teardown, with unchanged timing.
-- Edge case: a second signal during the flush doesn't start a second flush.
-- Edge case: normal completion racing a signal flushes exactly once and the process doesn't exit before the flush settles or its deadline.
-- Error path: a collector that never answers doesn't push the exit past the deadline.
-- Error path: a signal while a pre-approval GitHub read is in flight and the collector stalls: no approval or comment is submitted after the signal, and the sandbox teardown keeps its 10 s budget.
+- Happy path: SIGINT during a long-running child command on a run without isolation reaps the child and ends by the signal at once, with no export and no handler of the run's own.
+- Happy path: the same on an isolated run completes the sandbox teardown with unchanged timing, starts the export beside it, and delivers the reached spans (current phase and root `cancelled`).
+- Edge case: a second signal doesn't start a second export or a second teardown.
+- Error path: a collector that never answers doesn't push the re-raise past the teardown settling; the spans are lost.
+- Error path: a signal while a pre-approval GitHub read is in flight on an isolated run: no approval or comment is submitted after the signal, and the teardown keeps its budget.
+- Error path: a signal during a phase refuses the next phase, the server start, the session request and the prompt, and never refuses a teardown phase.
 - Edge case: with tracing off, a cancelled isolated run tears down exactly as today.
 
 **Verification:**
 
 - Signal tests pass locally. Unit 9 confirms it on hosted runners.
 
-- [ ] **Unit 7: The post step's span**
+- [x] **Unit 7: The post step's span**
 
 **Goal:** The post step adds its span to the run's trace.
 
@@ -492,7 +491,7 @@ Early-exit span matrix (a trace never invents unreached phases):
 
 - Post tests pass. If Unit 1 fails, this unit is dropped and Unit 10 documents that the post step isn't traced.
 
-- [ ] **Unit 8: Action launcher wiring and the plugin pin**
+- [x] **Unit 8: Action launcher wiring and the plugin pin**
 
 **Goal:** The Action sends the three new launcher fields and pins the plugin release that reads them.
 
@@ -521,7 +520,7 @@ Early-exit span matrix (a trace never invents unreached phases):
 
 - Tests pass, the build is stable, and the pins match the published release.
 
-- [ ] **Unit 9: Real-receiver and hosted-runner tests**
+- [x] **Unit 9: Real-receiver and hosted-runner tests**
 
 **Goal:** Prove the wire format, links, shared session, cancellation and credential isolation against real components.
 
@@ -537,13 +536,13 @@ Early-exit span matrix (a trace never invents unreached phases):
 **Approach:**
 
 - A real OTLP receiver (the plugin's sink helpers) checks ids, parenting, nanosecond times, the shared session attribute, and links from turn roots to the run root.
-- Hosted rows: a cancelled isolated run and a cancelled non-isolated run both flush their reached spans, and a canary trace credential can't be found by the agent user when isolated.
+- Hosted rows: a cancelled isolated run delivers its reached spans by the time the teardown settles and the signal is re-raised; a cancelled non-isolated run ends at once with no export, and its command is stopped; a canary trace credential can't be found by the agent user when isolated.
 
 **Test scenarios:**
 
 - Integration: a full run against the real receiver yields one lifecycle trace and turn traces that link to its root span, all with the same session.
 - Integration: runs from two repositories on the same issue number, with the pinned plugin: each repository's lifecycle and turn spans share one session id, and the two repositories' session ids differ.
-- Integration: on both hosted images, both cancelled rows deliver reached spans before SIGTERM.
+- Integration: on both hosted images, the isolated row delivers its spans inside the teardown window and the non-isolated row ends as it always did.
 - Integration: the isolated agent user can't read the canary credential from the environment, files, the launcher document or state.
 
 **Verification:**
@@ -596,19 +595,19 @@ Early-exit span matrix (a trace never invents unreached phases):
 
 ## System-Wide Impact
 
-- **Interaction graph:** `run()` and every phase gain tracer calls; input parsing and the mask sites change; `services/cache` gains a tier hook; the sandbox lifecycle and exec adapter hand signal ownership to the new owner; `main.ts` waits for the flush; the plugin's launcher parser gains fields.
+- **Interaction graph:** `run()` and every phase gain tracer calls; input parsing and the mask sites change; `services/cache` gains a tier hook; the sandbox lifecycle's handler gains the trace hook and the cancelled flag; the plugin's launcher parser gains fields.
 - **Error propagation:** tracing never throws into the run; every export failure ends in one log line and the undelivered count.
 - **State lifecycle risks:** only the identity record enters Action state; credentials and inputs never do.
 - **API surface parity:** no new inputs; the launcher document gains optional fields; the plugin's session attribute changes for Action runs only.
 - **Integration coverage:** wire format, links and cancellation need the real receiver and hosted runners.
-- **Unchanged invariants:** with tracing off, runs behave as today apart from the signal owner; the relay, its rules and the turn trace shape are unchanged apart from the three fields and the link; the isolated teardown's budget and order are unchanged; the Action's outputs and summary keep their values.
+- **Unchanged invariants:** with tracing off, runs behave as today, a cancelled one included (the cancelled flag is set only by the sandbox's handler, so it only refuses work inside an isolated run's teardown window); the relay, its rules and the turn trace shape are unchanged apart from the three fields and the link; the isolated teardown's budget and order are unchanged; the Action's outputs and summary keep their values.
 
 ## Risks & Dependencies
 
 | Risk | Mitigation |
 | --- | --- |
 | Moving the scrubber breaks the plugin's self-contained bundle or changes its behaviour | Characterization suites first; the packed-install and import checks gate Unit 2 |
-| The signal owner changes how non-isolated runs stop on cancel | Real-signal tests in Unit 6 and hosted rows in Unit 9; the re-raise keeps the exit status |
+| Keeping a cancelled process alive for an export lets in-flight work resume | No run-wide handler: a run without isolation ends on the signal as today; an isolated run's export never extends its teardown |
 | The post step can't read its inputs or early state | Unit 1 decides first; Unit 7 drops out cleanly |
 | A secret appears late and isn't registered | Every mask site goes through the recording mask function; Unit 5 tests a mid-run secret |
 | Infra's keep-list lags | Unit 10 gates the release on infra's confirmation |

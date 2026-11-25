@@ -375,7 +375,7 @@ describe('runCleanup', () => {
         runId: 'run-123',
         lockEtag: null,
       }),
-    ).resolves.toEqual({quiescenceConfirmed: true, continuityUnverified: false})
+    ).resolves.toEqual({quiescenceConfirmed: true, continuityUnverified: false, cacheSaveOutcome: 'persisted'})
 
     expect(syncMetadataToStore).toHaveBeenCalled()
   })
@@ -497,7 +497,7 @@ describe('runCleanup', () => {
     })
 
     // #then the ordinary happy path is unaffected by the conservative default
-    expect(result).toEqual({quiescenceConfirmed: true, continuityUnverified: false})
+    expect(result).toEqual({quiescenceConfirmed: true, continuityUnverified: false, cacheSaveOutcome: 'persisted'})
   })
 
   it('complement: a run with no server handle at all is not forced unconfirmed', async () => {
@@ -552,7 +552,7 @@ describe('runCleanup', () => {
         runId: 'run-123',
         lockEtag: null,
       }),
-    ).resolves.toEqual({quiescenceConfirmed: true, continuityUnverified: false})
+    ).resolves.toEqual({quiescenceConfirmed: true, continuityUnverified: false, cacheSaveOutcome: 'persisted'})
 
     // #then the throw is caught and logged via cacheLogger (core.warning), not left to
     // crash cleanup
@@ -604,6 +604,74 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
     delete process.env.GITHUB_RUN_ID
     delete process.env.GITHUB_RUN_ATTEMPT
     delete process.env.RUNNER_TEMP
+  })
+
+  describe('the lifecycle trace', () => {
+    it.each([
+      {
+        saved: {cachePersisted: true, storePersisted: false, outcome: 'persisted'},
+        outcome: 'succeeded',
+        reason: 'persisted',
+      },
+      {
+        saved: {cachePersisted: false, storePersisted: false, outcome: 'cache-error'},
+        outcome: 'failed',
+        reason: 'cache-error',
+      },
+      {
+        saved: {cachePersisted: false, storePersisted: false, outcome: 'skipped-empty'},
+        outcome: 'skipped',
+        reason: 'skipped-empty',
+      },
+    ] as const)(
+      'ends the cache save span $outcome with the save’s own outcome as the reason, and returns it',
+      async ({saved, outcome, reason}) => {
+        // #given a save that ends with `saved`, under a recording tracer
+        const {saveCache} = await import('../../services/cache/index.js')
+        vi.mocked(saveCache).mockResolvedValueOnce(saved)
+        const {createRecordingTracer, spanNamed} = await import('../../shared/lifecycle-tracer.testing.js')
+        const {tracer, exported} = createRecordingTracer()
+        const cleanupSpan = tracer.startSpan('cleanup')
+        const {runCleanup} = await import('./cleanup.js')
+
+        // #when
+        const result = await runCleanup({...baseOptions(), traceSpan: cleanupSpan})
+        cleanupSpan.end()
+        tracer.root.end()
+        await tracer.flush()
+
+        // #then the save is a child of cleanup with the outcome and the reason, and the phase returns the outcome
+        const save = spanNamed(exported, 'cache save')
+        expect(save.parentSpanId).toBe(spanNamed(exported, 'cleanup').spanId)
+        expect(save.attributes['fro_bot.outcome']).toBe(outcome)
+        expect(save.attributes['fro_bot.reason']).toBe(reason)
+        expect(result.cacheSaveOutcome).toBe(saved.outcome)
+      },
+    )
+
+    it('records a declined save as a skipped span, and returns ownership-declined', async () => {
+      // #given a ledger that cannot vouch for the session
+      const {createOwnershipLedger} = await import('@fro-bot/runtime')
+      const ledger = createOwnershipLedger()
+      ledger.adopt('ses_child', 'reviewer')
+      ledger.markUnknown('ses_child')
+      const {createRecordingTracer, spanNamed} = await import('../../shared/lifecycle-tracer.testing.js')
+      const {tracer, exported} = createRecordingTracer()
+      const cleanupSpan = tracer.startSpan('cleanup')
+      const {runCleanup} = await import('./cleanup.js')
+
+      // #when
+      const result = await runCleanup({...baseOptions({ownershipLedger: ledger}), traceSpan: cleanupSpan})
+      cleanupSpan.end()
+      tracer.root.end()
+      await tracer.flush()
+
+      // #then
+      const save = spanNamed(exported, 'cache save')
+      expect(save.attributes['fro_bot.outcome']).toBe('skipped')
+      expect(save.attributes['fro_bot.reason']).toBe('ownership-declined')
+      expect(result.cacheSaveOutcome).toBe('ownership-declined')
+    })
   })
 
   it('declines cache persistence when the ownership ledger has an unknown entry', async () => {
@@ -1045,7 +1113,7 @@ describe('runCleanup persistence safety gate (plan Unit 12)', () => {
           leaseRenewal: lease,
         }),
       ),
-    ).resolves.toEqual({quiescenceConfirmed: true, continuityUnverified: false})
+    ).resolves.toEqual({quiescenceConfirmed: true, continuityUnverified: false, cacheSaveOutcome: 'persisted'})
 
     // #then release is still attempted with the (stale) etag stop() settled on, and the
     // failed conditional delete is swallowed -- non-fatal, matching every other release failure
@@ -1129,7 +1197,7 @@ describe('runCleanup attachment directory removal', () => {
     const result = await runCleanup(minimalOptions())
 
     // #then the run's own safety evidence is still produced normally
-    expect(result).toEqual({quiescenceConfirmed: true, continuityUnverified: false})
+    expect(result).toEqual({quiescenceConfirmed: true, continuityUnverified: false, cacheSaveOutcome: 'persisted'})
     const {saveState} = await import('@actions/core')
     expect(saveState).toHaveBeenCalledWith('cacheSaved', expect.any(String))
   })
