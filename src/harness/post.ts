@@ -293,11 +293,23 @@ async function persistRunState(logger: Logger, span: LifecycleSpan, outcome: Pos
     // a reason this process cannot verify (it has no sandbox account, journal or process view). Retrying a save could
     // checkpoint a database a live sandbox process is still writing, so it never retries. Nothing is killed or deleted
     // here either: the main step owns that, and the hosted VM is discarded after the job.
-    logger.warning(
-      'Skipping post-action save: this run used isolate-agent and the main step did not confirm the sandbox was stopped and restored',
-      {cacheSaved},
-    )
-    decide(span, outcome, 'safety-skip', {outcome: 'skipped', reason: 'sandbox-unconfirmed'})
+    //
+    // A `restored` sandbox with the seeded `not-persisted` is a different case: the teardown finished, so the sandbox is
+    // not what is unconfirmed. The main step ended between that teardown and its save (a signal or a failure), and a
+    // killed server may have left a torn session database (#2168), so the save is still declined.
+    if (sandboxState === 'restored') {
+      logger.info(
+        'Skipping post-action save: the main step ended before saving its session (cancelled or failed), so post does not retry it',
+        {cacheSaved},
+      )
+      decide(span, outcome, 'safety-skip', {outcome: 'skipped', reason: 'main-ended-before-save'})
+    } else {
+      logger.warning(
+        'Skipping post-action save: this run used isolate-agent and the main step did not confirm the sandbox was stopped and restored',
+        {cacheSaved},
+      )
+      decide(span, outcome, 'safety-skip', {outcome: 'skipped', reason: 'sandbox-unconfirmed'})
+    }
     await writeCacheSaveResultSummary(
       {cachePersisted: false, storePersisted: false, outcome: 'ownership-declined'},
       'post-skip-safety',

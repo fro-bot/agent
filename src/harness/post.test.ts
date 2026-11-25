@@ -101,6 +101,22 @@ async function uploadedKeysFor(state: Record<string, string>): Promise<readonly 
   return uploaded
 }
 
+/** Runs the post hook for an armed isolate-agent run with the given teardown and save state. */
+async function postIsolated(state: {readonly sandboxState: string; readonly cacheSaved: string}) {
+  const core = await import('@actions/core')
+  vi.mocked(core.getState).mockImplementation((key: string) => {
+    if (key === 'shouldSaveCache') return 'true'
+    if (key === 'isolatedRun') return 'true'
+    if (key === 'sandboxState') return state.sandboxState
+    if (key === 'cacheSaved') return state.cacheSaved
+    return ''
+  })
+  const {runPost} = await import('./post.js')
+  const logger = createMockLogger()
+  await runPost({logger})
+  return logger
+}
+
 describe('post action', () => {
   beforeEach(() => {
     vi.resetModules()
@@ -188,6 +204,40 @@ describe('post action', () => {
         expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining('isolate-agent'), expect.any(Object))
       },
     )
+
+    describe('an isolate-agent run whose main step ended before saving (not-persisted)', () => {
+      const ENDED_EARLY =
+        'Skipping post-action save: the main step ended before saving its session (cancelled or failed), so post does not retry it'
+      const UNCONFIRMED =
+        'Skipping post-action save: this run used isolate-agent and the main step did not confirm the sandbox was stopped and restored'
+
+      it('says the main step ended early, not that the sandbox went unconfirmed, when the sandbox was restored', async () => {
+        // #given a restored sandbox and a CACHE_SAVED that is still the seeded not-persisted
+        // #when the post hook runs
+        const logger = await postIsolated({sandboxState: 'restored', cacheSaved: 'not-persisted'})
+
+        // #then it declines to save, and says why accurately
+        const {saveCache} = await import('../services/cache/index.js')
+        expect(saveCache).not.toHaveBeenCalled()
+        expect(logger.info).toHaveBeenCalledWith(ENDED_EARLY, expect.any(Object))
+        expect(logger.warning).not.toHaveBeenCalledWith(UNCONFIRMED, expect.any(Object))
+      })
+
+      it.each(['pending', 'unsafe', ''])(
+        'keeps the unconfirmed-sandbox warning, and does not save, when the sandbox state is %j',
+        async sandboxState => {
+          // #given a sandbox the main step never confirmed restored
+          // #when the post hook runs
+          const logger = await postIsolated({sandboxState, cacheSaved: 'not-persisted'})
+
+          // #then the original warning, unchanged
+          const {saveCache} = await import('../services/cache/index.js')
+          expect(saveCache).not.toHaveBeenCalled()
+          expect(logger.warning).toHaveBeenCalledWith(UNCONFIRMED, expect.any(Object))
+          expect(logger.info).not.toHaveBeenCalledWith(ENDED_EARLY, expect.any(Object))
+        },
+      )
+    })
 
     describe('log uploads on isolated runs (the log directory is sandbox-writable)', () => {
       const armedIsolated = {shouldSaveCache: 'true', isolatedRun: 'true', cacheSaved: 'not-persisted'}
