@@ -170,20 +170,32 @@ function toolErrorType(type: string | undefined, message: string | undefined): s
   return message === GUARD_REFUSAL_TEXT ? 'plugin.reuse-guard' : type
 }
 
-/** How far into a report's text the `<subagent …>` header is looked for. */
+/** How far into a report's text the subagent header is looked for. */
 const REPORT_HEADER_WINDOW = 400
 
 /**
- * The state a subagent report carries. The report's own header is the truth (`<subagent … state="running" …>`): the
- * item's `metadata.state` says `completed` even on the interim report a parent gets while the child's own background work
- * still runs. Reads only the head of the text, by `indexOf`, so cost does not grow with a report's size.
+ * The two header forms a subagent report opens with. OpenCode 2.3.2 writes `<subagent sessionID=… state=… …>`; 2.4.1
+ * (upstream #64971) writes `<background-result kind="subagent" sessionID=… state=… …>`. A `<background-result>` of any
+ * other kind (`shell`, `image`, `codemode`) is not a subagent report.
+ */
+const REPORT_HEADER_PREFIXES = ['<subagent ', '<background-result kind="subagent" '] as const
+
+/**
+ * The state a subagent report carries. The report's own header is the truth (`<subagent … state="running" …>` on 2.3.2,
+ * `<background-result kind="subagent" … state="running" …>` on 2.4.1): the item's `metadata.state` says `completed` even
+ * on the interim report a parent gets while the child's own background work still runs. Reads only the head of the text,
+ * by `indexOf`, so cost does not grow with a report's size.
  */
 export function reportStateOf(text: unknown, metadata: Json | undefined): string | undefined {
   if (typeof text === 'string') {
     const head = text.slice(0, REPORT_HEADER_WINDOW)
     const close = head.indexOf('>')
     const marker = head.indexOf(' state="')
-    if (head.startsWith('<subagent ') && marker !== -1 && (close === -1 || marker < close)) {
+    if (
+      REPORT_HEADER_PREFIXES.some(prefix => head.startsWith(prefix)) &&
+      marker !== -1 &&
+      (close === -1 || marker < close)
+    ) {
       const from = marker + ' state="'.length
       const to = head.indexOf('"', from)
       if (to !== -1) return head.slice(from, to)

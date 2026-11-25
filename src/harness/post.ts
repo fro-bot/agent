@@ -293,11 +293,25 @@ async function persistRunState(logger: Logger, span: LifecycleSpan, outcome: Pos
     // a reason this process cannot verify (it has no sandbox account, journal or process view). Retrying a save could
     // checkpoint a database a live sandbox process is still writing, so it never retries. Nothing is killed or deleted
     // here either: the main step owns that, and the hosted VM is discarded after the job.
-    logger.warning(
-      'Skipping post-action save: this run used isolate-agent and the main step did not confirm the sandbox was stopped and restored',
-      {cacheSaved},
-    )
-    decide(span, outcome, 'safety-skip', {outcome: 'skipped', reason: 'sandbox-unconfirmed'})
+    //
+    // A `restored` sandbox with `not-persisted` is a different case: the teardown finished, so the sandbox is not what is
+    // unconfirmed. `not-persisted` does not say why nothing durable was recorded: the main step may have ended between the
+    // teardown and its save (a signal or a failure, which leave the seeded value), or cleanup may have finished its save
+    // attempt and had both backends reject it. Say only what the state establishes. Either way post declines: a killed
+    // server may have left a torn session database (#2168).
+    if (sandboxState === 'restored') {
+      logger.info(
+        'Skipping post-action save: the sandbox was restored but the main step recorded no durable session save, so post does not retry it',
+        {cacheSaved},
+      )
+      decide(span, outcome, 'safety-skip', {outcome: 'skipped', reason: 'no-save-recorded'})
+    } else {
+      logger.warning(
+        'Skipping post-action save: this run used isolate-agent and the main step did not confirm the sandbox was stopped and restored',
+        {cacheSaved},
+      )
+      decide(span, outcome, 'safety-skip', {outcome: 'skipped', reason: 'sandbox-unconfirmed'})
+    }
     await writeCacheSaveResultSummary(
       {cachePersisted: false, storePersisted: false, outcome: 'ownership-declined'},
       'post-skip-safety',

@@ -160,3 +160,15 @@ export function readLifecycleRunIdentity(
     ...(trigger === undefined ? {} : {trigger}),
   }
 }
+
+const EVENT_ACTION_PATTERN = /^[a-z_]{1,64}$/
+
+/**
+ * The event and its activity as the lifecycle trace's input names them (`issue_comment.created`). The activity is GitHub's
+ * own word; one that is not a plain lowercase word is left out, so the name stays a fixed vocabulary and never free text.
+ */
+export function describeTraceEvent(context: {readonly eventType: string; readonly action: string | null}): string {
+  return context.action !== null && EVENT_ACTION_PATTERN.test(context.action)
+    ? `${context.eventType}.${context.action}`
+    : context.eventType
+}

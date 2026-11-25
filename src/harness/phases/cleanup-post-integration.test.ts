@@ -224,4 +224,38 @@ describe('cleanup + post integration: the object-store boundary is touched at mo
     expect(logger.info).toHaveBeenCalledWith('Post-action cache saved', expect.any(Object))
     expect(logger.info).toHaveBeenCalledWith(expect.stringContaining('withheld the object-store session publish'))
   })
+
+  it('isolated run, cleanup completes but both backends reject the write: post declines without retrying or blaming an early exit', async () => {
+    // #given an isolate-agent run whose teardown was restored, and a real cleanup that completes its save attempt: the Actions
+    // cache write returns its -1 sentinel and the object-store upload fails, so nothing durable lands
+    mocks.stateStore.set('isolatedRun', 'true')
+    mocks.stateStore.set('sandboxState', 'restored')
+    const {saveCache: actionsCacheSaveCache} = await import('@actions/cache')
+    vi.mocked(actionsCacheSaveCache).mockResolvedValueOnce(-1)
+    vi.mocked(storeAdapter.upload).mockResolvedValueOnce(err(new Error('simulated upload failure')))
+
+    // #when the real cleanup path saves
+    await runCleanupPhase()
+
+    // #then cleanup finished its attempt and recorded not-persisted, the same state an early exit leaves
+    expect(mocks.stateStore.get('cacheSaved')).toBe('not-persisted')
+    expect(actionsCacheSaveCache).toHaveBeenCalledTimes(1)
+    expect(storeAdapter.upload).toHaveBeenCalledTimes(1)
+
+    // #when the post hook runs later
+    const logger = await runPostPhase()
+
+    // #then it does not retry either backend
+    expect(actionsCacheSaveCache).toHaveBeenCalledTimes(1)
+    expect(storeAdapter.upload).toHaveBeenCalledTimes(1)
+    // #and it reports only what the state establishes, never an early exit, a cancellation or a failure
+    expect(logger.info).toHaveBeenCalledWith(
+      'Skipping post-action save: the sandbox was restored but the main step recorded no durable session save, so post does not retry it',
+      expect.any(Object),
+    )
+    const messages = [...vi.mocked(logger.info).mock.calls, ...vi.mocked(logger.warning).mock.calls].map(call =>
+      String(call[0]),
+    )
+    expect(messages.filter(message => /cancel|ended before|failed/i.test(message))).toEqual([])
+  })
 })

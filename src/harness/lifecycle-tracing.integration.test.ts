@@ -48,6 +48,8 @@ const attr = (span: WireSpan, key: string): string | undefined => {
   return value?.stringValue ?? value?.intValue
 }
 
+const anyNumber: unknown = expect.any(Number)
+
 const sinks: OtlpSink[] = []
 afterEach(async () => {
   vi.restoreAllMocks()
@@ -72,6 +74,7 @@ async function exportRun(): Promise<{
   })
   const sessionId = buildTraceSessionId('fro-bot', 'agent', 'issue-42', createRegistryScrubber(registry))
   if (sessionId !== undefined) tracer.setSessionId(sessionId)
+  tracer.setRunInput({ref: 'main', event: 'issue_comment.created', isolateAgent: false})
 
   await withSpan(
     tracer.startSpan('bootstrap'),
@@ -196,6 +199,43 @@ describe('the lifecycle trace at a real OTLP receiver', () => {
     expect(attr(spans.find(span => span.name === 'routing') as WireSpan, 'fro_bot.outcome')).toBe('skipped')
     expect(attr(spans.find(span => span.name === 'routing') as WireSpan, 'fro_bot.reason')).toBe('no_mention')
     expect(attr(spans.find(span => span.name === 'bootstrap') as WireSpan, 'fro_bot.outcome')).toBe('succeeded')
+  })
+
+  it('puts the Langfuse summary on the root span exactly as set, and on no other span', async () => {
+    // #given / #when a failed run with three phases, one of them with a child
+    const {spans} = await exportRun()
+    const summary = [
+      'langfuse.observation.input',
+      'langfuse.observation.output',
+      'langfuse.observation.level',
+      'langfuse.observation.status_message',
+    ]
+
+    // #then
+    const root = spans.find(span => span.name === 'action.main') as WireSpan
+    expect(JSON.parse(attr(root, 'langfuse.observation.input') ?? '')).toEqual({
+      trigger: 'issue_comment',
+      event: 'issue_comment.created',
+      repository: 'fro-bot/agent',
+      ref: 'main',
+      isolateAgent: false,
+    })
+    // the phases are the root's direct children: `server start` is the execution phase's, so it is not one
+    expect(JSON.parse(attr(root, 'langfuse.observation.output') ?? '')).toEqual({
+      outcome: 'failed',
+      reason: 'exception',
+      durationMs: anyNumber,
+      phases: [
+        {name: 'bootstrap', outcome: 'succeeded', ms: anyNumber},
+        {name: 'routing', outcome: 'skipped', ms: anyNumber},
+        {name: 'execution', outcome: 'succeeded', ms: anyNumber},
+        {name: 'cleanup', outcome: 'failed', ms: anyNumber},
+      ],
+    })
+    expect(attr(root, 'langfuse.observation.level')).toBe('ERROR')
+    expect(attr(root, 'langfuse.observation.status_message')).toBe('exception')
+    for (const span of spans.filter(item => item.name !== 'action.main'))
+      for (const key of summary) expect(attr(span, key)).toBeUndefined()
   })
 
   it('exports the link a turn trace would use: the root span ids are those the launcher is given', async () => {
