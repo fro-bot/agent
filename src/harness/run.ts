@@ -31,6 +31,7 @@ import {
   buildTraceSessionId,
   buildTracingRunIdentity,
   buildTracingRunLink,
+  describeTraceEvent,
   liveActionTracingHost,
   readLifecycleRunIdentity,
   relayRequestFromInputs,
@@ -138,7 +139,11 @@ export async function run(): Promise<number> {
     }
   }
   const refName = process.env.GITHUB_REF_NAME?.trim() ?? ''
-  if (refName !== '') tracer.root.setAttribute('fro_bot.ref', freeText(refName, 'ref'))
+  if (refName !== '') {
+    tracer.root.setAttribute('fro_bot.ref', freeText(refName, 'ref'))
+    // The same ref for the root's Langfuse input, which the tracer scrubs (or leaves out) itself.
+    tracer.setRunInput({ref: refName})
+  }
 
   // Cancellation and the trace. A run WITHOUT `isolate-agent` installs no handler of its own and keeps none alive: a signal ends it
   // as it always did (the exec adapter reaps its commands and re-raises), and it sends no lifecycle trace. An isolated run's
@@ -198,6 +203,7 @@ async function runWithTrace(trace: RunTrace, startTime: number, bootstrapLogger:
   const bindTraceSession = (context: TriggerContext | undefined): void => {
     if (!tracer.enabled || context === undefined) return
     try {
+      tracer.setRunInput({event: describeTraceEvent(context)})
       const logicalKey = buildLogicalKey(context, getInvocationIdentity())
       if (logicalKey == null) return
       tracer.root.setAttribute('fro_bot.logical_key', logicalKey.key)
@@ -223,6 +229,7 @@ async function runWithTrace(trace: RunTrace, startTime: number, bootstrapLogger:
   // From the raw input, read before bootstrap: a bootstrap that fails (the runner preflight, the persisted-credential check,
   // an unparseable value) returns before any lifecycle exists, and cleanup must still treat the run as isolated.
   const isolationRequested = isIsolationRequested(core.getInput('isolate-agent'))
+  tracer.setRunInput({isolateAgent: isolationRequested})
 
   let reactionCtx: ReactionContext | null = null
   let exitCode = 0

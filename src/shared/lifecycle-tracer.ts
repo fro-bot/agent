@@ -4,6 +4,7 @@ import type {PendingSpan, Scrubber} from '@fro-bot/runtime/tracing/scrub'
 import type {Logger} from './logger.js'
 import type {SecretRegistry} from './secret-registry.js'
 import type {TracingInputs} from './types.js'
+import {Buffer} from 'node:buffer'
 import {randomBytes} from 'node:crypto'
 import process from 'node:process'
 import {parseTraceRelayConfig} from '@fro-bot/runtime'
@@ -109,6 +110,23 @@ export const LIFECYCLE_ATTRIBUTE = {
 } as const
 
 /**
+ * The attribute keys Langfuse's OpenTelemetry ingestion reads from a trace's root observation, to show the trace's input and
+ * output (its Sessions view) and its level and status message. Set on the `action.main` root alone, never on a phase.
+ */
+export const SUMMARY_ATTRIBUTE = {
+  input: 'langfuse.observation.input',
+  output: 'langfuse.observation.output',
+  level: 'langfuse.observation.level',
+  statusMessage: 'langfuse.observation.status_message',
+} as const
+
+/**
+ * Each of the root's input and output strings is at most this many UTF-8 bytes, measured on the JSON that is sent. The output
+ * cuts its phase list at a whole entry; a summary still over the cap, or one the scrubber would change at all, is left out.
+ */
+export const SUMMARY_MAX_BYTES = 4_096
+
+/**
  * What a span ended with. The Action's invocation outcomes (`InvocationOutcome` in `harness/outcome.ts`, which this layer cannot
  * import; `lifecycle-tracer.test.ts` pins the two together) plus `cancelled`, which only tracing knows: a signalled run's outputs
  * and job summary are unchanged.
@@ -179,6 +197,18 @@ export function parseTraceIds(text: string): TraceIds | null {
   }
 }
 
+/**
+ * What the root span's Langfuse input says about the run, beyond the identity the tracer was given (`repository` and `trigger`).
+ * Every field is optional: one that is not known yet, or never is, is left out of the summary.
+ */
+export interface RunInput {
+  /** The ref name: free text, so it is scrubbed, and left out when the registry cannot match a secret. */
+  readonly ref?: string
+  /** The event and its activity, a fixed vocabulary (`issue_comment.created`). */
+  readonly event?: string
+  readonly isolateAgent?: boolean
+}
+
 export interface FlushResult {
   readonly spans: number
   /** Spans in batches the collector did not acknowledge, plus spans that never fit. Not a count of spans it did not ingest. */
@@ -196,6 +226,11 @@ export interface LifecycleTracer {
   readonly startSpan: (name: string, options?: {readonly parent?: LifecycleSpan}) => LifecycleSpan
   /** The Langfuse session. Spans that ended before it was known get it at export. */
   readonly setSessionId: (sessionId: string) => void
+  /**
+   * What the run is, for the root span's Langfuse input. Merged over earlier calls (a field given again replaces it, one left
+   * out stays), and read at export, so call it as soon as a value is known. Nothing on any other span.
+   */
+  readonly setRunInput: (input: RunInput) => void
   /**
    * A signal arrived: ends every span still open as `cancelled` with `reason` (a fixed word such as the signal's name), the
    * root last, so the trace says where the run was when it stopped. Synchronous. Spans that end later (the phase unwinding as
@@ -259,6 +294,7 @@ export function createNoopTracer(): LifecycleTracer {
     root: NOOP_SPAN,
     startSpan: () => NOOP_SPAN,
     setSessionId: () => undefined,
+    setRunInput: () => undefined,
     cancel: () => undefined,
     flush: async () => NOOP_RESULT,
   }
@@ -336,6 +372,43 @@ function scrubThenCap(scrubber: Scrubber, text: string, cap: number): BoundedTex
   if (!result.ok) return {text: OMITTED_TEXT, omitted: result.reason}
   if (scrubber.survived?.(result.text) === true) return {text: OMITTED_TEXT, omitted: 'literal-survived'}
   return {text: cut(result.text, cap)}
+}
+
+const utf8Bytes = (text: string): number => Buffer.byteLength(text, 'utf8')
+
+/** What a phase of the root's output says: a name, how it ended, and how long it ran. */
+interface PhaseSummary {
+  readonly name: string
+  readonly outcome: string
+  readonly ms: number
+}
+
+/**
+ * The root's output as JSON of at most `SUMMARY_MAX_BYTES`: the phases that fit, in order, cut at a whole entry, with
+ * `truncatedPhases` counting the rest. The part before the phases (an outcome, a reason of at most `FREE_TEXT_MAX_CHARS`
+ * characters and a number) is far under the cap, so a cut always leaves a valid summary. Every text in it is already scrubbed,
+ * so the bytes counted here are the bytes sent.
+ */
+function boundedOutput(base: Readonly<Record<string, unknown>>, phases: readonly PhaseSummary[]): string {
+  const render = (count: number): string =>
+    JSON.stringify({
+      ...base,
+      phases: phases.slice(0, count),
+      ...(count < phases.length ? {truncatedPhases: phases.length - count} : {}),
+    })
+  const whole = render(phases.length)
+  if (utf8Bytes(whole) <= SUMMARY_MAX_BYTES) return whole
+  let count = 0
+  while (count < phases.length && utf8Bytes(render(count + 1)) <= SUMMARY_MAX_BYTES) count += 1
+  return render(count)
+}
+
+/** `ERROR` for a failed run; `WARNING` for one that did not run to a result (cancelled, skipped, incomplete, never ended). */
+function levelOf(outcome: string): 'ERROR' | 'WARNING' | 'DEFAULT' {
+  if (outcome === 'failed') return 'ERROR'
+  if (outcome === 'cancelled' || outcome === 'skipped' || outcome === 'incomplete' || outcome === 'unfinished')
+    return 'WARNING'
+  return 'DEFAULT'
 }
 
 interface ExceptionRecord {
@@ -470,6 +543,7 @@ export function createLifecycleTracer(options: CreateLifecycleTracerOptions): Li
   const ids: TraceIds = options.continueFrom ?? {traceId: hex(16), rootSpanId: hex(8), invocationId: hex(8)}
   const records: SpanRecord[] = []
   let sessionId: string | undefined
+  let runInput: RunInput = {}
   let closed = false
   let overflow = 0
   let flushed: Promise<FlushResult> | undefined
@@ -566,6 +640,110 @@ export function createLifecycleTracer(options: CreateLifecycleTracerOptions): Li
     identityAttributes[`langfuse.trace.metadata.${key.replace('.', '_')}`] = value
   }
 
+  /**
+   * One field of the summary, scrubbed on its own and then cut: before it is part of any JSON, so a redaction can never reach
+   * the JSON's own syntax, and so the size that is checked later is the size of what is sent. A field the scrubber cannot take
+   * (or one over the input cap) is the fixed marker, and `omitted` says why.
+   */
+  function scrubField(preparation: Preparation, spanText: SpanText, label: string, text: string): BoundedText {
+    if (text.length > INPUT_MAX_CHARS) {
+      note(spanText, label, 'over-input-cap')
+      return {text: OMITTED_TEXT, omitted: 'over-input-cap'}
+    }
+    const bounded = scrubThenCap(preparation.scrubber, text, FREE_TEXT_MAX_CHARS)
+    if (bounded.omitted !== undefined) note(spanText, label, bounded.omitted)
+    return bounded
+  }
+
+  /** Free text for the summary: undefined when no scrub can be trusted with it (the registry cannot match a secret), or when it could not be scrubbed. */
+  function freeSummaryText(
+    preparation: Preparation,
+    spanText: SpanText,
+    label: string,
+    text: string,
+  ): string | undefined {
+    if (!preparation.matchable) return undefined
+    const field = scrubField(preparation, spanText, label, text)
+    return field.omitted === undefined ? field.text : undefined
+  }
+
+  /**
+   * The last check on a summary's JSON, on the exact text that would be sent: within `SUMMARY_MAX_BYTES` of UTF-8, and left
+   * exactly as it is by the scrubber, with no registered literal in it. The fields were scrubbed one by one, so this finds nothing
+   * in a summary of ordinary values. When it does (a registered literal made of the JSON's own keys and punctuation, say), the
+   * attribute is left out: a redaction here would rewrite JSON syntax, or grow the text past the cap after it was checked.
+   */
+  function admitSummary(preparation: Preparation, spanText: SpanText, label: string, json: string): string | undefined {
+    if (utf8Bytes(json) <= SUMMARY_MAX_BYTES && scrubsUnchanged(preparation.scrubber, json)) return json
+    note(spanText, label, 'unsafe-summary')
+    return undefined
+  }
+
+  /** The root's input: what the run is, with whatever is known. Undefined when nothing is. */
+  function summarizeInput(preparation: Preparation, spanText: SpanText): string | undefined {
+    const {trigger, repository} = identity
+    const fixed = (label: string, text: string | undefined): string | undefined =>
+      text === undefined || text.length > IDENTITY_MAX_CHARS
+        ? undefined
+        : scrubField(preparation, spanText, label, text).text
+    const summary = {
+      trigger: fixed('summary.trigger', trigger),
+      event: fixed('summary.event', runInput.event),
+      // Free text: a repository and a ref name come from outside, so neither is exported when no scrub can be trusted with it.
+      repository:
+        repository === undefined ? undefined : freeSummaryText(preparation, spanText, 'summary.repository', repository),
+      ref: runInput.ref === undefined ? undefined : freeSummaryText(preparation, spanText, 'summary.ref', runInput.ref),
+      isolateAgent: runInput.isolateAgent,
+    }
+    const known = Object.fromEntries(Object.entries(summary).filter(([, value]) => value !== undefined))
+    return Object.keys(known).length === 0
+      ? undefined
+      : admitSummary(preparation, spanText, 'summary.input', JSON.stringify(known))
+  }
+
+  /**
+   * The root's Langfuse summary, built at export from the spans the tracer holds: the input, the output (how the run ended and
+   * each direct child of the root as a phase), the level and the status message. Order of work: every text field is scrubbed
+   * alone; the object is built from the scrubbed fields; its JSON is cut to the byte cap at a whole phase; and the finished JSON
+   * is checked once more (`admitSummary`), and left out rather than rewritten if that check finds anything.
+   */
+  function summarizeRoot(
+    record: SpanRecord,
+    preparation: Preparation,
+    spanText: SpanText,
+    reason: string | undefined,
+  ): Record<string, string> {
+    const {endFallbackMs} = preparation
+    const attributes: Record<string, string> = {}
+    const input = summarizeInput(preparation, spanText)
+    if (input !== undefined) attributes[SUMMARY_ATTRIBUTE.input] = input
+    const spent = (span: SpanRecord): number => Math.max(0, Math.round((span.endMs ?? endFallbackMs) - span.startMs))
+    const outcomeOf = (span: SpanRecord): string =>
+      span.result?.outcome ?? (span.endMs === undefined ? 'unfinished' : 'unset')
+    const phases = records
+      .filter(span => span !== record && span.parentSpanId === record.spanId)
+      .map(span => ({
+        name: scrubField(preparation, spanText, 'summary.phase', span.name).text,
+        outcome: outcomeOf(span),
+        ms: spent(span),
+      }))
+    const outcome = outcomeOf(record)
+    const bounded = reason === undefined ? undefined : scrubField(preparation, spanText, 'summary.reason', reason)
+    const output = admitSummary(
+      preparation,
+      spanText,
+      'summary.output',
+      boundedOutput(
+        {outcome, ...(bounded === undefined ? {} : {reason: bounded.text}), durationMs: spent(record)},
+        phases,
+      ),
+    )
+    if (output !== undefined) attributes[SUMMARY_ATTRIBUTE.output] = output
+    attributes[SUMMARY_ATTRIBUTE.level] = levelOf(outcome)
+    if (bounded !== undefined) attributes[SUMMARY_ATTRIBUTE.statusMessage] = bounded.text
+    return attributes
+  }
+
   function toPending(record: SpanRecord, preparation: Preparation): PendingSpan {
     const {scrubber, endFallbackMs} = preparation
     const spanText: SpanText = {left: SPAN_TEXT_BUDGET_CHARS, omitted: []}
@@ -588,6 +766,7 @@ export function createLifecycleTracer(options: CreateLifecycleTracerOptions): Li
     if (reason !== undefined) attributes[LIFECYCLE_ATTRIBUTE.reason] = reason
     else if (record.endMs === undefined) attributes[LIFECYCLE_ATTRIBUTE.reason] = 'unfinished'
     if (preparation.session !== undefined) attributes[LIFECYCLE_ATTRIBUTE.session] = preparation.session
+    if (record === rootRecord) Object.assign(attributes, summarizeRoot(record, preparation, spanText, reason))
 
     const events = record.events.map(event => ({
       name: event.name,
@@ -760,6 +939,10 @@ export function createLifecycleTracer(options: CreateLifecycleTracerOptions): Li
     startSpan,
     setSessionId: id => {
       if (id.length > 0) sessionId = id
+    },
+    setRunInput: input => {
+      if (closed) return
+      runInput = {...runInput, ...Object.fromEntries(Object.entries(input).filter(([, value]) => value !== undefined))}
     },
     cancel: reason => {
       // The budget runs from the first signal, even if the export is already under way and nothing here is left to end.

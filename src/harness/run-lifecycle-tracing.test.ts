@@ -430,6 +430,9 @@ async function execute(plan: RunPlan = {}): Promise<{exitCode: number; spans: De
   return {exitCode, spans: allSpans(target)}
 }
 
+const anyNumber: unknown = expect.any(Number)
+const anyString: unknown = expect.any(String)
+
 const FULL_RUN = [
   'bootstrap',
   'routing',
@@ -1089,6 +1092,116 @@ describe('run with lifecycle tracing', () => {
       expect(phaseNames(spans)).toEqual([...FULL_RUN.slice(0, FULL_RUN.indexOf('cleanup') + 1)])
       expect(byName(spans, 'cleanup').status?.code).toBe(2)
       expect(attr(rootOf(spans), 'fro_bot.outcome')).toBe('failed')
+    })
+  })
+
+  describe('the root’s Langfuse summary', () => {
+    const summaryKeys = [
+      'langfuse.observation.input',
+      'langfuse.observation.output',
+      'langfuse.observation.level',
+      'langfuse.observation.status_message',
+    ]
+    const parsed = (span: Decoded, key: string): unknown => JSON.parse(String(attr(span, key)))
+
+    it('says what the run is and how it ended, on the root alone', async () => {
+      // #given a full run of an issue comment on main
+      // #when
+      const {spans} = await execute({cacheSaveOutcome: 'persisted'})
+
+      // #then
+      const root = rootOf(spans)
+      expect(parsed(root, 'langfuse.observation.input')).toEqual({
+        trigger: 'issue_comment',
+        event: 'issue_comment.created',
+        repository: 'fro-bot/agent',
+        ref: 'main',
+        isolateAgent: false,
+      })
+      expect(parsed(root, 'langfuse.observation.output')).toEqual({
+        outcome: 'succeeded',
+        durationMs: anyNumber,
+        phases: FULL_RUN.map(name => ({name, outcome: anyString, ms: anyNumber})),
+      })
+      expect(attr(root, 'langfuse.observation.level')).toBe('DEFAULT')
+      // a run that went well has no reason to give
+      expect(attr(root, 'langfuse.observation.status_message')).toBeUndefined()
+      for (const span of spans.filter(item => item !== root))
+        for (const key of summaryKeys) expect(attr(span, key)).toBeUndefined()
+    })
+
+    it('records that the run asked for isolation', async () => {
+      // #given
+      inputs.values.set('isolate-agent', 'true')
+
+      // #when
+      const {spans} = await execute({})
+
+      // #then
+      expect(parsed(rootOf(spans), 'langfuse.observation.input')).toMatchObject({isolateAgent: true})
+    })
+
+    it('keeps the input and the skip reason for a run that routing skipped', async () => {
+      // #given / #when
+      const {spans} = await execute({routing: 'skip'})
+
+      // #then the event is known even though the run stopped there
+      const root = rootOf(spans)
+      expect(parsed(root, 'langfuse.observation.input')).toMatchObject({event: 'issue_comment.created'})
+      expect(attr(root, 'langfuse.observation.level')).toBe('WARNING')
+      expect(attr(root, 'langfuse.observation.status_message')).toBe('no_mention')
+      expect(parsed(root, 'langfuse.observation.output')).toMatchObject({outcome: 'skipped', reason: 'no_mention'})
+    })
+
+    it('marks a failed run as an error', async () => {
+      // #given / #when
+      const {spans} = await execute({bootstrap: 'null'})
+
+      // #then
+      const root = rootOf(spans)
+      expect(attr(root, 'langfuse.observation.level')).toBe('ERROR')
+      expect(parsed(root, 'langfuse.observation.output')).toMatchObject({
+        outcome: 'failed',
+        phases: [{name: 'bootstrap', outcome: 'failed'}, {name: 'cleanup'}, {name: 'report'}],
+      })
+    })
+
+    it('says cancelled, as a warning, for a run a signal ended', async () => {
+      // #given a signal that arrives while routing is open
+      await arrange({})
+      const {runBootstrap} = await import('./phases/bootstrap.js')
+      let hook: {
+        onSignal: (signal: 'SIGINT' | 'SIGTERM') => void
+        flush: (options: {boundMs: number}) => Promise<unknown>
+      }
+      vi.mocked(runBootstrap).mockImplementation(async (_logger, options) => {
+        if (options?.signalTrace === undefined) throw new Error('no signal trace handed to bootstrap')
+        hook = options.signalTrace
+        return createBootstrap()
+      })
+      const {runRouting} = await import('./phases/routing.js')
+      const routing = vi.mocked(runRouting).getMockImplementation()
+      vi.mocked(runRouting).mockImplementation(async (...args) => {
+        hook.onSignal('SIGINT')
+        await hook.flush({boundMs: 2_000})
+        return routing?.(...args) ?? Promise.reject(new Error('no routing'))
+      })
+
+      // #when
+      await run()
+
+      // #then
+      const root = rootOf(allSpans(target))
+      expect(attr(root, 'langfuse.observation.level')).toBe('WARNING')
+      expect(attr(root, 'langfuse.observation.status_message')).toBe('sigint')
+      expect(parsed(root, 'langfuse.observation.output')).toMatchObject({
+        outcome: 'cancelled',
+        reason: 'sigint',
+        phases: [
+          {name: 'bootstrap', outcome: 'succeeded'},
+          {name: 'routing', outcome: 'cancelled'},
+        ],
+      })
     })
   })
 })
