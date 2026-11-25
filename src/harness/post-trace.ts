@@ -7,7 +7,7 @@ import {getInvocationIdentity} from '../shared/env.js'
 import {createLifecycleTracer, NOOP_SPAN, parseTraceIds} from '../shared/lifecycle-tracer.js'
 import {createSecretRegistry} from '../shared/secret-registry.js'
 import {STATE_KEYS} from './config/state-keys.js'
-import {parseTraceInputs, takeTraceInputs, TRACE_INPUT_MESSAGES} from './config/trace-inputs.js'
+import {parseTraceInputs, takeTraceInputs} from './config/trace-inputs.js'
 
 /**
  * The post step's part of the lifecycle trace: one span, added to the trace the main step started, after its root ended.
@@ -78,10 +78,7 @@ function buildPostTrace(options: StartPostTraceOptions): PostTrace {
   if (ids === null) return OFF
 
   const inputs = parseTraceInputs(raw, {
-    // The main step said a dropped credential-less header once; the same parse here would say it again.
-    warning: message => {
-      if (message !== TRACE_INPUT_MESSAGES.headerWithoutCredential) core.warning(message)
-    },
+    warning: message => core.warning(message),
     // The main step said it once; post says only what is wrong.
     notice: () => undefined,
     info: () => undefined,
