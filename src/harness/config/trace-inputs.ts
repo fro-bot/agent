@@ -48,6 +48,8 @@ export const TRACE_INPUT_MESSAGES = {
   noCredential:
     'trace-endpoint is set and trace-headers is empty: tracing is on, and spans are sent to the endpoint with no credential.',
   headersWithoutEndpoint: 'trace-headers is ignored because trace-endpoint is empty, so tracing is off.',
+  headerWithoutCredential:
+    'trace-headers has an Authorization header with no credential (is the secret set?), so tracing is off',
   headerLine: {
     format: (line: number) => `trace-headers line ${line} is not in the form "Name: value", so tracing is off.`,
     name: (line: number) =>
@@ -61,6 +63,12 @@ export const TRACE_INPUT_MESSAGES = {
 const OFF: TracingInputs = {enabled: false}
 
 const BASIC_OR_BEARER = /^(basic|bearer)[ \t]+(\S+)$/i
+
+/**
+ * An auth scheme word with nothing after it: what `Authorization: Bearer ${{ secrets.X }}` becomes when the secret is unset.
+ * Only the `Authorization` header is checked; another header whose value happens to be `Bearer` is the operator's own text.
+ */
+const SCHEME_WITHOUT_CREDENTIAL = /^(?:basic|bearer|token)$/i
 
 function hasControlOrReplacement(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
@@ -143,6 +151,10 @@ function parseHeaderLines(raw: string): HeaderLines {
     const lower = name.toLowerCase()
     if (seen.has(lower)) return {ok: false, message: TRACE_INPUT_MESSAGES.headerLine.repeated(lineNumber)}
     seen.add(lower)
+    // Refused, not sent without it: a missing token must mean no request at all, so the collector is never the control.
+    if (lower === 'authorization' && SCHEME_WITHOUT_CREDENTIAL.test(value)) {
+      return {ok: false, message: TRACE_INPUT_MESSAGES.headerWithoutCredential}
+    }
     headers.push({name, value})
   }
   return {ok: true, headers}

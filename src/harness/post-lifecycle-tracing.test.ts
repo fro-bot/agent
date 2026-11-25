@@ -269,6 +269,22 @@ describe('the post step’s span', () => {
       expect(await afterPost()).toEqual({received: 0, warnings: 0})
     })
 
+    it('with an Authorization header that has no credential: one value-free warning, nothing sent', async () => {
+      // #given a valid trace record and an input that has lost its credential since main (main would have saved none)
+      inputs.values.set('trace-headers', 'Authorization: Bearer')
+      setState(traced())
+
+      // #when
+      const {received} = await afterPost()
+
+      // #then post says so itself, with the one fixed message, and sends nothing
+      const core = await import('@actions/core')
+      expect(received).toBe(0)
+      expect(vi.mocked(core.warning).mock.calls).toEqual([
+        ['trace-headers has an Authorization header with no credential (is the secret set?), so tracing is off'],
+      ])
+    })
+
     it('with state but no trace inputs', async () => {
       inputs.values.clear()
       setState(traced())
