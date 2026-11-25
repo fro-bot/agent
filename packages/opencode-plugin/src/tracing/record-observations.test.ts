@@ -22,6 +22,39 @@ describe('reportStateOf', () => {
     expect(reportStateOf(text, {state: 'completed'})).toBe('running')
   })
 
+  it.each([
+    ['2.3.2 `<subagent …>`', '<subagent sessionID="ses_1" state="running" description="mid">\nnotes\n</subagent>'],
+    [
+      '2.4.1 `<background-result kind="subagent" …>`',
+      '<background-result kind="subagent" sessionID="ses_1" state="running" description="mid">\nnotes\n</background-result>',
+    ],
+  ])('reads the header state from the %s form', (_form, text) => {
+    // #given an interim report in either server version's header form, with metadata that says completed
+    // #when / #then the header wins in both forms (2.4.1 used to fall back to the metadata `completed`)
+    expect(reportStateOf(text, {state: 'completed'})).toBe('running')
+  })
+
+  it.each([
+    ['a `<background-result>` header without a kind', '<background-result sessionID="ses_1" state="running">x'],
+    ['a `<background-result>` of another kind', '<background-result kind="shell" id="sh_1" state="running">x'],
+    [
+      'a `<background-result>` of a kind that only starts with subagent',
+      '<background-result kind="subagents" state="running">x',
+    ],
+    ['a `<background-result>` header with no state', '<background-result kind="subagent" sessionID="ses_1">x'],
+    [
+      'a `<background-result>` header that closes before the state',
+      '<background-result kind="subagent">\n state="running"',
+    ],
+    ['a `<background-result>` header with an unterminated state', '<background-result kind="subagent" state="running'],
+    ['text that merely contains a header later', 'x <background-result kind="subagent" state="running">'],
+  ])('falls back to metadata for %s', (_label, text) => {
+    // #given a header that is not a subagent report header
+    // #when / #then the metadata decides, and nothing is invented without it
+    expect(reportStateOf(text, {state: 'completed'})).toBe('completed')
+    expect(reportStateOf(text, undefined)).toBeUndefined()
+  })
+
   it('falls back to metadata when the text has no header, and to nothing when neither has a state', () => {
     // #given text that is not a subagent report
     // #when / #then
@@ -30,9 +63,12 @@ describe('reportStateOf', () => {
     expect(reportStateOf('<subagent ses_1>', {})).toBeUndefined()
   })
 
-  it('looks only at the head of a huge report', () => {
+  it.each([
+    ['<subagent sessionID="ses_1" description="x">'],
+    ['<background-result kind="subagent" sessionID="ses_1" description="x">'],
+  ])('looks only at the head of a huge report: %s', header => {
     // #given a state marker far past the header window, inside the body
-    const text = `<subagent sessionID="ses_1" description="x">\n${'a'.repeat(5000)} state="running"`
+    const text = `${header}\n${'a'.repeat(5000)} state="running"`
 
     // #when / #then the body is not read, so the metadata decides
     expect(reportStateOf(text, {state: 'completed'})).toBe('completed')
@@ -98,16 +134,16 @@ describe('observeEvent', () => {
     }
   })
 
-  it('reads a subagent report from the item, with the header state, and the child id from metadata', () => {
+  it.each([
+    ['2.3.2', '<subagent sessionID="ses_c" state="running" description="d">x'],
+    ['2.4.1', '<background-result kind="subagent" sessionID="ses_c" state="running" description="d">x'],
+  ])('reads a subagent report (%s form) from the item, with the header state and the child id', (_version, text) => {
     // #given an interim report item
     const raw = event('session.inbox.enqueued', {
       inboxID: 'msg_9',
       item: {
         type: 'synthetic',
-        payload: {
-          text: '<subagent sessionID="ses_c" state="running" description="d">x',
-          metadata: {source: 'subagent', childID: 'ses_c', state: 'completed'},
-        },
+        payload: {text, metadata: {source: 'subagent', childID: 'ses_c', state: 'completed'}},
       },
     })
 
