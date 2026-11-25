@@ -205,13 +205,13 @@ describe('post action', () => {
       },
     )
 
-    describe('an isolate-agent run whose main step ended before saving (not-persisted)', () => {
-      const ENDED_EARLY =
-        'Skipping post-action save: the main step ended before saving its session (cancelled or failed), so post does not retry it'
+    describe('an isolate-agent run with a restored sandbox and no durable save recorded (not-persisted)', () => {
+      const NO_DURABLE_SAVE =
+        'Skipping post-action save: the sandbox was restored but the main step recorded no durable session save, so post does not retry it'
       const UNCONFIRMED =
         'Skipping post-action save: this run used isolate-agent and the main step did not confirm the sandbox was stopped and restored'
 
-      it('says the main step ended early, not that the sandbox went unconfirmed, when the sandbox was restored', async () => {
+      it('says no durable save was recorded, not that the sandbox went unconfirmed, when the sandbox was restored', async () => {
         // #given a restored sandbox and a CACHE_SAVED that is still the seeded not-persisted
         // #when the post hook runs
         const logger = await postIsolated({sandboxState: 'restored', cacheSaved: 'not-persisted'})
@@ -219,7 +219,7 @@ describe('post action', () => {
         // #then it declines to save, and says why accurately
         const {saveCache} = await import('../services/cache/index.js')
         expect(saveCache).not.toHaveBeenCalled()
-        expect(logger.info).toHaveBeenCalledWith(ENDED_EARLY, expect.any(Object))
+        expect(logger.info).toHaveBeenCalledWith(NO_DURABLE_SAVE, expect.any(Object))
         expect(logger.warning).not.toHaveBeenCalledWith(UNCONFIRMED, expect.any(Object))
       })
 
@@ -234,7 +234,7 @@ describe('post action', () => {
           const {saveCache} = await import('../services/cache/index.js')
           expect(saveCache).not.toHaveBeenCalled()
           expect(logger.warning).toHaveBeenCalledWith(UNCONFIRMED, expect.any(Object))
-          expect(logger.info).not.toHaveBeenCalledWith(ENDED_EARLY, expect.any(Object))
+          expect(logger.info).not.toHaveBeenCalledWith(NO_DURABLE_SAVE, expect.any(Object))
         },
       )
     })

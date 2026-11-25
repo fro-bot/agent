@@ -172,7 +172,7 @@ describe('the post step’s span', () => {
       {
         state: {isolatedRun: 'true', sandboxState: 'restored'},
         action: 'safety-skip',
-        reason: 'main-ended-before-save',
+        reason: 'no-save-recorded',
       },
       {state: {skipCache: 'true'}, action: 'skip', reason: 'skip-cache'},
     ])('records $action ($reason) as a skipped post span, with no error status', async ({state, action, reason}) => {
