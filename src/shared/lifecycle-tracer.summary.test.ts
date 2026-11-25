@@ -3,7 +3,13 @@ import type {CreateLifecycleTracerOptions, LifecycleTracer} from './lifecycle-tr
 import {Buffer} from 'node:buffer'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 import {startOtlpSink} from '../../packages/runtime/src/tracing/otlp-sink.testing.js'
-import {createLifecycleTracer, FREE_TEXT_MAX_CHARS, SUMMARY_ATTRIBUTE, SUMMARY_MAX_BYTES} from './lifecycle-tracer.js'
+import {
+  createLifecycleTracer,
+  FREE_TEXT_MAX_CHARS,
+  SUMMARY_ATTRIBUTE,
+  SUMMARY_MAX_BYTES,
+  SUMMARY_METADATA_PREFIX,
+} from './lifecycle-tracer.js'
 import {createSecretRegistry} from './secret-registry.js'
 import {createMockLogger} from './test-helpers.js'
 
@@ -33,11 +39,33 @@ const named = (spans: readonly Wire[], name: string): Wire => {
   if (found === undefined) throw new Error(`no span named ${name}`)
   return found
 }
-const json = (span: Wire, key: string): Record<string, unknown> => {
-  const text = attr(span, key)
-  if (text === undefined) throw new Error(`no ${key} on ${span.name}`)
-  return JSON.parse(text) as Record<string, unknown>
+/** The attribute's string, which the summary's input and output always are: Markdown text, not JSON. */
+const markdown = (span: Wire, key: string): string => {
+  const value = attr(span, key)
+  if (value === undefined) throw new Error(`no ${key} on ${span.name}`)
+  return value
 }
+const INPUT = 'langfuse.observation.input'
+const OUTPUT = 'langfuse.observation.output'
+const METADATA = 'langfuse.observation.metadata.'
+/** Every `langfuse.observation.metadata.<key>` of a span, with the value in the type it was sent as. */
+const metadataOf = (span: Wire): Record<string, unknown> =>
+  Object.fromEntries(
+    span.attributes
+      .filter(item => item.key.startsWith(METADATA))
+      .map(item => {
+        const {stringValue, intValue, boolValue, doubleValue} = item.value
+        return [
+          item.key.slice(METADATA.length),
+          stringValue ?? (intValue === undefined ? (boolValue ?? doubleValue) : Number(intValue)),
+        ]
+      }),
+  )
+const metadataKeys = (span: Wire): string[] =>
+  span.attributes.filter(item => item.key.startsWith(METADATA)).map(item => item.key)
+/** The output's first line, and its table as lines (the header, the divider, then a row for each phase). */
+const firstLine = (output: string): string => output.split('\n')[0] ?? ''
+const tableOf = (output: string): string[] => output.split('\n\n')[1]?.split('\n') ?? []
 
 const KEYS = [
   'langfuse.observation.input',
@@ -47,7 +75,6 @@ const KEYS = [
 ] as const
 
 const CANARY = 'ZZ-98765-canary-token'
-const escaped = (value: string): string => JSON.stringify(value).slice(1, -1)
 
 const sinks: OtlpSink[] = []
 afterEach(async () => {
@@ -81,7 +108,6 @@ async function setup(overrides: Partial<CreateLifecycleTracerOptions> = {}): Pro
 }
 
 const exported = (target: OtlpSink): Wire[] => target.accepted().flatMap(spansOf)
-const anyNumber: unknown = expect.any(Number)
 const containing = (text: string): unknown => expect.stringContaining(text)
 
 /** A run that went well: three phases, one with a child, and a root that ends with a reason. */
@@ -99,10 +125,41 @@ async function normalRun(): Promise<Wire[]> {
   return exported(target)
 }
 
+const T0 = 1_700_000_000_000
+
+/** A tracer on a clock the test moves by hand, so that every duration in the summary is known. */
+async function setupTimed(
+  overrides: Partial<CreateLifecycleTracerOptions> = {},
+): Promise<Awaited<ReturnType<typeof setup>> & {readonly at: (ms: number) => void}> {
+  let now = T0
+  const started = await setup({now: () => now, ...overrides})
+  return {...started, at: ms => (now = T0 + ms)}
+}
+
+/** Phases that run one after another, each for the given milliseconds, under a root that ends when the last one does. */
+async function runWithPhases(
+  durations: readonly number[],
+  overrides: Partial<CreateLifecycleTracerOptions> = {},
+): Promise<Wire> {
+  const {target, tracer, at} = await setupTimed(overrides)
+  let elapsed = 0
+  for (const [index, duration] of durations.entries()) {
+    at(elapsed)
+    const phase = tracer.startSpan(`phase-${index}`)
+    elapsed += duration
+    at(elapsed)
+    phase.end({outcome: 'succeeded'})
+  }
+  tracer.root.end({outcome: 'succeeded'})
+  await tracer.flush()
+  return named(exported(target), 'action.main')
+}
+
 describe('the root span’s Langfuse summary', () => {
   it('uses the keys Langfuse reads', () => {
     // #then
     expect(Object.values(SUMMARY_ATTRIBUTE)).toEqual([...KEYS])
+    expect(SUMMARY_METADATA_PREFIX).toBe('langfuse.observation.metadata')
   })
 
   describe('a normal run', () => {
@@ -116,37 +173,83 @@ describe('the root span’s Langfuse summary', () => {
         for (const key of KEYS) expect(attr(span, key)).toBeUndefined()
     })
 
-    it('records what the run is as the input, with the fields merged across calls', async () => {
+    it('says what the run is as one line of Markdown, with the fields merged across calls', async () => {
       // #given / #when
       const root = named(await normalRun(), 'action.main')
 
+      // #then the event, the repository and the ref in code spans, then the isolation
+      expect(markdown(root, INPUT)).toBe('`issue_comment.created` on `fro-bot/agent` @ `main`, not isolated')
+    })
+
+    it('pins the whole Markdown of one run: the line, the table, the order and the time of every phase', async () => {
+      // #given a run on a clock that the test sets: bootstrap 420 ms, execution 12.34 s with a child, cleanup 1.2 s, 108 s in all
+      const {target, tracer, at} = await setupTimed()
+      tracer.setRunInput({isolateAgent: false, ref: 'main', event: 'issue_comment.created'})
+      at(100)
+      const bootstrap = tracer.startSpan('bootstrap')
+      at(520)
+      bootstrap.end({outcome: 'succeeded'})
+      const execution = tracer.startSpan('execution')
+      at(600)
+      const child = execution.startChild('server start')
+      at(900)
+      child.end({outcome: 'succeeded'})
+      at(12_860)
+      execution.end({outcome: 'succeeded', reason: 'completed'})
+      const cleanup = tracer.startSpan('cleanup')
+      at(14_060)
+      cleanup.end({outcome: 'succeeded'})
+      at(108_000)
+      tracer.root.end({outcome: 'succeeded', reason: 'completed'})
+
+      // #when
+      await tracer.flush()
+
+      // #then the grandchild `server start` is not a phase
+      const root = named(exported(target), 'action.main')
+      expect(markdown(root, INPUT)).toBe('`issue_comment.created` on `fro-bot/agent` @ `main`, not isolated')
+      expect(markdown(root, OUTPUT)).toBe(
+        [
+          '**succeeded** in 1m 48s, 3 phases — completed',
+          '',
+          '| phase | outcome | time |',
+          '| --- | --- | --- |',
+          '| bootstrap | succeeded | 420ms |',
+          '| execution | succeeded | 12.3s |',
+          '| cleanup | succeeded | 1.2s |',
+        ].join('\n'),
+      )
+    })
+
+    it('puts the structured fields in root-only metadata, in the type each has', async () => {
+      // #given the same run as the pinned one
+      const {target, tracer, at} = await setupTimed()
+      tracer.setRunInput({isolateAgent: false, ref: 'main', event: 'issue_comment.created'})
+      tracer.startSpan('bootstrap').end({outcome: 'succeeded'})
+      tracer.startSpan('routing').end({outcome: 'skipped', reason: 'no_mention'})
+      tracer.startSpan('cleanup').end({outcome: 'failed', reason: 'exception'})
+      at(108_000)
+      tracer.root.end({outcome: 'succeeded', reason: 'completed'})
+
+      // #when
+      await tracer.flush()
+
       // #then
-      expect(json(root, 'langfuse.observation.input')).toEqual({
+      const spans = exported(target)
+      expect(metadataOf(named(spans, 'action.main'))).toEqual({
         trigger: 'issue_comment',
         event: 'issue_comment.created',
         repository: 'fro-bot/agent',
         ref: 'main',
-        isolateAgent: false,
-      })
-    })
-
-    it('records how the run ended as the output, with the direct children of the root as the phases', async () => {
-      // #given / #when
-      const root = named(await normalRun(), 'action.main')
-
-      // #then the grandchild `server start` is not a phase; each phase is a name, an outcome and its milliseconds
-      const output = json(root, 'langfuse.observation.output')
-      expect(output).toEqual({
+        isolate_agent: false,
         outcome: 'succeeded',
         reason: 'completed',
-        durationMs: anyNumber,
-        phases: [
-          {name: 'bootstrap', outcome: 'succeeded', ms: anyNumber},
-          {name: 'execution', outcome: 'succeeded', ms: anyNumber},
-          {name: 'cleanup', outcome: 'succeeded', ms: anyNumber},
-        ],
+        duration_ms: 108_000,
+        phase_count: 3,
+        failed_phases: 2,
       })
-      expect(output.durationMs as number).toBeGreaterThan(0)
+      // #and no other span has any, so the identity mirror is the only metadata the phases carry
+      for (const span of spans.filter(item => item.name !== 'action.main')) expect(metadataKeys(span)).toEqual([])
     })
 
     it('has the default level and the reason as the status message', async () => {
@@ -179,44 +282,113 @@ describe('the root span’s Langfuse summary', () => {
       const root = named(spans, 'action.main')
       expect(attr(root, 'langfuse.observation.level')).toBe(level)
       expect(attr(root, 'langfuse.observation.status_message')).toBe(reason)
-      expect(json(root, 'langfuse.observation.output')).toMatchObject({outcome, reason})
+      expect(firstLine(markdown(root, OUTPUT))).toMatch(
+        new RegExp(String.raw`^\*\*${outcome}\*\* in .*, 1 phase — ${reason}$`),
+      )
+      expect(metadataOf(root)).toMatchObject({outcome, reason})
       for (const key of KEYS) expect(attr(root, key)).toBeTypeOf('string')
       for (const span of spans.filter(item => item.name !== 'action.main'))
         for (const key of KEYS) expect(attr(span, key)).toBeUndefined()
     })
 
-    it('says cancelled, at the warning level, with the signal and the phase that was open', async () => {
-      // #given a finished phase and one that a signal interrupts
+    it('says skipped at the warning level, with the phase that skipped it in the table', async () => {
+      // #given
+      const {target, tracer, at} = await setupTimed()
+      tracer.setRunInput({event: 'issue_comment.created'})
+      at(300)
+      tracer.startSpan('routing').end({outcome: 'skipped', reason: 'no_mention'})
+      tracer.root.end({outcome: 'skipped', reason: 'no_mention'})
+
+      // #when
+      await tracer.flush()
+
+      // #then
+      const root = named(exported(target), 'action.main')
+      expect(markdown(root, OUTPUT)).toBe(
+        [
+          '**skipped** in 300ms, 1 phase — no_mention',
+          '',
+          '| phase | outcome | time |',
+          '| --- | --- | --- |',
+          '| routing | skipped | 0ms |',
+        ].join('\n'),
+      )
+      expect(attr(root, 'langfuse.observation.level')).toBe('WARNING')
+      expect(metadataOf(root)).toMatchObject({
+        outcome: 'skipped',
+        reason: 'no_mention',
+        phase_count: 1,
+        failed_phases: 1,
+      })
+    })
+
+    it('says failed at the error level, and counts the phases that did not succeed', async () => {
+      // #given a failed phase and the two that always follow
       const {target, tracer} = await setup()
-      tracer.setRunInput({isolateAgent: true})
-      tracer.startSpan('bootstrap').end({outcome: 'succeeded'})
+      tracer.startSpan('bootstrap').end({outcome: 'failed', reason: 'exception'})
+      tracer.startSpan('cleanup').end({outcome: 'succeeded'})
+      tracer.startSpan('report').end({outcome: 'succeeded'})
+      tracer.root.end({outcome: 'failed', reason: 'exception'})
+
+      // #when
+      await tracer.flush()
+
+      // #then
+      const root = named(exported(target), 'action.main')
+      expect(tableOf(markdown(root, OUTPUT)).map(row => row.split(' | ')[0])).toEqual([
+        '| phase',
+        '| ---',
+        '| bootstrap',
+        '| cleanup',
+        '| report',
+      ])
+      expect(markdown(root, OUTPUT)).toContain('| bootstrap | failed | ')
+      expect(attr(root, 'langfuse.observation.level')).toBe('ERROR')
+      expect(metadataOf(root)).toMatchObject({outcome: 'failed', phase_count: 3, failed_phases: 1})
+    })
+
+    it('says cancelled, at the warning level, with the signal and the phase that was open', async () => {
+      // #given a finished phase and one that a signal interrupts, 2 s into the run
+      const {target, tracer, at} = await setupTimed()
+      tracer.setRunInput({isolateAgent: true, event: 'pull_request.opened', ref: '2091/merge'})
+      at(100)
+      const bootstrap = tracer.startSpan('bootstrap')
+      at(600)
+      bootstrap.end({outcome: 'succeeded'})
       const execution = tracer.startSpan('execution')
       execution.startChild('install')
 
       // #when
+      at(2_000)
       tracer.cancel('sigterm')
       await tracer.flush()
 
       // #then
-      const spans = exported(target)
-      const root = named(spans, 'action.main')
+      const root = named(exported(target), 'action.main')
       expect(attr(root, 'langfuse.observation.level')).toBe('WARNING')
       expect(attr(root, 'langfuse.observation.status_message')).toBe('sigterm')
-      expect(json(root, 'langfuse.observation.output')).toEqual({
+      expect(markdown(root, INPUT)).toBe('`pull_request.opened` on `fro-bot/agent` @ `2091/merge`, isolated')
+      expect(markdown(root, OUTPUT)).toBe(
+        [
+          '**cancelled** in 2.0s, 2 phases — sigterm',
+          '',
+          '| phase | outcome | time |',
+          '| --- | --- | --- |',
+          '| bootstrap | succeeded | 500ms |',
+          '| execution | cancelled | 1.4s |',
+        ].join('\n'),
+      )
+      expect(metadataOf(root)).toMatchObject({
         outcome: 'cancelled',
         reason: 'sigterm',
-        durationMs: anyNumber,
-        phases: [
-          {name: 'bootstrap', outcome: 'succeeded', ms: anyNumber},
-          {name: 'execution', outcome: 'cancelled', ms: anyNumber},
-        ],
+        isolate_agent: true,
+        duration_ms: 2_000,
+        phase_count: 2,
+        failed_phases: 1,
       })
-      expect(json(root, 'langfuse.observation.input')).toMatchObject({isolateAgent: true})
-      for (const span of spans.filter(item => item.name !== 'action.main'))
-        for (const key of KEYS) expect(attr(span, key)).toBeUndefined()
     })
 
-    it('leaves the status message out when the run gave no reason, and names a phase that never ended', async () => {
+    it('leaves the reason out when the run gave none, and names a phase that never ended', async () => {
       // #given a root that ends with an outcome only, and a phase left open
       const {target, tracer} = await setup()
       tracer.startSpan('execution')
@@ -225,12 +397,50 @@ describe('the root span’s Langfuse summary', () => {
       // #when
       await tracer.flush()
 
-      // #then
+      // #then no dash, no status message, no reason in the metadata
       const root = named(exported(target), 'action.main')
       expect(attr(root, 'langfuse.observation.status_message')).toBeUndefined()
-      const output = json(root, 'langfuse.observation.output')
-      expect(output).not.toHaveProperty('reason')
-      expect(output.phases).toEqual([{name: 'execution', outcome: 'unfinished', ms: anyNumber}])
+      expect(firstLine(markdown(root, OUTPUT))).toMatch(/^\*\*succeeded\*\* in \S+, 1 phase$/)
+      expect(tableOf(markdown(root, OUTPUT))[2]).toMatch(/^\| execution \| unfinished \| \S+ \|$/)
+      expect(metadataOf(root)).not.toHaveProperty('reason')
+      expect(metadataOf(root)).toMatchObject({failed_phases: 1})
+    })
+
+    it('has no table for a run with no phases, and says 0 phases', async () => {
+      // #given
+      const {target, tracer} = await setup()
+      tracer.root.end({outcome: 'succeeded', reason: 'completed'})
+
+      // #when
+      await tracer.flush()
+
+      // #then
+      const root = named(exported(target), 'action.main')
+      expect(markdown(root, OUTPUT)).toMatch(/^\*\*succeeded\*\* in \S+, 0 phases — completed$/)
+      expect(metadataOf(root)).toMatchObject({phase_count: 0, failed_phases: 0})
+    })
+  })
+
+  describe('durations', () => {
+    it('reads milliseconds under a second, then seconds with a tenth, then minutes and seconds', async () => {
+      // #given phases of every size that matters, and a root of the same length as the sum
+      const durations = [0, 999, 1_000, 12_340, 59_949, 59_950, 60_000, 108_000, 3_600_000]
+
+      // #when
+      const root = await runWithPhases(durations)
+
+      // #then the 59.95 s phase would round to `60.0s`, so it is a minute
+      expect(tableOf(markdown(root, OUTPUT)).slice(2)).toEqual([
+        '| phase-0 | succeeded | 0ms |',
+        '| phase-1 | succeeded | 999ms |',
+        '| phase-2 | succeeded | 1.0s |',
+        '| phase-3 | succeeded | 12.3s |',
+        '| phase-4 | succeeded | 59.9s |',
+        '| phase-5 | succeeded | 1m 0s |',
+        '| phase-6 | succeeded | 1m 0s |',
+        '| phase-7 | succeeded | 1m 48s |',
+        '| phase-8 | succeeded | 60m 0s |',
+      ])
     })
   })
 
@@ -244,58 +454,52 @@ describe('the root span’s Langfuse summary', () => {
       await tracer.flush()
 
       // #then
-      expect(attr(named(exported(target), 'action.main'), 'langfuse.observation.input')).toBeUndefined()
+      expect(attr(named(exported(target), 'action.main'), INPUT)).toBeUndefined()
     })
 
-    it('leaves out a field the run does not know', async () => {
-      // #given only the event is known besides the identity
-      const {target, tracer} = await setup({identity: {trigger: 'workflow_dispatch'}})
-      tracer.setRunInput({event: 'workflow_dispatch'})
+    it.each([
+      [
+        'the event, with no repository or ref',
+        {trigger: 'workflow_dispatch'},
+        {event: 'workflow_dispatch'},
+        '`workflow_dispatch`',
+      ],
+      ['the trigger when the event is not known', {trigger: 'schedule'}, {ref: 'main'}, '`schedule` @ `main`'],
+      ['the isolation alone', {}, {isolateAgent: true}, 'isolated'],
+      ['the repository alone', {repository: 'fro-bot/agent'}, {}, 'on `fro-bot/agent`'],
+      [
+        'a pull request',
+        {repository: 'marcusrbrown/infra', trigger: 'pull_request'},
+        {event: 'pull_request.opened', ref: '2091/merge', isolateAgent: true},
+        '`pull_request.opened` on `marcusrbrown/infra` @ `2091/merge`, isolated',
+      ],
+    ] as const)('says %s, and drops the parts it does not know', async (_name, identity, input, expected) => {
+      // #given
+      const {target, tracer} = await setup({identity})
+      tracer.setRunInput(input)
       tracer.root.end({outcome: 'succeeded'})
 
       // #when
       await tracer.flush()
 
       // #then
-      expect(json(named(exported(target), 'action.main'), 'langfuse.observation.input')).toEqual({
-        trigger: 'workflow_dispatch',
-        event: 'workflow_dispatch',
-      })
+      expect(markdown(named(exported(target), 'action.main'), INPUT)).toBe(expected)
     })
 
-    it('stays under the cap with the longest ref and repository it can hold, each as bad as JSON makes it', async () => {
-      // #given control characters, which JSON writes as six characters each
-      const hostile = '\u0001'.repeat(300)
-      const {target, tracer} = await setup({identity: {repository: '\u0001'.repeat(256), trigger: 'issue_comment'}})
-      tracer.setRunInput({ref: hostile, event: 'issue_comment.created', isolateAgent: true})
+    it('stays under the cap with the longest ref and repository it can hold, in the widest characters', async () => {
+      // #given three-byte characters in every free field
+      const wide = '段'.repeat(300)
+      const {target, tracer} = await setup({identity: {repository: '段'.repeat(256), trigger: 'issue_comment'}})
+      tracer.setRunInput({ref: wide, event: '段'.repeat(256), isolateAgent: true})
       tracer.root.end({outcome: 'succeeded'})
 
       // #when
       await tracer.flush()
 
       // #then
-      const text = attr(named(exported(target), 'action.main'), 'langfuse.observation.input') ?? ''
-      expect(Buffer.byteLength(text, 'utf8')).toBeLessThanOrEqual(SUMMARY_MAX_BYTES)
-      expect(() => {
-        JSON.parse(text) as unknown
-      }).not.toThrow()
-    })
-
-    it('leaves the input out, whole, when hostile values in every field would take it past the cap', async () => {
-      // #given control characters in all four text fields: six bytes each in JSON, so over 4,096 together
-      const hostile = '\u0001'.repeat(256)
-      const {target, tracer} = await setup({identity: {repository: hostile, trigger: hostile}})
-      tracer.setRunInput({ref: hostile, event: hostile, isolateAgent: true})
-      tracer.root.end({outcome: 'succeeded'})
-
-      // #when
-      await tracer.flush()
-
-      // #then no attribute that is over the cap, and the rest of the summary is still there
-      const root = named(exported(target), 'action.main')
-      expect(attr(root, 'langfuse.observation.input')).toBeUndefined()
-      expect(attr(root, 'langfuse.observation.level')).toBe('DEFAULT')
-      expect(json(root, 'langfuse.observation.output')).toMatchObject({outcome: 'succeeded'})
+      const input = markdown(named(exported(target), 'action.main'), INPUT)
+      expect(Buffer.byteLength(input, 'utf8')).toBeLessThanOrEqual(SUMMARY_MAX_BYTES)
+      expect(input).toContain('…[truncated]')
     })
 
     it('is not recorded by a tracer that continues another’s trace: the post step has no root', async () => {
@@ -313,11 +517,66 @@ describe('the root span’s Langfuse summary', () => {
       const spans = exported(target)
       expect(spans.map(span => span.name)).toEqual(['post'])
       for (const key of KEYS) expect(attr(named(spans, 'post'), key)).toBeUndefined()
+      expect(metadataKeys(named(spans, 'post'))).toEqual([])
+    })
+  })
+
+  describe('text that came from outside', () => {
+    // A git ref can hold `|` and a backtick, and a phase name or a reason is whatever its caller wrote.
+    const HOSTILE_REF = 'feat/a|b`c\nd'
+    const HOSTILE_PHASE = 'ph|`x\ny\\z'
+    const HOSTILE_REASON = 'why|`\nnot'
+
+    async function hostileRun(): Promise<Wire> {
+      const {target, tracer, at} = await setupTimed()
+      tracer.setRunInput({ref: HOSTILE_REF, event: 'issue_comment.created', isolateAgent: true})
+      const phase = tracer.startSpan(HOSTILE_PHASE)
+      at(100)
+      phase.end({outcome: 'failed', reason: 'exception'})
+      at(2_000)
+      tracer.root.end({outcome: 'failed', reason: HOSTILE_REASON})
+      await tracer.flush()
+      return named(exported(target), 'action.main')
+    }
+
+    it('cannot break out of the code spans of the input, or onto a second line', async () => {
+      // #given / #when
+      const input = markdown(await hostileRun(), INPUT)
+
+      // #then a backtick or a line break in a ref would end the span or the line: the ref's become an apostrophe and a space
+      expect(input).toBe("`issue_comment.created` on `fro-bot/agent` @ `feat/a|b'c d`, isolated")
+      expect(input).not.toContain('\n')
+      expect(input.split('`')).toHaveLength(7)
+    })
+
+    it('cannot add a cell, a row or a line to the output, or end the code of a cell early', async () => {
+      // #given / #when
+      const output = markdown(await hostileRun(), OUTPUT)
+
+      // #then the pipe and the backtick are escaped, the backslash is doubled so it cannot escape the escape, and a line break is a space
+      expect(output).toBe(
+        [
+          '**failed** in 2.0s, 1 phase — why\\|\\` not',
+          '',
+          '| phase | outcome | time |',
+          '| --- | --- | --- |',
+          '| ph\\|\\`x y\\\\z | failed | 100ms |',
+        ].join('\n'),
+      )
+      expect(output.split('\n')).toHaveLength(5)
+    })
+
+    it('keeps the value as it is in the metadata, where nothing is rendered', async () => {
+      // #given / #when
+      const metadata = metadataOf(await hostileRun())
+
+      // #then scrubbed, not escaped
+      expect(metadata).toMatchObject({ref: HOSTILE_REF, reason: HOSTILE_REASON, outcome: 'failed'})
     })
   })
 
   describe('scrubbing', () => {
-    it('keeps a canary in the ref out of the payload, raw and JSON-escaped, and still sends the summary', async () => {
+    it('keeps a canary in the ref out of the payload, and still sends the summary', async () => {
       // #given a registered secret that the ref carries, and the reason of the run carries too
       const {target, tracer, registry} = await setup()
       registry.mask(CANARY)
@@ -328,40 +587,37 @@ describe('the root span’s Langfuse summary', () => {
       await tracer.flush()
 
       // #then
-      const text = target.requests.map(request => request.text).join('\n')
-      expect(text).not.toContain(CANARY)
-      expect(text).not.toContain(escaped(CANARY))
-      expect(text).not.toContain('ZZ-98765')
+      const payload = target.requests.map(request => request.text).join('\n')
+      expect(payload).not.toContain(CANARY)
+      expect(payload).not.toContain('ZZ-98765')
       const root = named(exported(target), 'action.main')
-      const input = json(root, 'langfuse.observation.input')
-      expect(input.ref).toEqual(containing('feature/'))
-      expect(input.ref).not.toContain('ZZ-98765')
+      expect(markdown(root, INPUT)).toEqual(containing('@ `feature/'))
       expect(attr(root, 'langfuse.observation.status_message')).not.toContain('ZZ-98765')
-      // #and the output still arrives, with the reason redacted inside it
-      const output = json(root, 'langfuse.observation.output') as {outcome: string; reason: string}
-      expect(output.outcome).toBe('failed')
-      expect(output.reason).toContain('broke on')
-      expect(output.reason).not.toContain('ZZ-98765')
+      // #and the output still arrives, with the reason redacted inside it, and so do the metadata
+      expect(firstLine(markdown(root, OUTPUT))).toMatch(/^\*\*failed\*\* in \S+, 0 phases — broke on /)
+      expect(metadataOf(root).reason).toEqual(containing('broke on'))
+      expect(metadataOf(root).ref).toEqual(containing('feature/'))
     })
 
-    it('scrubs a secret that JSON writes differently from the registered text', async () => {
-      // #given a secret with a quote and a backslash in it: in the JSON it is `pa\"ss\\word...`, not the registered text
-      const secret = String.raw`pa"ss\word-ZZ-98765-xyz`
+    it('scrubs a secret that the Markdown would write differently from the registered text', async () => {
+      // #given a secret with a pipe, a backtick and a line break in it: escaped, it is not the registered text
+      const secret = 'pa|ss`word\n-ZZ-98765-xyz'
       const {target, tracer, registry} = await setup()
       registry.mask(secret)
       tracer.setRunInput({ref: `feature/${secret}`})
-      tracer.root.end({outcome: 'succeeded'})
+      tracer.startSpan(`phase ${secret}`).end({outcome: 'succeeded'})
+      tracer.root.end({outcome: 'failed', reason: `broke ${secret}`})
 
       // #when
       await tracer.flush()
 
-      // #then
-      const text = target.requests.map(request => request.text).join('\n')
-      expect(text).not.toContain('ZZ-98765')
-      expect(text).not.toContain(escaped(secret))
-      expect(json(named(exported(target), 'action.main'), 'langfuse.observation.input').ref).toEqual(
-        containing('feature/'),
-      )
+      // #then it is scrubbed before it is escaped, so no part of it is left in the payload, and the summary arrived
+      const payload = target.requests.map(request => request.text).join('\n')
+      expect(payload).not.toContain('ZZ-98765')
+      expect(payload).not.toContain('pa|ss')
+      const root = named(exported(target), 'action.main')
+      expect(markdown(root, INPUT)).toEqual(containing('@ `feature/'))
+      expect(markdown(root, OUTPUT)).toEqual(containing('| phase '))
     })
 
     it('cuts a long ref to the free-text cap, after the scrub', async () => {
@@ -374,10 +630,10 @@ describe('the root span’s Langfuse summary', () => {
       await tracer.flush()
 
       // #then
-      const {ref} = json(named(exported(target), 'action.main'), 'langfuse.observation.input') as {ref: string}
-      expect(ref.startsWith('release/xxx')).toBe(true)
-      expect(ref.length).toBeLessThan(FREE_TEXT_MAX_CHARS + 32)
-      expect(ref).toContain('[truncated]')
+      const input = markdown(named(exported(target), 'action.main'), INPUT)
+      expect(input).toEqual(containing('@ `release/xxx'))
+      expect(input.length).toBeLessThan(FREE_TEXT_MAX_CHARS + 64)
+      expect(input).toContain('…[truncated]')
     })
 
     it('scrubs before it cuts, so a secret on the cut line leaves no front half behind', async () => {
@@ -391,10 +647,11 @@ describe('the root span’s Langfuse summary', () => {
       await tracer.flush()
 
       // #then not even the part a cut would have kept, and the summary did arrive with the safe part of the ref
-      const text = target.requests.map(request => request.text).join('\n')
-      expect(text).not.toContain(CANARY.slice(0, 12))
-      const {ref} = json(named(exported(target), 'action.main'), 'langfuse.observation.input') as {ref: string}
-      expect(ref.startsWith('a'.repeat(FREE_TEXT_MAX_CHARS - 16))).toBe(true)
+      const payload = target.requests.map(request => request.text).join('\n')
+      expect(payload).not.toContain(CANARY.slice(0, 12))
+      expect(markdown(named(exported(target), 'action.main'), INPUT)).toEqual(
+        containing(`@ \`${'a'.repeat(FREE_TEXT_MAX_CHARS - 16)}`),
+      )
     })
 
     it('scrubs a secret registered after the run recorded its input', async () => {
@@ -409,11 +666,12 @@ describe('the root span’s Langfuse summary', () => {
 
       // #then the summary arrived, with the part of the ref that was safe
       expect(target.requests.map(request => request.text).join('\n')).not.toContain('ZZ-98765')
-      const {ref} = json(named(exported(target), 'action.main'), 'langfuse.observation.input') as {ref: string}
-      expect(ref.startsWith('feature/')).toBe(true)
+      expect(markdown(named(exported(target), 'action.main'), INPUT)).toEqual(containing('@ `feature/'))
     })
+  })
 
-    it('drops the free-text fields, and only those, when a registered secret is one the scrubber cannot match', async () => {
+  describe('when no free text can be trusted', () => {
+    it('drops the repository and the ref, and only those, from the input, the metadata and the Markdown', async () => {
       // #given a 7-character credential: outside the scrubber's range, so no free text can be trusted to it
       const {target, tracer, registry} = await setup()
       registry.add('Zq9x4t7')
@@ -424,32 +682,33 @@ describe('the root span’s Langfuse summary', () => {
       // #when
       await tracer.flush()
 
-      // #then ref and repository are gone; the categories stay
+      // #then the event and the isolation stay
       const root = named(exported(target), 'action.main')
-      expect(json(root, 'langfuse.observation.input')).toEqual({
-        trigger: 'issue_comment',
-        event: 'issue_comment.created',
-        isolateAgent: true,
-      })
-      expect(json(root, 'langfuse.observation.output')).toEqual({
-        outcome: 'failed',
-        reason: 'exception',
-        durationMs: anyNumber,
-        phases: [{name: 'bootstrap', outcome: 'succeeded', ms: anyNumber}],
-      })
+      expect(markdown(root, INPUT)).toBe('`issue_comment.created`, isolated')
+      expect(metadataKeys(root).toSorted()).toEqual(
+        ['trigger', 'event', 'isolate_agent', 'outcome', 'reason', 'duration_ms', 'phase_count', 'failed_phases']
+          .map(key => `${METADATA}${key}`)
+          .toSorted(),
+      )
+      expect(firstLine(markdown(root, OUTPUT))).toMatch(/^\*\*failed\*\* in \S+, 1 phase — exception$/)
+      expect(tableOf(markdown(root, OUTPUT))[2]).toMatch(/^\| bootstrap \| succeeded \| \S+ \|$/)
       expect(attr(root, 'langfuse.observation.status_message')).toBe('exception')
       expect(attr(root, 'langfuse.observation.level')).toBe('ERROR')
-      expect(target.requests.map(request => request.text).join('\n')).not.toContain('Zq9x4t7')
+      const payload = target.requests.map(request => request.text).join('\n')
+      expect(payload).not.toContain('Zq9x4t7')
+      // #and the repository is still in the identity every span carries, which this summary does not decide
+      expect(metadataOf(root)).not.toHaveProperty('repository')
+      expect(metadataOf(root)).not.toHaveProperty('ref')
     })
   })
 
-  describe('a registered literal that overlaps the JSON itself', () => {
-    // A literal made of JSON keys and punctuation: the scrubber would take it out of the finished text and leave invalid JSON.
+  describe('a registered literal that overlaps the Markdown itself', () => {
+    // A literal made of the summary's own words and punctuation: the scrubber would take it out of the finished text and leave a broken table.
     it.each([
-      ['the input', 'langfuse.observation.input', '","isolateAgent":'],
-      ['the output', 'langfuse.observation.output', '"phases":[{"name":"'],
+      ['the input', INPUT, ', not isolated'],
+      ['the output', OUTPUT, '| phase | outcome | time |'],
     ] as const)(
-      'leaves %s valid or absent, never rewritten, and the literal out of the payload',
+      'leaves %s absent, never rewritten, and the literal out of the payload',
       async (_name, key, literal) => {
         // #given
         const {target, tracer, registry} = await setup()
@@ -465,12 +724,11 @@ describe('the root span’s Langfuse summary', () => {
         const root = named(exported(target), 'action.main')
         expect(attr(root, 'langfuse.observation.level')).toBe('ERROR')
         expect(attr(root, 'langfuse.observation.status_message')).toBe('exception')
-        // #and the attribute is omitted, not redacted into something that is no longer JSON
+        // #and the attribute is omitted, not redacted into something that is no longer what was built
         expect(attr(root, key)).toBeUndefined()
-        // #and every summary attribute that did arrive parses
-        for (const present of KEYS.filter(item => attr(root, item) !== undefined && item.endsWith('put')))
-          expect(() => json(root, present)).not.toThrow()
-        expect(target.requests.map(request => request.text).join('\n')).not.toContain(escaped(literal))
+        expect(target.requests.map(request => request.text).join('\n')).not.toContain(literal)
+        // #and the metadata is not touched by it
+        expect(metadataOf(root)).toMatchObject({outcome: 'failed', phase_count: 1})
       },
     )
 
@@ -480,15 +738,15 @@ describe('the root span’s Langfuse summary', () => {
       tracer.setRunInput({ref: 'main', isolateAgent: false})
       tracer.startSpan('bootstrap').end({outcome: 'succeeded'})
       tracer.root.end({outcome: 'succeeded'})
-      registry.add('"isolateAgent":false')
+      registry.add(', not isolated')
 
       // #when
       await tracer.flush()
 
       // #then
       const root = named(exported(target), 'action.main')
-      expect(attr(root, 'langfuse.observation.input')).toBeUndefined()
-      expect(json(root, 'langfuse.observation.output')).toMatchObject({outcome: 'succeeded'})
+      expect(attr(root, INPUT)).toBeUndefined()
+      expect(firstLine(markdown(root, OUTPUT))).toMatch(/^\*\*succeeded\*\* in /)
     })
 
     it.each(['unauthorized_author', 'own_posted_comment', 'bot_not_requested', 'sigterm'])(
@@ -504,19 +762,16 @@ describe('the root span’s Langfuse summary', () => {
 
         // #then
         const root = named(exported(target), 'action.main')
-        expect(json(root, 'langfuse.observation.output')).toMatchObject({outcome: 'skipped', reason})
-        expect(json(root, 'langfuse.observation.input')).toMatchObject({event: 'issue_comment.created'})
+        expect(firstLine(markdown(root, OUTPUT))).toMatch(new RegExp(String.raw`^\*\*skipped\*\* in .* — ${reason}$`))
+        expect(markdown(root, INPUT)).toEqual(containing('`issue_comment.created`'))
       },
     )
   })
 
   describe('the byte cap', () => {
-    const decodedOutput = (
-      root: Wire,
-    ): {phases: {name: string; outcome: string; ms: number}[]; truncatedPhases?: number} =>
-      json(root, 'langfuse.observation.output') as never
+    const rowsOf = (output: string): string[] => tableOf(output).slice(2)
 
-    it('counts bytes, not characters: multibyte phase names stay within 4,096 bytes and only whole entries are kept', async () => {
+    it('counts bytes, not characters: multibyte phase names stay within 4,096 bytes and only whole rows are kept', async () => {
       // #given 200 phases whose names are three bytes a character
       const {target, tracer} = await setup()
       for (let index = 0; index < 200; index += 1) tracer.startSpan(`段階-${index}-処理`).end({outcome: 'succeeded'})
@@ -527,16 +782,61 @@ describe('the root span’s Langfuse summary', () => {
 
       // #then
       const root = named(exported(target), 'action.main')
-      const text = attr(root, 'langfuse.observation.output') ?? ''
-      expect(Buffer.byteLength(text, 'utf8')).toBeLessThanOrEqual(SUMMARY_MAX_BYTES)
+      const output = markdown(root, OUTPUT)
+      expect(Buffer.byteLength(output, 'utf8')).toBeLessThanOrEqual(SUMMARY_MAX_BYTES)
       // close to the cap, so a count of characters would have kept more than fits
-      expect(Buffer.byteLength(text, 'utf8')).toBeGreaterThan(SUMMARY_MAX_BYTES - 200)
-      const output = decodedOutput(root)
-      expect(output.phases.length).toBeGreaterThan(10)
-      output.phases.forEach((entry, index) => {
-        expect(entry).toEqual({name: `段階-${index}-処理`, outcome: 'succeeded', ms: anyNumber})
+      expect(Buffer.byteLength(output, 'utf8')).toBeGreaterThan(SUMMARY_MAX_BYTES - 80)
+      const rows = rowsOf(output)
+      const kept = rows.length - 1
+      expect(kept).toBeGreaterThan(10)
+      expect(kept).toBeLessThan(200)
+      rows.slice(0, kept).forEach((row, index) => {
+        expect(row).toMatch(new RegExp(String.raw`^\| 段階-${index}-処理 \| succeeded \| \S+ \|$`))
       })
-      expect(output.truncatedPhases).toBe(200 - output.phases.length)
+      // #and the last line says how many are not shown, and the first line still counts all of them
+      expect(rows.at(-1)).toBe(`| … | ${200 - kept} more | |`)
+      expect(firstLine(output)).toContain(', 200 phases')
+      expect(metadataOf(root)).toMatchObject({phase_count: 200})
+    })
+
+    it('cuts at the last row that fits, not one earlier', async () => {
+      // #given
+      const {target, tracer} = await setup()
+      for (let index = 0; index < 200; index += 1) tracer.startSpan(`段階-${index}-処理`).end({outcome: 'succeeded'})
+      tracer.root.end({outcome: 'succeeded', reason: 'completed'})
+
+      // #when
+      await tracer.flush()
+
+      // #then adding the next row, and the shorter count that goes with it, would be over the cap
+      const output = markdown(named(exported(target), 'action.main'), OUTPUT)
+      const rows = rowsOf(output)
+      const kept = rows.length - 1
+      const next = `| 段階-${kept}-処理 | succeeded | 10ms |`
+      const more = `| … | ${200 - kept - 1} more | |`
+      const without = output.slice(0, output.lastIndexOf('\n'))
+      expect(Buffer.byteLength(`${without}\n${next}\n${more}`, 'utf8')).toBeGreaterThan(SUMMARY_MAX_BYTES)
+    })
+
+    it('measures the rows after they are escaped, so a name full of pipes and wide characters cannot push it over', async () => {
+      // #given 200 phases that each grow when escaped: a pipe and a backtick are two bytes each, the rest three
+      const {target, tracer} = await setup()
+      for (let index = 0; index < 200; index += 1) tracer.startSpan(`段|\`階-${index}`).end({outcome: 'succeeded'})
+      tracer.root.end({outcome: 'succeeded'})
+
+      // #when
+      await tracer.flush()
+
+      // #then
+      const output = markdown(named(exported(target), 'action.main'), OUTPUT)
+      expect(Buffer.byteLength(output, 'utf8')).toBeLessThanOrEqual(SUMMARY_MAX_BYTES)
+      const rows = rowsOf(output)
+      const kept = rows.length - 1
+      expect(kept).toBeGreaterThan(10)
+      rows.slice(0, kept).forEach((row, index) => {
+        expect(row).toMatch(new RegExp(`^\\| 段\\\\\\|\\\\\`階-${index} \\| succeeded \\| \\S+ \\|$`))
+      })
+      expect(rows.at(-1)).toBe(`| … | ${200 - kept} more | |`)
     })
 
     it('measures the names after they are scrubbed, so a replacement longer than the secret cannot push it over', async () => {
@@ -551,19 +851,16 @@ describe('the root span’s Langfuse summary', () => {
       await tracer.flush()
 
       // #then
-      const root = named(exported(target), 'action.main')
-      const text = attr(root, 'langfuse.observation.output') ?? ''
-      expect(Buffer.byteLength(text, 'utf8')).toBeLessThanOrEqual(SUMMARY_MAX_BYTES)
-      expect(text).not.toContain(secret)
-      const output = decodedOutput(root)
-      expect(output.phases.length).toBeGreaterThan(10)
-      expect(output.truncatedPhases).toBe(200 - output.phases.length)
-      for (const entry of output.phases) expect(entry.name).toMatch(/^p\d+-/)
+      const output = markdown(named(exported(target), 'action.main'), OUTPUT)
+      expect(Buffer.byteLength(output, 'utf8')).toBeLessThanOrEqual(SUMMARY_MAX_BYTES)
+      expect(output).not.toContain(secret)
+      const rows = rowsOf(output)
+      expect(rows.length).toBeGreaterThan(10)
+      for (const row of rows.slice(0, -1)) expect(row).toMatch(/^\| p\d+-/)
+      expect(rows.at(-1)).toMatch(/^\| … \| \d+ more \| \|$/)
     })
-  })
 
-  describe('the cap', () => {
-    it('cuts the phases at a whole entry and counts what it cut, for a run with many phases', async () => {
+    it('cuts the phases at a whole row and counts what it cut, for a run with many phases', async () => {
       // #given 300 phases
       const {target, tracer} = await setup()
       for (let index = 0; index < 300; index += 1) tracer.startSpan(`phase-${index}`).end({outcome: 'succeeded'})
@@ -573,24 +870,21 @@ describe('the root span’s Langfuse summary', () => {
       await tracer.flush()
 
       // #then
-      const text = attr(named(exported(target), 'action.main'), 'langfuse.observation.output') ?? ''
-      expect(Buffer.byteLength(text, 'utf8')).toBeLessThanOrEqual(SUMMARY_MAX_BYTES)
-      const output = JSON.parse(text) as {
-        outcome: string
-        phases: {name: string; outcome: string; ms: number}[]
-        truncatedPhases: number
-      }
-      expect(output.outcome).toBe('succeeded')
-      expect(output.phases.length).toBeGreaterThan(20)
-      expect(output.phases.length).toBeLessThan(300)
-      expect(output.truncatedPhases).toBe(300 - output.phases.length)
+      const output = markdown(named(exported(target), 'action.main'), OUTPUT)
+      expect(Buffer.byteLength(output, 'utf8')).toBeLessThanOrEqual(SUMMARY_MAX_BYTES)
+      expect(firstLine(output)).toMatch(/^\*\*succeeded\*\* in \S+, 300 phases — completed$/)
+      const rows = rowsOf(output)
+      const kept = rows.length - 1
+      expect(kept).toBeGreaterThan(20)
+      expect(kept).toBeLessThan(300)
+      expect(rows.at(-1)).toBe(`| … | ${300 - kept} more | |`)
       // the first ones, whole and in order
-      output.phases.forEach((entry, index) => {
-        expect(entry).toEqual({name: `phase-${index}`, outcome: 'succeeded', ms: anyNumber})
+      rows.slice(0, kept).forEach((row, index) => {
+        expect(row).toMatch(new RegExp(String.raw`^\| phase-${index} \| succeeded \| \S+ \|$`))
       })
     })
 
-    it('adds no count when everything fits', async () => {
+    it('adds no row about the rest when everything fits', async () => {
       // #given
       const {target, tracer} = await setup()
       tracer.startSpan('bootstrap').end({outcome: 'succeeded'})
@@ -600,9 +894,7 @@ describe('the root span’s Langfuse summary', () => {
       await tracer.flush()
 
       // #then
-      expect(json(named(exported(target), 'action.main'), 'langfuse.observation.output')).not.toHaveProperty(
-        'truncatedPhases',
-      )
+      expect(markdown(named(exported(target), 'action.main'), OUTPUT)).not.toContain(' more | |')
     })
   })
 })
