@@ -638,6 +638,24 @@ describe('run with lifecycle tracing', () => {
       expect(target.received()).toBe(0)
       expect(vi.mocked(core.saveState).mock.calls.map(call => call[0])).not.toContain('lifecycleTrace')
     })
+
+    it('an Authorization header with no credential turns tracing off: nothing is sent, no identity record is saved, one warning', async () => {
+      // #given a secret that was unset, so trace-headers is only `Authorization: Bearer`
+      inputs.values.set('trace-headers', 'Authorization: Bearer')
+
+      // #when
+      const {exitCode} = await execute()
+
+      // #then the run goes on untraced: zero requests reach the collector
+      const core = await import('@actions/core')
+      expect(exitCode).toBe(0)
+      expect(target.received()).toBe(0)
+      expect(vi.mocked(core.saveState).mock.calls.map(call => call[0])).not.toContain('lifecycleTrace')
+      const said = vi.mocked(core.warning).mock.calls.filter(call => String(call[0]).includes('trace-headers'))
+      expect(said).toEqual([
+        ['trace-headers has an Authorization header with no credential (is the secret set?), so tracing is off'],
+      ])
+    })
   })
 
   describe('the session', () => {

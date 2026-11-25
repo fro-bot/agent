@@ -49,7 +49,7 @@ export const TRACE_INPUT_MESSAGES = {
     'trace-endpoint is set and trace-headers is empty: tracing is on, and spans are sent to the endpoint with no credential.',
   headersWithoutEndpoint: 'trace-headers is ignored because trace-endpoint is empty, so tracing is off.',
   headerWithoutCredential:
-    'trace-headers has an Authorization header with no credential (is the secret set?); it was dropped',
+    'trace-headers has an Authorization header with no credential (is the secret set?), so tracing is off',
   headerLine: {
     format: (line: number) => `trace-headers line ${line} is not in the form "Name: value", so tracing is off.`,
     name: (line: number) =>
@@ -122,18 +122,12 @@ function maskInputs(io: Pick<TraceInputIo, 'mask'>, endpoint: string, headers: s
 }
 
 type HeaderLines =
-  | {
-      readonly ok: true
-      readonly headers: readonly {readonly name: string; readonly value: string}[]
-      /** An `Authorization` header with a scheme and no credential was left out. */
-      readonly droppedCredentiallessAuthorization: boolean
-    }
+  | {readonly ok: true; readonly headers: readonly {readonly name: string; readonly value: string}[]}
   | {readonly ok: false; readonly message: string}
 
 function parseHeaderLines(raw: string): HeaderLines {
   const headers: {name: string; value: string}[] = []
   const seen = new Set<string>()
-  let droppedCredentiallessAuthorization = false
   const lines = raw.split(/\r?\n/)
   for (const [index, line] of lines.entries()) {
     const trimmed = line.trim()
@@ -157,13 +151,13 @@ function parseHeaderLines(raw: string): HeaderLines {
     const lower = name.toLowerCase()
     if (seen.has(lower)) return {ok: false, message: TRACE_INPUT_MESSAGES.headerLine.repeated(lineNumber)}
     seen.add(lower)
+    // Refused, not sent without it: a missing token must mean no request at all, so the collector is never the control.
     if (lower === 'authorization' && SCHEME_WITHOUT_CREDENTIAL.test(value)) {
-      droppedCredentiallessAuthorization = true
-      continue
+      return {ok: false, message: TRACE_INPUT_MESSAGES.headerWithoutCredential}
     }
     headers.push({name, value})
   }
-  return {ok: true, headers, droppedCredentiallessAuthorization}
+  return {ok: true, headers}
 }
 
 /**
@@ -205,8 +199,6 @@ export function parseTraceInputs(
       io.warning(lines.message)
       return OFF
     }
-    // Dropped, not refused: the run goes on exactly as if the header had not been given (with no credential).
-    if (lines.droppedCredentiallessAuthorization) io.warning(TRACE_INPUT_MESSAGES.headerWithoutCredential)
 
     if (url.data.protocol === 'http:' && lines.headers.length > 0) {
       io.warning(TRACE_INPUT_MESSAGES.credentialOverHttp)
@@ -225,10 +217,7 @@ export function parseTraceInputs(
       return OFF
     }
 
-    // After a drop the warning above has already said so.
-    if (lines.headers.length === 0 && !lines.droppedCredentiallessAuthorization) {
-      io.notice(TRACE_INPUT_MESSAGES.noCredential)
-    }
+    if (lines.headers.length === 0) io.notice(TRACE_INPUT_MESSAGES.noCredential)
     return {enabled: true, url: endpoint, headers: lines.headers}
   } catch {
     // Never fails the run. The message is fixed text: whatever threw may hold a value.

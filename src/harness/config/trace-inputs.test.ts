@@ -1,5 +1,6 @@
 import {Buffer} from 'node:buffer'
 import {describe, expect, it, vi} from 'vitest'
+import {relayRequestFromInputs} from '../../services/setup/tracing.js'
 import {
   parseTraceInputs,
   readTraceInputs,
@@ -102,40 +103,37 @@ describe('parseTraceInputs', () => {
       'Authorization:   Bearer   ',
       'Authorization: Basic',
       'Authorization: Token',
-    ])('drops %j, warns once without the value, and goes on with no credential', header => {
+    ])('turns tracing off for %j, with one warning that holds no value', header => {
       // #given an Authorization header whose secret was empty
       const {result, warning, notice, info} = parse(ENDPOINT, header)
 
-      // #then the header is dropped and tracing stays on with no credential, with the warning as the only message
-      expect(result).toEqual({enabled: true, url: ENDPOINT, headers: []})
+      // #then tracing is off, so no relay starts and nothing is sent, and the warning is the only message
+      expect(result).toEqual({enabled: false})
+      expect(relayRequestFromInputs(result)).toBeNull()
       expect(warning).toHaveBeenCalledTimes(1)
       expect(warning).toHaveBeenCalledWith(TRACE_INPUT_MESSAGES.headerWithoutCredential)
       expect(warning).toHaveBeenCalledWith(
-        'trace-headers has an Authorization header with no credential (is the secret set?); it was dropped',
+        'trace-headers has an Authorization header with no credential (is the secret set?), so tracing is off',
       )
       expect(notice).not.toHaveBeenCalled()
       expect(info).not.toHaveBeenCalled()
     })
 
-    it('logs the no-credential notice when trace-headers really is empty, but not after a drop', () => {
-      // #given the same endpoint, once with no headers and once with a dropped header
-      const empty = parse(ENDPOINT, '')
-      const dropped = parse(ENDPOINT, 'Authorization: Bearer')
+    it('stays on, with the notice, when trace-headers really is empty', () => {
+      // #given the same endpoint with no headers at all
+      const {result, warning, notice} = parse(ENDPOINT, '')
 
-      // #then only the empty input says it has no credential
-      expect(empty.notice).toHaveBeenCalledWith(TRACE_INPUT_MESSAGES.noCredential)
-      expect(dropped.notice).not.toHaveBeenCalled()
-      expect(dropped.result).toEqual(empty.result)
+      // #then the existing path is unchanged: on, no credential, one notice
+      expect(result).toEqual({enabled: true, url: ENDPOINT, headers: []})
+      expect(notice).toHaveBeenCalledTimes(1)
+      expect(notice).toHaveBeenCalledWith(TRACE_INPUT_MESSAGES.noCredential)
+      expect(warning).not.toHaveBeenCalled()
     })
 
-    it('keeps the other headers when it drops one', () => {
+    it('turns tracing off for the other headers too', () => {
       const {result, warning} = parse(ENDPOINT, `Authorization: Bearer\n${VERSION}`)
 
-      expect(result).toEqual({
-        enabled: true,
-        url: ENDPOINT,
-        headers: [{name: 'x-langfuse-ingestion-version', value: '4'}],
-      })
+      expect(result).toEqual({enabled: false})
       expect(warning).toHaveBeenCalledTimes(1)
     })
 
@@ -145,7 +143,6 @@ describe('parseTraceInputs', () => {
       expect(warning).toHaveBeenCalledTimes(1)
       expect(String(warning.mock.calls[0]?.[0])).not.toMatch(/Bearer|Basic|Token/)
     })
-
     it('leaves a Bearer token alone', () => {
       const {result, warning, notice} = parse(ENDPOINT, 'Authorization: Bearer abc')
 
@@ -170,10 +167,10 @@ describe('parseTraceInputs', () => {
       expect(warning).not.toHaveBeenCalled()
     })
 
-    it('lets a loopback http collector go on with no credential once the header is dropped', () => {
+    it('is off for a loopback http collector too, with the one warning', () => {
       const {result, warning} = parse('http://127.0.0.1:4318/v1/traces', 'Authorization: Bearer')
 
-      expect(result).toEqual({enabled: true, url: 'http://127.0.0.1:4318/v1/traces', headers: []})
+      expect(result).toEqual({enabled: false})
       expect(warning).toHaveBeenCalledTimes(1)
       expect(warning).toHaveBeenCalledWith(TRACE_INPUT_MESSAGES.headerWithoutCredential)
     })

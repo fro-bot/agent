@@ -162,21 +162,6 @@ describe('the post step’s span', () => {
       expect(spans.some(item => item.name === 'action.main')).toBe(false)
     })
 
-    it('sends the post span without a credential, and does not repeat the main step’s dropped-header warning', async () => {
-      // #given an Authorization header whose secret was unset, so only the scheme is left
-      inputs.values.set('trace-headers', 'Authorization: Bearer')
-      setState(traced())
-
-      // #when
-      await post()
-
-      // #then the header is dropped as in the main step (the span is still sent), and the main step already said so
-      const core = await import('@actions/core')
-      expect(target.accepted()).toHaveLength(1)
-      expect(target.accepted()[0]?.headers.authorization).toBeUndefined()
-      expect(vi.mocked(core.warning)).not.toHaveBeenCalled()
-    })
-
     it.each([
       {state: {shouldSaveCache: 'false'}, action: 'skip', reason: 'event-not-processed'},
       {state: {cacheSaved: 'durable'}, action: 'skip', reason: 'saved-durable'},
@@ -281,6 +266,15 @@ describe('the post step’s span', () => {
       ['non-string ids', JSON.stringify({traceId: 1, rootSpanId: 2, invocationId: 3})],
     ])('with a record that is %s, and says nothing about it', async (_name, record) => {
       setState({shouldSaveCache: 'true', cacheSaved: 'not-persisted', lifecycleTrace: record})
+      expect(await afterPost()).toEqual({received: 0, warnings: 0})
+    })
+
+    it('with an Authorization header that has no credential: tracing is off, and the main step’s warning is not repeated', async () => {
+      // #given a secret that was unset, so the header is only a scheme word, and a main step that left its trace record
+      inputs.values.set('trace-headers', 'Authorization: Bearer')
+      setState(traced())
+
+      // #then post sends nothing and says nothing
       expect(await afterPost()).toEqual({received: 0, warnings: 0})
     })
 
