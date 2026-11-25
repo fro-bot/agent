@@ -200,6 +200,7 @@ export interface StageDefaultBranchSkillsOptions {
 /** Variables that would point git at a repository other than the one named on the command line. */
 const REDIRECTING_GIT_ENV = [
   'GIT_ALTERNATE_OBJECT_DIRECTORIES',
+  'GIT_COMMON_DIR',
   'GIT_DIR',
   'GIT_INDEX_FILE',
   'GIT_NAMESPACE',
