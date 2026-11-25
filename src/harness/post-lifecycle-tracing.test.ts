@@ -162,6 +162,21 @@ describe('the post step’s span', () => {
       expect(spans.some(item => item.name === 'action.main')).toBe(false)
     })
 
+    it('sends the post span without a credential, and does not repeat the main step’s dropped-header warning', async () => {
+      // #given an Authorization header whose secret was unset, so only the scheme is left
+      inputs.values.set('trace-headers', 'Authorization: Bearer')
+      setState(traced())
+
+      // #when
+      await post()
+
+      // #then the header is dropped as in the main step (the span is still sent), and the main step already said so
+      const core = await import('@actions/core')
+      expect(target.accepted()).toHaveLength(1)
+      expect(target.accepted()[0]?.headers.authorization).toBeUndefined()
+      expect(vi.mocked(core.warning)).not.toHaveBeenCalled()
+    })
+
     it.each([
       {state: {shouldSaveCache: 'false'}, action: 'skip', reason: 'event-not-processed'},
       {state: {cacheSaved: 'durable'}, action: 'skip', reason: 'saved-durable'},

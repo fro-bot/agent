@@ -346,7 +346,7 @@ The Action can send an OpenTelemetry trace of each run to a collector you operat
 ```
 
 - `trace-endpoint` is the full URL of the collector's OTLP/HTTP traces route. It must be `https`. Plain `http` is accepted only for a loopback IP address such as `127.0.0.1`, for a collector running in the same job.
-- `trace-headers` holds the collector credential, one `Name: value` header per line, for example `Authorization: Bearer <token>`. Keep it in a secret. It is refused with an `http` endpoint, because a loopback collector cannot prove who it is. For the same reason, do not put a token in the path or query of an `http` endpoint.
+- `trace-headers` holds the collector credential, one `Name: value` header per line, for example `Authorization: Bearer <token>`. Keep it in a secret. It is refused with an `http` endpoint, because a loopback collector cannot prove who it is. For the same reason, do not put a token in the path or query of an `http` endpoint. An `Authorization` header that is only a scheme word (`Bearer`, `Basic` or `Token`), as happens when the secret it reads is unset, is dropped with a warning, and tracing goes on with no credential.
 - A value that is not accepted turns tracing off with one warning. It never fails the run.
 
 ### What a trace contains

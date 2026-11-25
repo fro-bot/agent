@@ -93,6 +93,87 @@ describe('parseTraceInputs', () => {
     })
   })
 
+  describe('an Authorization header with a scheme and no credential', () => {
+    // An unset secret in `Authorization: Bearer ${{ secrets.X }}` leaves the scheme word alone (the runner trims the space).
+    it.each([
+      'Authorization: Bearer',
+      'Authorization: bearer',
+      'authorization: BEARER',
+      'Authorization:   Bearer   ',
+      'Authorization: Basic',
+      'Authorization: Token',
+    ])('drops %j, warns once without the value, and goes on with no credential', header => {
+      // #given an Authorization header whose secret was empty
+      const {result, warning, notice, info} = parse(ENDPOINT, header)
+
+      // #then the header is dropped, tracing stays on, and the no-credential notice applies
+      expect(result).toEqual({enabled: true, url: ENDPOINT, headers: []})
+      expect(warning).toHaveBeenCalledTimes(1)
+      expect(warning).toHaveBeenCalledWith(TRACE_INPUT_MESSAGES.headerWithoutCredential)
+      expect(warning).toHaveBeenCalledWith(
+        'trace-headers has an Authorization header with no credential (is the secret set?); it was dropped',
+      )
+      expect(notice).toHaveBeenCalledWith(TRACE_INPUT_MESSAGES.noCredential)
+      expect(info).not.toHaveBeenCalled()
+    })
+
+    it('keeps the other headers when it drops one', () => {
+      const {result, warning} = parse(ENDPOINT, `Authorization: Bearer\n${VERSION}`)
+
+      expect(result).toEqual({
+        enabled: true,
+        url: ENDPOINT,
+        headers: [{name: 'x-langfuse-ingestion-version', value: '4'}],
+      })
+      expect(warning).toHaveBeenCalledTimes(1)
+    })
+
+    it('says nothing about a value in its warning', () => {
+      const {warning} = parse(ENDPOINT, 'Authorization: Bearer')
+
+      expect(warning).toHaveBeenCalledTimes(1)
+      expect(String(warning.mock.calls[0]?.[0])).not.toMatch(/Bearer|Basic|Token/)
+    })
+
+    it('leaves a Bearer token alone', () => {
+      const {result, warning, notice} = parse(ENDPOINT, 'Authorization: Bearer abc')
+
+      expect(result).toEqual({enabled: true, url: ENDPOINT, headers: [{name: 'Authorization', value: 'Bearer abc'}]})
+      expect(warning).not.toHaveBeenCalled()
+      expect(notice).not.toHaveBeenCalled()
+    })
+
+    it('leaves an Authorization value that is not a bare scheme word alone', () => {
+      const {result, warning} = parse(ENDPOINT, 'Authorization: sk-lf-canary-0002')
+
+      expect(result).toMatchObject({enabled: true, headers: [{name: 'Authorization', value: 'sk-lf-canary-0002'}]})
+      expect(warning).not.toHaveBeenCalled()
+    })
+
+    it('applies to the Authorization header only: another header whose value is `Bearer` is kept', () => {
+      // #given a custom header that happens to hold the word
+      const {result, warning} = parse(ENDPOINT, 'X-Auth-Scheme: Bearer')
+
+      // #then it is a plain value, not a missing credential
+      expect(result).toEqual({enabled: true, url: ENDPOINT, headers: [{name: 'X-Auth-Scheme', value: 'Bearer'}]})
+      expect(warning).not.toHaveBeenCalled()
+    })
+
+    it('lets a loopback http collector go on with no credential once the header is dropped', () => {
+      const {result, warning} = parse('http://127.0.0.1:4318/v1/traces', 'Authorization: Bearer')
+
+      expect(result).toEqual({enabled: true, url: 'http://127.0.0.1:4318/v1/traces', headers: []})
+      expect(warning).toHaveBeenCalledTimes(1)
+      expect(warning).toHaveBeenCalledWith(TRACE_INPUT_MESSAGES.headerWithoutCredential)
+    })
+
+    it('is still masked, as before', () => {
+      const {mask} = parse(ENDPOINT, 'Authorization: Bearer')
+
+      expect(masked(mask)).toContain('Authorization: Bearer')
+    })
+  })
+
   describe('off', () => {
     it('is off and silent for an empty endpoint with empty headers', () => {
       const {result, warning, notice, info} = parse('', '')

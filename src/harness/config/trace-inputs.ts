@@ -48,6 +48,8 @@ export const TRACE_INPUT_MESSAGES = {
   noCredential:
     'trace-endpoint is set and trace-headers is empty: tracing is on, and spans are sent to the endpoint with no credential.',
   headersWithoutEndpoint: 'trace-headers is ignored because trace-endpoint is empty, so tracing is off.',
+  headerWithoutCredential:
+    'trace-headers has an Authorization header with no credential (is the secret set?); it was dropped',
   headerLine: {
     format: (line: number) => `trace-headers line ${line} is not in the form "Name: value", so tracing is off.`,
     name: (line: number) =>
@@ -61,6 +63,12 @@ export const TRACE_INPUT_MESSAGES = {
 const OFF: TracingInputs = {enabled: false}
 
 const BASIC_OR_BEARER = /^(basic|bearer)[ \t]+(\S+)$/i
+
+/**
+ * An auth scheme word with nothing after it: what `Authorization: Bearer ${{ secrets.X }}` becomes when the secret is unset.
+ * Only the `Authorization` header is checked; another header whose value happens to be `Bearer` is the operator's own text.
+ */
+const SCHEME_WITHOUT_CREDENTIAL = /^(?:basic|bearer|token)$/i
 
 function hasControlOrReplacement(value: string): boolean {
   for (let index = 0; index < value.length; index += 1) {
@@ -114,12 +122,18 @@ function maskInputs(io: Pick<TraceInputIo, 'mask'>, endpoint: string, headers: s
 }
 
 type HeaderLines =
-  | {readonly ok: true; readonly headers: readonly {readonly name: string; readonly value: string}[]}
+  | {
+      readonly ok: true
+      readonly headers: readonly {readonly name: string; readonly value: string}[]
+      /** An `Authorization` header with a scheme and no credential was left out. */
+      readonly droppedCredentiallessAuthorization: boolean
+    }
   | {readonly ok: false; readonly message: string}
 
 function parseHeaderLines(raw: string): HeaderLines {
   const headers: {name: string; value: string}[] = []
   const seen = new Set<string>()
+  let droppedCredentiallessAuthorization = false
   const lines = raw.split(/\r?\n/)
   for (const [index, line] of lines.entries()) {
     const trimmed = line.trim()
@@ -143,9 +157,13 @@ function parseHeaderLines(raw: string): HeaderLines {
     const lower = name.toLowerCase()
     if (seen.has(lower)) return {ok: false, message: TRACE_INPUT_MESSAGES.headerLine.repeated(lineNumber)}
     seen.add(lower)
+    if (lower === 'authorization' && SCHEME_WITHOUT_CREDENTIAL.test(value)) {
+      droppedCredentiallessAuthorization = true
+      continue
+    }
     headers.push({name, value})
   }
-  return {ok: true, headers}
+  return {ok: true, headers, droppedCredentiallessAuthorization}
 }
 
 /**
@@ -187,6 +205,8 @@ export function parseTraceInputs(
       io.warning(lines.message)
       return OFF
     }
+    // Dropped, not refused: the run goes on exactly as if the header had not been given (the no-credential notice below).
+    if (lines.droppedCredentiallessAuthorization) io.warning(TRACE_INPUT_MESSAGES.headerWithoutCredential)
 
     if (url.data.protocol === 'http:' && lines.headers.length > 0) {
       io.warning(TRACE_INPUT_MESSAGES.credentialOverHttp)
