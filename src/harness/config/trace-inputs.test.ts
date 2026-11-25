@@ -1,5 +1,6 @@
 import {Buffer} from 'node:buffer'
 import {describe, expect, it, vi} from 'vitest'
+import {relayRequestFromInputs} from '../../services/setup/tracing.js'
 import {
   parseTraceInputs,
   readTraceInputs,
@@ -90,6 +91,94 @@ describe('parseTraceInputs', () => {
 
       expect(result).toMatchObject({enabled: true, headers: []})
       expect(notice).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  describe('an Authorization header with a scheme and no credential', () => {
+    // An unset secret in `Authorization: Bearer ${{ secrets.X }}` leaves the scheme word alone (the runner trims the space).
+    it.each([
+      'Authorization: Bearer',
+      'Authorization: bearer',
+      'authorization: BEARER',
+      'Authorization:   Bearer   ',
+      'Authorization: Basic',
+      'Authorization: Token',
+    ])('turns tracing off for %j, with one warning that holds no value', header => {
+      // #given an Authorization header whose secret was empty
+      const {result, warning, notice, info} = parse(ENDPOINT, header)
+
+      // #then tracing is off, so no relay starts and nothing is sent, and the warning is the only message
+      expect(result).toEqual({enabled: false})
+      expect(relayRequestFromInputs(result)).toBeNull()
+      expect(warning).toHaveBeenCalledTimes(1)
+      expect(warning).toHaveBeenCalledWith(TRACE_INPUT_MESSAGES.headerWithoutCredential)
+      expect(warning).toHaveBeenCalledWith(
+        'trace-headers has an Authorization header with no credential (is the secret set?), so tracing is off',
+      )
+      expect(notice).not.toHaveBeenCalled()
+      expect(info).not.toHaveBeenCalled()
+    })
+
+    it('stays on, with the notice, when trace-headers really is empty', () => {
+      // #given the same endpoint with no headers at all
+      const {result, warning, notice} = parse(ENDPOINT, '')
+
+      // #then the existing path is unchanged: on, no credential, one notice
+      expect(result).toEqual({enabled: true, url: ENDPOINT, headers: []})
+      expect(notice).toHaveBeenCalledTimes(1)
+      expect(notice).toHaveBeenCalledWith(TRACE_INPUT_MESSAGES.noCredential)
+      expect(warning).not.toHaveBeenCalled()
+    })
+
+    it('turns tracing off for the other headers too', () => {
+      const {result, warning} = parse(ENDPOINT, `Authorization: Bearer\n${VERSION}`)
+
+      expect(result).toEqual({enabled: false})
+      expect(warning).toHaveBeenCalledTimes(1)
+    })
+
+    it('says nothing about a value in its warning', () => {
+      const {warning} = parse(ENDPOINT, 'Authorization: Bearer')
+
+      expect(warning).toHaveBeenCalledTimes(1)
+      expect(String(warning.mock.calls[0]?.[0])).not.toMatch(/Bearer|Basic|Token/)
+    })
+    it('leaves a Bearer token alone', () => {
+      const {result, warning, notice} = parse(ENDPOINT, 'Authorization: Bearer abc')
+
+      expect(result).toEqual({enabled: true, url: ENDPOINT, headers: [{name: 'Authorization', value: 'Bearer abc'}]})
+      expect(warning).not.toHaveBeenCalled()
+      expect(notice).not.toHaveBeenCalled()
+    })
+
+    it('leaves an Authorization value that is not a bare scheme word alone', () => {
+      const {result, warning} = parse(ENDPOINT, 'Authorization: sk-lf-canary-0002')
+
+      expect(result).toMatchObject({enabled: true, headers: [{name: 'Authorization', value: 'sk-lf-canary-0002'}]})
+      expect(warning).not.toHaveBeenCalled()
+    })
+
+    it('applies to the Authorization header only: another header whose value is `Bearer` is kept', () => {
+      // #given a custom header that happens to hold the word
+      const {result, warning} = parse(ENDPOINT, 'X-Auth-Scheme: Bearer')
+
+      // #then it is a plain value, not a missing credential
+      expect(result).toEqual({enabled: true, url: ENDPOINT, headers: [{name: 'X-Auth-Scheme', value: 'Bearer'}]})
+      expect(warning).not.toHaveBeenCalled()
+    })
+
+    it('is off for a loopback http collector too, with the one warning', () => {
+      const {result, warning} = parse('http://127.0.0.1:4318/v1/traces', 'Authorization: Bearer')
+
+      expect(result).toEqual({enabled: false})
+      expect(warning).toHaveBeenCalledTimes(1)
+      expect(warning).toHaveBeenCalledWith(TRACE_INPUT_MESSAGES.headerWithoutCredential)
+    })
+
+    it('is still masked, as before', () => {
+      const {mask} = parse(ENDPOINT, 'Authorization: Bearer')
+
+      expect(masked(mask)).toContain('Authorization: Bearer')
     })
   })
 
