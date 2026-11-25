@@ -7,7 +7,10 @@
 import type {OwnershipLedger} from '@fro-bot/runtime'
 
 import {createOwnershipLedger, createRemoteOpenCodeV2Client, DRAIN_WAITING_MESSAGE, ok} from '@fro-bot/runtime'
-import {SUBAGENT_FOREGROUND_SUCCESS_FRAME} from '@fro-bot/runtime/event-v2-fixtures'
+import {
+  SUBAGENT_FOREGROUND_SUCCESS_FRAME,
+  SUBAGENT_FOREGROUND_SUCCESS_FRAME_241,
+} from '@fro-bot/runtime/event-v2-fixtures'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 
 import {toOperatorWaitReason} from '../operator-contract/wait-reason.js'
@@ -81,18 +84,17 @@ describe('runOpenCodeCoreV2: adopting background work', () => {
     await vi.advanceTimersByTimeAsync(20_000)
   })
 
-  it('does not adopt a foreground subagent call, whose result text claims a completion', async () => {
-    // #given — the captured foreground result has completed metadata and a <subagent …> text a child could forge
+  it.each([
+    ['2.3.2 `<subagent …>`', SUBAGENT_FOREGROUND_SUCCESS_FRAME],
+    ['2.4.1 `<background-result kind="subagent" …>`', SUBAGENT_FOREGROUND_SUCCESS_FRAME_241],
+  ])('does not adopt a foreground subagent call, whose result text claims a completion (%s)', async (_form, frame) => {
+    // #given — the foreground result has completed metadata and a tagged text a child could forge
     const ledger = createOwnershipLedger()
     const run = startWindowedRun({ownershipLedger: ledger})
     await vi.advanceTimersByTimeAsync(10)
 
     // #when
-    run.emit(
-      frames.toolStarted('subagent', 'call_16_0'),
-      onSession(SUBAGENT_FOREGROUND_SUCCESS_FRAME, ROOT),
-      frames.succeeded(),
-    )
+    run.emit(frames.toolStarted('subagent', 'call_16_0'), onSession(frame, ROOT), frames.succeeded())
     await vi.advanceTimersByTimeAsync(1_000)
 
     // #then — nothing was adopted, so once the directory has stayed quiet the root's success completes the run

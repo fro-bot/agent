@@ -948,10 +948,16 @@ describe('subagent notice diagnostics', () => {
     readonly background?: boolean
     readonly via?: 'inbox' | 'synthetic'
     readonly inboxId?: string
+    /** `subagent` is the 2.3.2 header; `background-result` is the 2.4.1 one (upstream #64971). */
+    readonly form?: 'subagent' | 'background-result'
   }): unknown {
     const {tagState, metadataState, parent = PARENT_SESSION_ID, child = CHILD_SESSION_ID, background = false} = options
     const marker = background ? '\n\nBackground work still running:\n- shell (sh_1): sleep 45' : ''
-    const text = `<subagent sessionID="${child}" state="${tagState}" description="${SECRET_DESCRIPTION}">\n${SECRET_BODY}${marker}\n</subagent>`
+    const attributes = `sessionID="${child}" state="${tagState}" description="${SECRET_DESCRIPTION}"`
+    const text =
+      options.form === 'background-result'
+        ? `<background-result kind="subagent" ${attributes}>\n${SECRET_BODY}${marker}\n</background-result>`
+        : `<subagent ${attributes}>\n${SECRET_BODY}${marker}\n</subagent>`
     const metadata = {source: 'subagent', childID: child, agent: 'General', state: metadataState}
     if (options.via === 'synthetic') {
       return frame('session.synthetic', {sessionID: parent, text, description: SECRET_DESCRIPTION, metadata})
@@ -971,6 +977,25 @@ describe('subagent notice diagnostics', () => {
     const {logger} = await observe([midFlight])
 
     // #then
+    expect(noticeLines(logger)).toEqual([
+      {
+        parentSessionId: PARENT_SESSION_ID,
+        childSessionId: CHILD_SESSION_ID,
+        tagState: 'running',
+        metadataState: 'completed',
+        backgroundWorkRunning: true,
+        classification: 'settled',
+      },
+    ])
+  })
+
+  it('logs a 2.4.1 `<background-result kind="subagent">` report as the same two states', async () => {
+    // #given / #when the mid-flight report arrives in the 2.4.1 header form
+    const {logger} = await observe([
+      noticeFrame({tagState: 'running', metadataState: 'completed', background: true, form: 'background-result'}),
+    ])
+
+    // #then the tag state is read, not lost to `null`
     expect(noticeLines(logger)).toEqual([
       {
         parentSessionId: PARENT_SESSION_ID,

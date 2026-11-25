@@ -375,6 +375,25 @@ export const SUBAGENT_FOREGROUND_SUCCESS_FRAME = frame('session.tool.success', {
   executed: false,
 })
 
+/**
+ * `SUBAGENT_FOREGROUND_SUCCESS_FRAME` as a 2.4.1 server writes it. NOT a recording: built from upstream v2.4.1
+ * `BackgroundResult.render` (`packages/core/src/session/background-result.ts`, upstream #64971), which replaced the
+ * `<subagent …>` wrapper with `<background-result kind="subagent" …>`. Re-record against a 2.4.1 pin when one is wanted.
+ */
+export const SUBAGENT_FOREGROUND_SUCCESS_FRAME_241 = frame('session.tool.success', {
+  sessionID: 'ses_e7c764413ffetnK0nwDW21nYNV',
+  assistantMessageID: 'msg_18389bbfb001CZWJmESBpyKCto',
+  id: 'call_16_0',
+  content: [
+    {
+      type: 'text',
+      text: '<background-result kind="subagent" sessionID="ses_e7c7643f9ffekhDhU3IqIyIIJS" state="completed">\nchild done\n</background-result>',
+    },
+  ],
+  metadata: {sessionID: 'ses_e7c7643f9ffekhDhU3IqIyIIJS', status: 'completed', truncated: false},
+  executed: false,
+})
+
 // --- p12.out.json: session.moved -----------------------------------------------------------------------------------
 
 export const MOVED_SESSION_ID = 'ses_e7c70d6deffed2HvubLMRKrBW3'
@@ -400,6 +419,15 @@ export const SUBAGENT_NOTICE_MESSAGE = {
   text: `<subagent sessionID="${CHILD_SESSION_ID}" state="completed" description="bg child">\nchild result text\n</subagent>`,
   description: 'bg child',
   type: 'synthetic',
+} as const
+
+/**
+ * `SUBAGENT_NOTICE_MESSAGE` as a 2.4.1 server writes it: same metadata, the text wrapped by upstream v2.4.1
+ * `BackgroundResult.render`. NOT a recording; see `SUBAGENT_FOREGROUND_SUCCESS_FRAME_241`.
+ */
+export const SUBAGENT_NOTICE_MESSAGE_241 = {
+  ...SUBAGENT_NOTICE_MESSAGE,
+  text: `<background-result kind="subagent" sessionID="${CHILD_SESSION_ID}" state="completed" description="bg child">\nchild result text\n</background-result>`,
 } as const
 
 /** `GET /api/session/active` while the child was held and the parent had finished: only the child is listed. */
@@ -692,6 +720,25 @@ export const SHELL_NOTICE_ENQUEUED_FRAME = {
     },
   },
   durable: {aggregateID: SHELL_SESSION_ID, seq: 20, version: 1},
+} as const
+
+/**
+ * `SHELL_NOTICE_ENQUEUED_FRAME` as a 2.4.1 server writes it: same metadata, the text wrapped as
+ * `<background-result kind="shell" id=… state=… command=…>` (upstream v2.4.1 `packages/core/src/shell/result.ts`
+ * `notification`). NOT a recording; see `SUBAGENT_FOREGROUND_SUCCESS_FRAME_241`.
+ */
+export const SHELL_NOTICE_ENQUEUED_FRAME_241 = {
+  ...SHELL_NOTICE_ENQUEUED_FRAME,
+  data: {
+    ...SHELL_NOTICE_ENQUEUED_FRAME.data,
+    item: {
+      ...SHELL_NOTICE_ENQUEUED_FRAME.data.item,
+      payload: {
+        ...SHELL_NOTICE_ENQUEUED_FRAME.data.item.payload,
+        text: `<background-result kind="shell" id="${SHELL_ID}" state="completed" command="${SHELL_COMMAND}">\njob-output-line\n\n</background-result>`,
+      },
+    },
+  },
 } as const
 
 /** p20: the server delivers the notice into the woken turn. */
