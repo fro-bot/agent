@@ -5,8 +5,10 @@ import type {
 } from '../../services/github/review-delivery-receipt.js'
 import type {Octokit} from '../../services/github/types.js'
 import type {Logger} from '../../shared/logger.js'
-import {beforeEach, describe, expect, it, vi} from 'vitest'
+import {err, ok} from '@fro-bot/runtime'
+import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createReviewDeliveryReceiptOperations} from '../../services/github/review-delivery-receipt.js'
+import {markRunCancelled, resetRunCancellation, startCancellationCleanups} from '../../shared/cancellation.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {checkForkOrSelfGuard, submitReviewWithHeadGuard} from './review-guards.js'
 
@@ -663,5 +665,307 @@ describe('submitReviewWithHeadGuard publication receipt', () => {
     expect((octokit as unknown as MockOctokit).rest.pulls.createReview).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({event: 'REQUEST_CHANGES', commit_id: 'head-sha-abc'}),
     )
+  })
+})
+
+describe('submitReviewWithHeadGuard after a cancel', () => {
+  const IDENTITY: ReviewDeliveryReceiptIdentity = {repo: 'owner/repo', runId: 'run-1', prNumber: 1}
+  const params = (octokit: Octokit, receipt?: ReviewDeliveryReceiptOperations) => ({
+    octokit,
+    owner: 'owner',
+    repo: 'repo',
+    prNumber: 1,
+    event: 'APPROVE' as const,
+    body: 'lgtm',
+    reviewedHeadSha: 'head-sha-abc',
+    ...(receipt === undefined ? {} : {receipt: {ops: receipt, identity: IDENTITY, attempt: 1}}),
+  })
+
+  afterEach(() => {
+    resetRunCancellation()
+  })
+
+  it('submits no approval when the signal arrives while the pre-approval head read is in flight, and reserves nothing', async () => {
+    // #given a head read that is in flight when the signal arrives
+    const octokit = makeOctokit()
+    octokit.rest.pulls.get.mockImplementation(async () => {
+      markRunCancelled()
+      return {
+        data: {
+          head: {sha: 'head-sha-abc', repo: {full_name: 'owner/repo'}},
+          base: {repo: {full_name: 'owner/repo'}},
+          user: {login: 'pr-author'},
+        },
+      }
+    })
+    const reserve = vi.fn(async () => ({kind: 'reserved-configured' as const, etag: 'e'}))
+    const ops = makeReservationOps({reserve})
+
+    // #when the read finishes after the signal
+    const outcome = submitReviewWithHeadGuard(params(octokit as unknown as Octokit, ops), createMockLogger())
+
+    // #then the approval is refused before anything is reserved or sent
+    await expect(outcome).rejects.toMatchObject({name: 'RunCancelledError'})
+    expect(reserve).not.toHaveBeenCalled()
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+  })
+
+  it('releases the reservation and sends nothing when the signal arrives during the reservation round trip', async () => {
+    // #given a reservation that takes a signal with it
+    const octokit = makeOctokit()
+    const reserve = vi.fn(async () => {
+      markRunCancelled()
+      return {kind: 'reserved-configured' as const, etag: 'reservation-etag'}
+    })
+    const release = vi.fn(async () => undefined)
+    const ops = makeReservationOps({reserve, release})
+
+    // #when
+    const outcome = submitReviewWithHeadGuard(params(octokit as unknown as Octokit, ops), createMockLogger())
+
+    // #then the slot is given back (a rerun can still deliver the review) and no review was created
+    await expect(outcome).rejects.toMatchObject({name: 'RunCancelledError'})
+    expect(release).toHaveBeenCalledExactlyOnceWith(IDENTITY, 'reservation-etag')
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * The same guard over the REAL receipt operations and an in-memory conditional store, across a cancellation: what the store holds
+ * afterwards is what decides whether a rerun of the same run id can still deliver the review.
+ */
+describe('submitReviewWithHeadGuard with a real receipt store across a cancel', () => {
+  const IDENTITY: ReviewDeliveryReceiptIdentity = {repo: 'owner/repo', runId: 'run-1', prNumber: 1}
+  let logger: Logger
+
+  interface StoreHooks {
+    readonly onGet?: () => void | Promise<void>
+    readonly onPut?: () => void | Promise<void>
+  }
+
+  function createStore(hooks: StoreHooks = {}) {
+    // Each hook fires on the first call only: the signal of one run, not of the rerun that follows it.
+    const once = (hook: StoreHooks['onGet']): StoreHooks['onGet'] => {
+      let fired = false
+      return async () => {
+        if (fired) return
+        fired = true
+        await hook?.()
+      }
+    }
+    const onGet = once(hooks.onGet)
+    const onPut = once(hooks.onPut)
+    const objects = new Map<string, {readonly data: string; readonly etag: string}>()
+    let counter = 0
+    const deletes: {key: string; ifMatch: string}[] = []
+    const puts: string[] = []
+    const adapter: ObjectStoreAdapter = {
+      upload: vi.fn(),
+      download: vi.fn(),
+      list: vi.fn(),
+      getObject: vi.fn(async (key: string) => {
+        await onGet?.()
+        const found = objects.get(key)
+        return found === undefined
+          ? err(Object.assign(new Error('NoSuchKey: object not found'), {errorCode: 'NoSuchKey'}))
+          : ok(found)
+      }),
+      conditionalPut: vi.fn(async (key: string, data: string, options: {ifNoneMatch?: string; ifMatch?: string}) => {
+        await onPut?.()
+        puts.push(key)
+        const existing = objects.get(key)
+        if (options.ifNoneMatch === '*' && existing !== undefined) return err(new Error('PreconditionFailed'))
+        if (options.ifMatch !== undefined && existing?.etag !== options.ifMatch)
+          return err(new Error('PreconditionFailed'))
+        counter += 1
+        objects.set(key, {data, etag: `etag-${counter}`})
+        return ok({etag: `etag-${counter}`})
+      }),
+      conditionalDelete: vi.fn(async (key: string, options: {ifMatch: string}) => {
+        deletes.push({key, ifMatch: options.ifMatch})
+        if (objects.get(key)?.etag !== options.ifMatch) return err(new Error('PreconditionFailed'))
+        objects.delete(key)
+        return ok(undefined)
+      }),
+    }
+    return {adapter, objects, deletes, puts}
+  }
+
+  const runParams = (octokit: Octokit, adapter: ObjectStoreAdapter, logger: Logger) => ({
+    octokit,
+    owner: 'owner',
+    repo: 'repo',
+    prNumber: 1,
+    event: 'APPROVE' as const,
+    body: 'lgtm',
+    reviewedHeadSha: 'head-sha-abc',
+    receipt: {
+      ops: createReviewDeliveryReceiptOperations(createStoreConfig(), logger, adapter),
+      identity: IDENTITY,
+      attempt: 1,
+    },
+  })
+
+  /** What a rerun of the same run id sees: whether it can reserve, then submit. */
+  async function rerun(adapter: ObjectStoreAdapter) {
+    resetRunCancellation()
+    const octokit = makeOctokit()
+    const outcome = await submitReviewWithHeadGuard(runParams(octokit as unknown as Octokit, adapter, logger), logger)
+    return {outcome, octokit}
+  }
+
+  beforeEach(() => {
+    logger = createMockLogger()
+  })
+  afterEach(() => {
+    resetRunCancellation()
+  })
+
+  it('writes no receipt when the signal arrives during the store read, and a rerun delivers the review', async () => {
+    // #given a store whose read is in flight when the signal arrives
+    const store = createStore({
+      onGet: () => {
+        markRunCancelled()
+      },
+    })
+    const octokit = makeOctokit()
+
+    // #when the guard goes on
+    const outcome = submitReviewWithHeadGuard(runParams(octokit as unknown as Octokit, store.adapter, logger), logger)
+
+    // #then the conditional PUT never happened, nothing was sent, and the store is empty
+    await expect(outcome).rejects.toMatchObject({name: 'RunCancelledError'})
+    expect(store.puts).toEqual([])
+    expect(store.objects.size).toBe(0)
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+    // #and a rerun of the same run id reserves and delivers
+    const second = await rerun(store.adapter)
+    expect(second.outcome.submitted).toBe(true)
+  })
+
+  it('releases the receipt, conditioned on its etag, when the signal arrives during the PUT, and a rerun delivers', async () => {
+    // #given a PUT that lands and takes a signal with it
+    const store = createStore({
+      onPut: () => {
+        markRunCancelled()
+      },
+    })
+    const octokit = makeOctokit()
+
+    // #when
+    const outcome = submitReviewWithHeadGuard(runParams(octokit as unknown as Octokit, store.adapter, logger), logger)
+
+    // #then no review was sent, the receipt was deleted with its own etag, and the store is empty again
+    await expect(outcome).rejects.toMatchObject({name: 'RunCancelledError'})
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+    // the signal is acted on straight after the PUT: no second head lookup was made first
+    expect(octokit.rest.pulls.get).toHaveBeenCalledTimes(1)
+    expect(store.deletes.map(item => item.ifMatch)).toEqual(['etag-1'])
+    expect(store.objects.size).toBe(0)
+    expect((await rerun(store.adapter)).outcome.submitted).toBe(true)
+  })
+
+  it('releases the receipt when the second head lookup fails, and a rerun delivers', async () => {
+    // #given a head lookup that works once and then fails (the one after the reservation)
+    const store = createStore()
+    const octokit = makeOctokit()
+    octokit.rest.pulls.get.mockReset()
+    octokit.rest.pulls.get
+      .mockResolvedValueOnce({
+        data: {
+          head: {sha: 'head-sha-abc', repo: {full_name: 'owner/repo'}},
+          base: {repo: {full_name: 'owner/repo'}},
+          user: {login: 'pr-author'},
+        },
+      })
+      .mockRejectedValueOnce(new Error('GitHub is unavailable'))
+
+    // #when
+    const outcome = submitReviewWithHeadGuard(runParams(octokit as unknown as Octokit, store.adapter, logger), logger)
+
+    // #then the failure surfaces, no review was sent, and the receipt did not survive to block the rerun
+    await expect(outcome).rejects.toThrow('GitHub is unavailable')
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+    expect(store.deletes).toHaveLength(1)
+    expect(store.objects.size).toBe(0)
+    expect((await rerun(store.adapter)).outcome.submitted).toBe(true)
+  })
+
+  it('releases the receipt at once when the signal arrives while the second head lookup hangs', async () => {
+    // #given a second head lookup that does not answer until the test lets it
+    const store = createStore()
+    const octokit = makeOctokit()
+    let answer: () => void = () => undefined
+    const headResponse = {
+      data: {
+        head: {sha: 'head-sha-abc', repo: {full_name: 'owner/repo'}},
+        base: {repo: {full_name: 'owner/repo'}},
+        user: {login: 'pr-author'},
+      },
+    }
+    octokit.rest.pulls.get.mockReset()
+    octokit.rest.pulls.get.mockResolvedValueOnce(headResponse).mockImplementationOnce(
+      async () =>
+        new Promise(resolve => {
+          answer = () => resolve(headResponse)
+        }),
+    )
+    const outcome = submitReviewWithHeadGuard(runParams(octokit as unknown as Octokit, store.adapter, logger), logger)
+    await vi.waitFor(() => {
+      expect(store.objects.size).toBe(1)
+      expect(octokit.rest.pulls.get).toHaveBeenCalledTimes(2)
+    })
+
+    // #when the signal arrives while that lookup is still pending (the owner marks the run, then starts the cleanups)
+    markRunCancelled()
+    await Promise.all(startCancellationCleanups())
+    await vi.waitFor(() => {
+      expect(store.deletes).toHaveLength(1)
+    })
+
+    // #then the receipt is already gone, before the lookup has answered; and when it does, nothing is sent
+    expect(store.objects.size).toBe(0)
+    answer()
+    await expect(outcome).rejects.toMatchObject({name: 'RunCancelledError'})
+    expect(store.deletes).toHaveLength(1)
+    expect(octokit.rest.pulls.createReview).not.toHaveBeenCalled()
+  })
+
+  it('keeps the receipt when the review POST itself fails after it was sent', async () => {
+    // #given a POST that fails after the request may have gone out
+    const store = createStore()
+    const octokit = makeOctokit()
+    octokit.rest.pulls.createReview.mockRejectedValue(new Error('socket hang up'))
+
+    // #when
+    const outcome = submitReviewWithHeadGuard(runParams(octokit as unknown as Octokit, store.adapter, logger), logger)
+
+    // #then the failure surfaces and the receipt stays: a rerun must not send a second review
+    await expect(outcome).rejects.toThrow()
+    expect(store.deletes).toEqual([])
+    expect(store.objects.size).toBe(1)
+    expect((await rerun(store.adapter)).outcome).toMatchObject({submitted: false, reason: 'receipt-blocked'})
+  })
+
+  it('keeps the receipt when the signal arrives after the POST began', async () => {
+    // #given a POST during which the signal arrives
+    const store = createStore()
+    const octokit = makeOctokit()
+    octokit.rest.pulls.createReview.mockImplementation(async () => {
+      markRunCancelled()
+      await Promise.all(startCancellationCleanups())
+      return {data: {id: 999, state: 'APPROVED', html_url: 'https://github.com/pr/1/reviews/999'}}
+    })
+
+    // #when
+    const outcome = await submitReviewWithHeadGuard(
+      runParams(octokit as unknown as Octokit, store.adapter, logger),
+      logger,
+    )
+
+    // #then the review was sent, the receipt was not released, and it is marked delivered
+    expect(outcome.submitted).toBe(true)
+    expect(store.deletes).toEqual([])
+    expect(JSON.parse([...store.objects.values()][0]?.data ?? '{}')).toMatchObject({status: 'delivered', reviewId: 999})
   })
 })

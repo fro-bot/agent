@@ -54,9 +54,22 @@ const subagentTool = (description: string, text: string): {name: string; args: u
   args: {agent: 'general', description, prompt: text},
 })
 
-const launcherOn = (relay: string): Record<string, string> => ({
-  [TRACING_LAUNCHER_ENV]: JSON.stringify({version: 1, host: 'action', tracing: 'on', relay, identity: IDENTITY}),
+const launcherOn = (relay: string, extra: Record<string, unknown> = {}): Record<string, string> => ({
+  [TRACING_LAUNCHER_ENV]: JSON.stringify({
+    version: 1,
+    host: 'action',
+    tracing: 'on',
+    relay,
+    identity: IDENTITY,
+    ...extra,
+  }),
 })
+
+const RUN_LINK = {
+  rootSpan: {traceId: '0af7651916cd43dd8448eb211c80319c', spanId: 'b7ad6b7169203331'},
+  sessionId: 'fro-bot/agent:issue-42',
+  invocationId: '3f2a9c1e-7b4d-4e8a-9d6c-1a2b3c4d5e6f',
+}
 
 interface Harness {
   readonly sandbox: SandboxPaths
@@ -484,6 +497,90 @@ describe.skipIf(!runnable)('tracing in a real opencode V2', () => {
       await decoy.stop()
     }
   }, 90_000)
+
+  it('links every turn of a run to the run’s root span and gives them all the launcher’s session id', async () => {
+    // #given a launcher that carries the run link, and two turns of one OpenCode session
+    const steps: FakeStep[] = [
+      {all: ['R-ONE'], text: 'first answer'},
+      {all: ['R-TWO'], text: 'second answer'},
+    ]
+    await run({steps, env: url => launcherOn(url, RUN_LINK)}, async h => {
+      const session = await h.session()
+      const turnDone = async (text: string): Promise<void> => {
+        const before = h.spans().filter(isRoot).length
+        await prompt(h.api, session, text)
+        await waitUntil(`the ${text} turn's root span`, () => h.spans().filter(isRoot).length > before, 60_000)
+      }
+
+      // #when both turns finish and the server stops
+      await turnDone('R-ONE first')
+      await turnDone('R-TWO second')
+      await h.stop()
+
+      // #then there are two turn traces, each root linking to the SAME run root span, in the run's trace
+      const spans = h.spans()
+      const roots = spans.filter(isRoot)
+      expect(roots).toHaveLength(2)
+      expect(new Set(roots.map(span => span.traceId)).size).toBe(2)
+      for (const root of roots) expect(root.links).toEqual([RUN_LINK.rootSpan])
+      // #and a span that is not a turn root links to nothing
+      for (const span of spans.filter(span => !isRoot(span))) expect(span.links).toEqual([])
+
+      // #and every span of both turns carries the launcher's session id verbatim, and the invocation id; the OpenCode session stays
+      for (const span of spans) {
+        expect(span.attrs['langfuse.session.id']).toBe(RUN_LINK.sessionId)
+        expect(span.attrs['fro_bot.invocation.id']).toBe(RUN_LINK.invocationId)
+        expect(span.attrs['session.id']).toBe(session)
+      }
+    })
+  }, 120_000)
+
+  it('keeps the OpenCode root session as the Langfuse session, and links nothing, for a launcher without the run link', async () => {
+    // #given today's launcher document
+    await run({steps: simpleSteps}, async h => {
+      const session = await h.session()
+      await prompt(h.api, session, 'S-ONE hello')
+      await waitUntil('the root span', () => h.spans().some(isRoot), 60_000)
+      await h.stop()
+
+      // #then the session attribute is the OpenCode session, and no span has a link or an invocation id
+      const spans = h.spans()
+      expect(spans.length).toBeGreaterThan(0)
+      for (const span of spans) {
+        expect(span.attrs['langfuse.session.id']).toBe(session)
+        expect(span.attrs['fro_bot.invocation.id']).toBeUndefined()
+        expect(span.links).toEqual([])
+      }
+    })
+  }, 90_000)
+
+  it.each([
+    ['an unknown key', {extra: 'x'}],
+    ['an all-zero root span id', {rootSpan: {...RUN_LINK.rootSpan, spanId: '0'.repeat(16)}}],
+    ['an upper-case trace id', {rootSpan: {...RUN_LINK.rootSpan, traceId: RUN_LINK.rootSpan.traceId.toUpperCase()}}],
+    ['an over-long session id', {sessionId: 's'.repeat(201)}],
+    ['an empty session id', {sessionId: ''}],
+  ])(
+    'turns tracing off, exporting nothing, for a launcher with %s',
+    async (_label, extra) => {
+      // #given a launcher the plugin refuses
+      await run({steps: simpleSteps, env: url => launcherOn(url, extra)}, async h => {
+        const session = await h.session()
+
+        // #when a turn runs to its end
+        await prompt(h.api, session, 'S-ONE hello')
+        await sleep(5_000)
+        const answered = JSON.stringify(await idleMessages(h.api, session))
+        await h.stop()
+
+        // #then the session was answered, nothing reached the sink, and the plugin logged a fixed reason and no value
+        expect(answered).toContain('simple answer')
+        expect(h.sink.requests).toEqual([])
+        expect(h.server.stderr()).toMatch(/tracing off \(launcher-(?:malformed|run-invalid)\)/)
+      })
+    },
+    90_000,
+  )
 
   it('exports a tool span, outcome rejected, for a call this plugin’s own reuse guard refused', async () => {
     // #given a model that tries to resume a subagent session, which the built plugin's guard refuses in the before hook

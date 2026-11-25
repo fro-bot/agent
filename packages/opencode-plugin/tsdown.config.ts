@@ -6,7 +6,9 @@ import {defineConfig} from 'tsdown'
 const dirname = path.dirname(fileURLToPath(import.meta.url))
 
 // The entry is absolute: with `rootDir: ../../` a relative `src/index.ts` would bundle the Action's entry instead.
-// `effect` and `@opencode/plugin` come from the host at load time and stay external; `@fro-bot/runtime` is inlined.
+// `effect` and `@opencode/plugin` come from the host at load time and stay external; `@fro-bot/runtime` is inlined. The
+// plugin imports the runtime only through dedicated subpaths (`@fro-bot/runtime/tracing/scrub`, `.../tracing/exporter`,
+// `.../session-v2`), never its index, so the bundle holds only the modules those subpaths reach.
 export default defineConfig({
   entry: [path.join(dirname, 'src/index.ts')],
   format: 'esm',
@@ -24,7 +26,8 @@ export default defineConfig({
     onlyBundle: [
       '@bfra.me/es',
       // The OpenTelemetry SDK, inlined into the lazily loaded tracing chunk and never imported at runtime. The first
-      // five are declared devDependencies; the rest are their transitive dependencies, pinned by the lockfile.
+      // five are declared dependencies of `@fro-bot/runtime` (whose exporter imports them); the rest are their
+      // transitive dependencies, pinned by the lockfile.
       '@opentelemetry/api',
       '@opentelemetry/resources',
       '@opentelemetry/sdk-trace-base',

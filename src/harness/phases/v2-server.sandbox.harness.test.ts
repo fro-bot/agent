@@ -14,6 +14,7 @@ import {
   describeNamespaceMembers,
   findPaths,
   inspectOutput,
+  launcherLinkProbe,
   matrixDirectories,
   matrixSentinels,
   mountNamespaceIds,
@@ -656,5 +657,54 @@ describe('parseRows verdicts', () => {
 
     // #then the status is kept
     expect(rows.get('canary_scan')).toEqual([{status: 'INCOMPLETE', evidence: 'canary.xdg=0 skip.xdg=1'}])
+  })
+})
+
+describe('launcherLinkProbe', () => {
+  const IDS = {traceId: 'a'.repeat(32), rootSpanId: 'b'.repeat(16), invocationId: 'c'.repeat(16)}
+  const SESSION = 'owner/repo:issue-42'
+
+  /** Runs the probe as the tool shell would, against a NUL-separated environment file. */
+  function runProbe(entries: readonly string[], session: string | undefined = SESSION) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'launcher-probe-'))
+    try {
+      const file = path.join(dir, 'environ')
+      fs.writeFileSync(file, entries.map(entry => `${entry}\0`).join(''))
+      const probe = launcherLinkProbe(IDS, session, file)
+      const result = spawnSync('bash', ['-c', PRELUDE + probe.cmd], {encoding: 'utf8'})
+      return parseRows(result.stdout + result.stderr).get('launcher_link') ?? []
+    } finally {
+      fs.rmSync(dir, {recursive: true, force: true})
+    }
+  }
+  const document = JSON.stringify({
+    version: 1,
+    rootSpan: {traceId: IDS.traceId, spanId: IDS.rootSpanId},
+    sessionId: SESSION,
+    invocationId: IDS.invocationId,
+  })
+
+  it('writes the separator and the newline as `tr` arguments, not as a NUL and a newline in the command', () => {
+    // #given the command text
+    const {cmd} = launcherLinkProbe(IDS, SESSION)
+
+    // #then it carries a backslash, not the characters themselves (the first hosted run lost the row to exactly this)
+    expect(cmd).toContain(String.raw`tr '\0' '\n'`)
+    expect(cmd).not.toContain(String.fromCharCode(0))
+  })
+
+  it('reports WORKS when the server environment holds each id and the session once', () => {
+    expect(runProbe(['PATH=/usr/bin', `OPENCODE_FROBOT_TRACING=${document}`])).toEqual([
+      {status: 'WORKS', evidence: 'trace=1 span=1 session=1 invocation=1'},
+    ])
+  })
+
+  it('reports FAILED, with the counts, when the session is missing from the document', () => {
+    const rows = runProbe(['PATH=/usr/bin', `OPENCODE_FROBOT_TRACING=${document}`], 'someone/else:issue-1')
+    expect(rows).toEqual([{status: 'FAILED', evidence: 'trace=1 span=1 session=0 invocation=1'}])
+  })
+
+  it('reports FAILED when the launcher variable is not in the environment', () => {
+    expect(runProbe(['PATH=/usr/bin'])[0]?.status).toBe('FAILED')
   })
 })

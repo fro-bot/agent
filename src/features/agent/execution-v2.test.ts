@@ -13,9 +13,11 @@ import {
   REASONING_FRAMES,
   TEXT_SESSION_ID,
 } from '@fro-bot/runtime/event-v2-fixtures'
-import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
+import {afterEach, beforeEach, describe, expect, it, vi, type Mock} from 'vitest'
+import {markRunCancelled, resetRunCancellation} from '../../shared/cancellation.js'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {
+  CONNECTED,
   createFakeServer,
   DIRECTORY,
   frame,
@@ -304,6 +306,119 @@ describe('executeOpenCodeV2', () => {
     expect(server.calls.updateSession).toHaveBeenCalledWith(
       expect.objectContaining({sessionId: ROOT_SESSION_ID, title: 'Fro Bot: issue #1'}),
     )
+  })
+
+  describe('a cancelled run', () => {
+    afterEach(() => {
+      resetRunCancellation()
+    })
+
+    it('creates no session and submits no prompt when the signal came before the turn started', async () => {
+      // #given a server and a run that was cancelled while the preceding phase was still reading
+      const server = createFakeServer({onPrompt: (_, pipe) => succeedWithText(pipe)})
+      markRunCancelled()
+
+      // #when
+      const result = executeOpenCodeV2(
+        promptOptions(),
+        logger,
+        {agent: null, model: null, timeoutMs: 60_000},
+        handle(),
+        undefined,
+        server.client,
+      )
+      await advance(2_000)
+
+      // #then it failed without touching the server
+      expect(await result).toMatchObject({success: false})
+      expect(server.calls.createSession).not.toHaveBeenCalled()
+      expect(server.calls.prompt).not.toHaveBeenCalled()
+    })
+
+    it('submits no prompt when the signal arrives while the session is being created', async () => {
+      // #given a session creation during which the signal arrives
+      const server = createFakeServer({onPrompt: (_, pipe) => succeedWithText(pipe)})
+      const createSession = server.calls.createSession as Mock<(input: unknown) => Promise<unknown>>
+      createSession.mockImplementationOnce(async () => {
+        markRunCancelled()
+        return {success: true, data: {id: ROOT_SESSION_ID}}
+      })
+
+      // #when
+      const result = executeOpenCodeV2(
+        promptOptions(),
+        logger,
+        {agent: null, model: null, timeoutMs: 60_000},
+        handle(),
+        undefined,
+        server.client,
+      )
+      await advance(2_000)
+
+      // #then the session exists (it was in flight) and no prompt was sent into it
+      expect(await result).toMatchObject({success: false})
+      expect(server.calls.createSession).toHaveBeenCalledTimes(1)
+      expect(server.calls.prompt).not.toHaveBeenCalled()
+    })
+
+    it('submits no prompt when the signal arrives while the event subscription is pending', async () => {
+      // #given a subscription that is still being made when the signal arrives
+      const server = createFakeServer({onPrompt: (_, pipe) => succeedWithText(pipe)})
+      const subscribe = server.calls.subscribeEvents as Mock<(input: {signal?: AbortSignal}) => Promise<unknown>>
+      const healthy = subscribe.getMockImplementation()
+      let finishSubscribing: () => void = () => undefined
+      const subscribing = new Promise<void>(resolve => {
+        finishSubscribing = resolve
+      })
+      subscribe.mockImplementationOnce(async input => {
+        await subscribing
+        return healthy?.(input)
+      })
+      const result = executeOpenCodeV2(
+        promptOptions(),
+        logger,
+        {agent: null, model: null, timeoutMs: 60_000},
+        handle(),
+        undefined,
+        server.client,
+      )
+      await advance(500)
+      expect(subscribe).toHaveBeenCalledTimes(1)
+
+      // #when the signal arrives and then the subscription resolves
+      markRunCancelled()
+      finishSubscribing()
+      await advance(2_000)
+
+      // #then the stream was live and the run still sent nothing: the check is at the POST, after the wait
+      expect(await result).toMatchObject({success: false})
+      expect(server.calls.prompt).not.toHaveBeenCalled()
+    })
+
+    it('submits no prompt when the signal arrives while the stream has not yet announced itself', async () => {
+      // #given a subscription made, and a stream that has not sent `server.connected`
+      const server = createFakeServer({neverConnect: true, onPrompt: (_, pipe) => succeedWithText(pipe)})
+      const result = executeOpenCodeV2(
+        promptOptions(),
+        logger,
+        {agent: null, model: null, timeoutMs: 60_000},
+        handle(),
+        undefined,
+        server.client,
+      )
+      await advance(500)
+      expect(server.calls.subscribeEvents).toHaveBeenCalledTimes(1)
+      expect(server.calls.prompt).not.toHaveBeenCalled()
+
+      // #when the signal arrives and then the stream announces itself
+      markRunCancelled()
+      server.pipes[0]?.push(CONNECTED)
+      await advance(2_000)
+
+      // #then the wait ended and the POST never went out
+      expect(await result).toMatchObject({success: false})
+      expect(server.calls.prompt).not.toHaveBeenCalled()
+    })
   })
 
   it('excludes reasoning from the response text', async () => {

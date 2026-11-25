@@ -491,7 +491,7 @@ describe('runSupervisedOpencodeV2', () => {
     expect(start?.tracingHost).toBe(WORKSPACE_TRACING_HOST)
     expect(start?.config?.plugins).toEqual([
       `@fro.bot/systematic@${DEFAULT_SYSTEMATIC_VERSION}`,
-      '@fro.bot/opencode-plugin@0.2.0',
+      '@fro.bot/opencode-plugin@0.3.0',
     ])
     expect(start?.config?.permissions).toEqual(
       expect.arrayContaining([{action: 'external_directory', resource: '*', effect: 'ask'}]),

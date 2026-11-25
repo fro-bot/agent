@@ -1,6 +1,7 @@
 import type {Result} from '@bfra.me/es/result'
 import type {ObjectStoreConfig} from '@fro-bot/runtime'
-import type {ActionInputs, ModelConfig, OutputMode, ResponseMode} from '../../shared/types.js'
+import type {SecretRegistry} from '../../shared/secret-registry.js'
+import type {ActionInputs, ModelConfig, OutputMode, ResponseMode, TracingInputs} from '../../shared/types.js'
 import process from 'node:process'
 import * as core from '@actions/core'
 import * as github from '@actions/github'
@@ -17,7 +18,7 @@ import {
 import {err, ok} from '../../shared/types.js'
 import {validateJsonString, validatePositiveInteger} from '../../shared/validation.js'
 import {resolveAgentStateHome} from './agent-state-home.js'
-import {maskTraceInputs, parseTraceInputs} from './trace-inputs.js'
+import {parseTraceInputs, takeTraceInputs} from './trace-inputs.js'
 
 /**
  * Parse model input string in "provider/model" format.
@@ -115,24 +116,41 @@ function isForkPullRequestPayload(payload: unknown): boolean {
  *
  * @returns Result containing validated ActionInputs or an Error
  */
-export function parseActionInputs(): Result<ActionInputs, Error> {
+export interface ParseActionInputsOptions {
+  /**
+   * The run's secret registry: every mask below goes through it (it masks with `core.setSecret` and remembers the value for the
+   * lifecycle tracer's scrubber). Absent: the values are masked with `core.setSecret` alone.
+   */
+  readonly registry?: SecretRegistry
+  /**
+   * The trace inputs the run already read, masked and removed from the environment (`readTraceInputs`, which `run` calls first
+   * of everything). Absent: they are read, masked and removed here, first of everything this function does.
+   */
+  readonly tracing?: TracingInputs
+}
+
+export function parseActionInputs(options: ParseActionInputsOptions = {}): Result<ActionInputs, Error> {
+  const {registry} = options
+  const mask = (value: string): void => {
+    if (registry === undefined) core.setSecret(value)
+    else registry.mask(value, 'action-input')
+  }
   // Tracing credentials first of everything: read, masked and removed from the environment before any required input can fail
   // and return, so a run that fails early still leaves no header unmasked and no `INPUT_TRACE-*` copy for a child to inherit.
-  // The hyphen is preserved by @actions/core, as for auth-json: `trace-headers` is read from `INPUT_TRACE-HEADERS`.
-  const traceInputs = {endpoint: core.getInput('trace-endpoint'), headers: core.getInput('trace-headers')}
-  delete process.env['INPUT_TRACE-ENDPOINT']
-  delete process.env['INPUT_TRACE-HEADERS']
-  maskTraceInputs(traceInputs, {mask: value => core.setSecret(value)})
+  // The hyphen is preserved by @actions/core, as for auth-json: `trace-headers` is read from `INPUT_TRACE-HEADERS`. A run
+  // that already read them (`options.tracing`) has done all of this before it called bootstrap.
+  const traceInputs =
+    options.tracing === undefined ? takeTraceInputs({getInput: (name: string) => core.getInput(name)}, {mask}) : null
 
   try {
     const awsAccessKeyId = process.env.AWS_ACCESS_KEY_ID?.trim() ?? ''
     if (awsAccessKeyId.length > 0) {
-      core.setSecret(awsAccessKeyId)
+      mask(awsAccessKeyId)
     }
 
     const awsSecretAccessKey = process.env.AWS_SECRET_ACCESS_KEY?.trim() ?? ''
     if (awsSecretAccessKey.length > 0) {
-      core.setSecret(awsSecretAccessKey)
+      mask(awsSecretAccessKey)
     }
 
     // Required inputs
@@ -142,7 +160,7 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     }
     // Mask the token value everywhere @actions/core controls log output. Masking is
     // by VALUE, so this also covers the GH_TOKEN/GITHUB_TOKEN copies of the same string.
-    core.setSecret(githubToken)
+    mask(githubToken)
     // Delete the raw input from env (same hyphen-key gotcha as auth-json below:
     // @actions/core maps `github-token` to `INPUT_GITHUB-TOKEN`) so the OpenCode
     // server child (spawned with `{ ...process.env }`) does not inherit this copy.
@@ -155,7 +173,10 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
       return err(new Error('auth-json is required but was not provided'))
     }
     validateJsonString(authJson, 'auth-json')
+    // The whole document is masked with GitHub alone: it can be longer than the scrubber matches. Each leaf is what the
+    // lifecycle tracer's scrubber is given.
     core.setSecret(authJson)
+    registry?.addAuthJson(authJson)
     // @actions/core maps input names to env vars via name.replace(/ /g, '_').toUpperCase() —
     // spaces become underscores but hyphens are preserved, so `auth-json` reads from
     // `INPUT_AUTH-JSON` (not `INPUT_AUTH_JSON`). Delete the correct key so the raw secret is
@@ -165,12 +186,14 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
     // Tracing: the endpoint and the credential headers were read, masked and removed from the environment at the top, so
     // nothing above can leave them behind. Never allowed to fail the run: a refused value is tracing off with one warning
     // (trace-inputs.ts). Masking is not repeated here.
-    const tracing = parseTraceInputs(traceInputs, {
-      warning: message => core.warning(message),
-      notice: message => core.notice(message),
-      info: message => core.info(message),
-      mask: () => undefined,
-    })
+    const tracing =
+      options.tracing ??
+      parseTraceInputs(traceInputs ?? {endpoint: '', headers: ''}, {
+        warning: message => core.warning(message),
+        notice: message => core.notice(message),
+        info: message => core.info(message),
+        mask: () => undefined,
+      })
 
     // Optional string inputs (null if empty)
     const trustedHeadSha = core.getInput('trusted-head-sha').trim()
@@ -278,6 +301,9 @@ export function parseActionInputs(): Result<ActionInputs, Error> {
 
     // Validate opencode-config is valid JSON if provided
     if (opencodeConfig != null) {
+      // Before it is checked, so a document that fails the check still never reaches a span: header tokens and keys in it are
+      // secrets the Action never passes to GitHub, so only the scrubber learns them. Text that is not JSON is one secret.
+      registry?.addOpencodeConfig(opencodeConfig)
       validateJsonString(opencodeConfig, 'opencode-config')
 
       const parsedOpencodeConfig: unknown = JSON.parse(opencodeConfig)

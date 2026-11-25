@@ -1,6 +1,12 @@
 import {Buffer} from 'node:buffer'
 import {describe, expect, it, vi} from 'vitest'
-import {parseTraceInputs, TRACE_INPUT_MESSAGES, type TraceInputIo} from './trace-inputs.js'
+import {
+  parseTraceInputs,
+  readTraceInputs,
+  takeTraceInputs,
+  TRACE_INPUT_MESSAGES,
+  type TraceInputIo,
+} from './trace-inputs.js'
 
 const HOST_CANARY = 'collector-canary.example.test'
 const ENDPOINT = `https://${HOST_CANARY}/api/public/otel/v1/traces`
@@ -254,5 +260,98 @@ describe('parseTraceInputs', () => {
 
       expect(masked(mask).filter(value => value.includes('\uFFFD'))).toEqual([])
     })
+  })
+})
+
+describe('readTraceInputs', () => {
+  const source = (values: Record<string, string>, env: Record<string, string | undefined> = {}) => ({
+    getInput: (name: string) => values[name] ?? '',
+    env,
+  })
+
+  it('reads, masks, removes and validates the two inputs, in that order, in one call', () => {
+    // #given the runner's INPUT_ variables and the inputs they hold
+    const env: Record<string, string | undefined> = {
+      'INPUT_TRACE-ENDPOINT': ENDPOINT,
+      'INPUT_TRACE-HEADERS': `Authorization: ${BASIC}`,
+      PATH: '/usr/bin',
+    }
+    const {io, mask, warning} = createIo()
+
+    // #when
+    const result = readTraceInputs(
+      source({'trace-endpoint': ENDPOINT, 'trace-headers': `Authorization: ${BASIC}`}, env),
+      io,
+    )
+
+    // #then
+    expect(result).toEqual({enabled: true, url: ENDPOINT, headers: [{name: 'Authorization', value: BASIC}]})
+    expect(masked(mask)).toEqual(expect.arrayContaining([ENDPOINT, BASIC, PASSWORD]))
+    expect(env['INPUT_TRACE-ENDPOINT']).toBeUndefined()
+    expect(env['INPUT_TRACE-HEADERS']).toBeUndefined()
+    expect(env.PATH).toBe('/usr/bin')
+    expect(warning).not.toHaveBeenCalled()
+  })
+
+  it('masks each form once: the parse that follows the masking does not repeat it', () => {
+    // #given
+    const {io, mask} = createIo()
+
+    // #when
+    readTraceInputs(source({'trace-endpoint': ENDPOINT, 'trace-headers': `Authorization: ${BASIC}`}), io)
+
+    // #then
+    expect(masked(mask).filter(value => value === ENDPOINT)).toHaveLength(1)
+  })
+
+  it('is off, with nothing masked and nothing said, when both inputs are empty', () => {
+    // #given
+    const {io, mask, warning, notice, info} = createIo()
+
+    // #when
+    const result = readTraceInputs(source({}), io)
+
+    // #then
+    expect(result).toEqual({enabled: false})
+    expect(mask).not.toHaveBeenCalled()
+    expect(warning).not.toHaveBeenCalled()
+    expect(notice).not.toHaveBeenCalled()
+    expect(info).not.toHaveBeenCalled()
+  })
+
+  it('removes the variables and masks the values when the inputs are refused, with one fixed warning', () => {
+    // #given an http endpoint with a credential
+    const env: Record<string, string | undefined> = {'INPUT_TRACE-ENDPOINT': 'x', 'INPUT_TRACE-HEADERS': 'y'}
+    const {io, mask, warning} = createIo()
+
+    // #when
+    const result = readTraceInputs(
+      source(
+        {'trace-endpoint': 'http://collector.example.test/v1/traces', 'trace-headers': `Authorization: ${BASIC}`},
+        env,
+      ),
+      io,
+    )
+
+    // #then
+    expect(result).toEqual({enabled: false})
+    expect(warning).toHaveBeenCalledTimes(1)
+    expect(masked(mask)).toContain(BASIC)
+    expect(Object.keys(env).filter(name => name.startsWith('INPUT_TRACE'))).toEqual([])
+  })
+
+  it('takes without validating: the post step can mask and remove before anything that can fail', () => {
+    // #given
+    const env: Record<string, string | undefined> = {'INPUT_TRACE-ENDPOINT': ENDPOINT}
+    const {io, mask, warning} = createIo()
+
+    // #when
+    const raw = takeTraceInputs(source({'trace-endpoint': ENDPOINT, 'trace-headers': 'not a header'}, env), io)
+
+    // #then
+    expect(raw).toEqual({endpoint: ENDPOINT, headers: 'not a header'})
+    expect(masked(mask)).toContain(ENDPOINT)
+    expect(warning).not.toHaveBeenCalled()
+    expect(env['INPUT_TRACE-ENDPOINT']).toBeUndefined()
   })
 })

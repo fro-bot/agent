@@ -1,6 +1,7 @@
 ---
 title: Key a CI credential switch on the operation input, not an audit token
 date: 2026-07-17
+last_updated: 2026-11-23
 category: best-practices
 module: release-notes
 problem_type: best_practice
@@ -50,15 +51,38 @@ that can be set independently.
 # Keyed on release-tag (the operation), not correlation-id (an audit token):
 #   (a) a manual dispatch that sets release-tag without correlation-id must NOT
 #       hand the generation agent the PAT;
-#   (b) deploy-window compatibility — an old dispatcher (checked out from a
-#       released tag) that sets correlation-id but not release-tag keeps the old
-#       PAT + old mutation-prompt behavior working unchanged, instead of
-#       403-hard-failing the release job.
-token: ${{ github.event.inputs.release-tag != '' && github.token || secrets.FRO_BOT_PAT }}
+#   (b) an old dispatcher (checked out from a released tag) that sets
+#       correlation-id but not release-tag is not classified as the release
+#       operation, so an audit label never selects its credential.
+# Direct autonomous schedule/dispatch and release-tag narration use
+# github.token. Reusable callers and all other triggers retain the PAT.
+# This expression selects the CHECKOUT token only.
+token: ${{ github.event.inputs.release-tag != '' && github.token || ((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.workflow_ref == format('{0}/.github/workflows/fro-bot.yaml@{1}', github.repository, github.ref) && github.token) || secrets.FRO_BOT_PAT }}
 ```
 
-The mutating apply job requires **both** inputs, so a half-specified manual dispatch
-degrades to a harmless read-only generate run with no apply:
+This expression selects the **checkout** token only. The token passed to the
+agent action is a separate expression (`fro-bot.yaml:514`):
+
+```yaml
+github-token: ${{ steps.mint-app-token.outputs.github-token || (github.event.inputs.release-tag != '' && github.token) || secrets.FRO_BOT_PAT }}
+```
+
+The two paths are independent:
+
+- **Checkout token** (`fro-bot.yaml:376`): `release-tag` set → `github.token`; direct `schedule`/`workflow_dispatch` of `fro-bot.yaml` → `github.token`; everything else → PAT.
+- **Action token** (`fro-bot.yaml:514`): the minted owner-wide App token when the mint step ran → else `github.token` when `release-tag` is set → else PAT. The mint step runs for direct `schedule`/`workflow_dispatch` runs with `release-tag` empty (`fro-bot.yaml:385-397`).
+
+A direct dispatch that carries `correlation-id` without `release-tag` therefore skips the apply job but still receives the minted owner-wide App token in the action, which carries write permissions (`contents`, `pull_requests`, `issues`: write). The read-only guarantee holds for a dispatch with `release-tag` set and `correlation-id` absent: the apply job is skipped, the mint step is skipped, and both the checkout and the action get `github.token`. It does not hold for a dispatch that sets only `correlation-id`.
+
+The first arm of the checkout expression is the operation switch. The second arm gives direct `schedule` and
+`workflow_dispatch` runs of `fro-bot.yaml` itself the workflow token too; the
+`workflow_ref` comparison excludes reusable callers, whose `workflow_ref` names the
+caller's workflow. `secrets.FRO_BOT_PAT` remains the fallback for reusable callers
+and the other triggers.
+
+The mutating apply job requires **both** inputs, so a manual dispatch with
+`release-tag` set and `correlation-id` absent degrades to a read-only generate run
+with no apply (a dispatch with only `correlation-id` is covered above):
 
 ```yaml
 # Both inputs required: the artifact name needs correlation-id, and a
@@ -69,9 +93,13 @@ if: ${{ github.event.inputs.release-tag != '' && github.event.inputs.correlation
 
 Null-coercion note: for non-`workflow_dispatch` events (`mention`/`comment`/
 `schedule`/`workflow_call`), `github.event.inputs.release-tag` is null and
-`null != ''` evaluates false, so every non-release path keeps the write-capable PAT
-unchanged. A future refactor to strict comparison here would silently downgrade
-those write paths to the read-only token — the coercion behavior is load-bearing.
+`null != ''` evaluates false, so the operation arm never fires for them. Which
+credential such a run gets is then decided by the remaining arms: direct
+`schedule`/`workflow_dispatch` runs of `fro-bot.yaml` get the workflow token, while
+mention/comment events and reusable callers keep the write-capable PAT. A future
+refactor to strict comparison on the operation arm would classify every event
+without the input as a release run and silently downgrade those PAT paths to the
+read-only token — the coercion behavior is load-bearing.
 
 ## Why This Matters
 
@@ -80,17 +108,14 @@ those write paths to the read-only token — the coercion behavior is load-beari
 generation agent the write-capable PAT while it processes prompt-injectable,
 contributor-authored PR bodies. Keying on the operation input decouples the
 write credential from a non-security field that an attacker or a misdispatch can
-set on its own. The credential now tracks the operation, not a diagnostic label.
+set on its own. The checkout credential, and the action credential on release-narration runs, track the operation, not a diagnostic label.
 
-**Deploy-window compatibility, for free.** `@semantic-release/exec` runs its
-`successCmd` from the checkout of the **released tag**, not from `main`. During a
-rollout, an *old* dispatcher (from a tag published before this change) dispatches
-the *new* workflow and sets `correlation-id` but not `release-tag`. Because the
-switch keys on `release-tag` (absent → PAT), that old dispatcher keeps its old
-PAT + mutation-prompt behavior working unchanged, instead of receiving the
-read-only token, hitting a `403` on `gh release edit`, and hard-failing an
-already-published release. One design decision closed the security hole and
-removed the rollout hazard simultaneously.
+**Stale callers are not misclassified.** `@semantic-release/exec` runs its
+`successCmd` from the checkout of the **released tag**, not from `main`, so an
+*older* dispatcher can dispatch a *newer* workflow and set `correlation-id` without
+`release-tag`. Because the operation arm keys on `release-tag`, that dispatcher is
+not treated as the release operation, and the audit label never selects its
+credential; the other arms of the expression decide it.
 
 ## When to Apply
 
@@ -114,6 +139,7 @@ token: ${{ github.event.inputs.correlation-id != '' && github.token || secrets.F
 ### Good: credential keyed on the operation input
 
 ```yaml
+# operation arm of the real expression (full form under Guidance):
 token: ${{ github.event.inputs.release-tag != '' && github.token || secrets.FRO_BOT_PAT }}
 # mutating apply job additionally requires BOTH inputs:
 if: ${{ github.event.inputs.release-tag != '' && github.event.inputs.correlation-id != '' }}

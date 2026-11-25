@@ -1,0 +1,1 @@
+import{a as e,t}from"./rolldown-runtime-_8HjFqer.js";import{n,t as r}from"./esm-BT3L6a8H.js";var i=/* @__PURE__ */ t((t=>{Object.defineProperty(t,"__esModule",{value:!0}),t.getMachineId=void 0;let i=(n(),e(r));async function a(){i.diag.debug(`could not read machine-id: unsupported platform`)}t.getMachineId=a}));export default i();export{};

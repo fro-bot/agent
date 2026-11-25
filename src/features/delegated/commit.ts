@@ -11,6 +11,7 @@ import type {CommitOptions, CommitResult, FileChange} from './types.js'
 
 import {Buffer} from 'node:buffer'
 
+import {assertRunNotCancelled} from '../../shared/cancellation.js'
 import {DEFAULT_AUTHOR, FILE_VALIDATION} from './types.js'
 
 /**
@@ -190,6 +191,8 @@ export async function createCommit(octokit: Octokit, options: CommitOptions, log
     ...requestOptions,
   })
 
+  // The push: the one step of a brokered commit that changes what the branch holds. Everything before it is unreferenced objects.
+  assertRunNotCancelled('the push')
   await octokit.rest.git.updateRef({
     owner,
     repo,

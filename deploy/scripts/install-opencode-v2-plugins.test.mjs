@@ -16,7 +16,7 @@ import {fileURLToPath} from 'node:url'
 
 const SCRIPT = fileURLToPath(new URL('./install-opencode-v2-plugins.sh', import.meta.url))
 const SYSTEMATIC = '@fro.bot/systematic@3.27.1'
-const FRO_BOT = '@fro.bot/opencode-plugin@0.2.0'
+const FRO_BOT = '@fro.bot/opencode-plugin@0.3.0'
 
 /**
  * Builds a sandbox: a fake agent home, a fake `opencode` that records its call and (unless told to fail) installs the

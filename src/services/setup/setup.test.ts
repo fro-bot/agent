@@ -536,6 +536,49 @@ describe('setup', () => {
         expect(installOrder).toBeLessThan(saveOrder ?? Number.POSITIVE_INFINITY)
       })
 
+      it('records the tools cache, the OpenCode install, the plugin install and the save as children of the bootstrap span', async () => {
+        // #given a tools-cache miss, a binary the tool cache already holds, and a recording tracer
+        vi.mocked(tc.find).mockReturnValue('/opt/hostedtoolcache/opencode/2.2.6-sha/x64')
+        const {createRecordingTracer, spanNamed} = await import('../../shared/lifecycle-tracer.testing.js')
+        const {tracer, exported} = createRecordingTracer()
+        const bootstrap = tracer.startSpan('bootstrap')
+
+        // #when
+        await runSetup(createSetupInputs(), 'ghs_test_token', {traceSpan: bootstrap})
+        bootstrap.end()
+        tracer.root.end()
+        await tracer.flush()
+
+        // #then
+        const parent = spanNamed(exported, 'bootstrap').spanId
+        const children = exported.filter(span => span.parentSpanId === parent).map(span => span.name)
+        expect(children).toEqual(['tools cache restore', 'install opencode', 'install plugins', 'tools cache save'])
+        expect(spanNamed(exported, 'tools cache restore').attributes['fro_bot.reason']).toBe('miss')
+        expect(spanNamed(exported, 'install opencode').attributes['fro_bot.reason']).toBe('cached')
+        expect(spanNamed(exported, 'install plugins').attributes['fro_bot.reason']).toBe('installed')
+      })
+
+      it('ends the plugin install span failed when the install fails', async () => {
+        // #given an install that fails
+        vi.mocked(tc.find).mockReturnValue('/opt/hostedtoolcache/opencode/2.2.6-sha/x64')
+        const {createRecordingTracer, spanNamed} = await import('../../shared/lifecycle-tracer.testing.js')
+        vi.mocked(pluginInstallV2.installPluginsV2).mockResolvedValueOnce({
+          success: false,
+          error: {kind: 'install-failed'},
+        } as never)
+        const failing = createRecordingTracer()
+        const bootstrap = failing.tracer.startSpan('bootstrap')
+
+        // #when
+        await runSetup(createSetupInputs(), 'ghs_test_token', {traceSpan: bootstrap})
+        bootstrap.end()
+        failing.tracer.root.end()
+        await failing.tracer.flush()
+
+        // #then
+        expect(spanNamed(failing.exported, 'install plugins').attributes['fro_bot.outcome']).toBe('failed')
+      })
+
       it('skips the plugin install and the save on a tools-cache hit that already holds the plugins', async () => {
         // #given a hit, a findable binary and plugins the restored cache already holds
         vi.mocked(toolsCache.restoreToolsCache).mockResolvedValue({hit: true, restoredKey: 'opencode-tools-v2-key'})
