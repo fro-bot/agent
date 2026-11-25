@@ -1,16 +1,17 @@
 import type {OpenCodeV2ServerHandle, OwnershipLedger} from '@fro-bot/runtime'
-import type {OtlpSink, SinkRequest} from '../../packages/runtime/src/tracing/otlp-sink.testing.js'
+import type {OtlpSink, SinkRequest, TlsSink} from '../../packages/runtime/src/tracing/otlp-sink.testing.js'
 import type {TriggerContext} from '../features/triggers/types.js'
 import type {BootstrapPhaseResult} from './phases/bootstrap.js'
 import type {CacheRestorePhaseResult, CacheRestoreTrace} from './phases/cache-restore.js'
 import type {RoutingPhaseResult, RoutingPhaseSkip} from './phases/routing.js'
 import type {SandboxLifecycle} from './phases/sandbox-lifecycle.js'
 import {createHash} from 'node:crypto'
-import {buildTracingLauncherValue, TRACING_IDENTITY_FIELD_MAX_CHARS} from '@fro-bot/runtime'
+import {ACTION_TRACING_OFF, buildTracingLauncherValue, TRACING_IDENTITY_FIELD_MAX_CHARS} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
-import {startOtlpSink} from '../../packages/runtime/src/tracing/otlp-sink.testing.js'
+import {opensslAvailable, startOtlpSink, startTlsSink} from '../../packages/runtime/src/tracing/otlp-sink.testing.js'
 import {resolveActionTracing} from '../services/setup/tracing.js'
 import {markRunCancelled, resetRunCancellation} from '../shared/cancellation.js'
+import {createMockLogger} from '../shared/test-helpers.js'
 import {run} from './run.js'
 
 /**
@@ -20,11 +21,15 @@ import {run} from './run.js'
  */
 
 const loggers = vi.hoisted(() => ({all: [] as unknown[]}))
-const inputs = vi.hoisted(() => ({values: new Map<string, string>()}))
+const inputs = vi.hoisted(() => ({values: new Map<string, string>(), state: new Map<string, string>()}))
 
 vi.mock('@actions/core', () => ({
   getInput: vi.fn((name: string) => inputs.values.get(name) ?? ''),
-  saveState: vi.fn(),
+  getState: vi.fn((key: string) => inputs.state.get(key) ?? ''),
+  // What the main step saves is what the post step reads, so a handoff row sees only the state a real main step leaves.
+  saveState: vi.fn((key: string, value: string) => {
+    inputs.state.set(key, value)
+  }),
   setFailed: vi.fn(),
   setSecret: vi.fn(),
   warning: vi.fn(),
@@ -89,7 +94,8 @@ const MAIN_SECRET = 'mid-run-server-password-0xCAFE'
 const RELAY_CREDENTIAL = 'Basic cmVsYXktY2FuYXJ5OnJlbGF5LXNlY3JldA=='
 
 interface RunPlan {
-  readonly bootstrap?: 'null' | 'real-parser'
+  /** `forward-trace-inputs`: the fixture takes the trace inputs `run` hands bootstrap, as the real bootstrap does. */
+  readonly bootstrap?: 'null' | 'real-parser' | 'forward-trace-inputs'
   readonly routing?: 'skip'
   readonly repo?: {readonly owner: string; readonly repo: string}
   readonly dedup?: 'duplicate'
@@ -239,6 +245,8 @@ async function arrange(plan: RunPlan): Promise<void> {
   else if (plan.bootstrap === 'real-parser') {
     const actual = await vi.importActual<typeof import('./phases/bootstrap.js')>('./phases/bootstrap.js')
     vi.mocked(runBootstrap).mockImplementation(actual.runBootstrap)
+  } else if (plan.bootstrap === 'forward-trace-inputs') {
+    vi.mocked(runBootstrap).mockImplementation(async (_logger, options) => createBootstrap(sandbox, options?.tracing))
   } else {
     vi.mocked(runBootstrap).mockResolvedValue(
       createBootstrap(
@@ -456,6 +464,7 @@ describe('run with lifecycle tracing', () => {
     vi.clearAllMocks()
     loggers.all.length = 0
     inputs.values.clear()
+    inputs.state.clear()
     target = await startOtlpSink()
     sinks.push(target)
     inputs.values.set('trace-endpoint', target.url)
@@ -637,6 +646,100 @@ describe('run with lifecycle tracing', () => {
       expect(exitCode).toBe(0)
       expect(target.received()).toBe(0)
       expect(vi.mocked(core.saveState).mock.calls.map(call => call[0])).not.toContain('lifecycleTrace')
+    })
+  })
+
+  describe.skipIf(!opensslAvailable())('an Authorization header with no credential, against an https collector', () => {
+    // A valid https endpoint, so the input rules do not refuse it for the endpoint; the TLS sink counts every connection the
+    // run opens to it, a refused handshake included, so "nothing sent" is a count of zero connections, not an absent body.
+    let tls: TlsSink
+
+    beforeEach(async () => {
+      tls = await startTlsSink()
+      inputs.values.set('trace-endpoint', tls.url)
+    })
+
+    afterEach(async () => {
+      await tls.stop()
+    })
+
+    /** The trace inputs reach bootstrap as `run` hands them, and the relay would start if tracing were on. */
+    const PLAN = {bootstrap: 'forward-trace-inputs', relay: 'live'} as const
+
+    /** The host the server start was given, which is what decides the traced plugin config and the launcher document. */
+    const launcherOf = async (): Promise<{host: ReturnType<typeof resolveActionTracing>; document: unknown}> => {
+      const {runCacheRestore} = await import('./phases/cache-restore.js')
+      const source = vi.mocked(runCacheRestore).mock.calls[0]?.[3]
+      if (source === undefined) throw new Error('the server start was never reached')
+      const host = resolveActionTracing(source)
+      return {host, document: JSON.parse(buildTracingLauncherValue(host))}
+    }
+    const traceWarnings = async (): Promise<unknown[][]> => {
+      const core = await import('@actions/core')
+      return vi.mocked(core.warning).mock.calls.filter(call => String(call[0]).includes('trace-headers'))
+    }
+
+    it('starts no relay and gives OpenCode the tracing-off launcher, and nothing reaches the collector', async () => {
+      // #given a secret that was unset, so trace-headers is only `Authorization: Bearer`
+      inputs.values.set('trace-headers', 'Authorization: Bearer')
+
+      // #when
+      const {exitCode} = await execute(PLAN)
+
+      // #then the relay is never launched (the fixture would have started one if tracing were on)
+      const {createTraceRelayLaunch} = await import('./phases/trace-relay-process.js')
+      expect(exitCode).toBe(0)
+      expect(createTraceRelayLaunch).not.toHaveBeenCalled()
+      // #and the server start gets the exact off document, so the plugin is not placed last for tracing
+      const {host, document} = await launcherOf()
+      expect(host).toBe(ACTION_TRACING_OFF)
+      expect(document).toEqual(JSON.parse(buildTracingLauncherValue(ACTION_TRACING_OFF)))
+      // #and no lifecycle export and no identity record, so no connection to the collector at all
+      expect(tls.connections()).toBe(0)
+      expect(target.received()).toBe(0)
+      const core = await import('@actions/core')
+      expect(vi.mocked(core.saveState).mock.calls.map(call => call[0])).not.toContain('lifecycleTrace')
+      // #and one warning, with no value in it
+      expect(await traceWarnings()).toEqual([
+        ['trace-headers has an Authorization header with no credential (is the secret set?), so tracing is off'],
+      ])
+    })
+
+    it('is on for the same endpoint with a credential: the relay is launched, the host is on, and the run exports', async () => {
+      // #given the same endpoint and a real token (the control: without the rejection, the run looks like this)
+      inputs.values.set('trace-headers', 'Authorization: Bearer abc')
+
+      // #when
+      await execute(PLAN)
+
+      // #then
+      const {createTraceRelayLaunch} = await import('./phases/trace-relay-process.js')
+      expect(createTraceRelayLaunch).toHaveBeenCalledTimes(1)
+      expect((await launcherOf()).host).toMatchObject({host: 'action', tracing: 'on'})
+      expect(tls.connections()).toBeGreaterThan(0)
+      expect(await traceWarnings()).toEqual([])
+    })
+
+    it('hands the post step only the state main saved, and the post step sends nothing and warns no second time', async () => {
+      // #given a main step that ran with the unset secret
+      inputs.values.set('trace-headers', 'Authorization: Bearer')
+      await execute(PLAN)
+
+      // #when the post step starts from what main saved (the state map is filled by main's own saveState calls)
+      const {startPostTrace} = await import('./post-trace.js')
+      const postLogger = createMockLogger()
+      const post = startPostTrace({logger: postLogger, env: {}})
+      await post.finish({outcome: 'succeeded'})
+
+      // #then main saved no trace identity, so post is off, connects to nothing, and says nothing more
+      expect(inputs.state.has('lifecycleTrace')).toBe(false)
+      expect(post.enabled).toBe(false)
+      expect(tls.connections()).toBe(0)
+      expect(target.received()).toBe(0)
+      expect(await traceWarnings()).toEqual([
+        ['trace-headers has an Authorization header with no credential (is the secret set?), so tracing is off'],
+      ])
+      expect(vi.mocked(postLogger.warning)).not.toHaveBeenCalled()
     })
   })
 
