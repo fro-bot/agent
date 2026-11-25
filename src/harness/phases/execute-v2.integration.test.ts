@@ -1088,8 +1088,11 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
     // #then the run waited for the shell and for the turn its notice started: it did not release on the first idle
     expect(result).toMatchObject({success: true, exitCode: 0})
     expect(executionMs).toBeGreaterThanOrEqual(4_000)
+    // The notice header is `<shell id=…>` on OpenCode 2.3.2 and `<background-result kind="shell" id=…>` from 2.4.0
+    // (upstream #64971). `raw` is the JSON request body, so the 2.4.1 form's quotes arrive escaped.
+    const shellNoticeHeader = /<shell id=|<background-result kind=\\?"shell\\?" id=/
     const shellNoticeSeen = provider.requests.some(
-      item => item.raw.includes('<shell id=') && item.raw.includes(SHELL_MARKER),
+      item => shellNoticeHeader.test(item.raw) && item.raw.includes(SHELL_MARKER),
     )
     expect(shellNoticeSeen).toBe(true)
     expect(JSON.stringify(consoleMock.outputTextContent.mock.calls)).toContain(

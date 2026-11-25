@@ -16,6 +16,7 @@ import {
   buildTraceSessionId,
   buildTracingRunIdentity,
   buildTracingRunLink,
+  describeTraceEvent,
   liveActionTracingHost,
   readLifecycleRunIdentity,
   relayRequestFromInputs,
@@ -310,5 +311,24 @@ describe('readLifecycleRunIdentity', () => {
 
   it('takes the job from the invocation identity', () => {
     expect(readLifecycleRunIdentity({GITHUB_RUN_ATTEMPT: '2'}, 'triage')).toEqual({attempt: '2', job: 'triage'})
+  })
+})
+
+describe('describeTraceEvent', () => {
+  it('names the event and its activity', () => {
+    expect(describeTraceEvent({eventType: 'issue_comment', action: 'created'})).toBe('issue_comment.created')
+    expect(describeTraceEvent({eventType: 'pull_request', action: 'review_requested'})).toBe(
+      'pull_request.review_requested',
+    )
+  })
+
+  it('names the event alone when it has no activity', () => {
+    expect(describeTraceEvent({eventType: 'workflow_dispatch', action: null})).toBe('workflow_dispatch')
+  })
+
+  it('leaves out an activity that is not a plain lowercase word, so the name stays a fixed vocabulary', () => {
+    expect(describeTraceEvent({eventType: 'issues', action: 'opened by "someone"'})).toBe('issues')
+    expect(describeTraceEvent({eventType: 'issues', action: ''})).toBe('issues')
+    expect(describeTraceEvent({eventType: 'issues', action: 'x'.repeat(65)})).toBe('issues')
   })
 })

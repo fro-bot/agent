@@ -7,7 +7,8 @@ import {getObjectProperty, getStringProperty} from './payload-accessors.js'
  * Subagent completion notices for OpenCode V2 (v2.2.0).
  *
  * When a background subagent finishes, the server enqueues a synthetic message on the PARENT session. Its text is
- * `<subagent sessionID="…" state="…" description="…">…</subagent>`, and its structured `metadata` is
+ * `<subagent sessionID="…" state="…" description="…">…</subagent>` (2.4.1 wraps it as
+ * `<background-result kind="subagent" sessionID="…" state="…" description="…">…</background-result>`), and its structured `metadata` is
  * `{source: "subagent", childID, agent, state}` (`packages/core/src/session/subagent-completion.ts:37-44`; captured
  * in probe P2). The model-visible text embeds child output, so it can be forged by any content a child produced.
  * This reader therefore NEVER parses text: only the `metadata` object settles anything.
