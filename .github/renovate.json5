@@ -214,11 +214,10 @@
     },
     {
       // Keep @types/node on the major the code actually runs on. Every runtime
-      // surface is Node 24 — `using: node24` in action.yaml, node:24 in both
-      // deploy Dockerfiles, and node-version 24 in harness-release. Newer types
-      // describe a stdlib none of them have, and type-checking against them
-      // succeeds by construction, so CI cannot catch the mismatch. Raise this
-      // together with the runtime, not ahead of it.
+      // surface is Node 24 — `using: node24` in action.yaml and node:24 in both
+      // deploy Dockerfiles. Newer types describe a stdlib none of them have, and
+      // type-checking against them succeeds by construction, so CI cannot catch
+      // the mismatch. Raise this together with the runtime, not ahead of it.
       matchPackageNames: ['@types/node'],
       allowedVersions: '<25',
     },

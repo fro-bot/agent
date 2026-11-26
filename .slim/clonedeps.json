@@ -4,27 +4,27 @@
   "dependencies": [
     {
       "name": "opencode (session engine)",
-      "resolvedVersion": "2.4.2",
+      "resolvedVersion": "2.4.1",
       "repoUrl": "https://github.com/anomalyco/opencode.git",
-      "ref": "v2.4.2",
+      "ref": "v2.4.1",
       "path": ".slim/clonedeps/repos/anomalyco__opencode",
       "packagePath": "packages/core",
       "reason": "OpenCode V2 session engine source: how a turn runs, the session events it publishes, plugin loading and hooks, model and provider resolution. Pinned to the V2 version the Action runs."
     },
     {
       "name": "opencode (server)",
-      "resolvedVersion": "2.4.2",
+      "resolvedVersion": "2.4.1",
       "repoUrl": "https://github.com/anomalyco/opencode.git",
-      "ref": "v2.4.2",
+      "ref": "v2.4.1",
       "path": ".slim/clonedeps/repos/anomalyco__opencode",
       "packagePath": "packages/server",
       "reason": "OpenCode V2 HTTP server source: routes, handlers and the event stream the Action consumes."
     },
     {
       "name": "@opencode/plugin",
-      "resolvedVersion": "2.4.2",
+      "resolvedVersion": "2.4.1",
       "repoUrl": "https://github.com/anomalyco/opencode.git",
-      "ref": "v2.4.2",
+      "ref": "v2.4.1",
       "path": ".slim/clonedeps/repos/anomalyco__opencode",
       "packagePath": "packages/plugin",
       "reason": "OpenCode V2 plugin API source, for checking the hooks and host services a plugin gets."
