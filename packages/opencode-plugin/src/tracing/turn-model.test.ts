@@ -3,6 +3,8 @@ import type {ChatRecord, InvokeRecord, SpanRecord, ToolRecord, TurnModelLimits} 
 
 import {describe, expect, it} from 'vitest'
 
+import {createScrubber} from './content.js'
+import {toExportSpan} from './genai-attributes.js'
 import {observeEvent} from './record-observations.js'
 import {recordedFixtures} from './turn-model.fixtures.js'
 import {DEFAULT_LIMITS} from './turn-model.js'
@@ -135,6 +137,37 @@ function script() {
     },
   }
   return api
+}
+
+/** A turn that dispatches a subagent and goes quiet: its report has not arrived. `quiet` is when it last did anything. */
+function quietDispatch() {
+  const s = script()
+  s.prompt('p', 'mp')
+  s.enqueued('p', 'mp', 'user')
+  s.started('p')
+  s.delivered('p', 'mp')
+  s.request('p')
+  s.stepStarted('p', 'sp')
+  s.toolBefore('p', 'c1', 'subagent')
+  s.toolAfter('p', 'c1', 'subagent', 'kid')
+  s.stepEnded('p', 'sp')
+  s.ended('p')
+  return {s, quiet: lastAt(s.out)}
+}
+
+/** The same session after the inactivity bound closed its root: the child's report arrives late and runs a turn. */
+function lateReport(quietDispatched: ReturnType<typeof script>, quiet: number) {
+  const late = script()
+  late.out.push(...quietDispatched.out, {kind: 'tick', at: quiet + DEFAULT_LIMITS.rootInactivityMs + 1})
+  late.at(quiet + DEFAULT_LIMITS.rootInactivityMs + 10)
+  late.enqueued('p', 'mr', 'synthetic', 'kid', 'completed')
+  late.started('p')
+  late.delivered('p', 'mr')
+  late.request('p')
+  late.stepStarted('p', 'sr')
+  late.stepEnded('p', 'sr')
+  late.ended('p')
+  return late
 }
 
 describe('recorded fixtures', () => {
@@ -680,18 +713,7 @@ describe('turn model on constructed orderings', () => {
 
   it('a subagent that never reports leaves its root closed by the inactivity bound, incomplete; a later report is a continuation', () => {
     // #given a dispatch whose child finishes but whose report arrives only after the inactivity bound
-    const s = script()
-    s.prompt('p', 'mp')
-    s.enqueued('p', 'mp', 'user')
-    s.started('p')
-    s.delivered('p', 'mp')
-    s.request('p')
-    s.stepStarted('p', 'sp')
-    s.toolBefore('p', 'c1', 'subagent')
-    s.toolAfter('p', 'c1', 'subagent', 'kid')
-    s.stepEnded('p', 'sp')
-    s.ended('p')
-    const quiet = lastAt(s.out)
+    const {s, quiet} = quietDispatch()
 
     // #when time passes to exactly the bound, then one millisecond past it
     const atBound = replay([...s.out, {kind: 'tick', at: quiet + DEFAULT_LIMITS.rootInactivityMs}], {flush: false})
@@ -704,22 +726,44 @@ describe('turn model on constructed orderings', () => {
     expect(past.model.stats().openTraces).toBe(0)
 
     // #when the report arrives later
-    const late = script()
-    late.out.push(...s.out, {kind: 'tick', at: quiet + DEFAULT_LIMITS.rootInactivityMs + 1})
-    late.at(quiet + DEFAULT_LIMITS.rootInactivityMs + 10)
-    late.enqueued('p', 'mr', 'synthetic', 'kid', 'completed')
-    late.started('p')
-    late.delivered('p', 'mr')
-    late.request('p')
-    late.stepStarted('p', 'sr')
-    late.stepEnded('p', 'sr')
-    late.ended('p')
-    const {records} = replay(late.out)
+    const {records} = replay(lateReport(s, quiet).out)
 
     // #then it starts a new trace marked as a continuation that names the first
     const [first, continuation] = roots(records)
     expect(continuation?.marks).toContain('continuation')
     expect(continuation?.continuationOf).toBe(first?.traceId)
+  })
+
+  it('names the original trace and its late continuation, each once on its own root', () => {
+    // #given the late-report replay: a closed root, then a report that opens a continuation trace
+    const {s, quiet} = quietDispatch()
+    const {records} = replay(lateReport(s, quiet).out)
+    const [first, continuation] = roots(records)
+    expect(continuation?.marks).toContain('continuation')
+
+    // #when every record is exported
+    const spans = records.map(record => toExportSpan(record, {}, createScrubber()))
+
+    // #then the two traces have distinct ids
+    const traceIds = [...new Set(spans.map(span => span.traceId))]
+    expect(traceIds).toHaveLength(2)
+    expect(first?.traceId).not.toBe(continuation?.traceId)
+
+    // #and each has exactly one span with the trace name, the root of that trace, and the same name in both
+    for (const root of [first, continuation]) {
+      const named = spans.filter(
+        span => span.traceId === root?.traceId && span.attributes['langfuse.trace.name'] !== undefined,
+      )
+      expect(named.map(span => span.spanId)).toEqual([root?.spanId])
+      expect(named[0]?.parentSpanId).toBeUndefined()
+      expect(named[0]?.attributes['langfuse.trace.name']).toBe('fro-bot run')
+    }
+    // #and the continuation still says which trace it continues
+    const exportedContinuation = spans.find(span => span.spanId === continuation?.spanId)
+    expect(exportedContinuation?.attributes['fro_bot.turn.continuation_of']).toBe(first?.traceId)
+
+    // #and the continuation has child spans of its own, none of them named
+    expect(spans.filter(span => span.traceId === continuation?.traceId).length).toBeGreaterThan(1)
   })
 
   it('a report with no trace and no tombstone gets its own trace, marked unattributed', () => {

@@ -986,17 +986,6 @@ describe('the Langfuse trace name', () => {
     expect(span.attributes[TRACE_NAME]).toBe('fro-bot run')
   })
 
-  it('names the root of a continuation trace the same as its source', () => {
-    // #given the root of a trace that continues a closed one
-    const source = exported(invoke())
-    const continuation = exported(invoke({prompts: [], marks: ['continuation'], continuationOf: 'trace-0'}))
-
-    // #then the continuation carries the same name, and it still says what it continues
-    expect(source.attributes[TRACE_NAME]).toBe('fro-bot run')
-    expect(continuation.attributes[TRACE_NAME]).toBe(source.attributes[TRACE_NAME])
-    expect(continuation.attributes['fro_bot.turn.continuation_of']).toBe('trace-0')
-  })
-
   it('does not name the trace on a span that has a parent', () => {
     // #given each kind of span inside an existing trace, a child session's invoke_agent included
     const records: SpanRecord[] = [
