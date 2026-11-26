@@ -1225,6 +1225,64 @@ describe('continuing a trace', () => {
   })
 })
 
+describe('the Langfuse trace name', () => {
+  const TRACE_NAME = 'langfuse.trace.name'
+
+  it('names the trace on the root span alone, with a fixed string', async () => {
+    // #given a root with a phase, a nested span and a span started under the no-op parent
+    const target = await sink()
+    const {tracer} = harness(target.url)
+    const phase = tracer.startSpan('bootstrap')
+    tracer.startSpan('install opencode', {parent: phase}).end({outcome: 'succeeded'})
+    phase.end({outcome: 'succeeded'})
+    tracer.startSpan('cleanup', {parent: NOOP_SPAN}).end({outcome: 'succeeded'})
+    tracer.root.end({outcome: 'succeeded'})
+
+    // #when
+    await tracer.flush()
+
+    // #then the root carries it and no other span does
+    const spans = allSpans(target)
+    expect(spans).toHaveLength(4)
+    expect(attr(named(spans, 'action.main'), TRACE_NAME)).toBe('fro-bot action')
+    for (const span of spans.filter(item => item.name !== 'action.main')) expect(attr(span, TRACE_NAME)).toBeUndefined()
+  })
+
+  it('exports the name whole when a registered secret holds it, and names it once, on the root', async () => {
+    // #given a registered secret that is the name itself, so the scrubber would withhold the string if it saw it
+    const target = await sink()
+    const made = harness(target.url)
+    made.registry.mask('fro-bot action')
+    made.tracer.startSpan('bootstrap').end({outcome: 'succeeded'})
+    made.tracer.root.end({outcome: 'succeeded'})
+
+    // #when
+    await made.tracer.flush()
+
+    // #then the name is the literal, not a redaction or the withheld marker
+    const spans = allSpans(target)
+    expect(attr(named(spans, 'action.main'), TRACE_NAME)).toBe('fro-bot action')
+    expect(spans.filter(span => attr(span, TRACE_NAME) !== undefined)).toHaveLength(1)
+  })
+
+  it('does not name the trace on the post step’s span, which hangs from the saved root of the main step’s trace', async () => {
+    // #given a tracer continuing the main step's trace
+    const target = await sink()
+    const ids = {traceId: '1'.repeat(32), rootSpanId: '2'.repeat(16), invocationId: '3'.repeat(16)}
+    const {tracer} = harness(target.url, {continueFrom: ids})
+
+    // #when it records its span and flushes
+    tracer.startSpan('post').end({outcome: 'succeeded'})
+    tracer.root.end({outcome: 'succeeded'})
+    await tracer.flush()
+
+    // #then the span is a child in the main trace, whose root names it, so it carries no name of its own
+    const [post] = allSpans(target)
+    expect(post?.parentSpanId).toBe(ids.rootSpanId)
+    expect(attr(post as Decoded, TRACE_NAME)).toBeUndefined()
+  })
+})
+
 describe('parseTraceIds', () => {
   const good = {traceId: '1'.repeat(32), rootSpanId: '2'.repeat(16), invocationId: '3'.repeat(16)}
 

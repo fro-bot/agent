@@ -365,6 +365,8 @@ A trace can hold private repository content, text written by other people (issue
 
 Every span also carries the session id, the repository, the run id and attempt, the job, the trigger and the Action step's invocation id. For Langfuse, every span carries `langfuse.session.id` and the run identity as `langfuse.trace.metadata.*`. Other backends ignore these. In an Action run the session is the conversation: `<owner>/<repo>:<key>`, where the key is the issue, pull request or discussion, or the run itself for `schedule` and `workflow_dispatch`. A session id the scrubber would change is sent as `sha256:` and a hash instead. A local session uses the OpenCode root session's id. Turns exported before this release stay in Langfuse under the OpenCode root session id, while new Action turns use the qualified key, so a conversation that spans the upgrade shows as two sessions; every turn span carries `fro_bot.root_session.id`, the OpenCode root session id, to join them.
 
+For Langfuse, the root span of each trace carries `langfuse.trace.name`, which Langfuse shows as the trace's name. The run's own trace (below) is named `fro-bot action` from this Action release. Turn traces are named `fro-bot run` (a continuation trace has the same name) once the Action pins the next `@fro.bot/opencode-plugin` release that sets it; until then they have no name. Both are fixed strings, and only the root span has one.
+
 ### The run's own trace
 
 The Action also sends one trace per run of its own work, with service name `fro-bot-action`. Its root span `action.main` covers the main step. Under it are:

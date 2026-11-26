@@ -972,3 +972,62 @@ describe('what the tool lifecycle and unobservable retries add to a span', () =>
     expect(span.attributes['fro_bot.request.attempt']).toBe(2)
   })
 })
+
+describe('the Langfuse trace name', () => {
+  const TRACE_NAME = 'langfuse.trace.name'
+
+  it('names the trace on a root invoke_agent span, with a fixed string that carries no content', () => {
+    // #given a turn's root span, whose prompt and agent are content
+    const span = exported(
+      invoke({prompts: [{messageId: 'm1', at: 1_000, content: {text: 'K-PROMPT'}, midTurn: false}]}),
+    )
+
+    // #then the trace is named by the literal and nothing the turn holds
+    expect(span.attributes[TRACE_NAME]).toBe('fro-bot run')
+  })
+
+  it('does not name the trace on a span that has a parent', () => {
+    // #given each kind of span inside an existing trace, a child session's invoke_agent included
+    const records: SpanRecord[] = [
+      chat({parentSpanId: 'span-parent'}),
+      tool({parentSpanId: 'span-parent'}),
+      invoke({role: 'child', parentSpanId: 'span-parent'}),
+    ]
+
+    // #then none carries the name
+    for (const record of records) expect(exported(record).attributes[TRACE_NAME]).toBeUndefined()
+  })
+
+  it('names exactly the root of every replayed trace, a subagent tree included', () => {
+    // #given the nested-subagent fixture: a root and two child sessions in one trace
+    const {records} = replay(recordedFixtures['subagent-nested']?.observations ?? [])
+
+    // #when every record is exported
+    const spans = records.map(record => exported(record))
+
+    // #then each trace has one named span, and it is the one without a parent
+    const named = spans.filter(span => span.attributes[TRACE_NAME] !== undefined)
+    expect(named.length).toBeGreaterThan(0)
+    expect(named.every(span => span.parentSpanId === undefined)).toBe(true)
+    expect(spans.filter(span => span.parentSpanId === undefined)).toEqual(named)
+    for (const traceId of new Set(spans.map(span => span.traceId)))
+      expect(named.filter(span => span.traceId === traceId)).toHaveLength(1)
+  })
+
+  it('exports the literal whole even when the scrubber would rewrite it, and when the session id falls back', () => {
+    // #given a scrubber that rewrites every string it sees, and a session id it will not leave alone
+    const base = createScrubber()
+    const rewriting = {
+      ...base,
+      scrub: (text: string) => ({ok: true, text: `[REDACTED:${text.length}]`, redactions: 1}) as const,
+    }
+
+    // #when a root and a child are exported
+    const root = toExportSpan(invoke(), {identity: IDENTITY, sessionId: 'o/r:key'}, rewriting)
+    const child = toExportSpan(chat({parentSpanId: 'span-parent'}), {sessionId: 'o/r:key'}, rewriting)
+
+    // #then the root's name is the literal, and the child still has none
+    expect(root.attributes[TRACE_NAME]).toBe('fro-bot run')
+    expect(child.attributes[TRACE_NAME]).toBeUndefined()
+  })
+})
