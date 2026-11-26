@@ -1,6 +1,6 @@
 # Harness Package — Agent Notes
 
-`@fro.bot/harness` is the **default OpenCode for Fro Bot**: a published, patched OpenCode binary built via orw's LLM-merge integration method. It replaces the stock OpenCode download in the action setup.
+`@fro.bot/harness` is the patched OpenCode V1 binary, built with orw's LLM-merge integration method, that Fro Bot ran before the Action moved to OpenCode V2 only. The Action no longer uses it and nothing in CI builds or releases it; the package stays until a later cleanup.
 
 ## Purpose
 
@@ -40,7 +40,7 @@ The package ships two bins (`bin` in `package.json`; `package-invariants.test.ts
 
 Provenance = upstream release tag + ordered integration refs (each pinned by upstream commit SHA) + frozen integration commit SHA + build sha. `harness info`/`patches`/`doctor` report this.
 
-The LLM merge runs **once per release bump** in CI, is maintainer-reviewed as the bump PR, and is **frozen** — its SHA is pinned. Per-platform builds pin to the frozen integration commit. The action consumes the published, frozen, pre-built binary; the merge never runs during an action invocation.
+Each published release froze its LLM merge as a maintainer-reviewed integration commit, and every platform build pinned to that commit.
 
 ## Per-Platform Distribution
 
@@ -53,115 +53,24 @@ The harness ships as a main `@fro.bot/harness` package + per-platform packages:
 
 Each per-platform package contains only that platform's native binary. The `postinstall` resolver and the bins' resolver (`resolve-binary.ts` → `platform.ts`) select the host's binary by computed package name (`@fro.bot/harness-<os>-<arch>`). `OPENCODE_PATH` (native binary only) overrides it; a PATH search for a native `opencode` is honored only under `HARNESS_ALLOW_PATH_FALLBACK=1` (dev). `postinstall` is advisory (`|| true`) and is skipped by managers that disable lifecycle scripts, so the bins must not depend on it.
 
-The per-platform packages are **not listed in the source `package.json` `optionalDependencies`** — that keeps the workspace `bun.lock` clean (the packages only exist on npm after a release). The release workflow **injects** `optionalDependencies` (pinned to the release version) into the published main package's `package.json` at publish time.
+The per-platform packages are **not listed in the source `package.json` `optionalDependencies`** — that keeps the workspace `bun.lock` clean (the packages only exist on npm after a release). Releases injected `optionalDependencies` (pinned to the release version) into the published main package's `package.json` at publish time.
 
 Harness builds target **linux and darwin only** (x64 + arm64); Windows is unsupported.
 
 ## Distribution Channels and Versioning
 
-The harness is distributed through **two channels** from one release run:
+Each release was distributed through **two channels**:
 
 - **npm** — for local `bunx @fro.bot/harness` / `mise` use. Published as a SemVer **prerelease**: `<base>-harness.<short8>` (e.g. `1.17.3-harness.ed359558`), with the `latest` dist-tag set explicitly (prereleases are not `latest` by default).
-- **GitHub Release** — for the Fro Bot action to download (the same way it downloads stock OpenCode); the Action setup consumes this tarball, not the npm package. The release tag uses the same SemVer **prerelease** string as npm: `<base>-harness.<short8>` (no `v`), carrying OpenCode-shaped assets `opencode-{linux-x64,linux-arm64}.tar.gz` / `opencode-{darwin-x64,darwin-arm64}.zip` (binary at archive root) plus `SHA256SUMS`.
+- **GitHub Release** — the tarballs the Action's V1 setup downloaded. The release tag uses the same SemVer **prerelease** string as npm: `<base>-harness.<short8>` (no `v`), carrying OpenCode-shaped assets `opencode-{linux-x64,linux-arm64}.tar.gz` / `opencode-{darwin-x64,darwin-arm64}.zip` (binary at archive root) plus `SHA256SUMS`.
 
 The tag has no `v` so semantic-release's `^v(.+)` scan ignores harness releases. The `-harness.` prerelease identifier keeps them out of Renovate stable candidates. The binary self-reports the `+harness.<sha>` build-metadata form (`harness --version`).
 
 The harness test suite reads repo-root `src/services/setup/opencode.ts` as source text to keep its local predicate mirror honest, so the suite requires the full monorepo checkout.
 
-## Integrate→Build Bridge
+## Releases
 
-The release workflow connects the LLM merge to the per-platform build matrix via a **pushed git ref**. The merge runs through the Fro Bot workflow (which already installs OpenCode and provisions auth); the merged tree is pushed to a throwaway ref the build matrix fetches.
-
-### `prepare-integrate` job
-
-Resolves the base version (dispatch input or tag) and renders the merge prompt from `packages/harness/prompt.txt` using values from `harness.config.json` (base version, release repo, integration refs). Emits `base_version`, `rendered_prompt`, and `has_refs` as job outputs.
-
-`has_refs` is derived from the **parsed merge list** after the ref-parsing loop — not from the raw `integrationRefs` string. Whitespace-only or malformed-only entries that produce no real merge ref correctly yield `has_refs=false`.
-
-### `integrate` job (merge via Fro Bot)
-
-Skipped when `has_refs == 'false'` (empty carry set). When it runs, `uses: ./.github/workflows/harness-integrate.yaml` — a dedicated workflow, **not** `fro-bot.yaml`, and **never** `secrets: inherit`. The caller job declares `permissions: {id-token: write, contents: read}` and passes exactly three secrets explicitly (`APPLICATION_ID`, `APPLICATION_PRIVATE_KEY`, `OPENCODE_CONFIG`) plus `model: ${{ vars.HARNESS_MODEL }}` and the rendered prompt. Withholding the durable model credential is the point: it must never reach this workflow. The Fro Bot agent:
-
-1. Clones `anomalyco/opencode` into a disposable work dir, creates the integration branch at the base version tag, and merges the configured refs.
-2. Builds and verifies the host CLI as a correctness gate.
-3. Pushes the integrated branch to `refs/harness-integrate/<version>` in this repo using an **inline-minted, short-lived GitHub App installation token** scoped to `contents: write` on this repo (`scripts/harness/mint-app-token.ts`; the App private key is step-env-only and never touches disk or `GITHUB_ENV`). It posts nothing to GitHub — the summary is plain text in the job log only.
-
-The model credential is likewise minted per run: `scripts/harness/mint-broker-credential.ts` exchanges the job's GitHub OIDC token for a short-lived credential and feeds it in as `auth-json`. Neither credential is a durable secret, and the job's `contents: write` scope is why the integration commit must omit workflow files (see below).
-
-The merge runs with `output-mode: working-dir` so branch/PR delivery semantics do not apply; the prompt itself owns the push to the throwaway ref.
-
-The integration commit **intentionally omits `.github/workflows/`** — the prompt strips it before committing, because the push authenticates as a GitHub App and GitHub rejects App pushes that touch workflow files without the `workflows` permission. Their absence from a `refs/harness-integrate/*` tree is expected, not truncation. See [the incident writeup](../../docs/solutions/workflow-issues/integrate-push-strips-workflow-files-2026-08-07.md).
-
-### `build` matrix (consumer)
-
-Each platform job (`needs: [prepare-integrate, integrate]`) runs when `prepare-integrate` succeeded **and** `integrate` did not fail. This means:
-
-- **Empty carry set** (`has_refs=false`): `integrate` is skipped → `integrate.result == 'skipped'` → build runs. The fetch-integrate step clones the stock release tag directly instead of fetching `refs/harness-integrate/<version>`.
-- **Non-empty carry set** (`has_refs=true`): `integrate` runs → if it succeeds, build runs; if it fails or is cancelled, build is blocked.
-
-Each platform job:
-
-1. Fetches `refs/harness-integrate/<version>` (non-empty carry) or clones the stock tag (empty carry) and resolves the tip SHA as the integration commit.
-2. Checks out the fetched tree and runs `build-platform.ts --source-tree <tree> --integration-commit <sha>`, which builds from the supplied merged source tree. Each platform job runs its own clean install + build.
-3. Emits the resolved `integration_commit` as a job output so `publish` consumes the same commit rather than re-resolving the force-pushed ref.
-
-The `--source-tree` flag is explicit and fail-closed: if the directory is missing or empty, the build fails rather than silently falling back to a clone.
-
-### Supply-chain controls
-
-- Merged refs come **only** from the `harness.config.json` carry-policy allowlist — no arbitrary ref can be injected at dispatch time.
-- The release is maintainer-gated `workflow_dispatch`.
-- `build` and `publish` are commit-pinned to a single resolved `integration_commit` (resolved once in `build`, consumed by `publish`).
-
-### `OPENCODE_AUTH_JSON` secret
-
-Required for any release that runs an LLM merge (i.e. any release with integration refs configured). The integrate job reuses the repository's existing `OPENCODE_AUTH_JSON` secret (the same model credential the action uses), so no separate secret is needed:
-
-- **Name:** `OPENCODE_AUTH_JSON`
-- **Value:** JSON mapping provider to auth config:
-  ```json
-  {"anthropic": {"type": "api", "key": "sk-ant-..."}}
-  ```
-
-The integrate job maps it to an internal env var, writes it to a 0600 temp file, and passes it to OpenCode as a file-based credential. The value is never echoed to logs or included in any artifact.
-
-### Dispatching a release
-
-**Dry run** (validate build infrastructure, skip publish):
-
-```bash
-gh workflow run harness-release.yaml \
-  --repo fro-bot/agent \
-  --field base_version=<configured-base-release> \
-  --field dry_run=true
-```
-
-**Real patched release** (the merge runs through Fro Bot, which uses the inherited `OPENCODE_AUTH_JSON` model credential):
-
-```bash
-gh workflow run harness-release.yaml \
-  --repo fro-bot/agent \
-  --field base_version=<configured-base-release>
-```
-
-The publish job has no environment/reviewer gate — a non-dry-run dispatch publishes on green builds. Use `--field dry_run=true` to exercise the pipeline without publishing.
-
-## Publishing
-
-The packages are published to npm via **trusted publishing (OIDC)** from the release workflow (`.github/workflows/harness-release.yaml`) — no long-lived npm token. The workflow has `id-token: write` scoped to the `publish` job only; the `integrate` and `build` jobs run with `contents: read` and no `id-token`. The workflow upgrades npm to a trusted-publishing-capable version (npm ≥ 11.5.0; Node 24 ships an older npm), and runs a bare `npm publish` (provenance is automatic under OIDC; `--provenance`/`--access` flags are not needed — access is set via each package's `publishConfig`).
-
-### One-time npmjs.com setup (per package)
-
-Trusted publishing trusts at the **package level**, so each of the five packages (`@fro.bot/harness` + the four `@fro.bot/harness-<os>-<arch>` packages) needs its own trusted-publisher configured once on npmjs.com → the package's Settings → Trusted publishing → GitHub Actions:
-
-- **Organization or user:** `fro-bot`
-- **Repository:** `agent`
-- **Workflow filename:** `harness-release.yaml`
-- **Environment:** (leave blank)
-
-### First-publish bootstrap
-
-npm trusted publishing requires a package to **already exist** before it will accept OIDC publishes — a brand-new, never-published package cannot be trust-published from scratch, and npm has no pending-publisher or pre-registration flow for packages that don't yet exist. So the very first release of these five packages requires a one-time token-authenticated `npm publish` to claim the names; after that, the trusted-publisher config above governs all subsequent releases with no token. See `BOOTSTRAP.md` for the full procedure.
+The release workflows (`harness-integrate.yaml`, `harness-release.yaml`) and the model-credential minter went away when the Action moved to OpenCode V2 only, so this repo can no longer build or publish a harness release. Published versions stay on npm and GitHub Releases. `BOOTSTRAP.md` describes the retired first-publish procedure.
 
 ## Carry Policy
 
