@@ -154,6 +154,19 @@ const saveOutline = (name: string, spans: readonly DecodedSpan[]): void => {
 
 const isRoot = (span: DecodedSpan): boolean => span.name.startsWith('invoke_agent') && span.parentSpanId === undefined
 
+/** Langfuse names a trace from `langfuse.trace.name` on its root span: each exported trace has exactly one such span, the root. */
+const expectOneNamedRoot = (spans: readonly DecodedSpan[]): void => {
+  const traces = new Set(spans.map(span => span.traceId))
+  expect(traces.size).toBeGreaterThan(0)
+  for (const traceId of traces) {
+    const named = spans.filter(span => span.traceId === traceId && span.attrs['langfuse.trace.name'] !== undefined)
+    expect(named).toHaveLength(1)
+    expect(named[0]?.parentSpanId).toBeUndefined()
+    expect(named[0] !== undefined && isRoot(named[0])).toBe(true)
+    expect(named[0]?.attrs['langfuse.trace.name']).toBe('fro-bot run')
+  }
+}
+
 describe.skipIf(!runnable)('tracing in a real opencode V2', () => {
   // Every test cleans up its own server, provider and sink, even when it fails.
   const run = async (options: HarnessOptions, body: (h: Harness) => Promise<void>): Promise<void> => {
@@ -196,6 +209,7 @@ describe.skipIf(!runnable)('tracing in a real opencode V2', () => {
       saveOutline('one-tool-one-subagent', spans)
       expect(new Set(spans.map(span => span.traceId)).size).toBe(1)
       const root = spans.find(isRoot)
+      expectOneNamedRoot(spans)
       const byName = (name: string): DecodedSpan[] => spans.filter(span => span.name === name)
       const readSpan = byName('execute_tool read')[0]
       const dispatch = byName('execute_tool subagent')[0]
@@ -522,6 +536,7 @@ describe.skipIf(!runnable)('tracing in a real opencode V2', () => {
       const roots = spans.filter(isRoot)
       expect(roots).toHaveLength(2)
       expect(new Set(roots.map(span => span.traceId)).size).toBe(2)
+      expectOneNamedRoot(spans)
       for (const root of roots) expect(root.links).toEqual([RUN_LINK.rootSpan])
       // #and a span that is not a turn root links to nothing
       for (const span of spans.filter(span => !isRoot(span))) expect(span.links).toEqual([])

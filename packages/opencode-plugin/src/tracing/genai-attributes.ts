@@ -303,6 +303,25 @@ export function toPendingSpan(record: SpanRecord, options: AttributeOptions = {}
 const SESSION_ATTRIBUTE = 'langfuse.session.id'
 
 /**
+ * The trace's name in Langfuse, whose OTLP ingestion reads it from this attribute on the trace's root span (the span names
+ * `invoke_agent <agent>` name observations, not the trace). One fixed string for every trace, so it holds no content.
+ */
+export const TRACE_NAME_ATTRIBUTE = 'langfuse.trace.name'
+export const TRACE_NAME = 'fro-bot run'
+
+/**
+ * Names the trace on a span that is its root, and on nothing else. A span with no parent is the root: the turn model opens
+ * every trace with a parentless `invoke_agent` (a continuation of a closed trace included) and gives every other span a parent.
+ *
+ * Added after the scrub, never through it: the string is fixed text, and a scrubber that rewrote it (a registered value that
+ * happens to match a word of it) would split one name into several in Langfuse. A span that is not a root is returned as is.
+ */
+function withTraceName(span: ScrubbedSpan): ScrubbedSpan {
+  if (span.parentSpanId !== undefined) return span
+  return {...span, attributes: {...span.attributes, [TRACE_NAME_ATTRIBUTE]: TRACE_NAME}}
+}
+
+/**
  * Whether the span carries the launcher's session id exactly as given. Equal text is not enough: a value the scrubber withheld
  * is exported as the fixed marker `[omitted]`, so an id that is literally `[omitted]` would equal its own withheld form. The
  * omission status the scrub wrote (`<attribute>:<reason>`) is what says whether it was withheld.
@@ -331,6 +350,6 @@ export function toExportSpan(
   limits?: ContentLimits,
 ): ScrubbedSpan {
   const span = scrubSpan(toPendingSpan(record, options), scrubber, limits)
-  if (options.sessionId === undefined || sessionIdExportedAsGiven(span, options.sessionId)) return span
-  return scrubSpan(toPendingSpan(record, {...options, sessionId: undefined}), scrubber, limits)
+  if (options.sessionId === undefined || sessionIdExportedAsGiven(span, options.sessionId)) return withTraceName(span)
+  return withTraceName(scrubSpan(toPendingSpan(record, {...options, sessionId: undefined}), scrubber, limits))
 }
