@@ -464,6 +464,47 @@ function processRunning(needle: string): boolean {
   }
 }
 
+/** The pids of every process whose command line contains `needle` (`pgrep -f`; exit 1 means none). */
+function pidsRunning(needle: string): ReadonlySet<number> {
+  try {
+    const out = execFileSync('pgrep', ['-f', needle], {encoding: 'utf8'})
+    return new Set(
+      out
+        .split('\n')
+        .map(line => Number(line.trim()))
+        .filter(pid => Number.isInteger(pid) && pid > 0),
+    )
+  } catch {
+    return new Set()
+  }
+}
+
+/**
+ * The CLI's managed-server registrations: `service.json` (or `service-<channel>.json`) directly in `<state>/opencode`
+ * (`packages/cli/src/services/service-config.ts`). The server's own `pty/<id>/service.json` files are not registrations.
+ */
+function serviceRegistrations(stateHome: string): readonly string[] {
+  try {
+    return execFileSync('find', [path.join(stateHome, 'opencode'), '-maxdepth', '1', '-name', 'service*.json'], {
+      encoding: 'utf8',
+    })
+      .split('\n')
+      .filter(line => line.length > 0)
+  } catch {
+    return []
+  }
+}
+
+/** What the agent's shell tool printed, as the model saw it: every tool result in the last request, joined. */
+function toolOutput(provider: Provider): string {
+  const raw = provider.requests.at(-1)?.raw ?? '{}'
+  const body = JSON.parse(raw) as {messages?: {role?: string; content?: unknown}[]}
+  return (body.messages ?? [])
+    .filter(message => message.role === 'tool')
+    .map(message => (typeof message.content === 'string' ? message.content : JSON.stringify(message.content)))
+    .join('\n')
+}
+
 function sessionClaims(dbPath: string): readonly {id: string; suspended: number | null}[] {
   const db = new DatabaseSync(dbPath, {readOnly: true})
   try {
@@ -1254,4 +1295,67 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
     // #and no session is left claiming an execution the next run would resume
     expect(sessionClaims(box.dbPath).every(row => row.suspended === null)).toBe(true)
   }, 300_000)
+  describe("the agent's opencode CLI cannot start or reach a server (#2369)", () => {
+    const REFUSAL =
+      "opencode: this run's OpenCode server is managed by Fro Bot; the CLI cannot start or reach a server here"
+
+    it('refuses `opencode api get`, starts no second server and writes no service.json, and still prints --version', async () => {
+      // #given the real OpenCode directory on the job PATH, and a model whose shell runs the CLI the way the agent did in
+      // run 45877265561
+      const box = createSandbox()
+      sandboxes.push(box)
+      box.env.PATH = `${path.dirname(BINARY as string)}:${process.env.PATH ?? ''}`
+      const provider = await startScriptedProvider([
+        {tool: 'shell', args: {command: 'opencode api get /global/health; echo "API_EXIT=$?"'}},
+        {tool: 'shell', args: {command: 'opencode --version; echo "VERSION_EXIT=$?"'}},
+        {tool: 'shell', args: {command: 'opencode serve --service; echo "SERVE_EXIT=$?"'}},
+        {tool: 'shell', args: {command: 'command -v opencode; echo "WHICH_EXIT=$?"'}},
+        {text: 'Done.'},
+      ])
+      providers.push(provider)
+      const real = await startRealServer(box, provider)
+      const servicesBefore = pidsRunning('serve --service')
+
+      // #when the execute phase runs those commands
+      const result = await executePhase(real, box, 120_000)
+      const servicesAfter = pidsRunning('serve --service')
+
+      // #then every command ran and the run succeeded
+      expect(result).toMatchObject({success: true, exitCode: 0})
+      const output = toolOutput(provider)
+
+      // #and the API call is refused with exit 2 and the one-line message
+      expect(output).toContain('API_EXIT=2')
+      expect(output).toContain(REFUSAL)
+      expect(output).toContain('SERVE_EXIT=2')
+
+      // #and no second server exists: no new `serve --service` process, and no registration under the agent's state
+      const added = [...servicesAfter].filter(pid => !servicesBefore.has(pid))
+      for (const pid of added) {
+        try {
+          process.kill(pid, 'SIGKILL')
+        } catch {
+          // already gone
+        }
+      }
+      expect(added).toEqual([])
+      expect(serviceRegistrations(box.env.XDG_STATE_HOME as string)).toEqual([])
+
+      // #and the version check the ce:connect skill makes still prints the pinned version, from the real binary
+      expect(output).toContain(`opencode v${pin.version}`)
+      expect(output).toContain('VERSION_EXIT=0')
+
+      // #and the shell resolves `opencode` to the guard, not to the real binary's directory
+      const resolved = /(\S*opencode)\nWHICH_EXIT=0/.exec(output)?.[1] ?? ''
+      expect(path.dirname(resolved).startsWith(box.env.RUNNER_TEMP as string)).toBe(true)
+      expect(path.basename(path.dirname(resolved)).startsWith('fro-bot-opencode-cli-')).toBe(true)
+      expect(resolved).not.toBe(BINARY)
+
+      // #and the guard goes with the server
+      const guardDirectory = path.dirname(resolved)
+      await real.shutdown()
+      await real.exited
+      expect(existsSync(guardDirectory)).toBe(false)
+    }, 300_000)
+  })
 })
