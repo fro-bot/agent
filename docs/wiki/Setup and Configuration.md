@@ -220,7 +220,7 @@ The plugin install (`installPluginsV2`) runs unless `arePluginsCachedV2` finds b
 
 ## Configuration Assembly
 
-`buildCIConfigV2` (`src/services/setup/ci-config-v2.ts`) builds the server config when the server spawns. It is passed to the server at start and never written to disk. The ordered permissions, effective-rule verification, `update: disable` and `experimental.subagent_depth: 1` are described under [OpenCode V2 setup](#opencode-v2-setup). The operator's `opencode-config` is merged in, with `permission`, `tools`, `autoupdate` and `subagent_depth` stripped with a warning. Existing local `opencode.json` files are ignored.
+`buildCIConfigV2` (`src/services/setup/ci-config-v2.ts`) builds the server config when the server spawns. It is passed to the server at start and never written to disk, but the server receives it in its environment (`OPENCODE_CONFIG_CONTENT`) and the agent's shell inherits it, with or without `isolate-agent`, so the agent can read every value in `opencode-config`, including MCP `headers`, local-server `environment` and `{file:...}` references. Keep credentials out of it; provider keys belong in `auth-json`. The ordered permissions, effective-rule verification, `update: disable` and `experimental.subagent_depth: 1` are described under [OpenCode V2 setup](#opencode-v2-setup). The operator's `opencode-config` is merged in, with `permission`, `tools`, `autoupdate` and `subagent_depth` stripped with a warning. Existing local `opencode.json` files are ignored.
 
 ### Workspace identity and control API
 
