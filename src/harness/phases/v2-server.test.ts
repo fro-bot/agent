@@ -277,6 +277,8 @@ describe('startActionOpenCodeV2', () => {
     expect(startArgs?.directory).toBe('/workspace')
     // the process environment goes in as-is: the spawn scrubs it itself, so it is not filtered twice
     expect(startArgs?.env).toEqual({RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome})
+    // the guard for the agent's `opencode` command (#2369) is made in the runner's temp directory, which the runner removes
+    expect(startArgs?.cliShimParentDirectory).toBe(runnerTemp)
 
     const content = startArgs?.config as {provider: Record<string, {options: {apiKey: string}}>; plugins: string[]}
     const reference = content.provider.anthropic?.options.apiKey ?? ''
@@ -496,8 +498,10 @@ describe('startActionOpenCodeV2', () => {
     // #then the spawn options carry exactly the keys they always did
     expect(result.success).toBe(true)
     const startArgs = vi.mocked(deps.startServer as StartServer).mock.calls[0]?.[0]
+    // (plus where the guard for the agent's `opencode` command goes, #2369)
     expect(Object.keys(startArgs ?? {}).sort()).toEqual([
       'binaryPath',
+      'cliShimParentDirectory',
       'config',
       'directory',
       'env',

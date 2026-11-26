@@ -1,17 +1,20 @@
 import type {ChildProcess} from 'node:child_process'
 import type {Result} from '@bfra.me/es/result'
 import type {Logger} from '../shared/logger.js'
+import type {OpencodeCliShim} from './cli-shim.js'
 import type {SandboxViewPolicy} from './sandbox-view.js'
 import {Buffer} from 'node:buffer'
 import {spawn} from 'node:child_process'
 import {randomBytes} from 'node:crypto'
 import {readFileSync} from 'node:fs'
 import net from 'node:net'
+import os from 'node:os'
 import process from 'node:process'
 import {sleep} from '../shared/async.js'
 import {FRO_BOT_TRACING_LAUNCHER_ENV} from '../shared/constants.js'
 import {toErrorMessage} from '../shared/errors.js'
 import {err, ok} from '../shared/types.js'
+import {createOpencodeCliShim, prependPathDirectory} from './cli-shim.js'
 import {filterAgentEnv} from './filter-env.js'
 import {buildSetprivDropArgs} from './sandbox-identity.js'
 import {GATE_ERR_FILE, GATE_GO_FILE, GATE_NS_FILE, rootChainReport, rootChainTail} from './sandbox-namespace.js'
@@ -266,6 +269,13 @@ export interface StartOpenCodeV2ServerOptions {
   readonly gid?: number
   /** Launch through sudo and setpriv as a sandbox user. Mutually exclusive with `uid`/`gid`. */
   readonly sandbox?: OpenCodeV2SandboxLaunch
+  /**
+   * Where the guard for the agent's `opencode` command is made (see `cli-shim.ts`, fro-bot/agent#2369): a fresh directory
+   * under this one, put first on the child's `PATH` and removed when the server exits. Default `os.tmpdir()`. Not used with
+   * `sandbox`, whose lifecycle makes its own (the sandbox's `PATH` is fixed before the launch and its view must grant the
+   * directory), and not made on Windows, where the shim, a POSIX `sh` script, cannot run.
+   */
+  readonly cliShimParentDirectory?: string
   readonly timeouts?: Partial<OpenCodeV2Timeouts>
   /**
    * The caller's deadline, honoured for the server's whole life. Aborting during startup fails the start. Aborting
@@ -661,6 +671,25 @@ export async function startOpenCodeV2Server(
   // A self-update would replace the digest-verified binary mid-run.
   childEnv.OPENCODE_DISABLE_AUTOUPDATE = '1'
 
+  // The agent's shell inherits this PATH. A directory first on it holds an `opencode` that refuses every use of the CLI that
+  // would start or look for a server (#2369): the CLI's own autostart would run a second server on this state. The sandbox
+  // launch fixes its PATH in the lifecycle, so it brings its own directory; Windows cannot run the shim.
+  let cliShim: OpencodeCliShim | undefined
+  if (options.sandbox === undefined && process.platform !== 'win32') {
+    const made = createOpencodeCliShim({
+      binaryPath: options.binaryPath,
+      parentDirectory: options.cliShimParentDirectory ?? os.tmpdir(),
+    })
+    if (!made.success) {
+      // No server without the guard: it would be one the agent's CLI can start a rival to.
+      const failure = startError('spawn-failed', made.error)
+      logger.warning('OpenCode V2 server start failed', {kind: failure.kind})
+      return err(failure)
+    }
+    cliShim = made.data
+    childEnv.PATH = prependPathDirectory(cliShim.directory, childEnv.PATH)
+  }
+
   const serveArgs = ['serve', '--stdio', '--hostname', LOOPBACK, '--port', String(port)]
   const launch =
     options.sandbox === undefined
@@ -687,10 +716,16 @@ export async function startOpenCodeV2Server(
       'spawn-failed',
       `Failed to spawn the OpenCode V2 binary${code === undefined ? '' : ` (${code})`}`,
     )
+    cliShim?.remove()
     logger.warning('OpenCode V2 server start failed', {kind: failure.kind})
     return err(failure)
   }
   const state = trackChild(child)
+  // However the server ends (shutdown, a failed start, a crash, a kill) its guard goes with it.
+  state.exited.then(
+    () => cliShim?.remove(),
+    () => undefined,
+  )
   // The server closing its end of the pipe at exit raises EPIPE on a late write; there is nothing to do about it.
   child.stdin?.on('error', () => undefined)
 
@@ -706,6 +741,8 @@ export async function startOpenCodeV2Server(
   if (child.pid === undefined) {
     // A child that never spawned has no pid and no exit event to wait for.
     const failure = await spawnFailure
+    // A child that never spawned never exits, so nothing above removes the guard.
+    cliShim?.remove()
     logger.warning('OpenCode V2 server start failed', {kind: failure.kind})
     return err(failure)
   }

@@ -1,7 +1,7 @@
 import type {Fixture} from './server-v2-test-kit.js'
 import type {OpenCodeV2SandboxLaunch, OpenCodeV2SandboxView, OpenCodeV2ServerHandle} from './server-v2.js'
 import {spawn, spawnSync} from 'node:child_process'
-import {chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync} from 'node:fs'
+import {chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync} from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
@@ -183,6 +183,36 @@ child.on('exit', code => process.exit(code ?? 0))
     const sudoArgv = readFileSync(argvLog, 'utf8')
     expect(sudoArgv).not.toContain(secret)
     expect(sudoArgv).not.toContain(recorded.env.OPENCODE_PASSWORD ?? 'unreachable')
+  })
+
+  it('leaves the PATH to the lifecycle and makes no guard of its own under a sandbox launch (#2369)', async () => {
+    // #given a fixture server behind a fake sudo, and a parent directory a guard would be made in
+    const created = createFixture()
+    fixtures.push(created)
+    const {sudoPath} = writeFakeSudo()
+    const parent = mkdtempSync(path.join(os.tmpdir(), 'sandbox-guard-parent-'))
+
+    // #when started with a sandbox launch whose PATH the lifecycle built (its own guard comes first there)
+    const result = await startOpenCodeV2Server(
+      {
+        binaryPath: created.binaryPath,
+        directory: created.dir,
+        expectedPluginIds: [],
+        tracingHost: ACTION_TRACING_OFF,
+        timeouts: TIMEOUTS,
+        env: {PATH: '/job/path', HOME: '/home/runner'},
+        cliShimParentDirectory: parent,
+        sandbox: launchSpec({sudoPath, envPath: '/usr/bin/env', path: '/run/guard:/usr/local/bin:/usr/bin:/bin'}),
+      },
+      {debug: () => undefined, info: () => undefined, warning: () => undefined, error: () => undefined},
+    )
+
+    // #then the child has exactly the lifecycle's PATH, and the spawn made no directory of its own
+    expect(result.success).toBe(true)
+    if (result.success) handles.push(result.data)
+    expect(created.readRecord().env.PATH).toBe('/run/guard:/usr/local/bin:/usr/bin:/bin')
+    expect(readdirSync(parent)).toEqual([])
+    rmSync(parent, {recursive: true, force: true})
   })
 
   it('rejects a sandbox launch combined with a uid', async () => {

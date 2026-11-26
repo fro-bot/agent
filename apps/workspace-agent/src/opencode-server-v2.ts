@@ -538,6 +538,10 @@ export async function runSupervisedOpencodeV2(options: RunSupervisedOpencodeV2Op
             tracingHost: WORKSPACE_TRACING_HOST,
             config: built.data.content,
             env: buildOpencodeV2Env(parentEnv, databasePath),
+            // The guard for the agent's `opencode` command (#2369) goes beside the database: `<base>/spawn-x/opencode.db`
+            // names the root-owned base directory, which the agent can traverse but not write and which every spawn
+            // empties first, so a guard a crashed service left is gone at the next start.
+            cliShimParentDirectory: path.dirname(path.dirname(databasePath)),
             port,
             uid: AGENT_UID,
             gid: AGENT_GID,
