@@ -256,6 +256,19 @@ describe('the lifecycle trace at a real OTLP receiver', () => {
     }
   })
 
+  it('names the trace on the root span alone, so Langfuse shows a trace name', async () => {
+    // #given / #when a failed run with three phases, one of them with a child
+    const {spans} = await exportRun()
+
+    // #then exactly one span carries `langfuse.trace.name`, and it is the root (no parent)
+    const named = spans.filter(span => attr(span, 'langfuse.trace.name') !== undefined)
+    expect(named.map(span => span.name)).toEqual(['action.main'])
+    expect(named[0]?.parentSpanId ?? '').toBe('')
+    expect(attr(named[0] as WireSpan, 'langfuse.trace.name')).toBe('fro-bot action')
+    // #and none of the phases or the child does
+    expect(spans.length).toBeGreaterThan(1)
+  })
+
   it('exports the link a turn trace would use: the root span ids are those the launcher is given', async () => {
     // #given
     const {tracer} = await exportRun()
