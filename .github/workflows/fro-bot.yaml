@@ -346,6 +346,9 @@ jobs:
           set -euo pipefail
           ref=""
           pr_number=""
+          # Tracing stays off for a mention on a PR whose head is not confirmed to be this repository: the
+          # non-isolated agent reads that conversation and could read the trace token.
+          trace="true"
           if [ "${EVENT_NAME}" = "issue_comment" ] && [ "${IS_PR_COMMENT}" = "true" ]; then
             pr_number="${ISSUE_NUMBER}"
           elif [ "${EVENT_NAME}" = "pull_request_review_comment" ]; then
@@ -357,13 +360,16 @@ jobs:
               if [ "${head_repo}" = "${REPO}" ]; then
                 ref="$(printf '%s' "${pr_json}" | jq -r '.head.sha // empty')"
               else
+                trace="false"
                 echo "PR ${pr_number} head repo '${head_repo:-unknown}' is not this repository — using default branch." >&2
               fi
             else
+              trace="false"
               echo "Could not resolve PR ${pr_number} head (API error) — using default branch." >&2
             fi
           fi
           echo "ref=${ref}" >> "${GITHUB_OUTPUT}"
+          echo "trace=${trace}" >> "${GITHUB_OUTPUT}"
 
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -497,8 +503,8 @@ jobs:
         with:
           auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
           trusted-head-sha: ${{ steps.prehead.outputs.ref }}
-          trace-endpoint: https://traces.fro.bot/fro-bot/v1/traces
-          trace-headers: 'Authorization: Bearer ${{ secrets.FRO_BOT_TRACE_TOKEN }}'
+          trace-endpoint: ${{ steps.prehead.outputs.trace == 'true' && 'https://traces.fro.bot/fro-bot/v1/traces' || '' }}
+          trace-headers: "${{ steps.prehead.outputs.trace == 'true' && format('Authorization: Bearer {0}', secrets.FRO_BOT_TRACE_TOKEN) || '' }}"
           # Durable session state. The Actions cache alone is not sufficient: GitHub
           # issues read-only cache tokens for issue_comment and issues runs, so the
           # mention flows cannot persist state through the cache at all.
