@@ -347,7 +347,8 @@ jobs:
           ref=""
           pr_number=""
           # Tracing stays off for a mention on a PR whose head is not confirmed to be this repository: the
-          # non-isolated agent reads that conversation and could read the trace token.
+          # non-isolated agent reads that conversation and could read the trace token. The trace inputs also
+          # require a direct run of this workflow, so a reusable caller never exports to this collector.
           trace="true"
           if [ "${EVENT_NAME}" = "issue_comment" ] && [ "${IS_PR_COMMENT}" = "true" ]; then
             pr_number="${ISSUE_NUMBER}"
@@ -503,8 +504,8 @@ jobs:
         with:
           auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
           trusted-head-sha: ${{ steps.prehead.outputs.ref }}
-          trace-endpoint: ${{ steps.prehead.outputs.trace == 'true' && 'https://traces.fro.bot/fro-bot/v1/traces' || '' }}
-          trace-headers: "${{ steps.prehead.outputs.trace == 'true' && format('Authorization: Bearer {0}', secrets.FRO_BOT_TRACE_TOKEN) || '' }}"
+          trace-endpoint: ${{ steps.prehead.outputs.trace == 'true' && github.workflow_ref == format('{0}/.github/workflows/fro-bot.yaml@{1}', github.repository, github.ref) && 'https://traces.fro.bot/fro-bot/v1/traces' || '' }}
+          trace-headers: "${{ steps.prehead.outputs.trace == 'true' && github.workflow_ref == format('{0}/.github/workflows/fro-bot.yaml@{1}', github.repository, github.ref) && format('Authorization: Bearer {0}', secrets.FRO_BOT_TRACE_TOKEN) || '' }}"
           # Durable session state. The Actions cache alone is not sufficient: GitHub
           # issues read-only cache tokens for issue_comment and issues runs, so the
           # mention flows cannot persist state through the cache at all.
