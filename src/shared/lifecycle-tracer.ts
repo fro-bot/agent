@@ -1,6 +1,6 @@
 import type {TracingRunIdentity} from '@fro-bot/runtime'
 import type {ExporterLimits, SpanExporter, SpanExporterOptions} from '@fro-bot/runtime/tracing/exporter'
-import type {PendingSpan, Scrubber} from '@fro-bot/runtime/tracing/scrub'
+import type {PendingSpan, ScrubbedSpan, Scrubber} from '@fro-bot/runtime/tracing/scrub'
 import type {Logger} from './logger.js'
 import type {SecretRegistry} from './secret-registry.js'
 import type {TracingInputs} from './types.js'
@@ -571,6 +571,26 @@ function resolveText(
   return bounded.text
 }
 
+/**
+ * The trace's name in Langfuse, whose OTLP ingestion reads it from this attribute on the trace's root span (`action.main` names
+ * an observation, not the trace). A fixed string, so it holds no content.
+ */
+export const TRACE_NAME_ATTRIBUTE = 'langfuse.trace.name'
+export const TRACE_NAME = 'fro-bot action'
+
+/**
+ * Names the trace on its root span and on no other. The root is the one span with no parent: every span started through the
+ * tracer has one, the saved root of the main step's trace included, so the post step's `post` span is a child and the main
+ * step's `action.main` alone names the trace.
+ *
+ * Added after the scrub, never through it: the string is fixed text, and a scrubber that rewrote or withheld it (a registered
+ * value that happens to match it) would leave the trace unnamed or named by a redaction.
+ */
+function withTraceName(span: ScrubbedSpan): ScrubbedSpan {
+  if (span.parentSpanId !== undefined) return span
+  return {...span, attributes: {...span.attributes, [TRACE_NAME_ATTRIBUTE]: TRACE_NAME}}
+}
+
 export function createLifecycleTracer(options: CreateLifecycleTracerOptions): LifecycleTracer {
   const {inputs, logger, registry} = options
   if (!inputs.enabled) return createNoopTracer()
@@ -990,7 +1010,7 @@ export function createLifecycleTracer(options: CreateLifecycleTracerOptions): Li
         for (const record of records) {
           if (preparationExpired()) break
           try {
-            exporter.export(scrubSpan(toPending(record, preparation), scrubber))
+            exporter.export(withTraceName(scrubSpan(toPending(record, preparation), scrubber)))
           } catch {
             exporter.drop()
           }
