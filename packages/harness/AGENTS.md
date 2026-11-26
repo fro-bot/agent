@@ -1,6 +1,6 @@
 # Harness Package — Agent Notes
 
-`@fro.bot/harness` is the patched OpenCode V1 binary, built with orw's LLM-merge integration method, that Fro Bot ran before the Action moved to OpenCode V2 only. The Action no longer uses it and nothing in CI builds or releases it; the package stays until a later cleanup.
+`@fro.bot/harness` is the patched OpenCode V1 binary, built with orw's LLM-merge integration method, that Fro Bot ran before the Action moved to OpenCode V2 only. The Action no longer uses it, and CI no longer builds or publishes its native binaries (the root build still bundles the workspace package); the package stays until a later cleanup.
 
 ## Purpose
 
@@ -40,7 +40,7 @@ The package ships two bins (`bin` in `package.json`; `package-invariants.test.ts
 
 Provenance = upstream release tag + ordered integration refs (each pinned by upstream commit SHA) + frozen integration commit SHA + build sha. `harness info`/`patches`/`doctor` report this.
 
-Each published release froze its LLM merge as a maintainer-reviewed integration commit, and every platform build pinned to that commit.
+Each published release froze its LLM merge as one integration commit, and every platform build pinned to that commit.
 
 ## Per-Platform Distribution
 
