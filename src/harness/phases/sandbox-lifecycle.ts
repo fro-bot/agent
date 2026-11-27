@@ -1235,6 +1235,12 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
         const ran = await run(
           buildRunAsSandboxArgv(account, tools, [path.join(cliShim.directory, OPENCODE_CLI_SHIM_FILE), 'api']),
         )
+        // A probe that outlived its budget was killed, not finished: like any privileged timeout it is not known to have stopped, so
+        // the run fails closed here (`run` already marked it unsafe), before a launch spec exists. Only a probe that exited may
+        // fall back to going on without the guard.
+        if (ran.timedOutAfterMs !== undefined) {
+          return await failAndRelease('isolate-agent: the OpenCode CLI guard probe timed out')
+        }
         const read = readCliShimProbe({exitCode: ran.exitCode, stderr: ran.stderr ?? ''})
         if (!read.success) {
           guardRuns = false

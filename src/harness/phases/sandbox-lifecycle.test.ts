@@ -2289,6 +2289,65 @@ describe('createSandboxLifecycle', () => {
       },
     )
 
+    it('fails closed when the guard probe itself times out: unsafe, nothing launched, nothing taken back', async () => {
+      // #given a real privileged-command budget that the probe outlives (not an exit status: the command never exits), with
+      // every other command answering as in the other tests
+      const harness = createHarness()
+      const states: string[] = []
+      const probeCalls: string[] = []
+      const exec: ExecAdapter = {
+        ...harness.exec,
+        execWithTimeout: vi.fn(
+          async (_command: string, args: string[] | undefined, _timeoutMs: number, options?: ExecOptions) => {
+            const argv = args ?? []
+            // The account's PATH check prints the directories it can enter.
+            const script = argv.findIndex(arg => arg.startsWith('for d do'))
+            if (script !== -1) {
+              options?.listeners?.stdout?.(
+                Buffer.from(
+                  argv
+                    .slice(script + 2)
+                    .map(dir => `${dir}\n`)
+                    .join(''),
+                ),
+              )
+              return 0
+            }
+            if (argv.at(-1) === 'api' && argv.at(-2)?.endsWith('/fro-bot-opencode-cli-x/opencode') === true) {
+              probeCalls.push(argv.join(' '))
+              return 'timed-out' as const
+            }
+            return 0
+          },
+        ),
+      }
+      const lifecycle = guarded(harness, {exec, recordState: state => states.push(state)})
+
+      // #when prepared
+      const prepared = await lifecycle.prepare(prepareInput)
+
+      // #then the probe ran and timed out, the preparation failed, and it recorded unsafe (a caller that never releases must
+      // not read pending, and the launch spec was never published)
+      expect(probeCalls).toHaveLength(1)
+      expect(prepared.success).toBe(false)
+      expect(prepared.success ? '' : prepared.error).toMatch(/timed out|guard/i)
+      expect(states.at(-1)).toBe('unsafe')
+
+      // #and no launch is admitted
+      const spawn = vi.fn(async () => ({value: 'x', unconfirmed: false}))
+      const launched = await lifecycle.launch(spawn)
+      expect(launched.success).toBe(false)
+      expect(spawn).not.toHaveBeenCalled()
+      expect(harness.mocks.admit).not.toHaveBeenCalled()
+
+      // #and release keeps the account and takes nothing back, as for any other privileged timeout
+      const released = await lifecycle.release()
+      expect(released.restore).toBe('unsafe')
+      expect(harness.mocks.takeBack).not.toHaveBeenCalled()
+      expect(harness.mocks.deleteAccount).not.toHaveBeenCalled()
+      expect(states).not.toContain('restored')
+    })
+
     it('removes the guard once the files are back, and not before', async () => {
       // #given a prepared run
       const harness = createHarness()
