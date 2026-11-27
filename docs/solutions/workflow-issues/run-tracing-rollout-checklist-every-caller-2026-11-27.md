@@ -1,5 +1,5 @@
 ---
-title: Turn on run tracing in a caller repo, including the repo's own `uses: ./` jobs
+title: "Turn on run tracing in a caller repo, including the repo's own `uses: ./` jobs"
 date: 2026-11-27
 category: workflow-issues
 module: ci-workflows
@@ -25,7 +25,7 @@ tags:
 
 Configure and verify every call, including `uses: ./`, wrappers and their gates. Run tracing is set per Action call, with `trace-endpoint` and `trace-headers`; a call without them still runs and sends nothing, and nothing in the run says so, so a missing call, secret, egress entry or gate stays hidden until someone looks for a trace that isn't there.
 
-A traced call exports prompt and tool content to the collector (see [Tracing a run](../../wiki/Setup%20and%20Configuration.md#tracing-a-run)). By adding a repo, the operator accepts the collector's access and retention, and the sensitivity of that repo's content. Once a repo is in, all of its calls are traced; it is not a per-call option.
+A traced call exports prompt and tool content to the collector (see [Tracing a run](../../wiki/Setup%20and%20Configuration.md#tracing-a-run)). By adding a repo, the operator accepts the collector's access and retention, and the sensitivity of that repo's content. Once a repo is in, every eligible call is traced; it is not a per-call option. A call is eligible when the workflow and the code it checks out are trusted (item 7). Isolating the agent doesn't protect the credential from code the workflow itself runs outside the sandbox.
 
 ## Guidance
 
@@ -46,7 +46,7 @@ Work through this list for each repo.
    trace-headers: 'Authorization: Bearer ${{ secrets.FRO_BOT_TRACE_TOKEN }}'
    ```
 
-4. **Plumb reusable workflows.** Declare the secret as optional, and have each caller pass it by name. `secrets: inherit` does not cross owners. When a reusable workflow can't read the caller's variables, pass the endpoint as an input.
+4. **Plumb reusable workflows.** Declare the secret as optional, and have each caller pass it by name. `secrets: inherit` does not cross owners. When a reusable workflow can't read the caller's variables, pass the endpoint as an input. Declaring the secret optional doesn't turn tracing off by itself. An endpoint with empty headers exports without authentication to any collector that accepts it. Build the header as `format('Authorization: Bearer {0}', secrets.FRO_BOT_TRACE_TOKEN)`, so a missing token leaves the scheme alone and item 8 turns tracing off. Otherwise, blank both inputs when the token is absent.
 
    ```yaml
    FRO_BOT_TRACE_TOKEN:
@@ -59,7 +59,7 @@ Work through this list for each repo.
 6. **Allow the collector through egress blocks.** A job running Harden-Runner with `egress-policy: block` needs `traces.fro.bot:443` in its allowed endpoints (marcusrbrown/infra#2091). Without it the relay can't reach the collector.
 7. **Gate the calls that can't prove whose code they run.** These gates apply to self-runs, where the agent can't be isolated. They reduce exposure but are not a secrecy boundary:
    - **Fork mentions.** An authorized `@fro-bot` mention on a fork PR runs as `issue_comment` in the base repo, with its secrets. The `prehead` step sets `trace=false` unless the head repo is this repo, and also when the head lookup fails (`.github/workflows/fro-bot.yaml:352-373`).
-   - **`merge_group`.** It has no PR payload to check, so both inputs are blank (`.github/workflows/ci.yaml:275-276`):
+   - **`merge_group`.** It has no PR payload to check, so both inputs are blank (`.github/workflows/ci.yaml:275-276`). This relies on the job's own condition (`.github/workflows/ci.yaml:195-204`). That condition runs the job only on non-push events from a same-repo, non-bot PR. Copy the two together. Never pass the credential on a secret-bearing trigger that checks out and runs untrusted code:
 
      ```yaml
      trace-endpoint: ${{ github.event_name != 'merge_group' && 'https://traces.fro.bot/fro-bot/v1/traces' || '' }}
@@ -70,7 +70,7 @@ Work through this list for each repo.
 
    Even on an allowed self-run, the non-isolated agent reads model-visible untrusted content (comments, diffs), so prompt injection can expose the write-only token. That risk is accepted because the token can only write spans: the worst case is junk spans or used-up quota.
 8. **Pin v0.149.1 or later.** An unset secret expands to a bare `Authorization: Bearer`. From v0.149.1 (#2357), an `Authorization` value of only `Bearer`, `Basic` or `Token`, in any case, turns tracing off for the run (`SCHEME_WITHOUT_CREDENTIAL`, `src/harness/config/trace-inputs.ts:71`). The run starts no relay, exports no lifecycle trace and logs one warning: `trace-headers has an Authorization header with no credential (is the secret set?), so tracing is off`. Before v0.149.1 the relay started and the collector refused every span (fro-bot/.github#4338 hit this on v0.149.0 and was repinned to v0.149.1).
-9. **Verify by counts, not by a green run.** Export is best-effort and never fails a run, so a green run proves nothing. Check the run log for acknowledged relay batches with `dropped: 0` and a lifecycle export with `undelivered: 0`; no `Trace relay started` line means tracing was off. The exact lines are in [Check run tracing end to end](./run-tracing-live-check-2026-11-23.md).
+9. **Verify by counts, not by a green run.** Export is best-effort and never fails a run, so a green run proves nothing. Check the run log for two independent results: acknowledged relay batches with `dropped: 0` (turn spans), and a lifecycle export with `undelivered: 0`. A missing `Trace relay started` line can mean tracing was off, the run skipped early, or the relay failed to start, so read the warnings. An acknowledgment means the collector received the batch, not that the backend stored it. For an end-to-end check, find the trace in the backend. Before enabling a repo, also check that a run with the token omitted, and a run on a denied trigger, send no plugin or lifecycle spans to a test collector. The exact lines are in [Check run tracing end to end](./run-tracing-live-check-2026-11-23.md).
 
 ## Why This Matters
 

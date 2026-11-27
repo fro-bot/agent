@@ -40,7 +40,7 @@ Almost all of the fixes are in the launch environment that `createSandboxLifecyc
 **1. Mirror the runner's `PATH`, then check it as the agent.**
 
 - Capture `process.env.PATH` before setup's `core.addPath`, so the Action's own directories cannot shadow tools from earlier steps (`runBootstrap` in `src/harness/phases/bootstrap.ts`).
-- `buildSandboxPath` in `src/services/setup/sandbox-toolchain-path.ts` keeps absolute existing directories in runner order, then the system directories, and puts the Action's OpenCode directory last. The launch then puts the `opencode` CLI guard's directory first (`src/harness/phases/sandbox-lifecycle.ts:1221`). The guard keeps the agent's shell from starting a second server; see [the agent's opencode CLI can start a second OpenCode server](../integration-issues/agent-opencode-cli-autospawns-second-server-2026-11-27.md).
+- `buildSandboxPath` in `src/services/setup/sandbox-toolchain-path.ts` keeps absolute existing directories in runner order, then the system directories, and puts the Action's OpenCode directory last. When the `opencode` CLI guard's probe passes, the launch puts the guard's directory first (`src/harness/phases/sandbox-lifecycle.ts:1221`). If the probe fails without timing out, the sandbox starts with the original PATH, so a successful launch doesn't prove the guard is active. The guard keeps the agent's shell from starting a second server; see [the agent's opencode CLI can start a second OpenCode server](../integration-issues/agent-opencode-cli-autospawns-second-server-2026-11-27.md).
 - After the handoff, one shell run as the agent, with the candidate directories as its arguments, keeps only the entries it can enter:
 
   ```sh

@@ -40,7 +40,7 @@ The pin PR that brought in 2.4.2 had passed CI. Pin bumps come from the Fro Bot 
 ## Guidance
 
 1. **Revert the pin first, then find the cause.** Moving back to the last good version (#2375) restored reviews within minutes and gave time to investigate.
-2. **Reproduce on both binaries before blaming the bump.** A diff between versions pointed at three plausible upstream changes: background compaction tracing, keyed mutexes moved to host services, and SQLite transactions moved to Effect. None of them was the cause. A scripted-provider matrix on both real binaries showed every scenario ended alike and the schema was identical, so it was not a 2.4.2 regression. 2.4.2 went back in (#2377).
+2. **Reproduce on both binaries before blaming the bump.** A diff between versions pointed at three plausible upstream changes: background compaction tracing, keyed mutexes moved to host services, and SQLite transactions moved to Effect. A scripted-provider matrix on both real binaries found no difference between versions in any scenario it tested, and the schema was identical. So nothing showed a 2.4.2 regression, but the original hang's cause is still unknown. 2.4.2 went back in (#2377).
 3. **Expect hangs that exist on both versions.** The matrix found one. The sequence:
    - A background compaction summary is in flight when the final message goes out.
    - A later notice, such as a shell exiting, wakes the root while its context is over the limit.
@@ -59,7 +59,7 @@ The pin PR that brought in 2.4.2 had passed CI. Pin bumps come from the Fro Bot 
      }
    ```
 
-   The trail is capped at 20 entries (`EVENT_TRAIL_MAX_ENTRIES`) and 1 KiB (`EVENT_TRAIL_MAX_BYTES`), and repeats are folded. The same fields go on the lifecycle trace as the `deadline.diagnostics` event.
+   The trail is capped at 20 entries (`EVENT_TRAIL_MAX_ENTRIES`) and 1 KiB (`EVENT_TRAIL_MAX_BYTES`), and repeats are folded. A bounded summary of the same fields goes on the lifecycle trace as the `deadline.diagnostics` event. The warning line in the run log has the full snapshot.
 5. **Keep shared-feed diagnostics to the run's own sessions.** The server's event feed covers every location it serves. Record only the root, the children the run owns, and a short list of server-wide types (`src/features/agent/deadline-diagnostics-v2.ts:112-122`):
 
    ```ts
