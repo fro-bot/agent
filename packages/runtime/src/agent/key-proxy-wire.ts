@@ -27,9 +27,54 @@ export const KEY_PROXY_EXIT_INTERNAL = 70
 
 export type KeyProxyChildErrorCode = 'internal' | 'invalid-config' | 'start-failed'
 
+/** The first path segment of every MCP route: the child serves one brokered server at `/mcp/<route id>`. */
+export const KEY_PROXY_MCP_PATH_PREFIX = 'mcp'
+
+/**
+ * Request headers the forwarder sets or refuses itself, so an operator-configured header may not name one (compared
+ * case-insensitively): the hop-by-hop set, plus the headers it fixes (`host`, `accept-encoding`, `content-length`) and
+ * the one it refuses (`expect`).
+ */
+export const KEY_PROXY_MCP_FORBIDDEN_HEADERS: ReadonlySet<string> = new Set([
+  'accept-encoding',
+  'connection',
+  'content-length',
+  'expect',
+  'host',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'proxy-connection',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+])
+
+/**
+ * One brokered remote MCP server: the child forwards `/mcp/<id>` to `origin` + `path` and adds `headers` to every request
+ * it sends. The Action plans these from `opencode-config` (`planMcpBrokerV2`); the credential values in `headers` reach
+ * the child on stdin only.
+ */
+export interface KeyProxyMcpRouteConfig {
+  /** Opaque route id, one path segment. It never collides with a provider id: it lives under `/mcp/`. */
+  readonly id: string
+  /** `https://host[:port]`, no path. */
+  readonly origin: string
+  /** The absolute upstream path, exactly as configured (a trailing slash is kept). No query, no fragment. */
+  readonly path: string
+  /** The configured request headers, names as authored and unique case-insensitively. Set last on every request. */
+  readonly headers: Readonly<Record<string, string>>
+}
+
 export interface KeyProxyWireConfig {
   readonly version: 1
   readonly providers: readonly KeyProxyProviderConfig[]
+  /**
+   * Brokered MCP servers. Not served yet: {@link parseKeyProxyConfig} refuses a config that carries this field, so a
+   * child can never start with routes it cannot serve.
+   */
+  readonly mcp?: readonly KeyProxyMcpRouteConfig[]
   /** Extra TLS trust for the upstream (PEM). Set only by the supervisor's test options. */
   readonly ca?: string
 }
@@ -74,7 +119,12 @@ function parseProvider(value: unknown): KeyProxyProviderConfig | null {
   return {id, key, origin, routes: parsed as KeyProxyRoute[]}
 }
 
-/** Validates the decoded JSON. The error is a fixed code: nothing of the input is ever quoted. */
+/**
+ * Validates the decoded JSON. The error is a fixed code: nothing of the input is ever quoted.
+ *
+ * The field list below is the child's whole vocabulary, and it has no `mcp`: a config that carries MCP routes is refused,
+ * because starting without them would run the agent against servers whose credentials the child was meant to hold.
+ */
 export function parseKeyProxyConfig(value: unknown): Result<KeyProxyWireConfig, 'invalid-config'> {
   if (!isRecord(value) || !hasOnly(value, ['version', 'providers', 'ca'])) return err('invalid-config')
   if (value.version !== KEY_PROXY_CONFIG_VERSION) return err('invalid-config')

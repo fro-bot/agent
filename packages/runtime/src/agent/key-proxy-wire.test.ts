@@ -179,6 +179,36 @@ describe('parseKeyProxyConfig', () => {
   })
 })
 
+describe('MCP routes on the wire', () => {
+  const HEADER_CANARY = 'Bearer mcp-wire-CANARY-0001'
+  const route = {id: 's1', origin: 'https://mcp.example.com', path: '/mcp', headers: {Authorization: HEADER_CANARY}}
+
+  it('encodes the MCP routes into the frame the child reads', () => {
+    // #given a config that carries one brokered route
+    const base = parseKeyProxyConfig(validConfig())
+    if (!base.success) throw new Error('fixture')
+
+    // #when it is framed
+    const frame = encodeKeyProxyConfig({...base.data, mcp: [route]})
+
+    // #then the payload carries the route exactly as given
+    expect((JSON.parse(frame.subarray(4).toString('utf8')) as {mcp: unknown}).mcp).toEqual([route])
+  })
+
+  it('refuses a config that carries MCP routes: the child cannot serve them yet, so it must not start without them', () => {
+    // #given a valid provider config plus MCP routes
+    // #when the child parses it
+    const parsed = parseKeyProxyConfig({...validConfig(), mcp: [route]})
+
+    // #then it is refused with the fixed code, quoting nothing
+    expect(parsed).toEqual({success: false, error: 'invalid-config'})
+  })
+
+  it('refuses even an empty MCP list, so a field the child does not understand is never skipped', () => {
+    expect(parseKeyProxyConfig({...validConfig(), mcp: []})).toEqual({success: false, error: 'invalid-config'})
+  })
+})
+
 describe('parseKeyProxyChildLine', () => {
   it('parses the ready line', () => {
     expect(parseKeyProxyChildLine('{"ready":true,"port":43123}')).toEqual({kind: 'ready', port: 43123})

@@ -196,6 +196,29 @@ describe('runKeyProxyChild', () => {
     expect(r.output()).toBe('{"error":"invalid-config"}\n')
   })
 
+  it('exits 64 and never prints ready when the frame carries MCP routes it cannot serve, quoting nothing', async () => {
+    // #given a valid provider config that also carries a brokered MCP route with a header value
+    const HEADER_VALUE = 'Bearer child-mcp-CANARY-0009'
+    const upstream = await startTlsUpstream((_request, res) => res.end('{}'))
+    cleanups.push(upstream.close)
+    const r = run()
+    const config = await configFor(upstream.origin, upstream.ca)
+
+    // #when the frame arrives
+    r.stdin.write(
+      encodeKeyProxyConfig({
+        ...config,
+        mcp: [{id: 's1', origin: 'https://mcp.example.com', path: '/mcp', headers: {Authorization: HEADER_VALUE}}],
+      }),
+    )
+
+    // #then the child refuses the config with the fixed line and exits 64: no port was ever announced
+    expect(await r.waitForExit()).toBe(64)
+    expect(r.output()).toBe('{"error":"invalid-config"}\n')
+    expect(r.output()).not.toContain(HEADER_VALUE)
+    expect(r.output()).not.toContain('ready')
+  })
+
   it('exits 65 with a fixed line when the proxy refuses to start', async () => {
     // #given a config whose upstream is plain http
     const r = run()
