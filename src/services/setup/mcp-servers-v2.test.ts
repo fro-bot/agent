@@ -956,12 +956,12 @@ describe('planMcpBrokerV2', () => {
     it.each([
       [
         'a flat `disabled: true`, which the 2.4.2 client ignores',
-        (flags: object) => ({off: credentialed(flags)}),
+        (flags: Record<string, unknown>) => ({off: credentialed(flags)}),
         {disabled: true},
       ],
       [
         'a native `enabled: false`, which the 2.4.2 client ignores',
-        (flags: object) => ({servers: {off: credentialed(flags)}}),
+        (flags: Record<string, unknown>) => ({servers: {off: credentialed(flags)}}),
         {enabled: false},
       ],
     ])('brokers %s, because the server stays active', (_label, layout, flags) => {
@@ -975,10 +975,15 @@ describe('planMcpBrokerV2', () => {
     })
 
     it.each([
-      ['a flat `enabled: false`', (flags: object) => ({off: credentialed(flags)}), {enabled: false}, 'legacy'],
+      [
+        'a flat `enabled: false`',
+        (flags: Record<string, unknown>) => ({off: credentialed(flags)}),
+        {enabled: false},
+        'legacy',
+      ],
       [
         'a native `disabled: true`',
-        (flags: object) => ({servers: {off: credentialed(flags)}}),
+        (flags: Record<string, unknown>) => ({servers: {off: credentialed(flags)}}),
         {disabled: true},
         'native',
       ],
