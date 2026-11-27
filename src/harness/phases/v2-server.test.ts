@@ -1681,6 +1681,7 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
       port: 43_111,
       placeholder: PROXY_PLACEHOLDER,
       baseUrl: providerId => `http://127.0.0.1:43111/${providerId}`,
+      mcpUrl: routeId => `http://127.0.0.1:43111/mcp/${routeId}`,
       died: died.signal,
       crashed: () => false,
       stop,

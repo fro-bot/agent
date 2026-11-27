@@ -1,7 +1,13 @@
 import {resolveResponseDelivery} from '@fro-bot/runtime'
 import {describe, expect, it, vi} from 'vitest'
 import {createMockLogger, serializeLoggerCalls, unwrapErr, unwrapOk} from '../../shared/test-helpers.js'
-import {applyOperatorMcpV2, mcpToolNamespace, parseMcpServersV2} from './mcp-servers-v2.js'
+import {
+  applyBrokeredMcpV2,
+  applyOperatorMcpV2,
+  mcpToolNamespace,
+  parseMcpServersV2,
+  planMcpBrokerV2,
+} from './mcp-servers-v2.js'
 
 const LOCAL = {type: 'local', command: ['node', 'server.mjs'], environment: {API_BASE: 'http://localhost'}} as const
 const REMOTE = {type: 'remote', url: 'https://mcp.example.com/mcp'} as const
@@ -819,5 +825,533 @@ describe('applyOperatorMcpV2', () => {
       for (const forbidden of ['./secret', './x', 'Authorization', 'oauth']) expect(logged).not.toContain(forbidden)
       for (const name of ['kept', 'refLocal', 'remote', 'bad']) expect(logged).toContain(name)
     })
+  })
+})
+
+describe('planMcpBrokerV2', () => {
+  const TOKEN = 'planner-TOKEN-0123456789'
+  const BEARER = `Bearer ${TOKEN}`
+  const credentialed = (extra: Record<string, unknown> = {}) => ({
+    ...REMOTE,
+    headers: {Authorization: BEARER},
+    ...extra,
+  })
+
+  describe('what is brokered', () => {
+    it('turns a remote with headers into one route that holds the headers, in the legacy spelling', () => {
+      // #given a legacy `mcp.<name>` remote with a bearer header
+      // #when planned
+      const plan = unwrapOk(planMcpBrokerV2({search: credentialed()}))
+
+      // #then one route, with a route id, the fixed origin and path, and the header as written
+      expect(plan.routes).toEqual([
+        {
+          name: 'search',
+          layout: 'legacy',
+          route: {id: 's1', origin: 'https://mcp.example.com', path: '/mcp', headers: {Authorization: BEARER}},
+        },
+      ])
+      expect(plan.stripped).toEqual([])
+    })
+
+    it('plans the native `mcp.servers.<name>` layout the same way', () => {
+      const plan = unwrapOk(planMcpBrokerV2({servers: {search: credentialed()}}))
+
+      expect(plan.routes).toEqual([
+        {
+          name: 'search',
+          layout: 'native',
+          route: {id: 's1', origin: 'https://mcp.example.com', path: '/mcp', headers: {Authorization: BEARER}},
+        },
+      ])
+    })
+
+    it('leaves a remote with no `headers` key direct, and plans nothing for a local server', () => {
+      const plan = unwrapOk(planMcpBrokerV2({direct: REMOTE, docs: LOCAL, timeout: 9000}))
+
+      expect(plan).toEqual({routes: [], stripped: [], secrets: []})
+    })
+
+    it('plans nothing when there is no `mcp` block', () => {
+      expect(unwrapOk(planMcpBrokerV2(undefined))).toEqual({routes: [], stripped: [], secrets: []})
+    })
+
+    it('brokers `headers: {}` with zero headers, because a header name is never a guess at what is a credential', () => {
+      const plan = unwrapOk(planMcpBrokerV2({quiet: {...REMOTE, headers: {}}}))
+
+      expect(plan.routes.map(entry => entry.route.headers)).toEqual([{}])
+      expect(plan.secrets).toEqual([])
+    })
+
+    it('gives two remotes on one origin two routes, each with its own fixed path and id', () => {
+      const plan = unwrapOk(
+        planMcpBrokerV2({
+          one: {...REMOTE, url: 'https://mcp.example.com/tenant-a/mcp', headers: {'X-Key': 'tenant-a-key-0001'}},
+          two: {...REMOTE, url: 'https://mcp.example.com/tenant-b/mcp', headers: {'X-Key': 'tenant-b-key-0002'}},
+        }),
+      )
+
+      expect(plan.routes.map(entry => [entry.route.id, entry.route.origin, entry.route.path])).toEqual([
+        ['s1', 'https://mcp.example.com', '/tenant-a/mcp'],
+        ['s2', 'https://mcp.example.com', '/tenant-b/mcp'],
+      ])
+    })
+
+    it('keeps a trailing slash, a port and a bare origin path exactly as configured', () => {
+      const plan = unwrapOk(
+        planMcpBrokerV2({
+          slash: {...REMOTE, url: 'https://mcp.example.com/mcp/', headers: {}},
+          port: {...REMOTE, url: 'https://mcp.example.com:8443/mcp', headers: {}},
+          root: {...REMOTE, url: 'https://mcp.example.com', headers: {}},
+          defaultPort: {...REMOTE, url: 'https://mcp.example.com:443/mcp', headers: {}},
+        }),
+      )
+
+      expect(plan.routes.map(entry => [entry.route.origin, entry.route.path])).toEqual([
+        ['https://mcp.example.com', '/mcp/'],
+        ['https://mcp.example.com:8443', '/mcp'],
+        ['https://mcp.example.com', '/'],
+        ['https://mcp.example.com', '/mcp'],
+      ])
+    })
+
+    it('lets both spellings coexist, numbering routes in config order', () => {
+      const plan = unwrapOk(
+        planMcpBrokerV2({a: credentialed(), servers: {b: credentialed({url: 'https://b.example.com/mcp'})}}),
+      )
+
+      expect(plan.routes.map(entry => [entry.name, entry.layout, entry.route.id])).toEqual([
+        ['a', 'legacy', 's1'],
+        ['b', 'native', 's2'],
+      ])
+    })
+  })
+
+  describe('definitively disabled servers', () => {
+    it.each([
+      ['enabled: false', {enabled: false}],
+      ['disabled: true', {disabled: true}],
+      ['both spellings agreeing', {enabled: false, disabled: true}],
+    ])('strips the headers and plans no route for %s', (_label, flags) => {
+      const plan = unwrapOk(planMcpBrokerV2({off: credentialed(flags)}))
+
+      expect(plan.routes).toEqual([])
+      expect(plan.stripped).toEqual([{name: 'off', layout: 'legacy'}])
+      expect(plan.secrets).toEqual([])
+    })
+
+    it('strips a disabled native entry, and a disabled local entry that carries headers', () => {
+      const plan = unwrapOk(
+        planMcpBrokerV2({
+          servers: {off: credentialed({disabled: true})},
+          dead: {...LOCAL, headers: {A: 'b'}, enabled: false},
+        }),
+      )
+
+      expect(plan.stripped).toEqual([
+        {name: 'off', layout: 'native'},
+        {name: 'dead', layout: 'legacy'},
+      ])
+    })
+
+    it('brokers an entry that says `enabled: true`', () => {
+      const plan = unwrapOk(planMcpBrokerV2({on: credentialed({enabled: true})}))
+
+      expect(plan.routes).toHaveLength(1)
+    })
+  })
+
+  describe('which header values are masked and scanned', () => {
+    const secretsOf = (headers: Record<string, string>) =>
+      unwrapOk(planMcpBrokerV2({search: {...REMOTE, headers}})).secrets.map(secret => secret.value)
+
+    it('takes a value of 8 characters or more, and the token after Bearer, Basic or Token', () => {
+      expect(secretsOf({'X-Key': 'abcdefgh'})).toEqual(['abcdefgh'])
+      expect(secretsOf({Authorization: 'Bearer abcdefgh1'})).toEqual(['Bearer abcdefgh1', 'abcdefgh1'])
+      expect(secretsOf({Authorization: 'basic dXNlcjpwYXNz'})).toEqual(['basic dXNlcjpwYXNz', 'dXNlcjpwYXNz'])
+      expect(secretsOf({Authorization: 'TOKEN   tok-abcdefgh'})).toEqual(['TOKEN   tok-abcdefgh', 'tok-abcdefgh'])
+    })
+
+    it('leaves out a value of 7 characters or fewer, and a scheme token under the same floor', () => {
+      expect(secretsOf({'X-Key': 'abcdefg', 'X-Version': 'v1', 'X-Empty': ''})).toEqual([])
+      // `Bearer abcdefg` is 14 characters, so it is scanned as a whole; its 7-character token is not on its own.
+      expect(secretsOf({Authorization: 'Bearer abcdefg'})).toEqual(['Bearer abcdefg'])
+    })
+
+    it('does not split a value that merely starts with a scheme word', () => {
+      expect(secretsOf({Authorization: 'Bearertoken12345'})).toEqual(['Bearertoken12345'])
+    })
+
+    it('lists a value once, with the first server that holds it', () => {
+      const plan = unwrapOk(
+        planMcpBrokerV2({
+          one: {...REMOTE, headers: {'X-Key': 'shared-value-0001'}},
+          two: {...REMOTE, url: 'https://two.example.com/mcp', headers: {'X-Other': 'shared-value-0001'}},
+        }),
+      )
+
+      expect(plan.secrets).toEqual([{server: 'one', value: 'shared-value-0001'}])
+    })
+
+    it('does not mask the values of a disabled server, whose headers are only dropped', () => {
+      expect(unwrapOk(planMcpBrokerV2({off: credentialed({enabled: false})})).secrets).toEqual([])
+    })
+  })
+
+  describe('what is refused', () => {
+    /** Each case carries a recognisable value somewhere a refusal could quote it. */
+    const CANARY = 'REFUSAL-CANARY-4471'
+
+    function refusalOf(mcp: unknown) {
+      const refusal = unwrapErr(planMcpBrokerV2(mcp))
+      // The reason names the rule and a fix, and never a configured value.
+      expect(refusal.message).toMatch(/^isolate-agent: .+ Fix: .+\.$/)
+      expect(refusal.message).not.toContain(CANARY)
+      expect(refusal.message).not.toContain('set `isolate-agent: false`')
+      return refusal
+    }
+
+    const withCanary = (extra: Record<string, unknown>) => ({
+      ...REMOTE,
+      headers: {Authorization: `Bearer ${CANARY}`},
+      ...extra,
+    })
+
+    it.each([
+      ['an entry under a key that holds a reference', {'{env:SERVER}': withCanary({})}, 'reference-key'],
+      ['a `{file:}` key', {'{file:/x}': withCanary({})}, 'reference-key'],
+      [
+        'an `enabled`-only stub that also sets headers',
+        {stub: {enabled: false, headers: {Authorization: `Bearer ${CANARY}`}}},
+        'enabled-stub',
+      ],
+      [
+        'a `type` built from a reference',
+        {x: {type: '{env:KIND}', url: 'https://a.example/mcp', headers: {Authorization: `Bearer ${CANARY}`}}},
+        'unresolved-type',
+      ],
+      [
+        'a local server with headers',
+        {x: {...LOCAL, headers: {Authorization: `Bearer ${CANARY}`}}},
+        'local-with-headers',
+      ],
+      ['an entry with no type', {x: {url: 'https://a.example/mcp', headers: {A: CANARY}}}, 'unsupported-type'],
+      ['an unknown type', {x: withCanary({type: 'sse'})}, 'unsupported-type'],
+      [
+        '`enabled` and `disabled` that contradict',
+        {x: withCanary({enabled: true, disabled: true})},
+        'conflicting-flags',
+      ],
+      [
+        '`enabled: false` with `disabled: false`',
+        {x: withCanary({enabled: false, disabled: false})},
+        'conflicting-flags',
+      ],
+      ['an `enabled` flag that is a reference', {x: withCanary({enabled: '{env:ON}'})}, 'unresolved-flag'],
+      ['a `disabled` flag that is not a boolean', {x: withCanary({disabled: 'yes'})}, 'unresolved-flag'],
+      [
+        'a disabled entry that holds a reference, which could resolve into the flag',
+        {x: withCanary({enabled: false, note: '{env:NOTE}'})},
+        'reference',
+      ],
+      [
+        '`Bearer {env:TOKEN}` in a header',
+        {x: withCanary({headers: {Authorization: 'Bearer {env:TOKEN}'}})},
+        'reference',
+      ],
+      ['a `{file:}` value in a header', {x: withCanary({headers: {'X-Key': '{file:/run/secret}'}})}, 'reference'],
+      ['a reference in the url', {x: withCanary({url: 'https://{env:HOST}/mcp'})}, 'reference'],
+      ['a reference in an unknown field of the entry', {x: withCanary({extra: {deep: ['{file:./y}']}})}, 'reference'],
+      ['a reference in a header name', {x: withCanary({headers: {'X-{env:N}': 'v'}})}, 'reference'],
+      ['an `oauth` object', {x: withCanary({oauth: {}})}, 'oauth'],
+      ['an `oauth` object with a client secret', {x: withCanary({oauth: {clientSecret: CANARY}})}, 'oauth'],
+    ] as const)('refuses %s', (_label, mcp, kind) => {
+      expect(refusalOf(mcp).kind).toBe(kind)
+    })
+
+    it.each([
+      ['plain http', `http://mcp.example.com/${CANARY}`, 'url-not-https'],
+      ['http on loopback', `http://127.0.0.1:8080/${CANARY}`, 'url-not-https'],
+      ['userinfo', `https://user:${CANARY}@mcp.example.com/mcp`, 'url-userinfo'],
+      ['an empty userinfo', 'https://@mcp.example.com/mcp', 'url-userinfo'],
+      ['a fragment', `https://mcp.example.com/mcp#${CANARY}`, 'url-fragment'],
+      ['an empty fragment', 'https://mcp.example.com/mcp#', 'url-fragment'],
+      ['a query string', `https://mcp.example.com/mcp?sig=${CANARY}`, 'url-query'],
+      ['an empty query string', 'https://mcp.example.com/mcp?', 'url-query'],
+      ['a cloud metadata host', `https://169.254.169.254/${CANARY}`, 'url-unsafe-host'],
+      ['a path that normalises away', `https://mcp.example.com/a/../${CANARY}`, 'url-path'],
+      ['a path with a dot segment', 'https://mcp.example.com/a/./b', 'url-path'],
+      ['a path with an empty segment', 'https://mcp.example.com/a//b', 'url-path'],
+      ['a path with a semicolon', 'https://mcp.example.com/a;b', 'url-path'],
+      ['a path with an encoded slash', 'https://mcp.example.com/a%2Fb', 'url-path'],
+      ['a path with a space', 'https://mcp.example.com/a b', 'url-path'],
+      ['a backslash', String.raw`https://mcp.example.com\mcp`, 'url-path'],
+      ['a scheme-relative form', 'https:mcp.example.com/mcp', 'url-invalid'],
+      ['text that is not a URL', `not a url ${CANARY}`, 'url-invalid'],
+    ])('refuses %s in the url', (_label, url, kind) => {
+      expect(refusalOf({x: withCanary({url})}).kind).toBe(kind)
+    })
+
+    it('refuses a url that is not a string', () => {
+      expect(refusalOf({x: {type: 'remote', url: 5, headers: {A: CANARY}}}).kind).toBe('url-invalid')
+    })
+
+    it.each([
+      ['Host', 'host'],
+      ['Connection', 'connection'],
+      ['Transfer-Encoding', 'transfer-encoding'],
+      ['TRANSFER-ENCODING', 'transfer-encoding'],
+      ['Content-Length', 'content-length'],
+      ['Accept-Encoding', 'accept-encoding'],
+      ['Upgrade', 'upgrade'],
+      ['Expect', 'expect'],
+      ['Proxy-Authorization', 'proxy-authorization'],
+    ])('refuses the header %s, which the forwarder owns', (name, lowered) => {
+      const refusal = refusalOf({x: withCanary({headers: {[name]: CANARY}})})
+
+      expect(refusal.kind).toBe('header-forbidden')
+      expect(refusal.message).toContain(`"${lowered}"`)
+    })
+
+    it('refuses two header names that differ only in case, naming neither value', () => {
+      const refusal = refusalOf({x: withCanary({headers: {'X-Key': CANARY, 'x-key': `${CANARY}-2`}})})
+
+      expect(refusal.kind).toBe('header-duplicate')
+    })
+
+    it.each([
+      ['a name with a space', 'Bad Name'],
+      ['an empty name', ''],
+      ['a name with a colon', 'X:Key'],
+      ['a name with a newline', 'X-Key\r\nX-Injected'],
+      ['a non-ASCII name', 'X-Clé'],
+    ])('refuses %s, without echoing it', (_label, name) => {
+      const refusal = refusalOf({x: withCanary({headers: {[name]: 'value-0001'}})})
+
+      expect(refusal.kind).toBe('header-name-invalid')
+      expect(refusal.message).not.toContain(name === '' ? 'EMPTY-NAME-SENTINEL' : name)
+    })
+
+    it.each([
+      ['a newline', `a\nb${CANARY}`],
+      ['a carriage return', `a\r${CANARY}`],
+      ['a NUL', `a\u0000${CANARY}`],
+      ['DEL', `a\u007F${CANARY}`],
+      ['a character above Latin-1', `a\u2603${CANARY}`],
+    ])('refuses a header value with %s', (_label, value) => {
+      expect(refusalOf({x: withCanary({headers: {'X-Key': value}})}).kind).toBe('header-value-invalid')
+    })
+
+    it.each([
+      ['null', null],
+      ['a list', [['A', CANARY]]],
+      ['a string', CANARY],
+    ])('refuses `headers` that is %s', (_label, headers) => {
+      expect(refusalOf({x: withCanary({headers})}).kind).toBe('headers-invalid')
+    })
+
+    it('refuses a header whose value is not a string', () => {
+      expect(refusalOf({x: withCanary({headers: {'X-Key': 5}})}).kind).toBe('header-value-invalid')
+    })
+
+    it('refuses an `mcp` value that is not an object', () => {
+      expect(unwrapErr(planMcpBrokerV2('nope')).kind).toBe('unreadable-layout')
+    })
+
+    it('refuses more servers, more headers, longer values or more header text than the wire frame carries', () => {
+      const many = Object.fromEntries(
+        Array.from({length: 65}, (_value, index) => [`s${index}`, {...REMOTE, headers: {}}] as const),
+      )
+      const manyHeaders = Object.fromEntries(Array.from({length: 33}, (_value, index) => [`X-H${index}`, 'v'] as const))
+
+      expect(refusalOf(many).kind).toBe('too-many-servers')
+      expect(refusalOf({x: withCanary({headers: manyHeaders})}).kind).toBe('too-many-headers')
+      expect(refusalOf({x: withCanary({headers: {'X-Key': 'a'.repeat(4097)}})}).kind).toBe('header-value-too-long')
+      expect(unwrapOk(planMcpBrokerV2({x: {...REMOTE, headers: {'X-Key': 'a'.repeat(4096)}}})).routes).toHaveLength(1)
+    })
+
+    it('refuses headers that together outgrow the frame, though each server is within its own limits', () => {
+      const heavy = (index: number) =>
+        [
+          `s${index}`,
+          {
+            ...REMOTE,
+            headers: Object.fromEntries(Array.from({length: 8}, (_v, h) => [`X-H${h}`, 'a'.repeat(1000)] as const)),
+          },
+        ] as const
+      const servers = Object.fromEntries(Array.from({length: 40}, (_v, index) => heavy(index)))
+
+      expect(refusalOf(servers).kind).toBe('headers-too-large')
+    })
+
+    it('names the server by its sanitised, bounded name, never as typed', () => {
+      const refusal = unwrapErr(
+        planMcpBrokerV2({[`my server/${'x'.repeat(100)}"quoted"`]: {...LOCAL, headers: {A: 'b'}}}),
+      )
+
+      expect(refusal.server).toBe(`my_server_${'x'.repeat(54)}`)
+      expect(refusal.message).toContain(`"${refusal.server}"`)
+      expect(refusal.message).not.toContain('/')
+    })
+
+    it('refuses the first bad entry even when other entries are fine, and plans nothing', () => {
+      const result = planMcpBrokerV2({good: credentialed(), bad: withCanary({url: 'http://mcp.example.com/mcp'})})
+
+      expect(unwrapErr(result).kind).toBe('url-not-https')
+    })
+
+    it('does not refuse a bad shape on an entry that has no `headers` key', () => {
+      // A remote with an `http://` url and no headers carries no credential, so it stays direct and unchanged.
+      const plan = unwrapOk(planMcpBrokerV2({plain: {type: 'remote', url: 'http://mcp.example.com/mcp'}}))
+
+      expect(plan.routes).toEqual([])
+    })
+  })
+})
+
+describe('applyBrokeredMcpV2', () => {
+  const HEADER = 'Bearer rewrite-CANARY-0123456789'
+  const LOOPBACK = 'http://127.0.0.1:43111/mcp/s1'
+  const route = (name: string, layout: 'legacy' | 'native', url = LOOPBACK) =>
+    ({name, layout, action: 'route', url}) as const
+  const strip = (name: string, layout: 'legacy' | 'native') => ({name, layout, action: 'strip'}) as const
+
+  it('points a legacy entry at its route, drops its headers, sets `oauth: false` and keeps its other fields', () => {
+    // #given a credentialed legacy remote with settings of its own, next to servers the broker does not touch
+    const operator = {
+      model: 'a/b',
+      mcp: {
+        search: {...REMOTE, headers: {Authorization: HEADER}, timeout: 9000, codemode: false},
+        direct: REMOTE,
+        docs: LOCAL,
+        timeout: 5000,
+      },
+    }
+
+    // #when rewritten
+    const result = unwrapOk(applyBrokeredMcpV2(operator, {servers: [route('search', 'legacy')]}))
+
+    // #then only that entry changed: loopback url, no headers, oauth false, the rest as written, in the same key order
+    expect(result).toEqual({
+      model: 'a/b',
+      mcp: {
+        search: {type: 'remote', url: LOOPBACK, timeout: 9000, codemode: false, oauth: false},
+        direct: REMOTE,
+        docs: LOCAL,
+        timeout: 5000,
+      },
+    })
+    expect(Object.keys((result.mcp as Record<string, unknown>).search as object)).toEqual([
+      'type',
+      'url',
+      'timeout',
+      'codemode',
+      'oauth',
+    ])
+    expect(JSON.stringify(result)).not.toContain(HEADER)
+    // The input is not mutated.
+    expect((operator.mcp.search.headers as Record<string, string>).Authorization).toBe(HEADER)
+  })
+
+  it('rewrites the native `mcp.servers.<name>` layout, and both spellings in one config', () => {
+    const operator = {
+      mcp: {
+        legacy: {...REMOTE, headers: {Authorization: HEADER}},
+        servers: {native: {...REMOTE, headers: {Authorization: HEADER}}, other: REMOTE},
+      },
+    }
+
+    const result = unwrapOk(
+      applyBrokeredMcpV2(operator, {
+        servers: [
+          route('legacy', 'legacy', 'http://127.0.0.1:1/mcp/s1'),
+          route('native', 'native', 'http://127.0.0.1:1/mcp/s2'),
+        ],
+      }),
+    )
+
+    expect(result.mcp).toEqual({
+      legacy: {type: 'remote', url: 'http://127.0.0.1:1/mcp/s1', oauth: false},
+      servers: {native: {type: 'remote', url: 'http://127.0.0.1:1/mcp/s2', oauth: false}, other: REMOTE},
+    })
+  })
+
+  it('drops the headers of a stripped entry and touches nothing else about it', () => {
+    const operator = {mcp: {off: {...REMOTE, headers: {Authorization: HEADER}, enabled: false}}}
+
+    const result = unwrapOk(applyBrokeredMcpV2(operator, {servers: [strip('off', 'legacy')]}))
+
+    expect(result.mcp).toEqual({off: {...REMOTE, enabled: false}})
+    expect(JSON.stringify(result)).not.toContain(HEADER)
+  })
+
+  it('does not confuse a legacy server named `servers` with the native map, nor reach into `timeout`', () => {
+    const operator = {mcp: {servers: {...REMOTE, headers: {Authorization: HEADER}}, timeout: {startup: 1000}}}
+
+    const result = unwrapOk(applyBrokeredMcpV2(operator, {servers: [route('servers', 'legacy')]}))
+
+    expect(result.mcp).toEqual({
+      servers: {type: 'remote', url: LOOPBACK, oauth: false},
+      timeout: {startup: 1000},
+    })
+  })
+
+  it('keeps a server named `__proto__` an own key', () => {
+    const operator = JSON.parse(
+      `{"mcp": {"__proto__": {"type": "remote", "url": "https://a.example/mcp", "headers": {"A": "${HEADER}"}}}}`,
+    ) as Record<string, unknown>
+
+    const result = unwrapOk(applyBrokeredMcpV2(operator, {servers: [route('__proto__', 'legacy')]}))
+
+    expect(Object.keys(result.mcp as object)).toEqual(['__proto__'])
+    expect(JSON.stringify(result)).not.toContain(HEADER)
+  })
+
+  it('returns the config as it was when nothing is brokered and nothing has headers', () => {
+    const operator = {model: 'a/b', mcp: {direct: REMOTE, docs: LOCAL}}
+
+    expect(unwrapOk(applyBrokeredMcpV2(operator, {servers: []}))).toEqual(operator)
+    expect(unwrapOk(applyBrokeredMcpV2({model: 'a/b'}, {servers: []}))).toEqual({model: 'a/b'})
+  })
+
+  it('fails, naming the server and no value, when a planned entry is not in the config', () => {
+    const operator = {mcp: {search: {...REMOTE, headers: {Authorization: HEADER}}}}
+
+    const message = unwrapErr(applyBrokeredMcpV2(operator, {servers: [route('search', 'native')]}))
+
+    expect(message).toContain('"search"')
+    expect(message).not.toContain(HEADER)
+  })
+
+  it('fails when a planned entry has no headers to drop, rather than rewrite a server it never classified', () => {
+    const operator = {mcp: {search: REMOTE}}
+
+    expect(unwrapErr(applyBrokeredMcpV2(operator, {servers: [route('search', 'legacy')]}))).toContain('"search"')
+  })
+
+  it('fails closed when any entry keeps headers the plan did not cover, without quoting them', () => {
+    // #given two credentialed servers, only one of which was planned
+    const operator = {
+      mcp: {
+        planned: {...REMOTE, headers: {Authorization: HEADER}},
+        missed: {...REMOTE, headers: {Authorization: HEADER}},
+      },
+    }
+
+    // #when rewritten
+    const message = unwrapErr(applyBrokeredMcpV2(operator, {servers: [route('planned', 'legacy')]}))
+
+    // #then it fails and names the server that kept its headers
+    expect(message).toContain('"missed"')
+    expect(message).not.toContain(HEADER)
+  })
+
+  it('fails closed on a leftover entry the broker would refuse, without quoting it', () => {
+    const operator = {mcp: {local: {...LOCAL, headers: {Authorization: HEADER}}}}
+
+    const message = unwrapErr(applyBrokeredMcpV2(operator, {servers: []}))
+
+    expect(message).toContain('isolate-agent')
+    expect(message).not.toContain(HEADER)
   })
 })

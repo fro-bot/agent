@@ -1,8 +1,9 @@
 import type {ProviderKeyEntryV2} from './credential-files-v2.js'
 import {describe, expect, it} from 'vitest'
-import {createMockLogger} from '../../shared/test-helpers.js'
+import {createMockLogger, unwrapErr} from '../../shared/test-helpers.js'
 import {buildCIConfigV2} from './ci-config-v2.js'
 import {checkConfigForKeys, resolveKeyProxyProviders} from './key-proxy-providers.js'
+import {planMcpBrokerV2} from './mcp-servers-v2.js'
 
 const CANARY = 'sk-CANARY-do-not-print-0001'
 
@@ -632,6 +633,130 @@ describe('checkConfigForKeys: an auth-json key value in the config the sandbox r
   it('ignores an empty key, which would match any text', () => {
     expect(
       checkConfigForKeys({keys: [{providerId: 'openai', key: ''}], configs: [{label: 'c', text: '{}'}]}).success,
+    ).toBe(true)
+  })
+})
+
+describe('checkConfigForKeys: a brokered MCP header value in the config the sandbox reads', () => {
+  const TOKEN = 'mcp-scan-TOKEN-0123456789'
+  const HEADER = `Bearer ${TOKEN}`
+  const LOOPBACK = 'http://127.0.0.1:43111/mcp/s1'
+  const REMOTE = {type: 'remote', url: 'https://mcp.example.com/mcp', headers: {Authorization: HEADER}} as const
+
+  /** The path `startActionOpenCodeV2` takes: plan, then rewrite both config variants. */
+  function prepare(config: Record<string, unknown>, headers: Record<string, string> = {Authorization: HEADER}) {
+    const mcp = {authed: {...REMOTE, headers}, ...(config.mcp as object)}
+    const opencodeConfig = JSON.stringify({...config, mcp})
+    const plan = planMcpBrokerV2(mcp)
+    if (!plan.success) throw new Error(`planner refused: ${plan.error.message}`)
+    const build = (tracing: boolean) => {
+      const built = buildCIConfigV2(
+        {
+          opencodeConfig,
+          credential: 'provision',
+          plugins: [],
+          runnerTemp: '/tmp/runner',
+          runId: 1,
+          runAttempt: 1,
+          tracing,
+          brokeredMcp: {servers: [{name: 'authed', layout: 'legacy', action: 'route', url: LOOPBACK}]},
+        },
+        createMockLogger(),
+      )
+      if (!built.success) throw new Error(`build failed: ${built.error}`)
+      return JSON.stringify(built.data.content)
+    }
+    return {
+      secrets: plan.data.secrets,
+      untraced: {label: 'the OpenCode config (OPENCODE_CONFIG_CONTENT)', text: build(false)},
+      traced: {label: 'the traced OpenCode config (OPENCODE_CONFIG_CONTENT)', text: build(true)},
+    }
+  }
+
+  /** The scan of both variants, as the start runs it. */
+  function deliver(config: Record<string, unknown>, headers?: Record<string, string>) {
+    const prepared = prepare(config, headers)
+    return checkConfigForKeys({keys: [], mcpSecrets: prepared.secrets, configs: [prepared.untraced, prepared.traced]})
+  }
+
+  it('accepts a rewritten config that holds no copy of the value', () => {
+    expect(deliver({}).success).toBe(true)
+  })
+
+  it.each(['untraced', 'traced'] as const)(
+    'refuses the bare token of `Bearer <token>` copied into a local server environment, in the %s config',
+    variant => {
+      // #given the token also written into a local server's environment, where the broker cannot reach it
+      const prepared = prepare({mcp: {docs: {type: 'local', command: ['node'], environment: {TOKEN}}}})
+
+      // #when only that variant is scanned
+      const result = checkConfigForKeys({keys: [], mcpSecrets: prepared.secrets, configs: [prepared[variant]]})
+
+      // #then the run stops with a remedy that names the server and the text, and not the value
+      const error = unwrapErr(result)
+      expect(error).toContain('MCP server "authed"')
+      expect(error).toContain(prepared[variant].label)
+      expect(error).toMatch(/Fix: /)
+      expect(error).not.toContain(TOKEN)
+      expect(error).not.toContain('isolate-agent: false')
+    },
+  )
+
+  it('refuses the traced config on its own when only that one holds a copy', () => {
+    const result = checkConfigForKeys({
+      keys: [],
+      mcpSecrets: [{server: 'authed', value: TOKEN}],
+      configs: [
+        {label: 'the OpenCode config', text: '{}'},
+        {label: 'the traced OpenCode config', text: JSON.stringify({x: TOKEN})},
+      ],
+    })
+
+    expect(unwrapErr(result)).toContain('the traced OpenCode config')
+  })
+
+  it('refuses the whole header value copied elsewhere', () => {
+    expect(deliver({mcp: {docs: {type: 'local', command: ['node'], environment: {AUTH: HEADER}}}}).success).toBe(false)
+  })
+
+  it('refuses a value that needs JSON escaping, in its escaped form', () => {
+    const tricky = String.raw`mcp-"quoted"\back-0042`
+    const result = checkConfigForKeys({
+      keys: [],
+      mcpSecrets: [{server: 'authed', value: tricky}],
+      configs: [{label: 'the config', text: JSON.stringify({a: {b: tricky}})}],
+    })
+
+    expect(result.success).toBe(false)
+  })
+
+  it('does not refuse a short header value that also appears elsewhere: it is brokered, not scanned', () => {
+    // #given a 2-character header value and the same two characters in another field
+    const result = deliver(
+      {model: 'v1/x', mcp: {docs: {type: 'local', command: ['v1'], environment: {X: 'v1'}}}},
+      {'X-V': 'v1'},
+    )
+
+    // #then the run goes on
+    expect(result.success).toBe(true)
+  })
+
+  it('still checks provider keys, and reports the first value it finds', () => {
+    const result = checkConfigForKeys({
+      keys: [{providerId: 'openai', key: 'sk-both-0001'}],
+      mcpSecrets: [{server: 'authed', value: TOKEN}],
+      configs: [{label: 'the config', text: JSON.stringify({a: 'sk-both-0001', b: TOKEN})}],
+    })
+
+    const error = unwrapErr(result)
+    expect(error).toContain('provider "openai"')
+    expect(error).not.toContain('sk-both-0001')
+  })
+
+  it('ignores an empty secret, which would match any text', () => {
+    expect(
+      checkConfigForKeys({keys: [], mcpSecrets: [{server: 'authed', value: ''}], configs: [{label: 'c', text: '{}'}]})
+        .success,
     ).toBe(true)
   })
 })

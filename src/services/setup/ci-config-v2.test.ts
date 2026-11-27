@@ -1,8 +1,8 @@
 import type {PermissionRuleV2} from '@fro-bot/runtime'
 import {evaluatePermissionV2, resolveResponseDelivery, verifyPermissionRules} from '@fro-bot/runtime'
 import {describe, expect, it, vi} from 'vitest'
-import {createMockLogger, serializeLoggerCalls, unwrapErr} from '../../shared/test-helpers.js'
-import {buildCIConfigV2} from './ci-config-v2.js'
+import {createMockLogger, serializeLoggerCalls, unwrapErr, unwrapOk} from '../../shared/test-helpers.js'
+import {buildCIConfigV2, prepareOperatorConfigV2} from './ci-config-v2.js'
 
 const RUNNER_TEMP = '/home/runner/work/_temp'
 const RESPONSE_DIR = `${RUNNER_TEMP}/fro-bot-response/12345-1`
@@ -1203,5 +1203,164 @@ describe('buildCIConfigV2 proxied providers (isolate-agent key proxy)', () => {
 
   it('leaves the config as it was when nothing is proxied', () => {
     expect(build({proxiedProviders: {}}).content).toEqual(build().content)
+  })
+})
+
+describe('prepareOperatorConfigV2', () => {
+  const logger = () => createMockLogger()
+
+  it('is an empty operator config when there is no input', () => {
+    expect(unwrapOk(prepareOperatorConfigV2({opencodeConfig: null, credential: 'provision'}, logger()))).toEqual({})
+  })
+
+  it.each([
+    ['text that is not JSON', '{nope', 'opencode-config must be valid JSON'],
+    ['JSON that is not an object', '[1]', 'opencode-config must be a JSON object'],
+  ])('refuses %s', (_label, opencodeConfig, message) => {
+    expect(unwrapErr(prepareOperatorConfigV2({opencodeConfig, credential: 'provision'}, logger()))).toBe(message)
+  })
+
+  it('refuses an {env:} reference on a withheld run, and allows it on a provisioned one', () => {
+    const opencodeConfig = JSON.stringify({model: '{env:MODEL}'})
+
+    expect(unwrapErr(prepareOperatorConfigV2({opencodeConfig, credential: 'withhold'}, logger()))).toContain('{env:}')
+    expect(unwrapOk(prepareOperatorConfigV2({opencodeConfig, credential: 'provision'}, logger()))).toEqual({
+      model: '{env:MODEL}',
+    })
+  })
+
+  it('applies the per-trigger MCP filter and strips operator permissions, as the build does', () => {
+    const opencodeConfig = JSON.stringify({
+      permission: {bash: 'allow'},
+      mcp: {
+        docs: {type: 'local', command: ['node']},
+        authed: {type: 'remote', url: 'https://a.example/mcp', headers: {A: 'b'}},
+      },
+    })
+
+    const operator = unwrapOk(prepareOperatorConfigV2({opencodeConfig, credential: 'withhold'}, logger()))
+
+    expect(operator).toEqual({mcp: {docs: {type: 'local', command: ['node']}}})
+  })
+})
+
+describe('buildCIConfigV2 brokered MCP servers (isolate-agent)', () => {
+  const HEADER = 'Bearer ci-config-CANARY-0123456789'
+  const LOOPBACK = 'http://127.0.0.1:43111/mcp/s1'
+  const CREDENTIALED = {type: 'remote', url: 'https://mcp.example.com/mcp', headers: {Authorization: HEADER}} as const
+  const route = (name: string, layout: 'legacy' | 'native' = 'legacy') =>
+    ({name, layout, action: 'route', url: LOOPBACK}) as const
+
+  it('rewrites a planned entry to its loopback route with no headers and `oauth: false`', () => {
+    // #given a credentialed remote and its plan
+    // #when the config is built
+    const {content} = build({
+      opencodeConfig: JSON.stringify({mcp: {authed: CREDENTIALED}}),
+      brokeredMcp: {servers: [route('authed')]},
+    })
+
+    // #then the entry the sandbox reads has no credential anywhere
+    expect(content.mcp).toEqual({authed: {type: 'remote', url: LOOPBACK, oauth: false}})
+    expect(JSON.stringify(content)).not.toContain(HEADER)
+  })
+
+  it('rewrites the native layout, and does so in the traced and the untraced config alike', () => {
+    const inputs = {
+      opencodeConfig: JSON.stringify({mcp: {servers: {authed: CREDENTIALED}}}),
+      brokeredMcp: {servers: [route('authed', 'native')]},
+    }
+
+    const untraced = build({...inputs, tracing: false}).content
+    const traced = build({...inputs, tracing: true}).content
+
+    for (const content of [untraced, traced]) {
+      expect(content.mcp).toEqual({servers: {authed: {type: 'remote', url: LOOPBACK, oauth: false}}})
+      expect(JSON.stringify(content)).not.toContain(HEADER)
+    }
+  })
+
+  it('composes with the provider rewrite', () => {
+    const {content} = build({
+      opencodeConfig: JSON.stringify({mcp: {authed: CREDENTIALED}}),
+      brokeredMcp: {servers: [route('authed')]},
+      proxiedProviders: {openai: {baseURL: 'http://127.0.0.1:43111/openai', apiKey: 'placeholder-0123456789abcdefgh'}},
+    })
+
+    expect(content.mcp).toEqual({authed: {type: 'remote', url: LOOPBACK, oauth: false}})
+    expect(providerOf(content).openai?.options.baseURL).toBe('http://127.0.0.1:43111/openai')
+  })
+
+  it('strips the headers of a disabled entry that the plan marks as stripped', () => {
+    const {content} = build({
+      opencodeConfig: JSON.stringify({mcp: {off: {...CREDENTIALED, enabled: false}}}),
+      brokeredMcp: {servers: [{name: 'off', layout: 'legacy', action: 'strip'}]},
+    })
+
+    expect(content.mcp).toEqual({off: {type: 'remote', url: 'https://mcp.example.com/mcp', enabled: false}})
+  })
+
+  it('leaves the entry as written when the run is not brokered', () => {
+    const {content} = build({opencodeConfig: JSON.stringify({mcp: {authed: CREDENTIALED}})})
+
+    expect(content.mcp).toEqual({authed: CREDENTIALED})
+  })
+
+  it('fails the build, quoting nothing, when a credentialed entry is not in the plan', () => {
+    const result = buildCIConfigV2(
+      {
+        ...BASE_INPUTS,
+        opencodeConfig: JSON.stringify({mcp: {authed: CREDENTIALED}}),
+        brokeredMcp: {servers: []},
+      },
+      createMockLogger(),
+    )
+
+    const message = unwrapErr(result)
+    expect(message).toContain('"authed"')
+    expect(message).not.toContain(HEADER)
+  })
+
+  it('fails the build when a planned entry is missing from the config', () => {
+    const result = buildCIConfigV2(
+      {
+        ...BASE_INPUTS,
+        opencodeConfig: JSON.stringify({mcp: {other: CREDENTIALED}}),
+        brokeredMcp: {servers: [route('authed')]},
+      },
+      createMockLogger(),
+    )
+
+    expect(unwrapErr(result)).toContain('"authed"')
+  })
+
+  it('drops a credentialed remote on a withheld run with no error, and a plan with no servers is satisfied', () => {
+    const result = buildCIConfigV2(
+      {
+        ...BASE_INPUTS,
+        credential: 'withhold',
+        opencodeConfig: JSON.stringify({mcp: {authed: CREDENTIALED}}),
+        brokeredMcp: {servers: []},
+      },
+      createMockLogger(),
+    )
+
+    expect(result.success).toBe(true)
+    expect(result.success && result.data.content).not.toHaveProperty('mcp')
+  })
+
+  it('fails on a withheld run whose kept static local server carries headers', () => {
+    const result = buildCIConfigV2(
+      {
+        ...BASE_INPUTS,
+        credential: 'withhold',
+        opencodeConfig: JSON.stringify({mcp: {docs: {type: 'local', command: ['node'], headers: {A: HEADER}}}}),
+        brokeredMcp: {servers: []},
+      },
+      createMockLogger(),
+    )
+
+    const message = unwrapErr(result)
+    expect(message).toContain('isolate-agent')
+    expect(message).not.toContain(HEADER)
   })
 })

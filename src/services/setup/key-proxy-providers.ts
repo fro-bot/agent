@@ -458,25 +458,49 @@ export interface ConfigTextToCheck {
   readonly text: string
 }
 
+/** A remote MCP header value the broker holds (`planMcpBrokerV2`), and the sanitized name of the server that holds it. */
+export interface McpSecretToCheck {
+  readonly server: string
+  readonly value: string
+}
+
+function appearsIn(value: string, text: string): boolean {
+  return text.includes(value) || text.includes(JSON.stringify(value).slice(1, -1))
+}
+
 /**
- * The last check before a config reaches the sandbox user: no `auth-json` key value may appear in any config text it will
- * read, raw or JSON-escaped. This is by value, not by field name, so it holds for a key written anywhere in `opencode-config`
- * (a root `apiKey`, a nested `api` object, a model setting) however the resolver or the config builder treats that field.
- * The refusal names the provider and the text, never the value.
+ * The last check before a config reaches the sandbox user: no `auth-json` key value and no brokered MCP header value may
+ * appear in any config text it will read, raw or JSON-escaped. This is by value, not by field name, so it holds for a
+ * value written anywhere in `opencode-config` (a root `apiKey`, a nested `api` object, a model setting, a local server's
+ * `environment`) however the resolver or the config builder treats that field. The refusal names the provider or the
+ * server and the text, never the value.
  */
 export function checkConfigForKeys(options: {
   readonly keys: readonly ProviderKeyEntryV2[]
+  /** Header values the broker holds. Only those long enough to be a credential are passed (`planMcpBrokerV2`). */
+  readonly mcpSecrets?: readonly McpSecretToCheck[]
   readonly configs: readonly ConfigTextToCheck[]
 }): Result<null, string> {
   for (const {providerId, key} of options.keys) {
     if (key.length === 0) continue
-    const escaped = JSON.stringify(key).slice(1, -1)
     for (const {label, text} of options.configs) {
-      if (text.includes(key) || text.includes(escaped)) {
+      if (appearsIn(key, text)) {
         return err(
           `isolate-agent: the API key for provider "${providerId}" appears in ${label}, which the sandbox user can read. ` +
             'Fix: remove the value from the `opencode-config` input (isolation keeps only `auth-json` keys out of the sandbox; ' +
             'values written into `opencode-config` stay visible to it), or set `isolate-agent: false`.',
+        )
+      }
+    }
+  }
+  for (const {server, value} of options.mcpSecrets ?? []) {
+    if (value.length === 0) continue
+    for (const {label, text} of options.configs) {
+      if (appearsIn(value, text)) {
+        return err(
+          `isolate-agent: a header value of MCP server "${server}" appears in ${label}, which the sandbox user can read. ` +
+            'Fix: remove the copy from the `opencode-config` input; the broker holds the header for the server, ' +
+            'but a second copy elsewhere in the config stays visible to the sandbox.',
         )
       }
     }
