@@ -6,7 +6,7 @@ import {afterEach, describe, expect, it, vi} from 'vitest'
 import {startOtlpSink, type OtlpSink} from '../integration.fixture.js'
 import {createScrubber} from './content.js'
 import {CLEANUP_BOUND_MS, DRAIN_BOUND_MS, startTracing} from './index.js'
-import {minCpuMs} from './timing.testing.js'
+import {cpuMs, minCpuMs} from './timing.testing.js'
 
 /** A fake host: records every registered hook and exposes a pushable event stream. */
 function fakeObserverHost() {
@@ -848,17 +848,25 @@ describe('the handlers', () => {
     }
     const size = JSON.stringify(payload).length
 
-    // The handler's CPU time on a fresh tracing handle: the snapshot ledger is bounded, so a handle that held many snapshots
-    // would start omitting content and look cheaper than it is.
-    const handlerCpuMs = async (attempts: number): Promise<number> => {
+    // One hook call on its own fresh tracing handle, so on an empty snapshot ledger: the ledger is bounded, and a handle that
+    // already held snapshots would omit or truncate content and make a costly snapshot look cheap. Starting and stopping the
+    // handle are outside the measurement; only the hook call is timed.
+    const hookCpuMs = async (): Promise<number> => {
       const target = await sink()
       const fake = fakeObserverHost()
       const handle = await startTracing(fake.host, LOCAL(target.url), {env: {}, log: () => {}})
-      const best = minCpuMs(() => {
+      const used = cpuMs(() => {
         fake.call('session.context', payload)
-      }, attempts)
+      })
       await handle.stop()
       fake.end()
+      return used
+    }
+    // An untimed warm-up on its own handle, then the least of `attempts` timed calls, each on a fresh handle.
+    const handlerCpuMs = async (attempts: number): Promise<number> => {
+      await hookCpuMs()
+      let best = Number.POSITIVE_INFINITY
+      for (let attempt = 0; attempt < attempts; attempt += 1) best = Math.min(best, await hookCpuMs())
       return best
     }
     const serializeCpuMs = (attempts: number): number =>
