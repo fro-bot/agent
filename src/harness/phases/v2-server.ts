@@ -844,9 +844,9 @@ function planBrokeredMcp(
   )
   if (!operator.success) return err(`Invalid OpenCode configuration: ${operator.error}`)
   // OpenCode resolves `{env:}` and `{file:}` in the config text before it reads it, so a top-level key built from one could
-  // become `mcp` and add servers, with headers, after the plan. A withheld run never reaches here with one: it removes
-  // `{file:}` keys and refuses `{env:}` in the whole config.
-  if (options.credential === 'provision' && Object.keys(operator.data).some(key => /\{(?:env|file):/.test(key))) {
+  // become `mcp` and add servers, with headers, after the plan. A withheld run cannot have one left to refuse: the filter
+  // removes `{file:}` keys and the build refuses `{env:}` in the whole config, so only a provisioned run is affected.
+  if (Object.keys(operator.data).some(key => /\{(?:env|file):/.test(key))) {
     return err(
       'isolate-agent: opencode-config has a top-level key built from a reference, which could add MCP servers the broker never sees. ' +
         'Fix: write every top-level key out literally.',
