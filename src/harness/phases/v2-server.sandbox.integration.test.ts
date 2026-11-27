@@ -110,6 +110,7 @@ import {unwrapOk} from '../../shared/test-helpers.js'
 import {parseTraceInputs} from '../config/trace-inputs.js'
 import {startKeyProxyProcess, type KeyProxyProcess} from './key-proxy-process.js'
 import {snapshotLogDirectory} from './log-snapshot.js'
+import {findServicesOfAccount} from './owned-service-processes.js'
 import {createSandboxLifecycle} from './sandbox-lifecycle.js'
 import {startTraceRelayProcess, type TraceRelayProcess, type TraceRelayStopResult} from './trace-relay-process.js'
 import {
@@ -2595,17 +2596,11 @@ describe.skipIf(!gated)("isolate-agent PATH mirrors the runner's", () => {
   const opencodeDirectory = path.dirname(BINARY ?? '')
 
   let result: IsolatedRunResult | undefined
-  // `serve --service` processes the run left behind: none may be new (the CLI's autostart is detached, in its own group).
-  let newServices: number[] = []
-  const servicePids = (): ReadonlySet<number> => {
-    const found = spawnSync('pgrep', ['-f', 'serve --service'], {encoding: 'utf8'})
-    return new Set(
-      found.stdout
-        .split('\n')
-        .map(line => Number(line.trim()))
-        .filter(pid => Number.isInteger(pid) && pid > 0),
-    )
-  }
+  // The sandbox account's `serve --service` processes, read before the run is released (the lifecycle stops everything the
+  // account owns at release, so nothing here is ever signalled). Only processes of that account's uid count: other services on
+  // the host are not this suite's.
+  let accountUid: number | undefined
+  let accountServices: readonly number[] = []
   const expected = {
     nodePath: pathTools.node ?? '',
     nodeVersion: gated ? runnerReports('node -v') : '',
@@ -2667,7 +2662,6 @@ describe.skipIf(!gated)("isolate-agent PATH mirrors the runner's", () => {
     fs.mkdirSync(responseDir, {recursive: true})
     const keyFile = writeKeyFile(keyDir)
     initWorkspace(workspace)
-    const servicesBefore = servicePids()
     result = await runIsolated({
       tools,
       env,
@@ -2678,15 +2672,13 @@ describe.skipIf(!gated)("isolate-agent PATH mirrors the runner's", () => {
       logger,
       opencodeDirectory,
       opencodeBinaryPath: BINARY ?? '',
+      onPrepared: launch => {
+        accountUid = launch.account.uid
+      },
+      beforeShutdown: async () => {
+        accountServices = accountUid === undefined ? [] : findServicesOfAccount(accountUid)
+      },
     })
-    newServices = [...servicePids()].filter(pid => !servicesBefore.has(pid))
-    for (const pid of newServices) {
-      try {
-        process.kill(pid, 'SIGKILL')
-      } catch {
-        // already gone
-      }
-    }
   }, 600_000)
 
   afterAll(() => {
@@ -2741,7 +2733,8 @@ describe.skipIf(!gated)("isolate-agent PATH mirrors the runner's", () => {
     expect(failuresFor(result?.rows ?? new Map(), 'path_opencode_guard_readonly', 'WORKS')).toEqual([])
 
     // #and no `serve --service` process started, and no managed-server registration was written under the agent's state
-    expect(newServices).toEqual([])
+    expect(accountUid).toBeGreaterThan(0)
+    expect(accountServices).toEqual([])
     const stateDirectory = path.join(xdgRoot, 'state', 'opencode')
     const registrations = fs.existsSync(stateDirectory)
       ? fs.readdirSync(stateDirectory).filter(name => /^service.*\.json$/.test(name))

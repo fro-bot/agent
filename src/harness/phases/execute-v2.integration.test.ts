@@ -37,6 +37,7 @@ import {createExecAdapter} from '../../services/setup/adapters.js'
 import {installPluginsV2, resolvePluginSpecsV2} from '../../services/setup/plugin-install-v2.js'
 import {createMockLogger, unwrapOk} from '../../shared/test-helpers.js'
 import {computeDrainDeadlineMs, runExecute} from './execute.js'
+import {findServicesOwnedByState, killOwnedServices} from './owned-service-processes.js'
 import {releaseOptionsFromExecution, runReleaseV2} from './release-v2.js'
 import {createSessionReaderV2, resolveSessionForLogicalKeyV2} from './session-v2.js'
 import {startActionOpenCodeV2} from './v2-server.js'
@@ -461,21 +462,6 @@ function processRunning(needle: string): boolean {
     return true
   } catch {
     return false
-  }
-}
-
-/** The pids of every process whose command line contains `needle` (`pgrep -f`; exit 1 means none). */
-function pidsRunning(needle: string): ReadonlySet<number> {
-  try {
-    const out = execFileSync('pgrep', ['-f', needle], {encoding: 'utf8'})
-    return new Set(
-      out
-        .split('\n')
-        .map(line => Number(line.trim()))
-        .filter(pid => Number.isInteger(pid) && pid > 0),
-    )
-  } catch {
-    return new Set()
   }
 }
 
@@ -1314,13 +1300,19 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
       ])
       providers.push(provider)
       const real = await startRealServer(box, provider)
-      const servicesBefore = pidsRunning('serve --service')
 
       // #when the execute phase runs those commands
       const result = await executePhase(real, box, 120_000)
-      const servicesAfter = pidsRunning('serve --service')
 
-      // #then every command ran and the run succeeded
+      // #then no second server exists: no `serve --service` process that provably belongs to this run (its environment
+      // names this test's own state directory). Other services on the host are not this test's: they are neither looked at
+      // nor signalled. Checked first, and any process found is this run's own autostart, so it is stopped before anything
+      // else can fail the test and leave it running.
+      const owned = findServicesOwnedByState(box.env.XDG_STATE_HOME as string)
+      killOwnedServices(owned)
+      expect(owned).toEqual([])
+
+      // #and every command ran and the run succeeded
       expect(result).toMatchObject({success: true, exitCode: 0})
       const output = toolOutput(provider)
 
@@ -1329,16 +1321,7 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
       expect(output).toContain(REFUSAL)
       expect(output).toContain('SERVE_EXIT=2')
 
-      // #and no second server exists: no new `serve --service` process, and no registration under the agent's state
-      const added = [...servicesAfter].filter(pid => !servicesBefore.has(pid))
-      for (const pid of added) {
-        try {
-          process.kill(pid, 'SIGKILL')
-        } catch {
-          // already gone
-        }
-      }
-      expect(added).toEqual([])
+      // #and no managed-server registration was written under the agent's state
       expect(serviceRegistrations(box.env.XDG_STATE_HOME as string)).toEqual([])
 
       // #and the version check the ce:connect skill makes still prints the pinned version, from the real binary
