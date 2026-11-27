@@ -13,11 +13,16 @@ type Added = Parameters<Parameters<HostSurface['tool']['transform']>[0]>[0] exte
   ? T
   : never
 type BeforeCallback = (event: ToolCallBefore) => Promise<void> | void
+type AfterCallback = (event: unknown) => void
+
+/** An environment with no launcher variable, no headless marker and no user file anywhere. */
+const LOCAL_WITHOUT_FILE = {HOME: '/nonexistent/fro-bot-home', XDG_CONFIG_HOME: '/nonexistent/fro-bot-xdg'}
 
 function fakeHost() {
   const added: Added[] = []
   const order: string[] = []
   let before: BeforeCallback | undefined
+  const afters: AfterCallback[] = []
   const session = {
     list: vi.fn(async () => ({
       data: [
@@ -50,12 +55,13 @@ function fakeHost() {
       hook: async (name: string, callback: (event: never) => unknown) => {
         order.push(`hook:${name}`)
         if (name === 'execute.before') before = callback as BeforeCallback
+        if (name === 'execute.after') afters.push(callback as AfterCallback)
         return {dispose: async () => {}}
       },
     },
     event: {subscribe: () => (async function* () {})()},
   }
-  return {host, session, added, order, before: () => before}
+  return {host, session, added, order, before: () => before, after: () => afters[0]}
 }
 
 describe('plugin identity', () => {
@@ -76,8 +82,8 @@ describe('setupFroBotPlugin', () => {
     // #when
     await setupFroBotPlugin(host)
 
-    // #then a failure to register the guard must surface before anything else is exposed
-    expect(order).toEqual(['hook:execute.before', 'tools'])
+    // #then a failure to register either guard hook must surface before anything else is exposed
+    expect(order).toEqual(['hook:execute.before', 'hook:execute.after', 'tools'])
   })
 
   it('wires the guard hook to the subagent rule', async () => {
@@ -92,6 +98,97 @@ describe('setupFroBotPlugin', () => {
       TASK_REUSE_REJECTION,
     )
     await expect(Promise.resolve(hook?.({tool: 'subagent', input: {prompt: 'fresh'}}))).resolves.toBeUndefined()
+  })
+
+  describe('the same-run resume wiring', () => {
+    const PARENT = 'ses_parent0000000000000000'
+    const CHILD = 'ses_child00000000000000000'
+    const ACTION = JSON.stringify({version: 1, host: 'action', tracing: 'off'})
+    const WORKSPACE = JSON.stringify({version: 1, host: 'workspace'})
+
+    const dispatchEvent = (overrides: Record<string, unknown> = {}) => ({
+      tool: 'subagent',
+      sessionID: PARENT,
+      input: {agent: 'general', description: 'x', prompt: 'do it'},
+      status: 'completed',
+      result: {metadata: {sessionID: CHILD, status: 'running'}},
+      ...overrides,
+    })
+    const resume = (sessionID: string, caller = PARENT) => ({
+      tool: 'subagent',
+      sessionID: caller,
+      input: {agent: 'general', prompt: 'again', sessionID},
+    })
+
+    async function started(launcher: string | undefined) {
+      const fake = fakeHost()
+      const env = launcher === undefined ? LOCAL_WITHOUT_FILE : {[TRACING_LAUNCHER_ENV]: launcher}
+      await setupFroBotPlugin(fake.host, {env, log: () => {}})
+      return fake
+    }
+
+    it('admits a resume of a child the same run dispatched, on the Action host only', async () => {
+      // #given an Action launcher, and a fresh dispatch seen by the after hook
+      const {before, after} = await started(ACTION)
+      after()?.(dispatchEvent())
+
+      // #when / #then the caller can resume it, and a foreign id is still refused
+      await expect(Promise.resolve(before()?.(resume(CHILD)))).resolves.toBeUndefined()
+      await expect(Promise.resolve(before()?.(resume('ses_foreign000000000000000')))).rejects.toThrow(
+        TASK_REUSE_REJECTION,
+      )
+    })
+
+    it.each([
+      ['the workspace launcher', WORKSPACE],
+      ['no launcher', undefined],
+      ['a malformed launcher', '{"version":1,'],
+      ['an unsupported version', JSON.stringify({version: 2, host: 'action'})],
+    ])('refuses a recorded child with %s', async (_label, launcher) => {
+      // #given a host that is not the Action, and a recorded child
+      const {before, after} = await started(launcher)
+      after()?.(dispatchEvent())
+
+      // #when / #then
+      await expect(Promise.resolve(before()?.(resume(CHILD)))).rejects.toThrow(TASK_REUSE_REJECTION)
+    })
+
+    it('refuses the same resume after a reload: a new setup starts with no record', async () => {
+      // #given a first setup that recorded a child
+      const first = await started(ACTION)
+      first.after()?.(dispatchEvent())
+      await expect(Promise.resolve(first.before()?.(resume(CHILD)))).resolves.toBeUndefined()
+
+      // #when the plugin loads again
+      const second = await started(ACTION)
+
+      // #then the new instance refuses it
+      await expect(Promise.resolve(second.before()?.(resume(CHILD)))).rejects.toThrow(TASK_REUSE_REJECTION)
+    })
+
+    it('reads the process environment when the setup is handed none, like the tracing decision', async () => {
+      // #given a launcher in the process environment of the test runner
+      vi.stubEnv(TRACING_LAUNCHER_ENV, ACTION)
+      try {
+        const fake = fakeHost()
+        await setupFroBotPlugin(fake.host, {log: () => {}})
+        fake.after()?.(dispatchEvent())
+
+        // #when / #then
+        await expect(Promise.resolve(fake.before()?.(resume(CHILD)))).resolves.toBeUndefined()
+      } finally {
+        vi.unstubAllEnvs()
+      }
+    })
+
+    it('records nothing for a failed dispatch', async () => {
+      // #given a failed subagent call
+      const {before, after} = await started(ACTION)
+      after()?.(dispatchEvent({status: 'error'}))
+
+      // #when / #then
+      await expect(Promise.resolve(before()?.(resume(CHILD)))).rejects.toThrow(TASK_REUSE_REJECTION)
+    })
   })
 
   it('exposes the four session tools as direct tools, outside Code Mode', async () => {
@@ -157,8 +254,6 @@ const ON = JSON.stringify({
   relay: RELAY,
   identity: {repository: 'fro-bot/agent', runId: '1', attempt: '1', job: 'j', trigger: 'push'},
 })
-/** An environment with no launcher variable, no headless marker and no user file anywhere. */
-const LOCAL_WITHOUT_FILE = {HOME: '/nonexistent/fro-bot-home', XDG_CONFIG_HOME: '/nonexistent/fro-bot-xdg'}
 
 describe('the lazy tracing entry', () => {
   afterEach(() => {
@@ -188,7 +283,7 @@ describe('the lazy tracing entry', () => {
     await setup(host, {env, log: () => {}})
 
     // #then the plugin is registered as usual and the tracing module was never loaded
-    expect(order).toEqual(['hook:execute.before', 'tools'])
+    expect(order).toEqual(['hook:execute.before', 'hook:execute.after', 'tools'])
     expect(evaluated).not.toHaveBeenCalled()
   })
 
@@ -273,8 +368,8 @@ describe('the lazy tracing entry', () => {
     // #when
     await setup(host, {env: {[TRACING_LAUNCHER_ENV]: ON}, log: () => {}})
 
-    // #then the guard and both observer hooks reached the host's own hook function
-    expect(names).toEqual(['execute.before', 'execute.before', 'execute.after'])
+    // #then the guard's two hooks and both observer hooks reached the host's own hook function, the guard's first
+    expect(names).toEqual(['execute.before', 'execute.after', 'execute.before', 'execute.after'])
     expect(order).toContain('tools')
   })
 
@@ -338,7 +433,7 @@ describe('the lazy tracing entry', () => {
     await setup(host, {env: {[TRACING_LAUNCHER_ENV]: refused}, log: line => lines.push(line)})
 
     // #then
-    expect(order).toEqual(['hook:execute.before', 'tools'])
+    expect(order).toEqual(['hook:execute.before', 'hook:execute.after', 'tools'])
     expect(lines).toEqual(['tracing off (launcher-relay-invalid)'])
   })
 
@@ -369,7 +464,7 @@ describe('the lazy tracing entry', () => {
     ).resolves.toBeUndefined()
 
     // #then the guard and the tools are registered exactly as without tracing
-    expect(order).toEqual(['hook:execute.before', 'tools'])
+    expect(order).toEqual(['hook:execute.before', 'hook:execute.after', 'tools'])
     expect(added.map(tool => tool.name)).toEqual(Object.values(SESSION_TOOL_NAMES))
     await expect(Promise.resolve(before()?.({tool: 'subagent', input: {sessionID: 'ses_abc'}}))).rejects.toThrow(
       TASK_REUSE_REJECTION,
