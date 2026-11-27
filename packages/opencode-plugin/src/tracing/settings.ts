@@ -300,6 +300,27 @@ function resolveLauncher(raw: string): TracingSettings {
   return {mode: 'on', host: 'action', endpoint, identity, ...run}
 }
 
+/**
+ * Whether the launcher variable names the Action as the host that started this server. Strict and independent of tracing:
+ * only a present, size-capped, valid JSON object with `version` 1 and `host` `'action'` answers `'action'`. The tracing
+ * mode, relay and identity fields are not read, so an Action run with tracing off, or with a field the tracing decision
+ * would refuse, is still the Action. Anything else (no variable, a malformed or oversized one, an unknown version, the
+ * workspace or any other host) answers `undefined`. A user file and the headless markers never name the Action: only the
+ * Action's own launcher does. Pure and never throws; it logs nothing.
+ */
+export function readLauncherHost(env: Readonly<Record<string, string | undefined>>): 'action' | undefined {
+  const raw = env[TRACING_LAUNCHER_ENV]
+  if (raw === undefined || raw.length === 0 || raw.length > MAX_LAUNCHER_CHARS) return undefined
+  let document: unknown
+  try {
+    document = JSON.parse(raw)
+  } catch {
+    return undefined
+  }
+  if (!isRecord(document) || document.version !== TRACING_SETTINGS_VERSION) return undefined
+  return document.host === 'action' ? 'action' : undefined
+}
+
 /** Header names the exporter or the transport owns. A user file cannot set them. */
 const REFUSED_HEADER_NAMES: ReadonlySet<string> = new Set([
   'host',

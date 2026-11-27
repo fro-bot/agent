@@ -757,6 +757,42 @@ describe('runBootstrap isolate-agent preflight', () => {
     expect(options.opencodeDirectory).toBe(path.dirname(OPENCODE_BINARY))
   })
 
+  it('hands the lifecycle the OpenCode binary itself, for the guard in front of the agent’s opencode (#2369)', async () => {
+    // #given a setup that installed the binary at a tool-cache path
+    mocks.ensureOpenCodeAvailable.mockResolvedValue({
+      path: OPENCODE_BINARY,
+      version: '1.19.5',
+      didSetup: true,
+    })
+    mocks.createSandboxLifecycle.mockReturnValue({prepare: vi.fn(), release: vi.fn(), launch: vi.fn()})
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: true})})
+    mocks.runSandboxPreflight.mockResolvedValue({ok: true, tools})
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when bootstrap runs
+    await runBootstrap(createMockLogger())
+
+    // #then the lifecycle gets the executable setup resolved
+    const options = mocks.createSandboxLifecycle.mock.calls[0]?.[0] as {opencodeBinaryPath: string | null | undefined}
+    expect(options.opencodeBinaryPath).toBe(OPENCODE_BINARY)
+  })
+
+  it('hands the lifecycle no binary path when setup resolved a relative one', async () => {
+    // #given a resolved path that is not absolute
+    mocks.ensureOpenCodeAvailable.mockResolvedValue({path: 'opencode', version: '1.19.5', didSetup: false})
+    mocks.createSandboxLifecycle.mockReturnValue({prepare: vi.fn(), release: vi.fn(), launch: vi.fn()})
+    mocks.parseActionInputs.mockReturnValue({success: true, data: createActionInputs({isolateAgent: true})})
+    mocks.runSandboxPreflight.mockResolvedValue({ok: true, tools})
+    const {runBootstrap} = await import('./bootstrap.js')
+
+    // #when bootstrap runs
+    await runBootstrap(createMockLogger())
+
+    // #then no guard can be made from it, and the lifecycle is told so
+    const options = mocks.createSandboxLifecycle.mock.calls[0]?.[0] as {opencodeBinaryPath: string | null | undefined}
+    expect(options.opencodeBinaryPath).toBeNull()
+  })
+
   it('hands the lifecycle an undefined PATH when the runner had none, not the one setup made', async () => {
     // #given no PATH, and a setup that creates one
     vi.stubEnv('PATH', undefined)

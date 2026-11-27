@@ -153,6 +153,7 @@ inputs:
     description: >-
       JSON object to merge into the OpenCode config (OPENCODE_CONFIG_CONTENT).
       Values are merged on top of the autoupdate:false baseline; user values win on conflicts.
+      The agent can read every value here, so put no credential in it.
     required: false
   systematic-config:
     description: Custom Systematic plugin configuration JSON (deep-merged with existing config).

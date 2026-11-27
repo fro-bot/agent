@@ -582,6 +582,11 @@ export async function startActionOpenCodeV2(
     expectedPluginIds: [SYSTEMATIC_V2_PLUGIN_ID, FRO_BOT_PLUGIN_ID],
     config: builtUntraced.content,
     env: childEnv,
+    // Where the guard for the agent's `opencode` command goes when the spawn makes it (no sandbox; #2369): the runner's temp
+    // directory, which the runner removes with the job. Unset: the spawn's default.
+    ...(options.env.RUNNER_TEMP === undefined || options.env.RUNNER_TEMP === ''
+      ? {}
+      : {cliShimParentDirectory: options.env.RUNNER_TEMP}),
     ...(extra.sandbox === undefined ? {} : {sandbox: extra.sandbox}),
     ...(extra.signal === undefined ? {} : {signal: extra.signal}),
     ...(extra.onSpawn === undefined ? {} : {onSpawn: extra.onSpawn}),

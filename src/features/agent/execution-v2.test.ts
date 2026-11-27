@@ -4,6 +4,7 @@
  * deadline interrupt. The V1 counterparts live in `execution.test.ts` and `execution.stream-connect.test.ts`.
  */
 import type {OpenCodeV2ServerHandle} from '@fro-bot/runtime'
+import type {LifecycleSpan} from '../../shared/lifecycle-tracer.js'
 import type {Logger} from '../../shared/logger.js'
 import type {PromptOptions} from './types.js'
 import {createOwnershipLedger} from '@fro-bot/runtime'
@@ -929,6 +930,62 @@ describe('executeOpenCodeV2', () => {
       expect(outcome.error).toContain('timed out')
       expect(server.calls.interrupt).toHaveBeenCalledTimes(1)
       expect(server.calls.interrupt).toHaveBeenCalledWith(expect.objectContaining({sessionId: ROOT_SESSION_ID}))
+    })
+
+    it('adds what the root was doing to the execution span, once, in the same tick as the timeout line', async () => {
+      // #given a turn that starts, begins a compaction, and never ends, and a span to trace it on
+      const server = createFakeServer({
+        onPrompt: (_, pipe) => {
+          pipe.push(STARTED)
+          pipe.push(frame('session.compaction.started', {sessionID: ROOT_SESSION_ID, reason: 'auto'}))
+        },
+      })
+      const addEvent = vi.fn()
+
+      // #when
+      const result = executeOpenCodeV2(
+        promptOptions(),
+        logger,
+        {agent: null, model: null, timeoutMs: 3_000},
+        handle(),
+        undefined,
+        server.client,
+        {addEvent} as unknown as LifecycleSpan,
+      )
+      await advance(8_000)
+      await result
+
+      // #then
+      expect(addEvent).toHaveBeenCalledTimes(1)
+      expect(addEvent).toHaveBeenCalledWith(
+        'deadline.diagnostics',
+        expect.objectContaining({
+          'fro_bot.compaction': 'started-not-ended',
+          'fro_bot.waiting_on': 'execution-not-ended',
+        }),
+      )
+    })
+
+    it('reports the same without a span: the line is logged and nothing else is needed', async () => {
+      // #given a turn that never ends, and no span (an untraced run, or a caller that passes none)
+      const server = createFakeServer({onPrompt: (_, pipe) => pipe.push(STARTED)})
+
+      // #when
+      const result = executeOpenCodeV2(
+        promptOptions(),
+        logger,
+        {agent: null, model: null, timeoutMs: 3_000},
+        handle(),
+        undefined,
+        server.client,
+      )
+      await advance(8_000)
+      await result
+
+      // #then
+      expect(vi.mocked(logger.warning).mock.calls.filter(([m]) => m === 'Execution deadline diagnostics')).toHaveLength(
+        1,
+      )
     })
 
     it('does not interrupt for a failure that was not the deadline', async () => {

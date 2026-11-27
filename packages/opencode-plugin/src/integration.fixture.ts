@@ -37,6 +37,11 @@ export interface FakeStep {
   readonly status?: number
   /** Wait this long before answering, so a test can act while the request is in flight. */
   readonly delayMs?: number
+  /**
+   * Wait for this to settle before answering, so a test can hold a reply until it has scripted what follows. A rejection
+   * answers with a 500 that carries its message: a test that never releases the gate fails visibly, not by timing.
+   */
+  readonly gate?: Promise<void>
   /** After the text, stall this long before finishing the stream (cut short when the client goes away). */
   readonly hangMs?: number
   /** Write the text, then drop the connection mid-stream (a failure AFTER output started). */
@@ -126,6 +131,17 @@ export async function startFakeProvider(
       const step: FakeStep = index === -1 ? {text: 'ok'} : (queue.splice(index, 1)[0] ?? {text: 'ok'})
 
       if (step.delayMs != null) await sleep(step.delayMs)
+      if (step.gate != null) {
+        const refusal = await step.gate.then(
+          () => null,
+          (error: unknown) => (error instanceof Error ? error.message : String(error)),
+        )
+        if (refusal != null) {
+          res.writeHead(500, {'content-type': 'application/json'})
+          res.end(JSON.stringify({error: {message: `gate not released: ${refusal}`, type: 'server_error'}}))
+          return
+        }
+      }
       if (step.status != null && step.status !== 200) {
         res.writeHead(step.status, {'content-type': 'application/json'})
         res.end(JSON.stringify({error: {message: `scripted ${step.status}`, type: 'server_error'}}))

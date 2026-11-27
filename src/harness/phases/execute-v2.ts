@@ -1,6 +1,7 @@
 import type {OwnershipLedger, SessionSearchResult} from '@fro-bot/runtime'
 import type {AgentResultV2} from '../../features/agent/live-observation-v2.js'
 import type {ExecutionConfig, PromptOptions} from '../../features/agent/types.js'
+import type {LifecycleSpan} from '../../shared/lifecycle-tracer.js'
 import type {Logger} from '../../shared/logger.js'
 import type {CacheRestorePhaseResult} from './cache-restore.js'
 import {searchSessionsV2} from '@fro-bot/runtime/session-v2'
@@ -58,7 +59,10 @@ export interface ExecutionBackend {
 /** The longest the overflow archive may take. It is best-effort: a session left unarchived is re-continued next run. */
 export const ARCHIVE_TIMEOUT_MS = 10_000
 
-export function createExecutionBackendV2(cacheRestore: CacheRestorePhaseResult): ExecutionBackend {
+export function createExecutionBackendV2(
+  cacheRestore: CacheRestorePhaseResult,
+  traceSpan?: LifecycleSpan,
+): ExecutionBackend {
   const {serverHandle} = cacheRestore
   const client = createActionClientV2(serverHandle)
   const runStartedAt = Date.now()
@@ -66,7 +70,7 @@ export function createExecutionBackendV2(cacheRestore: CacheRestorePhaseResult):
 
   return {
     execute: async (promptOptions, logger, config, ledger) =>
-      executeOpenCodeV2(promptOptions, logger, config, serverHandle, ledger, client),
+      executeOpenCodeV2(promptOptions, logger, config, serverHandle, ledger, client, traceSpan),
 
     // Before the overflowed session is archived and its replacement starts, stop what it left running: its children,
     // and the shells its sessions started. The recovery session shares the directory, so a child still writing would

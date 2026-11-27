@@ -271,6 +271,9 @@ jobs:
           auth-json: ${{ secrets.OPENCODE_AUTH_JSON }}
           github-token: ${{ secrets.FRO_BOT_PAT }}
           model: ${{ vars.FRO_BOT_MODEL }}
+          # A merge-queue run has no pull_request payload to prove the head is this repository, so it runs untraced.
+          trace-endpoint: ${{ github.event_name != 'merge_group' && 'https://traces.fro.bot/fro-bot/v1/traces' || '' }}
+          trace-headers: "${{ github.event_name != 'merge_group' && format('Authorization: Bearer {0}', secrets.FRO_BOT_TRACE_TOKEN) || '' }}"
           opencode-config: ${{ secrets.OPENCODE_CONFIG }}
           prompt: ${{ env.PROMPT }}
           # 40 minutes, against this job's 50-minute cap. The action's deadline must expire

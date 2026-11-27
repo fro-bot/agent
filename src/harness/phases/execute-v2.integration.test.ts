@@ -37,17 +37,21 @@ import {createExecAdapter} from '../../services/setup/adapters.js'
 import {installPluginsV2, resolvePluginSpecsV2} from '../../services/setup/plugin-install-v2.js'
 import {createMockLogger, unwrapOk} from '../../shared/test-helpers.js'
 import {computeDrainDeadlineMs, runExecute} from './execute.js'
+import {findServicesOwnedByState, killOwnedServices} from './owned-service-processes.js'
 import {releaseOptionsFromExecution, runReleaseV2} from './release-v2.js'
 import {createSessionReaderV2, resolveSessionForLogicalKeyV2} from './session-v2.js'
 import {startActionOpenCodeV2} from './v2-server.js'
 
 const consoleMock = vi.hoisted(() => ({outputTextContent: vi.fn(), outputToolExecution: vi.fn()}))
 vi.mock('../../shared/console.js', () => consoleMock)
+// The Action's own logger writes warnings through `core.warning`: the deadline test reads them back from here.
+const coreWarning = vi.hoisted(() => vi.fn())
 vi.mock('@actions/core', async importOriginal => {
   const original = await importOriginal<typeof import('@actions/core')>()
   return {
     ...original,
     getInput: vi.fn(() => 'branch-pr'),
+    warning: coreWarning,
     saveState: vi.fn(),
     setOutput: vi.fn(),
     setSecret: vi.fn(),
@@ -134,7 +138,13 @@ interface Provider {
   readonly stop: () => Promise<void>
 }
 
-function sse(res: http.ServerResponse, delta: Record<string, unknown>, finish: string | null, usage = false): void {
+/** `usage` true reports a small fixed prompt; a number reports that many prompt tokens (it drives compaction). */
+function sse(
+  res: http.ServerResponse,
+  delta: Record<string, unknown>,
+  finish: string | null,
+  usage: boolean | number = false,
+): void {
   res.write(
     `data: ${JSON.stringify({
       id: 'c',
@@ -142,7 +152,15 @@ function sse(res: http.ServerResponse, delta: Record<string, unknown>, finish: s
       created: 1,
       model: 'fixture-model',
       choices: [{index: 0, delta, finish_reason: finish}],
-      ...(usage ? {usage: {prompt_tokens: 10, completion_tokens: 5, total_tokens: 15}} : {}),
+      ...(usage === false
+        ? {}
+        : {
+            usage: {
+              prompt_tokens: typeof usage === 'number' ? usage : 10,
+              completion_tokens: 5,
+              total_tokens: (typeof usage === 'number' ? usage : 10) + 5,
+            },
+          }),
     })}\n\n`,
   )
 }
@@ -215,7 +233,11 @@ async function startProvider(outsideFile: string): Promise<Provider> {
   }
 }
 
-function operatorConfig(baseURL: string, extra: Readonly<Record<string, unknown>> = {}): string {
+function operatorConfig(
+  baseURL: string,
+  extra: Readonly<Record<string, unknown>> = {},
+  contextLimit = 100_000,
+): string {
   return JSON.stringify({
     share: 'disabled',
     ...extra,
@@ -224,7 +246,7 @@ function operatorConfig(baseURL: string, extra: Readonly<Record<string, unknown>
         npm: '@ai-sdk/openai-compatible',
         name: 'Fake',
         options: {baseURL},
-        models: {'fixture-model': {name: 'Fixture', tool_call: true, limit: {context: 100_000, output: 8000}}},
+        models: {'fixture-model': {name: 'Fixture', tool_call: true, limit: {context: contextLimit, output: 8000}}},
       },
     },
   })
@@ -246,7 +268,16 @@ type ScriptStep = {readonly tool: string; readonly args: Record<string, unknown>
  * A scripted model for the release tests. Tool-offering requests walk `script` in order (past its end they answer
  * `fallback`); a request with no tools (the title) gets a short text. Every request body is kept.
  */
-async function startScriptedProvider(script: readonly ScriptStep[], fallback = 'ok'): Promise<Provider> {
+async function startScriptedProvider(
+  script: readonly ScriptStep[],
+  fallback = 'ok',
+  options: {
+    /** The prompt tokens each tool-offering step reports, in order (what makes a long context due for compaction). */
+    readonly promptTokens?: readonly number[]
+    /** A compaction summary request is answered with headers and then nothing: the stall of fro-bot/agent#2376. */
+    readonly holdSummary?: boolean
+  } = {},
+): Promise<Provider> {
   const requests: ModelRequest[] = []
   let toolTurn = 0
   const server = http.createServer((req, res) => {
@@ -265,8 +296,10 @@ async function startScriptedProvider(script: readonly ScriptStep[], fallback = '
       requests.push({hasTools, toolNames, raw})
       res.writeHead(200, {'content-type': 'text/event-stream', 'cache-control': 'no-cache'})
       sse(res, {role: 'assistant', content: ''}, null)
+      if (options.holdSummary === true && raw.includes('You MUST use this format')) return
       if (hasTools) {
         const step = script[toolTurn] ?? {text: fallback}
+        const reported = options.promptTokens?.[toolTurn] ?? true
         toolTurn += 1
         if ('tool' in step) {
           const call = {
@@ -276,10 +309,10 @@ async function startScriptedProvider(script: readonly ScriptStep[], fallback = '
             function: {name: step.tool, arguments: JSON.stringify(step.args)},
           }
           sse(res, {tool_calls: [call]}, null)
-          sse(res, {}, 'tool_calls', true)
+          sse(res, {}, 'tool_calls', reported)
         } else {
           sse(res, {content: step.text}, null)
-          sse(res, {}, 'stop', true)
+          sse(res, {}, 'stop', reported)
         }
       } else {
         sse(res, {content: 'Fixture title'}, null)
@@ -305,7 +338,11 @@ async function startRealServer(
   box: Sandbox,
   provider: Provider,
   extraPermissions: readonly {action: string; resource: string; effect: 'allow' | 'ask' | 'deny'}[] = [],
-  caller: {readonly extra?: Readonly<Record<string, unknown>>; readonly credential?: CredentialDisposition} = {},
+  caller: {
+    readonly extra?: Readonly<Record<string, unknown>>
+    readonly credential?: CredentialDisposition
+    readonly contextLimit?: number
+  } = {},
 ): Promise<OpenCodeV2ServerHandle> {
   process.env.RUNNER_TEMP = box.env.RUNNER_TEMP
   process.env.GITHUB_WORKSPACE = box.repo
@@ -326,7 +363,7 @@ async function startRealServer(
     binaryPath: BINARY as string,
     workspacePath: box.repo,
     authJson: JSON.stringify({fake: {type: 'api', key: CANARY}}),
-    opencodeConfig: operatorConfig(provider.baseURL, caller.extra),
+    opencodeConfig: operatorConfig(provider.baseURL, caller.extra, caller.contextLimit),
     credential: caller.credential ?? 'provision',
     systematicVersion: 'latest',
     model: MODEL,
@@ -462,6 +499,32 @@ function processRunning(needle: string): boolean {
   } catch {
     return false
   }
+}
+
+/**
+ * The CLI's managed-server registrations: `service.json` (or `service-<channel>.json`) directly in `<state>/opencode`
+ * (`packages/cli/src/services/service-config.ts`). The server's own `pty/<id>/service.json` files are not registrations.
+ */
+function serviceRegistrations(stateHome: string): readonly string[] {
+  try {
+    return execFileSync('find', [path.join(stateHome, 'opencode'), '-maxdepth', '1', '-name', 'service*.json'], {
+      encoding: 'utf8',
+    })
+      .split('\n')
+      .filter(line => line.length > 0)
+  } catch {
+    return []
+  }
+}
+
+/** What the agent's shell tool printed, as the model saw it: every tool result in the last request, joined. */
+function toolOutput(provider: Provider): string {
+  const raw = provider.requests.at(-1)?.raw ?? '{}'
+  const body = JSON.parse(raw) as {messages?: {role?: string; content?: unknown}[]}
+  return (body.messages ?? [])
+    .filter(message => message.role === 'tool')
+    .map(message => (typeof message.content === 'string' ? message.content : JSON.stringify(message.content)))
+    .join('\n')
 }
 
 function sessionClaims(dbPath: string): readonly {id: string; suspended: number | null}[] {
@@ -1254,4 +1317,122 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
     // #and no session is left claiming an execution the next run would resume
     expect(sessionClaims(box.dbPath).every(row => row.suspended === null)).toBe(true)
   }, 300_000)
+
+  it('names a compaction that started and never ended when the deadline lands on a root held by it (fro-bot/agent#2376)', async () => {
+    // #given the repro of #2376 (`s5-stall`): a 40k window, prompts that grow past it, a background shell whose exit
+    // notice wakes the root onto a context that is due for compaction, and a summary request that never answers
+    const box = createSandbox()
+    sandboxes.push(box)
+    const provider = await startScriptedProvider(
+      [
+        {tool: 'shell', args: {command: 'sleep 4', background: true}},
+        {tool: 'shell', args: {command: 'echo filler-2'}},
+        {tool: 'shell', args: {command: 'echo filler-3'}},
+        {text: 'FINAL: all done.'},
+      ],
+      'ack',
+      {promptTokens: [8_000, 22_000, 22_500, 26_000], holdSummary: true},
+    )
+    providers.push(provider)
+    const real = await startRealServer(box, provider, [], {contextLimit: 40_000})
+    coreWarning.mockClear()
+    const startedAt = Date.now()
+
+    // #when the execute phase runs into its deadline
+    const result = await executePhase(real, box, 20_000)
+    const release = await runReleaseV2({
+      serverHandle: real,
+      executionSucceeded: result.success,
+      rootSessionId: result.sessionId,
+      ledger: result.ownershipLedger,
+      liveObservation: result.liveObservation,
+      runStartedAt: startedAt,
+      deadlineMs: 0,
+      sessionRetention: 50,
+      logger: createMockLogger(),
+    })
+
+    // #then the run timed out, and one structured line says the root was held by a compaction that never ended
+    expect(result).toMatchObject({success: false, exitCode: 130})
+    const logged = coreWarning.mock.calls.map(([line]) => JSON.parse(String(line)) as Record<string, unknown>)
+    const timeoutIndex = logged.findIndex(entry => entry.message === 'Execution timeout reached')
+    expect(timeoutIndex).toBeGreaterThanOrEqual(0)
+    const diagnostics = logged.filter(entry => entry.message === 'Execution deadline diagnostics')
+    expect(diagnostics).toHaveLength(1)
+    expect(logged.indexOf(diagnostics[0] as Record<string, unknown>)).toBe(timeoutIndex + 1)
+    expect(diagnostics[0]?.waitingOn).toContain('execution-not-ended')
+    expect(diagnostics[0]).toMatchObject({
+      compaction: {state: 'started-not-ended', open: [{role: 'root', reason: 'auto'}]},
+    })
+    // Heartbeats follow it (the stream was alive and said nothing more): the last event of substance is the compaction.
+    const events = (diagnostics[0]?.recentEvents as {type: string}[])
+      .map(event => event.type)
+      .filter(type => type !== 'server.heartbeat')
+    expect(events.at(-1)).toBe('session.compaction.started')
+    expect(events).toContain('session.execution.started')
+    // #and it carries no model text
+    expect(JSON.stringify(diagnostics)).not.toContain('FINAL: all done.')
+    expect(release.drain.expired).toBe(false)
+  }, 300_000)
+
+  describe("the agent's opencode CLI cannot start or reach a server (#2369)", () => {
+    const REFUSAL =
+      "opencode: this run's OpenCode server is managed by Fro Bot; the CLI cannot start or reach a server here"
+
+    it('refuses `opencode api get`, starts no second server and writes no service.json, and still prints --version', async () => {
+      // #given the real OpenCode directory on the job PATH, and a model whose shell runs the CLI the way the agent did in
+      // run 45877265561
+      const box = createSandbox()
+      sandboxes.push(box)
+      box.env.PATH = `${path.dirname(BINARY as string)}:${process.env.PATH ?? ''}`
+      const provider = await startScriptedProvider([
+        {tool: 'shell', args: {command: 'opencode api get /global/health; echo "API_EXIT=$?"'}},
+        {tool: 'shell', args: {command: 'opencode --version; echo "VERSION_EXIT=$?"'}},
+        {tool: 'shell', args: {command: 'opencode serve --service; echo "SERVE_EXIT=$?"'}},
+        {tool: 'shell', args: {command: 'command -v opencode; echo "WHICH_EXIT=$?"'}},
+        {text: 'Done.'},
+      ])
+      providers.push(provider)
+      const real = await startRealServer(box, provider)
+
+      // #when the execute phase runs those commands
+      const result = await executePhase(real, box, 120_000)
+
+      // #then no second server exists: no `serve --service` process that provably belongs to this run (its environment
+      // names this test's own state directory). Other services on the host are not this test's: they are neither looked at
+      // nor signalled. Checked first, and any process found is this run's own autostart, so it is stopped before anything
+      // else can fail the test and leave it running.
+      const owned = findServicesOwnedByState(box.env.XDG_STATE_HOME as string)
+      killOwnedServices(owned)
+      expect(owned).toEqual([])
+
+      // #and every command ran and the run succeeded
+      expect(result).toMatchObject({success: true, exitCode: 0})
+      const output = toolOutput(provider)
+
+      // #and the API call is refused with exit 2 and the one-line message
+      expect(output).toContain('API_EXIT=2')
+      expect(output).toContain(REFUSAL)
+      expect(output).toContain('SERVE_EXIT=2')
+
+      // #and no managed-server registration was written under the agent's state
+      expect(serviceRegistrations(box.env.XDG_STATE_HOME as string)).toEqual([])
+
+      // #and the version check the ce:connect skill makes still prints the pinned version, from the real binary
+      expect(output).toContain(`opencode v${pin.version}`)
+      expect(output).toContain('VERSION_EXIT=0')
+
+      // #and the shell resolves `opencode` to the guard, not to the real binary's directory
+      const resolved = /(\S*opencode)\nWHICH_EXIT=0/.exec(output)?.[1] ?? ''
+      expect(path.dirname(resolved).startsWith(box.env.RUNNER_TEMP as string)).toBe(true)
+      expect(path.basename(path.dirname(resolved)).startsWith('fro-bot-opencode-cli-')).toBe(true)
+      expect(resolved).not.toBe(BINARY)
+
+      // #and the guard goes with the server
+      const guardDirectory = path.dirname(resolved)
+      await real.shutdown()
+      await real.exited
+      expect(existsSync(guardDirectory)).toBe(false)
+    }, 300_000)
+  })
 })

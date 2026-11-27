@@ -203,6 +203,8 @@ export async function runBootstrap(
       runnerPath,
       // `opencodeResult.path` is the executable setup resolved; the agent's `PATH` wants its directory.
       path.isAbsolute(opencodeResult.path) ? path.dirname(opencodeResult.path) : null,
+      // And the executable itself, which the guard in front of the agent's `opencode` runs for `--version` (#2369).
+      path.isAbsolute(opencodeResult.path) ? opencodeResult.path : null,
       inputs.agentStateHome,
       bootstrapOptions.signalTrace,
     ),
@@ -215,6 +217,7 @@ function createRunSandbox(
   responseFilePath: string | null,
   runnerPath: string | undefined,
   opencodeDirectory: string | null,
+  opencodeBinaryPath: string | null,
   agentStateHome: string | null,
   signalTrace: SandboxSignalTrace | undefined,
 ): SandboxLifecycle | null {
@@ -225,6 +228,7 @@ function createRunSandbox(
     env: process.env,
     runnerPath,
     opencodeDirectory,
+    opencodeBinaryPath,
     workspacePath: getGitHubWorkspace(),
     agentStateHome,
     responseDir: responseFilePath === null ? null : path.dirname(responseFilePath),

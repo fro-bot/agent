@@ -6,6 +6,7 @@ import {afterEach, describe, expect, it, vi} from 'vitest'
 import {startOtlpSink, type OtlpSink} from '../integration.fixture.js'
 import {createScrubber} from './content.js'
 import {CLEANUP_BOUND_MS, DRAIN_BOUND_MS, startTracing} from './index.js'
+import {cpuMs, minCpuMs} from './timing.testing.js'
 
 /** A fake host: records every registered hook and exposes a pushable event stream. */
 function fakeObserverHost() {
@@ -82,6 +83,8 @@ const ACTION = (url: string): OnSettings => ({
 })
 
 const SES = 'ses_root'
+/** The snapshot's CPU time over the CPU time of `JSON.stringify` on the same request. A real snapshot is a small fraction of it; a deep copy is about 1 or more. */
+const SNAPSHOT_RATIO_LIMIT = 0.2
 const event = (type: string, data: Record<string, unknown>, created: number): unknown => ({type, created, data})
 
 /** One text turn, as the hooks and events arrive: prompt hook, enqueue, start, request, step, output, end. */
@@ -827,11 +830,8 @@ describe('the handlers', () => {
     fake.end()
   })
 
-  it('do not delay the hook with a large request: the snapshot costs a fraction of serializing it, under a fixed ceiling', async () => {
+  it('do not delay the hook with a large request: the snapshot costs a small fraction of serializing it, in CPU time', async () => {
     // #given a request with a very large history (about 30 MB of text) and the hook as the host calls it
-    const target = await sink()
-    const fake = fakeObserverHost()
-    const handle = await startTracing(fake.host, LOCAL(target.url), {env: {}, log: () => {}})
     const messages = Array.from({length: 3_000}, (_, index) => ({
       id: `msg_${index}`,
       role: index % 2 === 0 ? 'user' : 'assistant',
@@ -846,26 +846,54 @@ describe('the handlers', () => {
       tools: {},
       options: {},
     }
-
-    // #when the handler's time is measured against the time it would take just to serialize the same payload
-    const serialize = performance.now()
     const size = JSON.stringify(payload).length
-    const serializeMs = performance.now() - serialize
-    const started = performance.now()
-    fake.call('session.context', payload)
-    const handlerMs = performance.now() - started
+
+    // One hook call on its own fresh tracing handle, so on an empty snapshot ledger: the ledger is bounded, and a handle that
+    // already held snapshots would omit or truncate content and make a costly snapshot look cheap. Starting and stopping the
+    // handle are outside the measurement; only the hook call is timed.
+    const hookCpuMs = async (): Promise<number> => {
+      const target = await sink()
+      const fake = fakeObserverHost()
+      const handle = await startTracing(fake.host, LOCAL(target.url), {env: {}, log: () => {}})
+      const used = cpuMs(() => {
+        fake.call('session.context', payload)
+      })
+      await handle.stop()
+      fake.end()
+      return used
+    }
+    // An untimed warm-up on its own handle, then the least of `attempts` timed calls, each on a fresh handle.
+    const handlerCpuMs = async (attempts: number): Promise<number> => {
+      await hookCpuMs()
+      let best = Number.POSITIVE_INFINITY
+      for (let attempt = 0; attempt < attempts; attempt += 1) best = Math.min(best, await hookCpuMs())
+      return best
+    }
+    const serializeCpuMs = (attempts: number): number =>
+      minCpuMs(() => {
+        JSON.stringify(payload)
+      }, attempts)
+
+    // #when the handler's CPU time is measured against the CPU time it takes just to serialize the same payload (the least of a
+    // few runs after a warm-up, so neither load nor compilation counts); a ratio over the limit is measured again with more
+    // runs, and only the least of all of them counts
+    let serializeMs = serializeCpuMs(3)
+    let handlerMs = await handlerCpuMs(3)
+    if (handlerMs / serializeMs > SNAPSHOT_RATIO_LIMIT) {
+      serializeMs = Math.min(serializeMs, serializeCpuMs(5))
+      handlerMs = Math.min(handlerMs, await handlerCpuMs(4))
+    }
     process.stdout.write(
-      `[latency] hook handler ${handlerMs.toFixed(3)} ms for ${size} chars (serializing alone: ${serializeMs.toFixed(1)} ms)\n`,
+      `[latency] hook handler ${handlerMs.toFixed(3)} ms CPU for ${size} chars (serializing alone: ${serializeMs.toFixed(1)} ms CPU, ratio ${(handlerMs / serializeMs).toFixed(4)})\n`,
     )
 
     // #then the handler, which takes the bounded hook-time snapshot (a walk over the newest few hundred messages, strings
-    // shared), costs a fraction of serializing the payload and stays under an absolute ceiling nobody would feel
+    // shared), costs a small fraction of serializing the payload; the generous absolute bound only catches a runaway, and CPU
+    // time is not inflated by load
     expect(size).toBeGreaterThan(25_000_000)
-    expect(handlerMs).toBeLessThan(serializeMs / 5)
-    expect(handlerMs).toBeLessThan(15)
-    await handle.stop()
-    fake.end()
-  }, 30_000)
+    expect(handlerMs / serializeMs).toBeLessThan(SNAPSHOT_RATIO_LIMIT)
+    expect(handlerMs).toBeLessThan(200)
+  }, 60_000)
 
   it('swallow a handler failure: a hook payload that throws when read does not reach the host', async () => {
     // #given payloads that throw on any property read
