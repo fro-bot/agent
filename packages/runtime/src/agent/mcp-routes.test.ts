@@ -2,15 +2,7 @@ import type {IncomingHttpHeaders} from 'node:http'
 import type {KeyProxyMcpRouteConfig} from './key-proxy-wire.js'
 import {describe, expect, it} from 'vitest'
 
-import {
-  buildMcpRequestHeaders,
-  buildMcpRoutes,
-  matchMcpRoute,
-  MCP_SESSION_EXPIRED_BODY,
-  MCP_SESSION_EXPIRED_TEXT,
-  sanitizeRetryAfter,
-} from './mcp-routes.js'
-import {MCP_SESSION_EXPIRED_SENTINEL} from './mcp-wire.fixtures.js'
+import {buildMcpRequestHeaders, buildMcpRoutes, matchMcpRoute, sanitizeRetryAfter} from './mcp-routes.js'
 
 const TOKEN = 'Bearer mcp-routes-CANARY-0001'
 
@@ -41,6 +33,7 @@ describe('buildMcpRoutes', () => {
       path: '/mcp',
       headers: {authorization: TOKEN},
     })
+    expect(routes.get('s1')?.secrets).toEqual([TOKEN, 'mcp-routes-CANARY-0001'])
     expect(routes.get('s2')?.path).toBe('/other/')
     expect(routes.get('s2')?.headers).toEqual({'x-api-key': 'k-12345678', accept: 'text/plain'})
   })
@@ -275,17 +268,5 @@ describe('sanitizeRetryAfter', () => {
     [undefined, undefined],
   ])('drops %s', (_name, value) => {
     expect(sanitizeRetryAfter(value)).toBeUndefined()
-  })
-})
-
-describe('the session-expired reply', () => {
-  it('holds the exact text the pinned OpenCode client looks for, in a JSON-RPC error shape', () => {
-    expect(MCP_SESSION_EXPIRED_TEXT).toBe(MCP_SESSION_EXPIRED_SENTINEL)
-    expect(MCP_SESSION_EXPIRED_BODY).toContain(MCP_SESSION_EXPIRED_SENTINEL)
-    expect(JSON.parse(MCP_SESSION_EXPIRED_BODY)).toEqual({
-      jsonrpc: '2.0',
-      id: null,
-      error: {code: -32_000, message: MCP_SESSION_EXPIRED_SENTINEL},
-    })
   })
 })

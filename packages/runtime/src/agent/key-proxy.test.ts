@@ -13,7 +13,6 @@ import {afterEach, describe, expect, it, vi} from 'vitest'
 import {buildKeyProxyUpstream} from './key-proxy-routes.js'
 import {startTlsUpstream} from './key-proxy-test-kit.js'
 import {startKeyProxy} from './key-proxy.js'
-import {MCP_SESSION_EXPIRED_BODY} from './mcp-routes.js'
 import {
   MCP_2025_STATEFUL_EXCHANGES,
   MCP_2026_STATELESS_EXCHANGES,
@@ -773,6 +772,31 @@ describe('key proxy: redirects and error bodies', () => {
     })
   })
 
+  it('keeps Retry-After and Retry-After-Ms of an error exactly as the upstream sent them, forwarded or replaced', async () => {
+    // #given an upstream that rate limits, once with a small body and once with one over the bound
+    const date = 'Wed, 21 Oct 2026 07:28:00 GMT'
+    let calls = 0
+    const h = await setup(
+      (_request, res) => {
+        calls += 1
+        res.writeHead(429, {'retry-after': date, 'retry-after-ms': '1500', 'content-type': 'application/json'})
+        res.end(calls === 1 ? '{}' : 'x'.repeat(400))
+      },
+      {limits: {maxErrorBodyBytes: 64}},
+    )
+
+    // #when both are answered
+    const forwarded = await h.send('/openai/chat/completions', {body: '{}'})
+    const replaced = await h.send('/openai/chat/completions', {body: '{}'})
+
+    // #then both hints reach the client in each case
+    for (const reply of [forwarded, replaced]) {
+      expect(reply.status).toBe(429)
+      expect(reply.headers['retry-after']).toBe(date)
+      expect(reply.headers['retry-after-ms']).toBe('1500')
+    }
+  })
+
   it('refuses an upstream whose certificate it does not trust', async () => {
     // #given an upstream with a self-signed certificate that is not in the proxy's trust
     const h = await setup(okJson, {untrusted: true})
@@ -1375,8 +1399,12 @@ describe('key proxy: MCP routes, replaying what OpenCode 2.4.2 sent', () => {
     })
 
     // #then each reply keeps the upstream's status and, on a success, its body, type and session id
-    const recordedReply = (status: number, body: string, type?: unknown, session?: unknown) =>
-      status < 300 ? {status, body, type, session} : {status}
+    const recordedReply = (status: number, body: string, type?: unknown, session?: unknown) => ({
+      status,
+      body,
+      type,
+      session,
+    })
     expect(
       replies.map(reply =>
         recordedReply(
@@ -1410,25 +1438,20 @@ describe('key proxy: MCP routes, replaying what OpenCode 2.4.2 sent', () => {
     expect(replies[index]?.body.toString()).toBe(MCP_2026_STATELESS_EXCHANGES[index]?.response.body)
   })
 
-  it('answers the recorded session-bearing 400 with the fixed session-expired body, and the probe 400 with a generic one', async () => {
+  it('relays the recorded 400s intact: the probe answer and the session-expired reply', async () => {
     const {replies} = await replayRecording(MCP_2025_STATEFUL_EXCHANGES)
 
-    // #given the two recorded 400s: the first probe has no session, the expired call has one
-    const expired = MCP_2025_STATEFUL_EXCHANGES.findIndex(
-      e => e.response.status === 400 && e.request.headers['mcp-session-id'] !== undefined,
-    )
-    const probe = MCP_2025_STATEFUL_EXCHANGES.findIndex(
-      e => e.response.status === 400 && e.request.headers['mcp-session-id'] === undefined,
+    // #given the 400s recorded against the pinned binary: the probe has no session, the expired call has one
+    const failures = MCP_2025_STATEFUL_EXCHANGES.flatMap((exchange, index) =>
+      exchange.response.status >= 400 ? [{exchange, reply: replies[index]}] : [],
     )
 
-    // #then the expired call carries the text OpenCode looks for, and the probe's own body is gone
-    expect(MCP_2025_STATEFUL_EXCHANGES[expired]?.response.body).toContain(MCP_SESSION_EXPIRED_SENTINEL)
-    expect(replies[expired]?.body.toString()).toBe(MCP_SESSION_EXPIRED_BODY)
-    expect(replies[expired]?.body.toString()).toContain(MCP_SESSION_EXPIRED_SENTINEL)
-    expect(replies[probe]?.body.toString()).not.toContain('Session-Id')
-    expect(JSON.parse(replies[probe]?.body.toString() ?? '{}')).toEqual({
-      error: {type: 'proxy_error', message: 'The upstream returned an error.'},
-    })
+    // #then the client gets each status and body as the upstream sent them, and one holds the text OpenCode reconnects on
+    expect(failures.map(({reply}) => [reply?.status, reply?.body.toString()])).toEqual(
+      failures.map(({exchange}) => [exchange.response.status, exchange.response.body]),
+    )
+    expect(failures.length).toBeGreaterThanOrEqual(2)
+    expect(failures.some(({reply}) => reply?.body.toString().includes(MCP_SESSION_EXPIRED_SENTINEL))).toBe(true)
   })
 })
 
@@ -1605,8 +1628,8 @@ describe('key proxy: MCP routes, response side', () => {
     expect((await sendMcp(h, {body: '{}'})).status).toBe(200)
   })
 
-  it('keeps the status of an upstream 401, drops the challenge and replaces a body that holds the credential', async () => {
-    // #given an upstream that rejects the credential and echoes it, with a challenge and a delay
+  it('keeps the status of an upstream 401, drops the challenge and cookie, and redacts the credential from its body', async () => {
+    // #given an upstream that rejects the credential, echoes it, and adds a challenge, a cookie and a delay
     const h = await setupMcp((request, res) => {
       res.writeHead(401, {
         'content-type': 'application/json',
@@ -1615,23 +1638,20 @@ describe('key proxy: MCP routes, response side', () => {
         'set-cookie': 'sid=upstream',
         'x-leak': 'upstream-detail',
       })
-      res.end(JSON.stringify({error: 'bad token', echoed: request.headers.authorization}))
+      res.end(JSON.stringify({error: 'bad token', echoed: request.headers.authorization, detail: 'keep me'}))
     })
 
     // #when the route is called
     const reply = await sendMcp(h, {body: '{}'})
 
-    // #then the status stays, the challenge and cookie are gone, the delay is kept, and the body is fixed text
+    // #then the status, type and delay stay, the challenge and cookie are gone, and only the credential is replaced
     expect(reply.status).toBe(401)
+    expect(reply.headers['content-type']).toBe('application/json')
     expect(reply.headers['www-authenticate']).toBeUndefined()
     expect(reply.headers['set-cookie']).toBeUndefined()
     expect(reply.headers['x-leak']).toBeUndefined()
     expect(reply.headers['retry-after']).toBe('30')
-    expect(reply.body.toString()).not.toContain('mcp-CANARY')
-    expect(reply.body.toString()).not.toContain('bad token')
-    expect(JSON.parse(reply.body.toString())).toEqual({
-      error: {type: 'proxy_error', message: 'The upstream returned an error.'},
-    })
+    expect(JSON.parse(reply.body.toString())).toEqual({error: 'bad token', echoed: '[REDACTED]', detail: 'keep me'})
   })
 
   it.each([
@@ -1648,121 +1668,164 @@ describe('key proxy: MCP routes, response side', () => {
     expect(reply.headers['retry-after']).toBeUndefined()
   })
 
-  it.each([404, 405, 429, 500, 502, 503])('keeps an upstream %i and replaces its body', async status => {
-    const h = await setupMcp((_request, res) => {
-      res.writeHead(status, {'content-type': 'text/plain'})
-      res.end(`detail ${MCP_TOKEN}`)
-    })
-    const reply = await sendMcp(h, {body: '{}'})
-    expect(reply.status).toBe(status)
-    expect(reply.body.toString()).not.toContain('detail')
-    expect(reply.body.toString()).not.toContain(MCP_TOKEN)
-  })
-
-  describe('a session that the upstream no longer knows', () => {
-    const lost = (status: number, body: string, headers: Record<string, string> = {}): UpstreamHandler => {
-      return (_request, res) => {
+  describe('error bodies', () => {
+    const failing =
+      (status: number, body: string, headers: Record<string, string> = {}): UpstreamHandler =>
+      (_request, res) => {
         res.writeHead(status, {'content-type': 'application/json', ...headers})
         res.end(body)
       }
-    }
+
+    it.each([404, 405, 429, 500, 502, 503])('passes an upstream %i body through with its type', async status => {
+      const h = await setupMcp(failing(status, 'plain detail', {'content-type': 'text/plain'}))
+      const reply = await sendMcp(h, {body: '{}'})
+      expect(reply.status).toBe(status)
+      expect(reply.headers['content-type']).toBe('text/plain')
+      expect(reply.body.toString()).toBe('plain detail')
+    })
 
     it.each([
-      ['the wording the TypeScript SDK server uses', 'Bad Request: Server not initialized'],
       [
-        'a JSON-RPC error that carries the text',
-        '{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"Server not initialized"}}',
+        'a modern HeaderMismatch 400',
+        400,
+        '{"jsonrpc":"2.0","id":1,"error":{"code":-32020,"message":"Header mismatch: Mcp-Name header value \'foo\' does not match body value \'bar\'"}}',
       ],
-      ['the text with the credential echoed beside it', `Server not initialized (${MCP_TOKEN})`],
-    ])(
-      'answers a session-bearing 400 that says so (%s) with the fixed body OpenCode reconnects on',
-      async (_name, body) => {
-        // #given an upstream that has lost the session
-        const h = await setupMcp(lost(400, body))
-
-        // #when the client calls with its session id
-        const reply = await sendMcp(h, {body: '{}', headers: {'mcp-session-id': MCP_SESSION}})
-
-        // #then the status is kept and the body is the fixed text, with nothing of the upstream's own in it
-        expect(reply.status).toBe(400)
-        expect(reply.body.toString()).toBe(MCP_SESSION_EXPIRED_BODY)
-        expect(reply.body.toString()).toContain(MCP_SESSION_EXPIRED_SENTINEL)
-        expect(reply.body.toString()).not.toContain(MCP_TOKEN)
-      },
-    )
-
-    it('does not use the fixed body for a 400 that carried no session id', async () => {
-      const h = await setupMcp(lost(400, 'Bad Request: Server not initialized'))
-      const reply = await sendMcp(h, {body: '{}'})
-      expect(reply.status).toBe(400)
-      expect(reply.body.toString()).not.toContain(MCP_SESSION_EXPIRED_SENTINEL)
+      [
+        'a modern UnsupportedProtocolVersion 400',
+        400,
+        '{"jsonrpc":"2.0","id":"server-discover-probe-1","error":{"code":-32022,"message":"Unsupported protocol version","data":{"supported":["2026-07-28"]}}}',
+      ],
+      [
+        'a modern method-not-found 404',
+        404,
+        '{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}',
+      ],
+    ])('lets the client read %s, so it does not misread a modern server as an old one', async (_name, status, body) => {
+      const h = await setupMcp(failing(status, body))
+      const reply = await sendMcp(h, {body: '{}', headers: {'mcp-protocol-version': '2026-07-28'}})
+      expect(reply.status).toBe(status)
+      expect(reply.headers['content-type']).toBe('application/json')
+      expect(reply.body.toString()).toBe(body)
     })
 
-    it('does not use the fixed body for a session-bearing 400 that says something else', async () => {
-      const h = await setupMcp(lost(400, 'Bad Request: Invalid params'))
-      const reply = await sendMcp(h, {body: '{}', headers: {'mcp-session-id': MCP_SESSION}})
-      expect(reply.status).toBe(400)
-      expect(reply.body.toString()).not.toContain(MCP_SESSION_EXPIRED_SENTINEL)
-      expect(reply.body.toString()).not.toContain('Invalid params')
-    })
-
-    it.each([401, 403, 404, 409, 500])(
-      'does not use the fixed body for a %i, which the client reads by status',
-      async status => {
-        const h = await setupMcp(lost(status, 'Bad Request: Server not initialized'))
-        const reply = await sendMcp(h, {body: '{}', headers: {'mcp-session-id': MCP_SESSION}})
-        expect(reply.status).toBe(status)
-        expect(reply.body.toString()).not.toContain(MCP_SESSION_EXPIRED_SENTINEL)
-      },
-    )
-
-    it('does not trust a compressed body to say so', async () => {
-      // #given a body that says so in plain text under a content-encoding the proxy never decodes
-      const h = await setupMcp(lost(400, 'Server not initialized', {'content-encoding': 'gzip'}))
-      const reply = await sendMcp(h, {body: '{}', headers: {'mcp-session-id': MCP_SESSION}})
-      expect(reply.status).toBe(400)
-      expect(reply.body.toString()).not.toContain(MCP_SESSION_EXPIRED_SENTINEL)
-    })
-
-    it('does not read a body over the bound', async () => {
-      const h = await setupMcp(lost(400, `Server not initialized${'x'.repeat(500)}`), {limits: {maxErrorBodyBytes: 64}})
-      const reply = await sendMcp(h, {body: '{}', headers: {'mcp-session-id': MCP_SESSION}})
-      expect(reply.status).toBe(400)
-      expect(reply.body.toString()).not.toContain(MCP_SESSION_EXPIRED_SENTINEL)
-    })
-
-    it('answers at once when the declared length is over the bound, without waiting for the body', async () => {
-      // #given an upstream that declares a large body, sends the text and then goes quiet
-      const h = await setupMcp(
-        (_request, res) => {
-          res.writeHead(400, {'content-type': 'text/plain', 'content-length': '100000'})
-          res.write('Server not initialized')
-        },
-        {limits: {maxErrorBodyBytes: 64}},
+    it('relays the recorded session-expired reply untouched, so the client reconnects', async () => {
+      // #given the 400 the pinned client received for an expired session, as recorded
+      const expired = MCP_2025_STATEFUL_EXCHANGES.find(
+        e => e.response.status === 400 && e.request.headers['mcp-session-id'] !== undefined,
       )
+      if (expired === undefined) throw new Error('fixture')
+      const h = await setupMcp(failing(400, expired.response.body))
 
       // #when the client calls with its session id
       const reply = await sendMcp(h, {body: '{}', headers: {'mcp-session-id': MCP_SESSION}})
 
-      // #then the reply is the generic error, with no wait for the rest of the body
+      // #then it gets the recorded status and body, which hold the text OpenCode reconnects on
       expect(reply.status).toBe(400)
-      expect(reply.body.toString()).not.toContain(MCP_SESSION_EXPIRED_SENTINEL)
+      expect(reply.body.toString()).toBe(expired.response.body)
+      expect(reply.body.toString()).toContain(MCP_SESSION_EXPIRED_SENTINEL)
     })
 
-    it('does not read a chunked body that grows past the bound, however it is split', async () => {
+    const SECRET = String.raw`Bearer tok"en\secret-12345678`
+    const TOKEN_ONLY = String.raw`tok"en\secret-12345678`
+
+    it('redacts every occurrence of a header value and of its scheme token, raw and JSON-escaped', async () => {
+      // #given an upstream that echoes the value and the bare token, as JSON and as text
+      const asJson = await setupMcp(failing(400, JSON.stringify({a: SECRET, b: TOKEN_ONLY, c: SECRET, keep: 'ok'})), {
+        route: {headers: {Authorization: SECRET}},
+      })
+      const asText = await setupMcp(
+        failing(400, `raw ${SECRET} and ${TOKEN_ONLY} and ${SECRET}`, {'content-type': 'text/plain'}),
+        {
+          route: {headers: {Authorization: SECRET}},
+        },
+      )
+
+      // #when each route is called
+      const json = (await sendMcp(asJson, {body: '{}'})).body.toString()
+      const text = (await sendMcp(asText, {body: '{}'})).body.toString()
+
+      // #then no form of the credential is left, and the rest is
+      expect(JSON.parse(json)).toEqual({a: '[REDACTED]', b: '[REDACTED]', c: '[REDACTED]', keep: 'ok'})
+      expect(text).toBe('raw [REDACTED] and [REDACTED] and [REDACTED]')
+      for (const form of [
+        SECRET,
+        TOKEN_ONLY,
+        JSON.stringify(SECRET).slice(1, -1),
+        JSON.stringify(TOKEN_ONLY).slice(1, -1),
+      ]) {
+        expect(json).not.toContain(form)
+        expect(text).not.toContain(form)
+      }
+    })
+
+    it('redacts the value of every configured header, not only the authorization one', async () => {
+      const h = await setupMcp(failing(400, 'seen tenant-7 and key-abcdefgh and a-short-one'), {
+        route: {headers: {'X-Tenant': 'tenant-7', 'X-Key': 'key-abcdefgh'}},
+      })
+      const reply = await sendMcp(h, {body: '{}'})
+      expect(reply.body.toString()).toBe('seen [REDACTED] and [REDACTED] and a-short-one')
+    })
+
+    it('leaves a header value shorter than 8 characters alone', async () => {
+      const h = await setupMcp(failing(400, 'v1 abc1234'), {
+        route: {headers: {'X-Version': 'v1', 'X-Short': 'abc1234'}},
+      })
+      expect((await sendMcp(h, {body: '{}'})).body.toString()).toBe('v1 abc1234')
+    })
+
+    it('redacts a scheme token that is on its own 8 characters or more, and not a shorter one', async () => {
+      const long = await setupMcp(failing(400, 'token onlytoken-1'), {
+        route: {headers: {Authorization: 'Basic onlytoken-1'}},
+      })
+      const short = await setupMcp(failing(400, 'token abcdefg'), {route: {headers: {Authorization: 'Basic abcdefg'}}})
+      expect((await sendMcp(long, {body: '{}'})).body.toString()).toBe('token [REDACTED]')
+      expect((await sendMcp(short, {body: '{}'})).body.toString()).toBe('token abcdefg')
+    })
+
+    it('replaces a compressed body with the fixed generic error, whatever it holds', async () => {
+      // #given a body in an encoding the proxy never decodes, which would carry the credential
+      const h = await setupMcp(failing(400, `Server not initialized ${MCP_TOKEN}`, {'content-encoding': 'gzip'}))
+
+      const reply = await sendMcp(h, {body: '{}', headers: {'mcp-session-id': MCP_SESSION}})
+
+      // #then the status stays and the body is fixed text with no encoding header
+      expect(reply.status).toBe(400)
+      expect(reply.headers['content-encoding']).toBeUndefined()
+      expect(JSON.parse(reply.body.toString())).toEqual({
+        error: {type: 'proxy_error', message: 'The upstream returned an error.'},
+      })
+    })
+
+    it('answers at once with the generic error when the declared length is over the bound', async () => {
       const h = await setupMcp(
         (_request, res) => {
-          res.writeHead(400, {'content-type': 'text/plain'})
-          res.write('Server not ')
-          res.write('x'.repeat(200))
-          res.write('initialized')
-          res.end()
+          res.writeHead(400, {'content-type': 'text/plain', 'content-length': '100000'})
+          res.write(MCP_TOKEN)
         },
         {limits: {maxErrorBodyBytes: 64}},
       )
-      const reply = await sendMcp(h, {body: '{}', headers: {'mcp-session-id': MCP_SESSION}})
+      const reply = await sendMcp(h, {body: '{}'})
       expect(reply.status).toBe(400)
-      expect(reply.body.toString()).not.toContain(MCP_SESSION_EXPIRED_SENTINEL)
+      expect(reply.body.toString()).not.toContain('mcp-CANARY')
+      expect(JSON.parse(reply.body.toString())).toEqual({
+        error: {type: 'proxy_error', message: 'The upstream returned an error.'},
+      })
+    })
+
+    it('replaces a chunked body that grows past the bound, with the credential straddling it', async () => {
+      const h = await setupMcp(
+        (_request, res) => {
+          res.writeHead(400, {'content-type': 'text/plain'})
+          res.write(MCP_TOKEN.slice(0, 10))
+          res.write('x'.repeat(100))
+          res.end(MCP_TOKEN.slice(10))
+        },
+        {limits: {maxErrorBodyBytes: 64}},
+      )
+      const reply = await sendMcp(h, {body: '{}'})
+      expect(reply.status).toBe(400)
+      expect(reply.body.toString()).not.toContain('mcp-CANARY')
+      expect(reply.body.toString()).toContain('proxy_error')
     })
   })
 
@@ -1887,21 +1950,16 @@ describe('key proxy: MCP routes, response side', () => {
     expect(received).toBe(chunk.length * total)
   }, 60_000)
 
-  it('does not cut a quiet GET stream before the idle limit, and ends one that goes idle past it', async () => {
-    // #given a stream that pauses 300 ms between frames under a 700 ms idle limit, then stalls
-    let closedUpstream: () => void = () => undefined
-    const closed = new Promise<void>(resolve => {
-      closedUpstream = resolve
-    })
+  it('does not cut a stream that stays quiet past the provider idle bound', async () => {
+    // #given frames 400 ms apart under a 150 ms idle limit
     const h = await setupMcp(
       (_request, res) => {
         res.writeHead(200, {'content-type': 'text/event-stream'})
-        res.on('close', closedUpstream)
         res.write(': a\n\n')
-        setTimeout(() => res.write(': b\n\n'), 300)
-        setTimeout(() => res.write(': c\n\n'), 600)
+        setTimeout(() => res.write(': b\n\n'), 400)
+        setTimeout(() => res.end(': c\n\n'), 800)
       },
-      {limits: {idleTimeoutMs: 700}},
+      {limits: {idleTimeoutMs: 150}},
     )
 
     // #when it is read to its end
@@ -1918,10 +1976,8 @@ describe('key proxy: MCP routes, response side', () => {
       req.end()
     })
 
-    // #then every frame before the stall arrived, the stall ended the stream, and the upstream saw it close
-    expect(outcome.text).toBe(': a\n\n: b\n\n: c\n\n')
-    expect(outcome.complete).toBe(false)
-    await closed
+    // #then every frame arrived and the stream ended cleanly, on the upstream's own end
+    expect(outcome).toEqual({text: ': a\n\n: b\n\n: c\n\n', complete: true})
   })
 
   it('destroys the upstream request when the client drops a GET stream', async () => {
@@ -1989,9 +2045,43 @@ describe('key proxy: MCP routes, response side', () => {
     expect(reply.body.toString()).toBe('Bad Gateway\n')
   })
 
-  it('answers a stalled upstream (no response headers) with a fixed 504', async () => {
-    const h = await setupMcp(() => undefined, {limits: {headersTimeoutMs: 200}})
-    expect((await sendMcp(h, {body: '{}'})).status).toBe(504)
+  it('waits for a response that comes after the provider first-byte bound, because only the client sets a tool call deadline', async () => {
+    // #given limits that a provider route would trip, and an upstream that answers well after them
+    const h = await setupMcp(
+      (_request, res) => {
+        setTimeout(() => {
+          res.writeHead(200, {'content-type': 'application/json'})
+          res.end('{"late":true}')
+        }, 600)
+      },
+      {limits: {headersTimeoutMs: 150, idleTimeoutMs: 150}},
+    )
+
+    // #when the route is called
+    const reply = await sendMcp(h, {body: '{}'})
+
+    // #then the response completes
+    expect(reply.status).toBe(200)
+    expect(reply.body.toString()).toBe('{"late":true}')
+  })
+
+  it('still cuts a connection that never completes its handshake', async () => {
+    // #given an upstream address that accepts TCP and never speaks TLS
+    const sockets: net.Socket[] = []
+    const silent = net.createServer(socket => sockets.push(socket))
+    await new Promise<void>(resolve => silent.listen(0, '127.0.0.1', resolve))
+    cleanups.push(async () => {
+      for (const socket of sockets) socket.destroy()
+      await new Promise<void>(resolve => silent.close(() => resolve()))
+    })
+    const {port} = silent.address() as net.AddressInfo
+    const h = await setupMcp(okJson, {route: {origin: `https://127.0.0.1:${port}`}, limits: {connectTimeoutMs: 200}})
+
+    // #when the route is called
+    const reply = await sendMcp(h, {body: '{}'})
+
+    // #then the connect bound still applies
+    expect(reply.status).toBe(504)
   })
 })
 

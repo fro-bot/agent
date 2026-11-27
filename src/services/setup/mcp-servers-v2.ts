@@ -38,7 +38,7 @@ import type {CredentialDisposition, KeyProxyMcpRouteConfig} from '@fro-bot/runti
 import type {Logger} from './types.js'
 
 import {err, ok} from '@bfra.me/es/result'
-import {KEY_PROXY_MCP_FORBIDDEN_HEADERS, validateUpstreamUrl} from '@fro-bot/runtime'
+import {KEY_PROXY_MCP_FORBIDDEN_HEADERS, mcpHeaderSecrets, validateUpstreamUrl} from '@fro-bot/runtime'
 
 interface McpServerBase {
   /** The key as authored. */
@@ -556,17 +556,11 @@ const MAX_BROKERED_HEADER_VALUE_LENGTH = 4096
 const MAX_BROKERED_HEADER_BYTES = 256 * 1024
 const MAX_BROKERED_URL_LENGTH = 2048
 
-/** Header values shorter than this are brokered but not masked or scanned: `1` or `v1` would refuse unrelated config. */
-const SECRET_FLOOR = 8
-
 /** RFC 9110 `token`: the characters a header name may hold. */
 const HEADER_NAME_TOKEN = /^[!#$%&'*+\-.^\w`|~]+$/
 
 /** What Node accepts in a header value (`checkInvalidHeaderChar`): tab, printable ASCII and the Latin-1 supplement. */
 const HEADER_VALUE_CHARS = /^[\t\x20-\x7E\x80-\xFF]*$/
-
-/** An authorization scheme and its token. */
-const SCHEME_TOKEN = /^(?:bearer|basic|token)\s+(\S(?:.*\S)?)\s*$/i
 
 const STRUCTURAL_ENCODING = /%(?:2f|5c|2e|3b|25)/i
 
@@ -682,15 +676,6 @@ function upstreamOf(raw: unknown): {readonly origin: string; readonly path: stri
     }
   }
   return {origin: url.origin, path: url.pathname}
-}
-
-/** The values of one header that are masked and scanned: the whole value, and the token after an authorization scheme. */
-function secretsOfHeaderValue(value: string): string[] {
-  const found: string[] = []
-  if (value.length >= SECRET_FLOOR) found.push(value)
-  const token = SCHEME_TOKEN.exec(value)?.[1]
-  if (token !== undefined && token.length >= SECRET_FLOOR) found.push(token)
-  return found
 }
 
 type HeadersCheck = Result<
@@ -902,7 +887,7 @@ export function planMcpBrokerV2(mcp: unknown): Result<McpBrokerPlanV2, McpBroker
 
     const server = mcpToolNamespace(name).slice(0, MAX_LOGGED_NAME_LENGTH)
     for (const header of Object.values(headers.data.headers)) {
-      for (const secret of secretsOfHeaderValue(header)) {
+      for (const secret of mcpHeaderSecrets(header)) {
         if (!secrets.has(secret)) secrets.set(secret, {server, value: secret})
       }
     }

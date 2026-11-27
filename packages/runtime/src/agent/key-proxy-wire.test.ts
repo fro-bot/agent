@@ -5,6 +5,7 @@ import {
   encodeKeyProxyConfig,
   KEY_PROXY_MAX_CONFIG_BYTES,
   KEY_PROXY_MCP_FORBIDDEN_HEADERS,
+  mcpHeaderSecrets,
   parseKeyProxyChildLine,
   parseKeyProxyConfig,
   readKeyProxyFrameLength,
@@ -279,6 +280,25 @@ describe('MCP routes on the wire', () => {
       success: false,
       error: 'invalid-config',
     })
+  })
+})
+
+describe('mcpHeaderSecrets', () => {
+  it('takes a value of 8 characters or more, and the token after Bearer, Basic or Token', () => {
+    expect(mcpHeaderSecrets('abcdefgh')).toEqual(['abcdefgh'])
+    expect(mcpHeaderSecrets('Bearer abcdefgh1')).toEqual(['Bearer abcdefgh1', 'abcdefgh1'])
+    expect(mcpHeaderSecrets('basic dXNlcjpwYXNz')).toEqual(['basic dXNlcjpwYXNz', 'dXNlcjpwYXNz'])
+    expect(mcpHeaderSecrets('TOKEN   tok-abcdefgh')).toEqual(['TOKEN   tok-abcdefgh', 'tok-abcdefgh'])
+  })
+
+  it('leaves out a value of 7 characters or fewer, and a scheme token under the same floor', () => {
+    expect(mcpHeaderSecrets('abcdefg')).toEqual([])
+    expect(mcpHeaderSecrets('')).toEqual([])
+    expect(mcpHeaderSecrets('Bearer abcdefg')).toEqual(['Bearer abcdefg'])
+  })
+
+  it('does not split a value that merely starts with a scheme word', () => {
+    expect(mcpHeaderSecrets('Bearertoken12345')).toEqual(['Bearertoken12345'])
   })
 })
 

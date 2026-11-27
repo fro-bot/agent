@@ -142,6 +142,7 @@ export {
   KEY_PROXY_MAX_CONFIG_BYTES,
   KEY_PROXY_MCP_FORBIDDEN_HEADERS,
   KEY_PROXY_MCP_PATH_PREFIX,
+  mcpHeaderSecrets,
   parseKeyProxyChildLine,
   parseKeyProxyConfig,
   readKeyProxyFrameLength,

@@ -18,8 +18,6 @@ import {
   buildMcpRequestHeaders,
   buildMcpRoutes,
   matchMcpRoute,
-  MCP_SERVER_NOT_INITIALIZED,
-  MCP_SESSION_EXPIRED_BODY,
   MCP_SUCCESS_RESPONSE_HEADERS,
   sanitizeRetryAfter,
 } from './mcp-routes.js'
@@ -50,9 +48,11 @@ import {
  * differences, because the agent's shell holds a route anyway and the recorded 2.4.2 client needs more than a provider does:
  * - POST, GET and DELETE on the fixed local path, with the query passed through; request headers are forwarded except
  *   credentials, cookies, hop-by-hop and forwarding headers, and the configured headers are set last (invariants 2 and 3).
- * - A non-2xx body is never forwarded. The status stays, the body is fixed text, `WWW-Authenticate` is dropped and a
- *   `Retry-After` delay in seconds is kept (invariant 5). The one exception is a session-bearing 400 whose body says the
- *   server is not initialized: the client gets a fixed body with that text, so OpenCode reconnects.
+ * - A non-2xx body is forwarded as a provider's is (invariant 5), redacted of each configured header value of 8 characters
+ *   or more and of the token after a Bearer, Basic or Token scheme, so a modern JSON-RPC error and a session-expired reply
+ *   reach the client. `WWW-Authenticate` and cookies are dropped; `Retry-After` is kept as a plain delay in seconds.
+ * - Only the connect timeout applies: the client sets its own deadline for a tool call (12 hours by default), so there is no
+ *   first-byte or idle cut. The run's teardown closes every socket.
  * - A 2xx streams through with backpressure; only a short response-header allowlist is copied (invariant 6).
  */
 
@@ -156,12 +156,6 @@ const SUCCESS_RESPONSE_HEADERS: readonly string[] = [
   'content-type',
 ]
 
-/** Upstream response headers passed to the client on a non-2xx whose body is forwarded. */
-const ERROR_RESPONSE_HEADERS: readonly string[] = ['content-type', 'retry-after', 'retry-after-ms']
-
-/** Upstream response headers kept on the fixed generic error that replaces a compressed or oversized error body. */
-const GENERIC_ERROR_RESPONSE_HEADERS: readonly string[] = ['retry-after', 'retry-after-ms']
-
 /** Headers that only describe one hop. Named by RFC 9110 §7.6.1 and its relatives. */
 const HOP_BY_HOP: ReadonlySet<string> = new Set([
   'connection',
@@ -203,6 +197,15 @@ interface RelayControl {
   readonly stop: () => void
 }
 
+/** Whose credentials an error body is redacted of, how its retry hint is kept, and what its log lines are called. */
+interface ErrorScope {
+  readonly label: string
+  /** Each credential as it appears in a body: raw UTF-8, then JSON-escaped when that differs. */
+  readonly secrets: readonly Buffer[]
+  /** `raw` copies `Retry-After` and `Retry-After-Ms` as sent; `seconds` keeps `Retry-After` only as a plain delay. */
+  readonly retryAfter: 'raw' | 'seconds'
+}
+
 /** What one upstream request needs once the route is resolved; everything else is the same for both kinds of route. */
 interface RelaySpec {
   /** For logs only: a provider id, or `mcp/<route id>`. Configured, never taken from the request. */
@@ -213,6 +216,11 @@ interface RelaySpec {
   readonly path: string
   readonly headers: http.OutgoingHttpHeaders
   readonly hasBody: boolean
+  /**
+   * `all`: the connect, first-byte and idle timeouts. `connect-only`: the connect timeout alone, for a route whose client
+   * sets its own deadline (a tool call may run for hours); the run's teardown closes every socket.
+   */
+  readonly timeouts: 'all' | 'connect-only'
   /** Answers an upstream response that is not a redirect. */
   readonly onResponse: (upstreamRes: IncomingMessage, status: number, control: RelayControl) => void
 }
@@ -286,6 +294,7 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
   const mcp = buildMcpRoutes(options.mcp ?? [])
   if (!mcp.success) return err(mcp.error)
   const mcpById = mcp.data
+  const mcpSecrets = new Map([...mcpById].map(([id, route]) => [id, route.secrets.flatMap(secretsFor)]))
   // A provider named `mcp` would answer under the MCP prefix, so the two route classes could not stay apart.
   if (mcpById.size > 0 && byId.has(KEY_PROXY_MCP_PATH_PREFIX)) return err('a provider id collides with the MCP prefix')
 
@@ -357,19 +366,38 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
     }
   }
 
-  /** Reads a non-2xx body whole, redacts the key and forwards it; or replaces it with the fixed generic error. */
+  /** The retry hints an error keeps, and the content type of a body that is forwarded. Never a challenge or a cookie. */
+  const copyErrorHeaders = (
+    res: ServerResponse,
+    source: IncomingHttpHeaders,
+    scope: ErrorScope,
+    withContentType: boolean,
+  ): void => {
+    if (withContentType) copyHeaders(res, source, ['content-type'])
+    if (scope.retryAfter === 'raw') {
+      copyHeaders(res, source, ['retry-after', 'retry-after-ms'])
+      return
+    }
+    const seconds = sanitizeRetryAfter(headerValue(source['retry-after']))
+    if (seconds !== undefined) res.setHeader('retry-after', seconds)
+  }
+
+  /**
+   * Reads a non-2xx body whole, redacts the route's credentials from it and forwards it with its content type; or replaces
+   * it with the fixed generic error when it is compressed or over the bound. The same for a provider and an MCP route.
+   */
   const forwardError = (
     upstreamRes: IncomingMessage,
     status: number,
-    provider: ProviderState,
+    scope: ErrorScope,
     res: ServerResponse,
     stop: () => void,
   ): void => {
     const generic = (category: string): void => {
       upstreamRes.destroy()
       stop()
-      logger.warning('key-proxy: upstream error replaced', {category, status, provider: provider.id})
-      copyHeaders(res, upstreamRes.headers, GENERIC_ERROR_RESPONSE_HEADERS)
+      logger.warning('key-proxy: upstream error replaced', {category, status, provider: scope.label})
+      copyErrorHeaders(res, upstreamRes.headers, scope, false)
       res.setHeader('content-type', 'application/json')
       res.setHeader('content-length', String(Buffer.byteLength(GENERIC_UPSTREAM_ERROR)))
       res.statusCode = status
@@ -398,79 +426,17 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
     upstreamRes.once('error', () => {
       if (overflowed || res.headersSent) return
       stop()
-      refuse(res, 502, 'upstream-error', provider.id)
+      refuse(res, 502, 'upstream-error', scope.label)
     })
     upstreamRes.once('end', () => {
       if (overflowed || res.headersSent) return
       stop()
       let body: Buffer = Buffer.concat(chunks)
-      for (const secret of provider.secrets) body = replaceAll(body, secret, Buffer.from(REDACTED))
-      copyHeaders(res, upstreamRes.headers, ERROR_RESPONSE_HEADERS)
+      for (const secret of scope.secrets) body = replaceAll(body, secret, Buffer.from(REDACTED))
+      copyErrorHeaders(res, upstreamRes.headers, scope, true)
       res.setHeader('content-length', String(body.length))
       res.statusCode = status
       res.end(body)
-    })
-  }
-
-  /**
-   * Replaces a non-2xx MCP body with fixed text of the same status. The one body that is read is a session-bearing 400 that
-   * says the server is not initialized: the client gets the fixed session-expired reply, so OpenCode reconnects. Every
-   * other body is never read, and `WWW-Authenticate` and every other header stays behind.
-   */
-  const forwardMcpError = (
-    upstreamRes: IncomingMessage,
-    status: number,
-    req: IncomingMessage,
-    res: ServerResponse,
-    label: string,
-    stop: () => void,
-  ): void => {
-    const retryAfter = sanitizeRetryAfter(headerValue(upstreamRes.headers['retry-after']))
-    const reply = (category: string, body: string): void => {
-      upstreamRes.destroy()
-      stop()
-      logger.warning('key-proxy: upstream error replaced', {category, status, provider: label})
-      if (res.headersSent) return
-      if (retryAfter !== undefined) res.setHeader('retry-after', retryAfter)
-      res.setHeader('content-type', 'application/json')
-      res.setHeader('content-length', String(Buffer.byteLength(body)))
-      res.statusCode = status
-      res.end(body)
-    }
-
-    if (status !== 400 || req.headers['mcp-session-id'] === undefined) return reply('status', GENERIC_UPSTREAM_ERROR)
-    const encoding = headerValue(upstreamRes.headers['content-encoding'])?.trim().toLowerCase()
-    if (encoding !== undefined && encoding !== '' && encoding !== 'identity')
-      return reply('compressed', GENERIC_UPSTREAM_ERROR)
-    if (Number(upstreamRes.headers['content-length'] ?? 0) > limits.maxErrorBodyBytes) {
-      return reply('oversized', GENERIC_UPSTREAM_ERROR)
-    }
-
-    const chunks: Buffer[] = []
-    let total = 0
-    let done = false
-    upstreamRes.on('data', (chunk: Buffer) => {
-      if (done) return
-      total += chunk.length
-      if (total > limits.maxErrorBodyBytes) {
-        done = true
-        chunks.length = 0
-        reply('oversized', GENERIC_UPSTREAM_ERROR)
-        return
-      }
-      chunks.push(chunk)
-    })
-    upstreamRes.once('error', () => {
-      if (done || res.headersSent) return
-      done = true
-      stop()
-      refuse(res, 502, 'upstream-error', label)
-    })
-    upstreamRes.once('end', () => {
-      if (done) return
-      done = true
-      const expired = Buffer.concat(chunks).includes(MCP_SERVER_NOT_INITIALIZED)
-      reply(expired ? 'session-expired' : 'status', expired ? MCP_SESSION_EXPIRED_BODY : GENERIC_UPSTREAM_ERROR)
     })
   }
 
@@ -505,6 +471,8 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
     const arm = (ms: number, category: 'connect' | 'headers' | 'idle'): void => {
       if (settled) return
       if (timer !== undefined) clearTimeout(timer)
+      timer = undefined
+      if (spec.timeouts === 'connect-only' && category !== 'connect') return
       timer = setTimeout(() => {
         logger.warning('key-proxy: upstream timed out', {category, provider: spec.label})
         activeUpstream?.destroy()
@@ -649,9 +617,12 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
         path: query === '' ? route.path : `${route.path}?${query}`,
         headers: buildMcpRequestHeaders(req.headers, route, hasBody),
         hasBody,
+        timeouts: 'connect-only',
         onResponse: (upstreamRes, status, control) => {
-          if (status >= 400) forwardMcpError(upstreamRes, status, req, res, label, control.stop)
-          else streamSuccess(upstreamRes, status, res, MCP_SUCCESS_RESPONSE_HEADERS, control)
+          if (status >= 400) {
+            const scope: ErrorScope = {label, secrets: mcpSecrets.get(route.id) ?? [], retryAfter: 'seconds'}
+            forwardError(upstreamRes, status, scope, res, control.stop)
+          } else streamSuccess(upstreamRes, status, res, MCP_SUCCESS_RESPONSE_HEADERS, control)
         },
       })
       return
@@ -665,9 +636,12 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
       path: matched.query === '' ? matched.route.upstreamPath : `${matched.route.upstreamPath}?${matched.query}`,
       headers: outboundHeaders(req, matched, hasBody),
       hasBody,
+      timeouts: 'all',
       onResponse: (upstreamRes, status, control) => {
-        if (status >= 400) forwardError(upstreamRes, status, matched.provider, res, control.stop)
-        else streamSuccess(upstreamRes, status, res, SUCCESS_RESPONSE_HEADERS, control)
+        if (status >= 400) {
+          const scope: ErrorScope = {label, secrets: matched.provider.secrets, retryAfter: 'raw'}
+          forwardError(upstreamRes, status, scope, res, control.stop)
+        } else streamSuccess(upstreamRes, status, res, SUCCESS_RESPONSE_HEADERS, control)
       },
     })
   }

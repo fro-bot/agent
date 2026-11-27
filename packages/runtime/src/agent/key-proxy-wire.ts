@@ -69,6 +69,25 @@ export const KEY_PROXY_MCP_FORBIDDEN_HEADERS: ReadonlySet<string> = new Set([
   'upgrade',
 ])
 
+/** Header values shorter than this are held by the child but neither redacted from error bodies nor scanned for. */
+export const KEY_PROXY_MCP_SECRET_FLOOR = 8
+
+/** `Authorization: Bearer <token>`: the token on its own is as good as the whole value, so it is a secret too. */
+const SCHEME_TOKEN = /^(?:bearer|basic|token)\s+(\S(?:.*\S)?)\s*$/i
+
+/**
+ * The strings of one header value that must not reach the agent: the whole value, and the token after a Bearer, Basic or
+ * Token scheme, each only at {@link KEY_PROXY_MCP_SECRET_FLOOR} characters or more. The Action masks and scans the same
+ * strings (`planMcpBrokerV2`), and the child redacts them from an error body.
+ */
+export function mcpHeaderSecrets(value: string): string[] {
+  const found: string[] = []
+  if (value.length >= KEY_PROXY_MCP_SECRET_FLOOR) found.push(value)
+  const token = SCHEME_TOKEN.exec(value)?.[1]
+  if (token !== undefined && token.length >= KEY_PROXY_MCP_SECRET_FLOOR) found.push(token)
+  return found
+}
+
 /**
  * One brokered remote MCP server: the child forwards `/mcp/<id>` to `origin` + `path` and adds `headers` to every request
  * it sends. The Action plans these from `opencode-config` (`planMcpBrokerV2`); the credential values in `headers` reach

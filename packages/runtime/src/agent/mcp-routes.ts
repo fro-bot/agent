@@ -7,6 +7,7 @@ import {
   KEY_PROXY_MAX_MCP_ROUTES,
   KEY_PROXY_MCP_FORBIDDEN_HEADERS,
   KEY_PROXY_MCP_PATH_PREFIX,
+  mcpHeaderSecrets,
   parseMcpRoute,
 } from './key-proxy-wire.js'
 
@@ -33,6 +34,8 @@ export interface McpRouteState {
   readonly path: string
   /** The configured request headers, names lower-cased. Set last on every request. */
   readonly headers: Readonly<Record<string, string>>
+  /** The header values the child redacts from an error body: each of 8 characters or more, and each scheme token. */
+  readonly secrets: readonly string[]
 }
 
 /** Response headers passed to the client on a 2xx. Anything else the upstream sends (cookies, challenges) stays behind. */
@@ -43,23 +46,6 @@ export const MCP_SUCCESS_RESPONSE_HEADERS: readonly string[] = [
   'content-type',
   'mcp-session-id',
 ]
-
-/**
- * The text OpenCode 2.4.2 reads as "the server no longer knows this session" (`failure` in `mcp/client.ts`): a 400 on a
- * request that carried a session id, whose body contains it. The client then drops the connection, initializes again and
- * retries the call (recorded in the Unit 2 spike).
- */
-export const MCP_SESSION_EXPIRED_TEXT = 'Bad Request: Server not initialized'
-
-/** What the upstream says when it has lost a session. Matched in the upstream body; the client gets the fixed text above. */
-export const MCP_SERVER_NOT_INITIALIZED = 'Server not initialized'
-
-/** The fixed body the client gets for an expired session, in the JSON-RPC error shape a server would send. */
-export const MCP_SESSION_EXPIRED_BODY = JSON.stringify({
-  jsonrpc: '2.0',
-  id: null,
-  error: {code: -32_000, message: MCP_SESSION_EXPIRED_TEXT},
-})
 
 /**
  * Request headers that never go upstream. The forwarder owns framing and the hop-by-hop set; the rest are client
@@ -116,6 +102,7 @@ export function buildMcpRoutes(routes: readonly KeyProxyMcpRouteConfig[]): Resul
       ...origin,
       path: checked.path,
       headers: Object.fromEntries(Object.entries(checked.headers).map(([name, value]) => [name.toLowerCase(), value])),
+      secrets: [...new Set(Object.values(checked.headers).flatMap(mcpHeaderSecrets))],
     })
   }
   return ok(states)
