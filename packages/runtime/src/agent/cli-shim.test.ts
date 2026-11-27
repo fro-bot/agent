@@ -1,9 +1,12 @@
 import {spawnSync} from 'node:child_process'
 import {
   chmodSync,
+  closeSync,
   existsSync,
+  fstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
   rmSync,
@@ -184,16 +187,23 @@ describe('createOpencodeCliShim', () => {
     expect(OPENCODE_CLI_SHIM_FILE).toBe('opencode')
 
     // #and the modes are exact: world-readable and executable, writable by the owner alone
-    expect(statSync(directory).mode & 0o7777).toBe(0o755)
-    expect(statSync(shimFile).mode & 0o7777).toBe(0o755)
-
-    // #and the creator owns both (the sandbox user is only ever granted read and execute)
+    // (the file is read through one handle, so its mode, owner and content come from the same file)
     const uid = process.getuid?.()
+    expect(statSync(directory).mode & 0o7777).toBe(0o755)
     expect(statSync(directory).uid).toBe(uid)
-    expect(statSync(shimFile).uid).toBe(uid)
+    const fd = openSync(shimFile, 'r')
+    try {
+      const shimStat = fstatSync(fd)
+      expect(shimStat.mode & 0o7777).toBe(0o755)
 
-    // #and the file is the script for that binary
-    expect(readFileSync(shimFile, 'utf8')).toBe(buildOpencodeCliShimScript(file))
+      // #and the creator owns it (the sandbox user is only ever granted read and execute)
+      expect(shimStat.uid).toBe(uid)
+
+      // #and the file is the script for that binary
+      expect(readFileSync(fd, 'utf8')).toBe(buildOpencodeCliShimScript(file))
+    } finally {
+      closeSync(fd)
+    }
     expect(runShim(shimFile, ['--version']).stdout).toBe('real:--version\n')
     expect(runShim(shimFile, ['api', 'get', '/global/health']).status).toBe(2)
   })
