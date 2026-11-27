@@ -2,6 +2,7 @@ import type {Result} from '@bfra.me/es/result'
 import type {
   BuiltConfigV2,
   CredentialDisposition,
+  KeyProxyMcpRouteConfig,
   OpenCodeV2SandboxLaunch,
   OpenCodeV2ServerHandle,
   OpenCodeV2TracingDecision,
@@ -9,6 +10,7 @@ import type {
 } from '@fro-bot/runtime'
 import type {ProviderKeyEntryV2} from '../../services/setup/credential-files-v2.js'
 import type {KeyProxyProviderPlan} from '../../services/setup/key-proxy-providers.js'
+import type {BrokeredMcpV2, McpBrokerPlanV2} from '../../services/setup/mcp-servers-v2.js'
 import type {InstallPluginsV2Options, PluginInstallV2Error} from '../../services/setup/plugin-install-v2.js'
 import type {RepoSkillsSource} from '../../services/setup/repo-skills.js'
 import type {ActionTracingSource} from '../../services/setup/tracing.js'
@@ -24,6 +26,7 @@ import {
   ACTION_TRACING_OFF,
   clearHeldClaims,
   FRO_BOT_PLUGIN_ID,
+  KEY_PROXY_MCP_PATH_PREFIX,
   modelProviderId,
   resolveSystematicSkillsDirsV2,
   spawnConfigFromConfig,
@@ -34,7 +37,7 @@ import {
 } from '@fro-bot/runtime'
 import {createExecAdapter} from '../../services/setup/adapters.js'
 import {parseAuthJsonInput} from '../../services/setup/auth-json.js'
-import {buildCIConfigV2} from '../../services/setup/ci-config-v2.js'
+import {buildCIConfigV2, prepareOperatorConfigV2} from '../../services/setup/ci-config-v2.js'
 import {
   parseProviderKeysV2,
   removeStaleAuthJsonV2,
@@ -42,6 +45,7 @@ import {
   writeCredentialFilesV2,
 } from '../../services/setup/credential-files-v2.js'
 import {checkConfigForKeys, resolveKeyProxyProviders} from '../../services/setup/key-proxy-providers.js'
+import {planMcpBrokerV2} from '../../services/setup/mcp-servers-v2.js'
 import {
   arePluginsCachedV2,
   installPluginsV2,
@@ -70,6 +74,10 @@ import {readV1DatabaseFacts, waitForV1Import} from './v1-import-wait.js'
  *    install during server readiness, whose deadline is shorter than the healthy install tail (181-370 s measured; the
  *    bound is 420 s). So this runs before every spawn, whatever setup or the tools cache did: a cache that already holds both exact specs costs two directory reads, and
  *    anything else gets the bounded installer.
+ * 2b. MCP broker (`isolate-agent`). Each remote MCP server that has `headers` is planned as a route on the key-proxy child, and
+ *    an entry the broker cannot protect fails the run, before anything is started. The order is fixed: plan the routes,
+ *    start the child, rewrite the entries to its loopback routes (in both config variants), scan both configs for every
+ *    value the child holds, then hand off. The child starts when there are provider routes or MCP routes.
  * 3. Config. `buildCIConfigV2` (the outside-directory deny with run-scoped exceptions, `question` denied, the plugins)
  *    plus a `{file:}` reference per key file. After the plugins, because one exception is the installed Systematic
  *    skills directory (fro-bot/agent#2009), and its generation directory only exists once the plugin is cached. For a
@@ -190,6 +198,14 @@ export interface StartActionOpenCodeV2Deps {
 }
 
 const GATE_REQUEST_TIMEOUT_MS = 5_000
+
+/** A logger that says nothing, for a build whose warnings a later build repeats. */
+const QUIET_LOGGER: Logger = {
+  debug: () => undefined,
+  info: () => undefined,
+  warning: () => undefined,
+  error: () => undefined,
+}
 
 /**
  * Up to OpenCode 2.2.6, `GET /api/agent` waits for plugin activation, and the server gives up on that wait after 5 s
@@ -315,6 +331,23 @@ export async function startActionOpenCodeV2(
     proxyPlans = resolved.data
   }
 
+  // `isolate-agent`: remote MCP servers with `headers` are brokered by the same child, so they are planned here, from what the
+  // trigger's filter keeps, with the key plans: a server the broker cannot protect refuses the run before anything starts or
+  // is written. Each value the child will hold is masked now, before any later line could carry it.
+  let brokerPlan: McpBrokerPlanV2 = {routes: [], stripped: [], secrets: []}
+  if (options.sandbox != null) {
+    const planned = planBrokeredMcp(options, proxyPlans)
+    if (!planned.success) return stageError('config', planned.error)
+    brokerPlan = planned.data
+    for (const secret of brokerPlan.secrets) options.maskSecret?.(secret.value)
+    if (brokerPlan.routes.length > 0 || brokerPlan.stripped.length > 0) {
+      logger.info('Remote MCP servers with headers are brokered under isolate-agent', {
+        brokered: brokerPlan.routes.length,
+        disabledWithHeaders: brokerPlan.stripped.length,
+      })
+    }
+  }
+
   const specs = resolvePluginSpecsV2(options.systematicVersion)
   if (!specs.success) return stageError('plugins', specs.error.message)
 
@@ -408,17 +441,42 @@ export async function startActionOpenCodeV2(
     >
   > => {
     let proxied: Record<string, {baseURL: string; apiKey: string}> = {}
-    if (options.sandbox != null && proxyPlans.length > 0) {
-      const started = await startProxyUnderLifecycle(options.sandbox, proxyPlans, keys.data, deps, options, logger)
-      if (!started.success) return started
-      owned.proxy = started.data
-      options.maskSecret?.(started.data.placeholder)
-      proxied = Object.fromEntries(
-        proxyPlans.map(plan => [
-          plan.providerId,
-          {baseURL: started.data.baseUrl(plan.providerId), apiKey: started.data.placeholder},
-        ]),
-      )
+    let brokeredMcp: BrokeredMcpV2 | undefined
+    if (options.sandbox != null) {
+      const stripped = brokerPlan.stripped.map(entry => ({...entry, action: 'strip'}) as const)
+      brokeredMcp = {servers: stripped}
+      // The one child serves provider routes and MCP routes: it starts when either set is non-empty, and not otherwise.
+      if (proxyPlans.length > 0 || brokerPlan.routes.length > 0) {
+        const started = await startProxyUnderLifecycle(
+          options.sandbox,
+          proxyPlans,
+          brokerPlan.routes.map(entry => entry.route),
+          keys.data,
+          deps,
+          options,
+          logger,
+        )
+        if (!started.success) return started
+        owned.proxy = started.data
+        options.maskSecret?.(started.data.placeholder)
+        proxied = Object.fromEntries(
+          proxyPlans.map(plan => [
+            plan.providerId,
+            {baseURL: started.data.baseUrl(plan.providerId), apiKey: started.data.placeholder},
+          ]),
+        )
+        // Only now is the child's port known: each brokered entry is rewritten to its route on it.
+        const proxy = started.data
+        brokeredMcp = {
+          servers: [
+            ...brokerPlan.routes.map(
+              entry =>
+                ({name: entry.name, layout: entry.layout, action: 'route', url: proxy.mcpUrl(entry.route.id)}) as const,
+            ),
+            ...stripped,
+          ],
+        }
+      }
     }
 
     const configInputs = {
@@ -432,6 +490,7 @@ export async function startActionOpenCodeV2(
         ? {}
         : {integrationWorkDir: options.env.FRO_BOT_INTEGRATION_WORK_DIR}),
       ...(options.sandbox == null ? {providerKeyFiles: keyFiles} : {proxiedProviders: proxied}),
+      ...(brokeredMcp === undefined ? {} : {brokeredMcp}),
       bundledSkillsDirectories,
       ...(repoSkillsDirectory === undefined ? {} : {repoSkillsDirectory}),
     }
@@ -442,15 +501,9 @@ export async function startActionOpenCodeV2(
     // The config a traced run would get (the plugin order and the dedupe of operator entries are the only differences), built
     // only when the relay is up now. Whether it is used is decided later, once, at the spawn: a relay that is down now never
     // comes back, so no traced variant is needed then. Built quietly, since the traced run's other warnings are the same ones.
-    const quiet: Logger = {
-      debug: () => undefined,
-      info: () => undefined,
-      warning: () => undefined,
-      error: () => undefined,
-    }
     const tracedConfig =
       resolveActionTracing(options.tracing).tracing === 'on'
-        ? buildCIConfigV2({...configInputs, tracing: true}, quiet)
+        ? buildCIConfigV2({...configInputs, tracing: true}, QUIET_LOGGER)
         : null
     const builtTraced = tracedConfig?.success === true ? tracedConfig.data : null
     if (usesDefaultModel) {
@@ -463,11 +516,13 @@ export async function startActionOpenCodeV2(
       })
     }
 
-    // Last check before anything is handed to the sandbox user: no auth-json key value may be in the config it will read.
-    // `OPENCODE_CONFIG_CONTENT` is the only config the sandbox gets (the proxy holds the keys, not a file).
+    // Last check before anything is handed to the sandbox user: no auth-json key value and no brokered MCP header value may be
+    // in the config it will read. `OPENCODE_CONFIG_CONTENT` is the only config the sandbox gets (the child holds the keys and
+    // the headers, not a file).
     if (options.sandbox != null) {
       const clean = checkConfigForKeys({
         keys: keys.data,
+        mcpSecrets: brokerPlan.secrets,
         configs: [
           {label: 'the OpenCode config (OPENCODE_CONFIG_CONTENT)', text: JSON.stringify(builtConfig.data.content)},
           // Either may be the one the child receives, so both are held to the same rule.
@@ -700,8 +755,15 @@ export async function startActionOpenCodeV2(
     // --- 6b. Key proxy probe (isolate-agent) ---------------------------------------------------------------
     //
     // The credential gate above is satisfied by the placeholder, so for an isolated run this is the real check of the key.
-    // Only the selected model's provider is probed: another provider's bad key must not block a run that never uses it.
-    if (owned.proxy !== null) {
+    // Only the selected model's provider is probed: another provider's bad key must not block a run that never uses it. A
+    // child that serves MCP routes alone has no provider to probe, and an MCP server gets no start-up probe: it connects in
+    // the background, and one that is unreachable or rejects its credential is only that server's failure.
+    if (owned.proxy !== null && proxyPlans.length === 0) {
+      gateDecision('key-proxy-probe', 'skipped')
+      logger.info('Key proxy probe skipped: no provider is proxied (the key proxy serves MCP routes only)', {
+        provider: modelProvider ?? null,
+      })
+    } else if (owned.proxy !== null) {
       const plan =
         modelProvider === undefined ? undefined : proxyPlans.find(entry => entry.providerId === modelProvider)
       if (plan === undefined) {
@@ -769,6 +831,35 @@ export async function startActionOpenCodeV2(
 }
 
 /**
+ * Plans the brokered MCP routes from the operator's config as the trigger's filter leaves it, and refuses what cannot be
+ * brokered. Built quietly: the build that follows logs what the filter dropped, once.
+ */
+function planBrokeredMcp(
+  options: StartActionOpenCodeV2Options,
+  proxyPlans: readonly KeyProxyProviderPlan[],
+): Result<McpBrokerPlanV2, string> {
+  const operator = prepareOperatorConfigV2(
+    {opencodeConfig: options.opencodeConfig, credential: options.credential},
+    QUIET_LOGGER,
+  )
+  if (!operator.success) return err(`Invalid OpenCode configuration: ${operator.error}`)
+  const planned = planMcpBrokerV2(operator.data.mcp)
+  if (!planned.success) return err(planned.error.message)
+  if (planned.data.routes.length > 0) {
+    // The child serves a provider at `/<provider id>/...` and an MCP server at `/mcp/<route id>`: a provider called `mcp`
+    // would own that prefix.
+    const clash = proxyPlans.find(plan => plan.providerId.toLowerCase() === KEY_PROXY_MCP_PATH_PREFIX)
+    if (clash !== undefined) {
+      return err(
+        `isolate-agent: provider "${clash.providerId}" would own the \`/${KEY_PROXY_MCP_PATH_PREFIX}/\` route prefix the key proxy serves MCP servers under. ` +
+          'Fix: rename the provider (its id in the auth-json input and in opencode-config).',
+      )
+    }
+  }
+  return ok(planned.data)
+}
+
+/**
  * Starts the key proxy as the lifecycle's: the lifecycle takes signal ownership and records the attempt before the child is
  * spawned, so a signal or a release that begins mid-start aborts it and stops what it produced. The caller releases the
  * lifecycle on any failure returned from here.
@@ -776,6 +867,7 @@ export async function startActionOpenCodeV2(
 async function startProxyUnderLifecycle(
   sandbox: SandboxLifecycle,
   plans: readonly KeyProxyProviderPlan[],
+  mcpRoutes: readonly KeyProxyMcpRouteConfig[],
   keys: readonly ProviderKeyEntryV2[],
   deps: StartActionOpenCodeV2Deps,
   options: StartActionOpenCodeV2Options,
@@ -788,6 +880,7 @@ async function startProxyUnderLifecycle(
       ...deps.keyProxyOptions,
       logger,
       providers: plans.map(plan => ({...plan, key: keyById.get(plan.providerId) ?? ''})),
+      mcpRoutes,
       signal: options.signal === undefined ? context.signal : AbortSignal.any([options.signal, context.signal]),
     })
     if (result.success) return {proxy: result.data, unconfirmed: false}
