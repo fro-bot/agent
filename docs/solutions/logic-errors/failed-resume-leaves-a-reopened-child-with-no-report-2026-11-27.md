@@ -6,7 +6,7 @@ module: agent-execution
 problem_type: logic_error
 component: background_job
 symptoms:
-  - "Before the fix, review predicted that a resumed grandchild stays outstanding, then unknown, after its resume call fails, and that isDrainComplete() stays false until the deadline"
+  - "Before the fix, review predicted that a resumed grandchild stays outstanding, then unknown, after its resume call fails, and that isDrainComplete() stays false: a finite-budget drain waits until its deadline, and a timeout-0 drain exits as unobservable with the ledger still incomplete"
   - "Before the fix, review predicted that if the prompt never reached the resumed child, no report would settle the entry the reopen made owed"
 root_cause: async_timing
 resolution_type: code_fix
@@ -29,7 +29,7 @@ A resume reopens the child's ledger entry on `tool_progress` (see the admission 
 ## Symptoms
 
 - Before the fix, review predicted that the reopened entry would stay outstanding after a failed call, because no report would come to settle it.
-- Before the fix, review predicted that a deeper entry would be marked `unknown` on every reconcile pass and hold `isDrainComplete()` false until the drain deadline.
+- Before the fix, review predicted that a deeper entry would be marked `unknown` on every reconcile pass and hold `isDrainComplete()` false. With a finite budget the drain waits until its deadline. With `timeout: 0` it exits as `unobservable` after three passes that see no owned work running, with the ledger still incomplete (`src/features/agent/drain-v2.ts:409-419`).
 
 ## What Didn't Work
 
