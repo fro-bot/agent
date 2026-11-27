@@ -154,3 +154,89 @@ describe('createExecutionDeadline — run() race causality', () => {
     deadline.dispose()
   })
 })
+
+describe('createExecutionDeadline — onTimeout', () => {
+  let mockLogger: Logger
+
+  beforeEach(() => {
+    mockLogger = createMockLogger()
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  it('runs a listener once when the deadline fires, after the timeout line and before the abort', async () => {
+    // #given
+    const {createExecutionDeadline} = await import('./execution-deadline.js')
+    const deadline = createExecutionDeadline(1_000, mockLogger)
+    const order: string[] = []
+    vi.mocked(mockLogger.warning).mockImplementation(() => {
+      order.push('log')
+    })
+    deadline.signal.addEventListener('abort', () => order.push('abort'))
+    deadline.onTimeout(() => order.push('listener'))
+
+    // #when it fires, and is then consulted again (which must not latch twice)
+    await vi.advanceTimersByTimeAsync(1_000)
+    deadline.isExpired()
+
+    // #then
+    expect(order).toEqual(['log', 'listener', 'abort'])
+    deadline.dispose()
+  })
+
+  it('runs no listener when the deadline never fires, and none after it is unsubscribed', async () => {
+    // #given
+    const {createExecutionDeadline} = await import('./execution-deadline.js')
+    const deadline = createExecutionDeadline(1_000, mockLogger)
+    const finished = vi.fn()
+    const removed = vi.fn()
+    deadline.onTimeout(finished)
+    deadline.onTimeout(removed)()
+
+    // #when the run ends normally before the deadline
+    deadline.dispose()
+    await vi.advanceTimersByTimeAsync(5_000)
+
+    // #then
+    expect(finished).not.toHaveBeenCalled()
+    expect(removed).not.toHaveBeenCalled()
+    expect(mockLogger.warning).not.toHaveBeenCalled()
+  })
+
+  it('still aborts when a listener throws, and runs the listeners after it', async () => {
+    // #given
+    const {createExecutionDeadline} = await import('./execution-deadline.js')
+    const deadline = createExecutionDeadline(1_000, mockLogger)
+    const second = vi.fn()
+    deadline.onTimeout(() => {
+      throw new Error('diagnostics failed')
+    })
+    deadline.onTimeout(second)
+
+    // #when
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    // #then
+    expect(deadline.signal.aborted).toBe(true)
+    expect(second).toHaveBeenCalledOnce()
+    deadline.dispose()
+  })
+
+  it('does not call a listener added after the deadline already fired', async () => {
+    // #given
+    const {createExecutionDeadline} = await import('./execution-deadline.js')
+    const deadline = createExecutionDeadline(1_000, mockLogger)
+    await vi.advanceTimersByTimeAsync(1_000)
+    const late = vi.fn()
+
+    // #when
+    deadline.onTimeout(late)
+
+    // #then
+    expect(late).not.toHaveBeenCalled()
+    deadline.dispose()
+  })
+})

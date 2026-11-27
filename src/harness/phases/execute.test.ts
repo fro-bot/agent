@@ -2,6 +2,7 @@ import type {OpenCodeV2ServerHandle, SessionSearchResult} from '@fro-bot/runtime
 import type {executeOpenCodeV2} from '../../features/agent/execution-v2.js'
 import type {AgentResult} from '../../features/agent/types.js'
 import type {MetricsCollector} from '../../features/observability/index.js'
+import type {LifecycleSpan} from '../../shared/lifecycle-tracer.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {CacheRestorePhaseResult} from './cache-restore.js'
 import type {RoutingPhaseResult} from './routing.js'
@@ -311,6 +312,32 @@ describe('runExecute overflow recovery', () => {
   afterEach(() => {
     vi.unstubAllEnvs()
     vi.restoreAllMocks()
+  })
+
+  it('hands the execution span to every execution it starts, the overflow restart included', async () => {
+    // #given an overflowing first execution and a traced run
+    const span = {addEvent: vi.fn()} as unknown as LifecycleSpan
+    mocks.executeOpenCodeV2
+      .mockResolvedValueOnce(createAgentResult())
+      .mockResolvedValueOnce(
+        createAgentResult({success: true, exitCode: 0, error: null, sessionId: 'recovered-session', llmError: null}),
+      )
+
+    // #when
+    await runExecute(
+      createBootstrap(1_000),
+      createRouting(),
+      createCacheRestore(),
+      createSessionPrep(),
+      createMetrics(),
+      undefined,
+      span,
+    )
+
+    // #then
+    expect(mocks.executeOpenCodeV2).toHaveBeenCalledTimes(2)
+    expect(mocks.executeOpenCodeV2.mock.calls[0]?.[6]).toBe(span)
+    expect(mocks.executeOpenCodeV2.mock.calls[1]?.[6]).toBe(span)
   })
 
   it('archives the overflowed session and restarts once with fresh bounded context', async () => {

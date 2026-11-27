@@ -2,6 +2,7 @@
  * One V2 prompt attempt: completion is raced between the session-wait route and the poll watchdog, and the wait route
  * is a hint that never completes an attempt by itself (it answers at once for a prompt that is not admitted yet).
  */
+import type {LifecycleSpan} from '../../shared/lifecycle-tracer.js'
 import type {Logger} from '../../shared/logger.js'
 import {createOwnershipLedger, shellLedgerKey} from '@fro-bot/runtime'
 import {
@@ -618,6 +619,143 @@ describe('runPromptAttemptV2', () => {
     expect(outcome.settlement.kind).toBe('deadline')
     deadline.dispose()
     expect(createDeadlineExceededError('x').name).toBe('DeadlineExceededError')
+  })
+
+  describe('what the deadline line says about the run', () => {
+    const CANARY = 'CANARY-delta-text-77d1'
+    const childNotice = frame('session.inbox.enqueued', {
+      ...(SUBAGENT_NOTICE_ENQUEUED_FRAME.data as object),
+      sessionID: ROOT_SESSION_ID,
+    })
+    const diagnosticsCalls = () =>
+      vi.mocked(logger.warning).mock.calls.filter(([message]) => message === 'Execution deadline diagnostics')
+    const spanWith = () => {
+      const addEvent = vi.fn()
+      return {addEvent, span: {addEvent} as unknown as LifecycleSpan}
+    }
+
+    it('names a compaction that started and never ended, right after the timeout line', async () => {
+      // #given a root that began a turn and then a background compaction summary that never answers
+      const deadline = createExecutionDeadline(2_000, logger)
+      const {addEvent, span} = spanWith()
+      const server = createFakeServer({
+        onPrompt: (_, pipe) => {
+          pipe.push(STARTED)
+          pipe.push(frame('session.text.delta', {sessionID: ROOT_SESSION_ID, ordinal: 0, delta: CANARY}))
+          pipe.push(frame('session.compaction.started', {sessionID: ROOT_SESSION_ID, reason: 'auto'}))
+        },
+      })
+
+      // #when the deadline fires
+      const result = attempt(server, {deadline, traceSpan: span})
+      await advance(5_000)
+      await result
+
+      // #then one diagnostics line follows the timeout line and says what the root was doing
+      const warnings = vi.mocked(logger.warning).mock.calls.map(([message]) => message)
+      expect(warnings.indexOf('Execution deadline diagnostics')).toBe(warnings.indexOf('Execution timeout reached') + 1)
+      expect(diagnosticsCalls()).toHaveLength(1)
+      expect(diagnosticsCalls()[0]?.[1]).toMatchObject({
+        waitingOn: ['execution-not-ended'],
+        rootRunning: true,
+        compaction: {state: 'started-not-ended', open: [{role: 'root', reason: 'auto'}]},
+      })
+      const events = (diagnosticsCalls()[0]?.[1]?.recentEvents as {type: string}[]).map(event => event.type)
+      expect(events.slice(-3)).toEqual([
+        'session.execution.started',
+        'session.text.delta',
+        'session.compaction.started',
+      ])
+      expect(JSON.stringify(vi.mocked(logger.warning).mock.calls)).not.toContain(CANARY)
+      // The same facts reach the trace as one event on the span.
+      expect(addEvent).toHaveBeenCalledOnce()
+      expect(addEvent.mock.calls[0]?.[0]).toBe('deadline.diagnostics')
+      expect(addEvent.mock.calls[0]?.[1]).toMatchObject({'fro_bot.compaction': 'started-not-ended'})
+      deadline.dispose()
+    })
+
+    it('says what a succeeded root was still waiting on: an owed notice turn, a queued item and outstanding children', async () => {
+      // #given a root that succeeded, then a completion notice was queued for it, with another child still running
+      const deadline = createExecutionDeadline(2_000, logger)
+      const ledger = createOwnershipLedger()
+      ledger.adopt(CHILD_SESSION_ID, 'noticed child')
+      ledger.adopt('ses_stillRunning222222', `label ${CANARY}`)
+      const server = createFakeServer({
+        onPrompt: (_, pipe) => {
+          pipe.push(STARTED)
+          pipe.push(SUCCEEDED)
+          setTimeout(() => pipe.push(childNotice), 500)
+        },
+      })
+
+      // #when
+      const result = attempt(server, {deadline, ownershipLedger: ledger})
+      await advance(5_000)
+      await result
+
+      // #then
+      expect(diagnosticsCalls()).toHaveLength(1)
+      expect(diagnosticsCalls()[0]?.[1]).toMatchObject({
+        waitingOn: ['notice-turn-owed', 'inbox-queued', 'owned-work-outstanding'],
+        rootTerminal: null,
+        turnOwed: true,
+        queuedInbox: {count: 1},
+        outstanding: {count: 1, entries: [{kind: 'child', session: '222222', state: 'outstanding'}]},
+      })
+      expect(JSON.stringify(diagnosticsCalls())).not.toContain(CANARY)
+      deadline.dispose()
+    })
+
+    it('logs nothing of the kind when the run finishes before the deadline', async () => {
+      // #given a normal turn that ends well inside the deadline
+      const deadline = createExecutionDeadline(600_000, logger)
+      const {addEvent, span} = spanWith()
+      const server = createFakeServer({
+        onPrompt: (_, pipe) => {
+          pipe.push(STARTED)
+          pipe.push(frame('session.compaction.started', {sessionID: ROOT_SESSION_ID, reason: 'auto'}))
+          pipe.push(frame('session.compaction.ended', {sessionID: ROOT_SESSION_ID, reason: 'auto'}))
+          pipe.push(SUCCEEDED)
+        },
+      })
+
+      // #when
+      const result = attempt(server, {deadline, traceSpan: span})
+      await advance(2_000)
+      expect(await result).toMatchObject({success: true})
+      deadline.dispose()
+      await advance(1_000)
+
+      // #then
+      expect(diagnosticsCalls()).toHaveLength(0)
+      expect(logger.warning).not.toHaveBeenCalledWith('Execution timeout reached', expect.anything())
+      expect(addEvent).not.toHaveBeenCalled()
+    })
+
+    it('stops reporting once the attempt has handed its observation over, even if the clock then reaches the deadline', async () => {
+      // #given a successful attempt that keeps observing, and a deadline nobody disposed
+      const deadline = createExecutionDeadline(3_000, logger)
+      const {addEvent, span} = spanWith()
+      const ledger = createOwnershipLedger()
+      const server = createFakeServer({
+        onPrompt: (_, pipe) => {
+          pipe.push(STARTED)
+          pipe.push(SUCCEEDED)
+        },
+      })
+      const result = attempt(server, {deadline, traceSpan: span, ownershipLedger: ledger, keepObserving: true})
+      await advance(1_000)
+      const outcome = await result
+      expect(outcome.liveObservation).toBeDefined()
+
+      // #when the deadline later fires
+      await advance(5_000)
+
+      // #then the timeout line is the deadline's own; this attempt adds nothing
+      expect(diagnosticsCalls()).toHaveLength(0)
+      expect(addEvent).not.toHaveBeenCalled()
+      await outcome.liveObservation?.stop()
+    })
   })
 })
 

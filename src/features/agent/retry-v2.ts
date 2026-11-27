@@ -1,4 +1,5 @@
 import type {ActionOpenCodeV2Client, OwnershipLedger} from '@fro-bot/runtime'
+import type {LifecycleSpan} from '../../shared/lifecycle-tracer.js'
 import type {Logger} from '../../shared/logger.js'
 import type {AttemptObservation, AttemptResult, FailureObservation, TurnEvidence} from './attempt-outcome.js'
 import type {ExecutionDeadline} from './execution-deadline.js'
@@ -7,6 +8,7 @@ import type {EventStreamResult, FormAskedResponderV2, PermissionAskedResponderV2
 import {createLLMFetchError} from '@fro-bot/runtime'
 import {toErrorMessage} from '../../shared/errors.js'
 import {reduceAttemptOutcome, shouldRetryFromOutcome} from './attempt-outcome.js'
+import {reportDeadlineDiagnosticsV2} from './deadline-diagnostics-v2.js'
 import {createDeadlineExceededError} from './execution-deadline.js'
 import {createOwnedWorkReconcilerV2} from './reconcile-v2.js'
 import {
@@ -82,6 +84,8 @@ export interface RunPromptAttemptV2Options {
   readonly keepObserving?: boolean
   /** The location the run's shells run in. With a ledger it turns on REST reconciliation of children and shells. */
   readonly directory?: string
+  /** The `execution` phase's span: the deadline's diagnostics line is also added to it as an event. */
+  readonly traceSpan?: LifecycleSpan
   /** Test seam: poll cadence and the no-activity bound. */
   readonly poll?: Pick<PollOptionsV2, 'initialActivityTimeoutMs' | 'pollIntervalMs' | 'restEveryTicks'>
   /** Test seam: cadence of the live reconcile tick. */
@@ -211,6 +215,17 @@ export async function runPromptAttemptV2(options: RunPromptAttemptV2Options): Pr
     deadline === undefined ? attemptController.signal : AbortSignal.any([attemptController.signal, deadline.signal])
 
   const tracker = createActivityTrackerV2()
+  // If the deadline fires while this attempt is still waiting, say what the root was doing: the deadline alone says only
+  // that time ran out. Unsubscribed in `finally`, so an attempt that decided, or was handed over, reports nothing.
+  const stopDeadlineReport = deadline?.onTimeout(() => {
+    reportDeadlineDiagnosticsV2({
+      tracker,
+      rootSessionId: sessionId,
+      logger,
+      ...(ownershipLedger === undefined ? {} : {ledger: ownershipLedger}),
+      ...(options.traceSpan === undefined ? {} : {traceSpan: options.traceSpan}),
+    })
+  })
   let eventStreamResult: EventStreamResult = {
     tokens: null,
     model: null,
@@ -426,6 +441,7 @@ export async function runPromptAttemptV2(options: RunPromptAttemptV2Options): Pr
       ...(sendUncertain ? {sendUncertain} : {}),
     }
   } finally {
+    stopDeadlineReport?.()
     reconciler?.dispose()
     if (!kept) await stopEventProcessor()
   }

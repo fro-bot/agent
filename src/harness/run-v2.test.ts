@@ -518,6 +518,8 @@ describe('run on an OpenCode V2 server', () => {
     // #then the release runs for a succeeded run, with the ledger, the root session and the retention the run was
     // configured with
     expect(vi.mocked(runExecute).mock.calls[0]?.[2]).toBe(cacheRestore)
+    // The `execution` phase's span goes to the execute phase, so an execution deadline can trace what the root was doing.
+    expect(vi.mocked(runExecute).mock.calls[0]?.[6]?.addEvent).toBeTypeOf('function')
     expect(vi.mocked(runReleaseV2)).toHaveBeenCalledTimes(1)
     expect(vi.mocked(runReleaseV2).mock.calls[0]?.[0]).toMatchObject({
       serverHandle: v2Handle,
