@@ -9,7 +9,7 @@ date: 2026-11-27
 
 ## Summary
 
-On OpenCode v2 a parent can wake a finished child by calling `subagent` with the child's `sessionID`, and the child's next reply arrives as a new report. The plugin guard refuses every `sessionID`, so a workflow that re-asks its own child loses that coverage. Two edits close the gap. First, the guard admits a resume of a child this run dispatched, on the Action host only. Second, the ownership ledger reopens that child so the run waits for its next report. The pin is 2.4.1 (`packages/runtime/src/shared/opencode-v2-pin.json`).
+On OpenCode v2 a parent can wake a finished child by calling `subagent` with the child's `sessionID`, and the child's next reply arrives as a new report. The plugin guard refuses every `sessionID`, so a workflow that re-asks its own child loses that coverage. Two edits close the gap. First, the guard admits a resume of a child this run dispatched, on the Action host only. Second, the ownership ledger reopens that child so the run waits for its next report. The pin is 2.4.2 (`packages/runtime/src/shared/opencode-v2-pin.json`).
 
 ## Problem Frame
 
@@ -20,7 +20,7 @@ The guard exists because a resumed child used to go untracked (#1759, #1769). `a
 - R1. The guard admits a resume `sessionID` only when it names a child this run dispatched from the calling session, and only on the Action host. Every other id gets the existing fixed refusal.
 - R2. The workspace server keeps refusing every resume. The gateway reaches the plugin through it, so the gateway keeps refusing too.
 - R3. A resume reopens the child's ledger entry as outstanding, and the next report settles it as usual. `adopt` is unchanged.
-- R4. The behavior is shown on the pinned 2.4.1 binary, and the docs that describe the guard are corrected.
+- R4. The behavior is shown on the pinned binary (2.4.1 when planned, 2.4.2 now), and the docs that describe the guard are corrected.
 
 ## Scope Boundaries
 
@@ -150,7 +150,7 @@ The guard exists because a resumed child used to go untracked (#1759, #1769). `a
 - A foreign id → fixed refusal, and no prompt reaches any session.
 - With the workspace launcher, dispatch a child and then resume it → refused.
 
-**Verification:** The plugin integration suite passes with `FRO_BOT_OPENCODE_V2_BIN` set to the 2.4.1 binary, and `bun run check:md-links` passes.
+**Verification:** The plugin integration suite passes with `FRO_BOT_OPENCODE_V2_BIN` set to the pinned binary; it passed on both 2.4.1 and 2.4.2, and `bun run check:md-links` passes.
 
 ## Risks
 
