@@ -16,13 +16,30 @@ import {
 import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {createMockLogger} from '../../shared/test-helpers.js'
 import {createDeadlineExceededError, createExecutionDeadline} from './execution-deadline.js'
-import {createFakeServer, frame, ROOT_SESSION_ID, STARTED, SUCCEEDED} from './execution-v2.fixture.js'
+import {CONNECTED, createFakeServer, frame, ROOT_SESSION_ID, STARTED, SUCCEEDED} from './execution-v2.fixture.js'
+import {createSubmissionFailureV2} from './prompt-sender-v2.js'
 import {runPromptAttemptV2} from './retry-v2.js'
 import {observeRootTerminal} from './session-poll-v2.js'
 import {createActivityTrackerV2} from './streaming-v2.js'
 
 const consoleMock = vi.hoisted(() => ({outputTextContent: vi.fn(), outputToolExecution: vi.fn()}))
 vi.mock('../../shared/console.js', () => consoleMock)
+
+/** Yields `items`, then goes silent and ignores every abort, as a stream whose shutdown outlasts the deadline does. */
+function silentAfter(items: readonly unknown[]): AsyncIterable<unknown> {
+  return {
+    [Symbol.asyncIterator]: () => {
+      let index = 0
+      return {
+        next: async () =>
+          index < items.length
+            ? {value: items[index++], done: false}
+            : new Promise<IteratorResult<unknown>>(() => undefined),
+        return: async () => ({value: undefined, done: true as const}),
+      }
+    },
+  }
+}
 
 async function advance(totalMs: number, stepMs = 100): Promise<void> {
   for (let elapsed = 0; elapsed < totalMs; elapsed += stepMs) await vi.advanceTimersByTimeAsync(stepMs)
@@ -696,7 +713,7 @@ describe('runPromptAttemptV2', () => {
       // #then
       expect(diagnosticsCalls()).toHaveLength(1)
       expect(diagnosticsCalls()[0]?.[1]).toMatchObject({
-        waitingOn: ['notice-turn-owed', 'inbox-queued', 'owned-work-outstanding'],
+        waitingOn: ['execution-not-ended', 'notice-turn-owed', 'inbox-queued', 'owned-work-outstanding'],
         rootTerminal: null,
         turnOwed: true,
         queuedInbox: {count: 1},
@@ -730,6 +747,50 @@ describe('runPromptAttemptV2', () => {
       expect(diagnosticsCalls()).toHaveLength(0)
       expect(logger.warning).not.toHaveBeenCalledWith('Execution timeout reached', expect.anything())
       expect(addEvent).not.toHaveBeenCalled()
+    })
+
+    it('emits no stall diagnostic for a result chosen before the deadline, even if the shutdown outlasts it', async () => {
+      // #given a root that succeeded at once, and a stream that will not shut down for 2 s, past a 1.5 s deadline
+      const deadline = createExecutionDeadline(1_500, logger)
+      const {addEvent, span} = spanWith()
+      const server = createFakeServer({})
+
+      // #when
+      const result = attempt(server, {
+        deadline,
+        traceSpan: span,
+        eventStream: silentAfter([CONNECTED, STARTED, SUCCEEDED]),
+      })
+      await advance(5_000)
+
+      // #then the result stands, and the deadline that fired during the shutdown explained nothing
+      expect(await result).toMatchObject({success: true, settlement: {kind: 'completion-observed'}})
+      expect(logger.warning).toHaveBeenCalledWith('Execution timeout reached', expect.anything())
+      expect(diagnosticsCalls()).toHaveLength(0)
+      expect(addEvent).not.toHaveBeenCalled()
+      deadline.dispose()
+    })
+
+    it('emits none either for a prompt submission that failed first, while the stream shuts down past the deadline', async () => {
+      // #given a prompt the server refuses, and a stream that will not shut down before the 1.5 s deadline
+      const deadline = createExecutionDeadline(1_500, logger)
+      const {addEvent, span} = spanWith()
+      const server = createFakeServer({})
+
+      // #when
+      const result = attempt(server, {
+        deadline,
+        traceSpan: span,
+        eventStream: silentAfter([CONNECTED]),
+        startPrompt: async () => createSubmissionFailureV2('refused', {kind: 'http', status: 400}),
+      })
+      await advance(5_000)
+
+      // #then
+      expect(await result).toMatchObject({success: false, outcome: 'submit_failed'})
+      expect(diagnosticsCalls()).toHaveLength(0)
+      expect(addEvent).not.toHaveBeenCalled()
+      deadline.dispose()
     })
 
     it('stops reporting once the attempt has handed its observation over, even if the clock then reaches the deadline', async () => {

@@ -9,6 +9,10 @@ import {isShellLedgerKey, shellIdFromLedgerKey} from '@fro-bot/runtime'
  * itself says only that time ran out; a root that stays open after its final message (fro-bot/agent#2376) left nothing
  * to read, because the event mapper drops the events that show why (a compaction that started and never ended above all).
  *
+ * Scoped to the run. The SSE feed covers every location on the server, so a frame is kept only when it is the root's, a
+ * descendant the run owns, or one of the few server-wide types in `SERVER_WIDE_TYPES`. Any other session's frame is
+ * dropped whole: its type, id suffix and timing never enter the trail, the compaction state or the log.
+ *
  * Content-free by construction. The trail below is fed RAW frames, before the mapper, and reads exactly four things from
  * one: its `type`, the `sessionID` in its data, and, for a compaction start, its `reason`. The type is kept only when it
  * is a plain dotted lowercase name, the session only as its last six characters, the reason only when it is one of the two
@@ -32,9 +36,11 @@ const QUEUED_INBOX_LISTED_MAX = 8
 const TRACE_EVENT_LIST_MAX_CHARS = 900
 
 const TYPE_PATTERN = /^[a-z][a-z0-9-]*(?:\.[a-z0-9-]+)+$/
+/** The event types with no session that are kept: they say the stream is alive and say nothing about anyone's work. */
+const SERVER_WIDE_TYPES: ReadonlySet<string> = new Set(['server.connected', 'server.heartbeat'])
 const SESSION_ID_PATTERN = /^[\w-]{1,128}$/
 
-export type TrailRole = 'child' | 'other' | 'root' | 'server'
+export type TrailRole = 'child' | 'root' | 'server'
 export type CompactionReason = 'auto' | 'manual'
 
 export interface TrailEntry {
@@ -49,7 +55,7 @@ export interface TrailEntry {
 }
 
 export interface OpenCompaction {
-  readonly role: Exclude<TrailRole, 'server'>
+  readonly role: 'child' | 'root'
   readonly session: string
   readonly reason: CompactionReason | null
   readonly atMs: number
@@ -60,14 +66,16 @@ export interface EventTrailV2 {
   readonly entries: TrailEntry[]
   /** The summed cost of `entries`, never above `EVENT_TRAIL_MAX_BYTES`. */
   bytes: number
-  /** Compactions that started and have not ended or failed, by full session id. */
-  readonly openCompactions: Map<string, OpenCompaction>
+  /** The root's compaction that started and has not ended or failed. Held apart from the children's, so they cannot evict it. */
+  rootCompaction: OpenCompaction | null
+  /** Owned children's open compactions by full session id, at most `OPEN_COMPACTIONS_MAX`; the oldest is dropped first. */
+  readonly childCompactions: Map<string, OpenCompaction>
   /** How the most recent compaction that ended did so, `null` before any. */
   lastCompactionEnd: 'ended' | 'failed' | null
 }
 
 export function createEventTrailV2(): EventTrailV2 {
-  return {entries: [], bytes: 0, openCompactions: new Map(), lastCompactionEnd: null}
+  return {entries: [], bytes: 0, rootCompaction: null, childCompactions: new Map(), lastCompactionEnd: null}
 }
 
 export interface RecordFrameContext {
@@ -99,14 +107,19 @@ export function recordFrameV2(trail: EventTrailV2, frame: unknown, context: Reco
   const data = typeof frame === 'object' && frame !== null ? (frame as Record<string, unknown>).data : undefined
   const rawSession = readString(data, 'sessionID')
   const sessionId = rawSession !== null && SESSION_ID_PATTERN.test(rawSession) ? rawSession : null
-  const role: TrailRole =
-    sessionId === null
-      ? 'server'
-      : sessionId === context.rootSessionId
-        ? 'root'
-        : context.isOwned(sessionId)
-          ? 'child'
-          : 'other'
+  // Whose frame this is. A session that is not the root or owned is somebody else's; a session-less frame is kept only
+  // when it is one of the server-wide types.
+  let role: TrailRole
+  if (sessionId === null) {
+    if (!SERVER_WIDE_TYPES.has(type)) return
+    role = 'server'
+  } else if (sessionId === context.rootSessionId) {
+    role = 'root'
+  } else if (context.isOwned(sessionId)) {
+    role = 'child'
+  } else {
+    return
+  }
   const session = sessionId === null ? null : sessionId.slice(-SESSION_SUFFIX_CHARS)
 
   const last = trail.entries.at(-1)
@@ -137,19 +150,24 @@ function trackCompaction(
   data: unknown,
   nowMs: number,
 ): void {
-  if (role === 'server' || session === null) return
-  const key = sessionId ?? session
+  if (role === 'server' || sessionId === null || session === null) return
   if (type === 'session.compaction.started') {
+    const open: OpenCompaction = {role, session, reason: readReason(data), atMs: nowMs}
+    if (role === 'root') {
+      trail.rootCompaction = open
+      return
+    }
     // Re-keyed so the oldest open one is the first in the map, and the one dropped when the bound is hit.
-    trail.openCompactions.delete(key)
-    trail.openCompactions.set(key, {role, session, reason: readReason(data), atMs: nowMs})
-    while (trail.openCompactions.size > OPEN_COMPACTIONS_MAX) {
-      const oldest = trail.openCompactions.keys().next()
+    trail.childCompactions.delete(sessionId)
+    trail.childCompactions.set(sessionId, open)
+    while (trail.childCompactions.size > OPEN_COMPACTIONS_MAX) {
+      const oldest = trail.childCompactions.keys().next()
       if (oldest.done === true) break
-      trail.openCompactions.delete(oldest.value)
+      trail.childCompactions.delete(oldest.value)
     }
   } else if (type === 'session.compaction.ended' || type === 'session.compaction.failed') {
-    trail.openCompactions.delete(key)
+    if (role === 'root') trail.rootCompaction = null
+    else trail.childCompactions.delete(sessionId)
     trail.lastCompactionEnd = type === 'session.compaction.ended' ? 'ended' : 'failed'
   }
 }
@@ -159,12 +177,16 @@ export type WaitingReason = 'execution-not-ended' | 'inbox-queued' | 'notice-tur
 export interface DeadlineStateV2 {
   /** The root session, as the last characters of its id. */
   readonly rootSession: string
-  /** What the run's completion was still waiting on, from the same facts `observeRootTerminal` decides on. */
+  /**
+   * What the run's completion was still waiting on, by the rule `observeRootTerminal` applies: the notice turn and the
+   * queued inbox count only when the stream is trusted (`!streamBlind`); a stale one after a stream drop is not a blocker.
+   * `turnOwed`, `queuedInbox` and `streamBlind` below are the raw observations, reported either way.
+   */
   readonly waitingOn: readonly WaitingReason[]
   readonly rootTerminal: 'failed' | 'interrupted' | 'succeeded' | null
   readonly rootRunning: boolean
   readonly turnOwed: boolean
-  /** The stream lost events, so `turnOwed` and the queue are not trusted by the completion rule. */
+  /** The stream lost events, so completion ignores `turnOwed` and the queue. */
   readonly streamBlind: boolean
   readonly queuedInbox: {readonly count: number; readonly ids: readonly string[]}
   readonly outstanding: {
@@ -178,7 +200,7 @@ export interface DeadlineStateV2 {
   readonly compaction: {
     readonly state: 'ended' | 'failed' | 'none' | 'started-not-ended'
     readonly open: readonly {
-      readonly role: Exclude<TrailRole, 'server'>
+      readonly role: 'child' | 'root'
       readonly session: string
       readonly reason: CompactionReason | null
       /** Milliseconds relative to the deadline: negative, how long before it the compaction started. */
@@ -210,16 +232,20 @@ export function describeDeadlineStateV2(options: DescribeDeadlineStateOptions): 
   const queued = [...tracker.queuedNoticeInboxIds]
   const unsettled = (ledger?.snapshot() ?? []).filter(entry => entry.state !== 'settled')
   const waitingOn: WaitingReason[] = []
-  // A null result with a notice turn owed or queued is explained by those; a root that is running, or that never ended
-  // for any other reason, has an execution that did not end.
-  if (tracker.rootRunning || (tracker.rootTerminal === null && !tracker.turnOwed && queued.length === 0)) {
-    waitingOn.push('execution-not-ended')
+  if (tracker.rootTerminal === null) waitingOn.push('execution-not-ended')
+  // The completion rule (`observeRootTerminal`) defers on these only while the stream is trusted.
+  if (!tracker.streamBlind) {
+    if (tracker.turnOwed) waitingOn.push('notice-turn-owed')
+    if (queued.length > 0) waitingOn.push('inbox-queued')
   }
-  if (tracker.turnOwed) waitingOn.push('notice-turn-owed')
-  if (queued.length > 0) waitingOn.push('inbox-queued')
   if (ledger !== undefined && !ledger.isDrainComplete()) waitingOn.push('owned-work-outstanding')
 
-  const open = [...trail.openCompactions.values()].map(compaction => ({
+  // The root's first: the trace's reason and start time come from the first one.
+  const openCompactions = [
+    ...(trail.rootCompaction === null ? [] : [trail.rootCompaction]),
+    ...trail.childCompactions.values(),
+  ]
+  const open = openCompactions.map(compaction => ({
     role: compaction.role,
     session: compaction.session,
     reason: compaction.reason,
@@ -282,6 +308,8 @@ function traceAttributes(state: DeadlineStateV2): Record<string, string> {
     'fro_bot.waiting_on': state.waitingOn.length === 0 ? 'none' : state.waitingOn.join(','),
     'fro_bot.root_terminal': state.rootTerminal ?? 'none',
     'fro_bot.root_running': String(state.rootRunning),
+    'fro_bot.turn_owed': String(state.turnOwed),
+    'fro_bot.stream_blind': String(state.streamBlind),
     'fro_bot.compaction': state.compaction.state,
     ...(firstOpen === undefined
       ? {}

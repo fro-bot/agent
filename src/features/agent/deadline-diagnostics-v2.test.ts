@@ -87,16 +87,14 @@ describe('event trail', () => {
     // #when
     record(trail, typed('session.text.delta', ROOT, {delta: CANARY, text: CANARY, input: {command: CANARY}}), 10)
     record(trail, typed('session.tool.called', CHILD, {input: {command: CANARY}}), 11, [CHILD])
-    record(trail, typed('shell.exited', undefined, {id: 'shl_1', status: CANARY}), 12)
-    record(trail, typed('session.text.delta', 'ses_stranger333333', {delta: CANARY}), 13)
+    record(trail, typed('server.heartbeat', undefined, {note: CANARY}), 12)
 
     // #then
     expect(JSON.stringify(trail)).not.toContain(CANARY)
     expect(trail.entries.map(entry => ({...entry}))).toEqual([
       {type: 'session.text.delta', role: 'root', session: '111111', atMs: 10, count: 1},
       {type: 'session.tool.called', role: 'child', session: '222222', atMs: 11, count: 1},
-      {type: 'shell.exited', role: 'server', session: null, atMs: 12, count: 1},
-      {type: 'session.text.delta', role: 'other', session: '333333', atMs: 13, count: 1},
+      {type: 'server.heartbeat', role: 'server', session: null, atMs: 12, count: 1},
     ])
   })
 
@@ -106,13 +104,54 @@ describe('event trail', () => {
 
     // #when
     record(trail, typed(`session.${CANARY} with spaces`, ROOT), 1)
-    record(trail, typed('session.ok', `ses_${CANARY} !`), 2)
     record(trail, typed('x'.repeat(200), ROOT), 3)
+    // An id that is not a plain id names no session, so it is not the run's: dropped like any other session-less frame.
+    record(trail, typed('session.ok', `ses_${CANARY} !`), 2)
 
     // #then
     expect(JSON.stringify(trail)).not.toContain(CANARY)
-    expect(trail.entries.map(entry => entry.type)).toEqual(['unknown', 'session.ok', 'unknown'])
-    expect(trail.entries[1]?.session).toBeNull()
+    // Both are the one `unknown` of the root, folded.
+    expect(trail.entries.map(entry => [entry.type, entry.count])).toEqual([['unknown', 2]])
+  })
+
+  describe('keeps unrelated sessions out', () => {
+    it('drops the frames of a session the run does not own, whole: no type, suffix or time', () => {
+      // #given the run's own events around a stranger's, on a server that serves every location
+      const trail = createEventTrailV2()
+
+      // #when
+      record(trail, typed('session.execution.started', ROOT), 1)
+      record(trail, typed('session.text.delta', 'ses_stranger333333', {delta: CANARY}), 2)
+      record(trail, typed('session.stranger-only.type', 'ses_stranger333333'), 3)
+      record(trail, typed('session.tool.called', CHILD, {}), 4, [CHILD])
+
+      // #then
+      expect(trail.entries.map(entry => [entry.type, entry.role, entry.atMs])).toEqual([
+        ['session.execution.started', 'root', 1],
+        ['session.tool.called', 'child', 4],
+      ])
+      expect(JSON.stringify(trail)).not.toContain('333333')
+      expect(JSON.stringify(trail)).not.toContain('stranger')
+    })
+
+    it('keeps a session-less frame only when its type is on the server-wide allowlist', () => {
+      // #given
+      const trail = createEventTrailV2()
+
+      // #when
+      for (const type of [
+        'server.connected',
+        'server.heartbeat',
+        'shell.exited',
+        'experimental.job.updated',
+        'vcs.branch.updated',
+      ]) {
+        record(trail, typed(type, undefined, {id: 'shl_other_run'}), 1)
+      }
+
+      // #then
+      expect(trail.entries.map(entry => entry.type)).toEqual(['server.connected', 'server.heartbeat'])
+    })
   })
 
   it('ignores a frame that has no type (a keepalive or a stranger shape)', () => {
@@ -136,9 +175,7 @@ describe('event trail', () => {
       record(trail, typed('session.compaction.delta', ROOT, {text: CANARY}), 5_100)
 
       // #then the delta changes nothing and its text is never read
-      expect([...trail.openCompactions.values()]).toEqual([
-        {session: '111111', role: 'root', reason: 'auto', atMs: 5_000},
-      ])
+      expect(trail.rootCompaction).toEqual({session: '111111', role: 'root', reason: 'auto', atMs: 5_000})
       expect(JSON.stringify(trail)).not.toContain(CANARY)
     })
 
@@ -154,7 +191,8 @@ describe('event trail', () => {
       record(trail, typed('session.compaction.failed', CHILD, {}), 4, [CHILD])
 
       // #then
-      expect(trail.openCompactions.size).toBe(0)
+      expect(trail.rootCompaction).toBeNull()
+      expect(trail.childCompactions.size).toBe(0)
       expect(trail.lastCompactionEnd).toBe('failed')
       expect(JSON.stringify(trail)).not.toContain(CANARY)
     })
@@ -165,23 +203,60 @@ describe('event trail', () => {
       record(trail, typed('session.compaction.started', ROOT, {reason: CANARY}), 1)
 
       // #then
-      expect([...trail.openCompactions.values()][0]?.reason).toBeNull()
+      expect(trail.rootCompaction?.reason).toBeNull()
       expect(JSON.stringify(trail)).not.toContain(CANARY)
     })
 
-    it('bounds the number of compactions it holds open', () => {
+    it('bounds the children compactions it holds open', () => {
       // #given / #when
       const trail = createEventTrailV2()
-      for (let index = 0; index < 50; index++) {
-        record(
-          trail,
-          typed('session.compaction.started', `ses_${String(index).padStart(10, '0')}`, {reason: 'auto'}),
-          index,
-        )
+      const children = Array.from({length: 50}, (_, index) => `ses_${String(index).padStart(10, '0')}`)
+      for (const [index, child] of children.entries()) {
+        record(trail, typed('session.compaction.started', child, {reason: 'auto'}), index, children)
       }
 
       // #then
-      expect(trail.openCompactions.size).toBeLessThanOrEqual(8)
+      expect(trail.childCompactions.size).toBeLessThanOrEqual(8)
+    })
+
+    it("keeps the root's open compaction through enough owned children starting theirs to fill the cap", () => {
+      // #given the root's compaction is open
+      const trail = createEventTrailV2()
+      record(trail, typed('session.compaction.started', ROOT, {reason: 'auto'}), 1)
+      const children = Array.from({length: 50}, (_, index) => `ses_${String(index).padStart(10, '0')}`)
+
+      // #when children start theirs, far past the cap
+      for (const [index, child] of children.entries()) {
+        record(trail, typed('session.compaction.started', child, {reason: 'manual'}), 10 + index, children)
+      }
+
+      // #then the root's is still held, first, and is the one the state reports first
+      expect(trail.rootCompaction).toMatchObject({role: 'root', reason: 'auto', atMs: 1})
+      const tracker = createActivityTrackerV2()
+      Object.assign(tracker, {eventTrail: trail})
+      const state = describeDeadlineStateV2({tracker, rootSessionId: ROOT, nowMs: 100})
+      expect(state.compaction.open[0]).toEqual({role: 'root', session: '111111', reason: 'auto', startedMs: -99})
+    })
+
+    it("ignores another session's compaction: it neither shows up nor replaces the root's", () => {
+      // #given the root's compaction is open
+      const trail = createEventTrailV2()
+      record(trail, typed('session.compaction.started', ROOT, {reason: 'auto'}), 1)
+
+      // #when a session of another location starts, then ends, its own
+      record(trail, typed('session.compaction.started', 'ses_stranger333333', {reason: 'manual'}), 2)
+      record(trail, typed('session.compaction.ended', 'ses_stranger333333', {reason: 'manual'}), 3)
+
+      // #then
+      expect(trail.rootCompaction).toMatchObject({reason: 'auto', atMs: 1})
+      expect(trail.childCompactions.size).toBe(0)
+      expect(trail.lastCompactionEnd).toBeNull()
+      const tracker = createActivityTrackerV2()
+      Object.assign(tracker, {eventTrail: trail})
+      expect(describeDeadlineStateV2({tracker, rootSessionId: ROOT, nowMs: 10}).compaction).toEqual({
+        state: 'started-not-ended',
+        open: [{role: 'root', session: '111111', reason: 'auto', startedMs: -9}],
+      })
     })
   })
 })
@@ -242,6 +317,39 @@ describe('describeDeadlineStateV2', () => {
     expect(state.waitingOn).toEqual(['notice-turn-owed', 'inbox-queued'])
     expect(state.rootTerminal).toBe('succeeded')
     expect(state.queuedInbox).toEqual({count: 2, ids: ['AAAAA1', 'BBBBB2']})
+  })
+
+  it('does not call a root with no result finished: execution-not-ended appears beside a notice blocker', () => {
+    // #given a root with no terminal result, a notice turn owed and an item queued, on a trusted stream
+    const tracker = createActivityTrackerV2()
+    tracker.turnOwed = true
+    tracker.queuedNoticeInboxIds.add('msg_inboxAAAAAAA1')
+
+    // #when / #then
+    expect(describeDeadlineStateV2({tracker, rootSessionId: ROOT, nowMs: 1}).waitingOn).toEqual([
+      'execution-not-ended',
+      'notice-turn-owed',
+      'inbox-queued',
+    ])
+  })
+
+  it('does not report a stale notice or inbox as a blocker after a stream drop, and keeps the raw observations', () => {
+    // #given a stream that lost events, a notice turn recorded as owed, an item recorded as queued, and no root result
+    const tracker = createActivityTrackerV2()
+    tracker.streamBlind = true
+    tracker.turnOwed = true
+    tracker.queuedNoticeInboxIds.add('msg_inboxAAAAAAA1')
+
+    // #when
+    const state = describeDeadlineStateV2({tracker, rootSessionId: ROOT, nowMs: 1})
+
+    // #then completion ignores both, so neither is a blocker; the root still has no result
+    expect(state.waitingOn).toEqual(['execution-not-ended'])
+    expect(state).toMatchObject({turnOwed: true, streamBlind: true, queuedInbox: {count: 1, ids: ['AAAAA1']}})
+
+    // #and a root with a result and nothing else owed is waiting on nothing
+    tracker.rootTerminal = {kind: 'succeeded'}
+    expect(describeDeadlineStateV2({tracker, rootSessionId: ROOT, nowMs: 1}).waitingOn).toEqual([])
   })
 
   it('lists outstanding and unknown owned work by id suffix, never by label', () => {
@@ -364,6 +472,62 @@ describe('reportDeadlineDiagnosticsV2', () => {
     expect(String(attributes['fro_bot.recent_events'])).toContain('session.compaction.started')
     expect(String(attributes['fro_bot.recent_events']).length).toBeLessThanOrEqual(900)
     expect(JSON.stringify(attributes)).not.toContain(CANARY)
+  })
+
+  it('reports the stale-stream case the same way in the log and in the trace', () => {
+    // #given a dropped stream, a stale inbox and no root result
+    const tracker = createActivityTrackerV2()
+    tracker.streamBlind = true
+    tracker.turnOwed = true
+    tracker.queuedNoticeInboxIds.add('msg_inboxAAAAAAA1')
+    const logger = createMockLogger()
+    const addEvent = vi.fn()
+
+    // #when
+    reportDeadlineDiagnosticsV2({
+      tracker,
+      rootSessionId: ROOT,
+      logger,
+      traceSpan: {addEvent} as unknown as LifecycleSpan,
+      nowMs: 1,
+    })
+
+    // #then
+    expect(vi.mocked(logger.warning).mock.calls[0]?.[1]).toMatchObject({
+      waitingOn: ['execution-not-ended'],
+      turnOwed: true,
+      streamBlind: true,
+      queuedInbox: {count: 1},
+    })
+    expect(addEvent.mock.calls[0]?.[1]).toMatchObject({
+      'fro_bot.waiting_on': 'execution-not-ended',
+      'fro_bot.turn_owed': 'true',
+      'fro_bot.stream_blind': 'true',
+      'fro_bot.queued_inbox': '1',
+    })
+  })
+
+  it('takes the trace reason and start time from the root, before any child', () => {
+    // #given a child that began compacting before the root, then the root
+    const tracker = createActivityTrackerV2()
+    record(tracker.eventTrail, typed('session.compaction.started', CHILD, {reason: 'manual'}), 1_000, [CHILD])
+    record(tracker.eventTrail, typed('session.compaction.started', ROOT, {reason: 'auto'}), 3_000)
+    const addEvent = vi.fn()
+
+    // #when
+    reportDeadlineDiagnosticsV2({
+      tracker,
+      rootSessionId: ROOT,
+      logger: createMockLogger(),
+      traceSpan: {addEvent} as unknown as LifecycleSpan,
+      nowMs: 5_000,
+    })
+
+    // #then
+    expect(addEvent.mock.calls[0]?.[1]).toMatchObject({
+      'fro_bot.compaction.reason': 'auto',
+      'fro_bot.compaction.started_ms': '-2000',
+    })
   })
 
   it('keeps the trace event inside its length bound when the trail is full of the longest names', () => {

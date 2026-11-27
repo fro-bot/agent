@@ -1225,10 +1225,10 @@ describe('subagent notice diagnostics', () => {
         ['session.step.started', 'root'],
         ['session.compaction.started', 'root'],
       ])
-      expect([...tracker.eventTrail.openCompactions.values()]).toMatchObject([{role: 'root', reason: 'auto'}])
+      expect(tracker.eventTrail.rootCompaction).toMatchObject({role: 'root', reason: 'auto'})
     })
 
-    it('tells a tracked child from the root and from a session the run does not own', async () => {
+    it('tells a tracked child from the root, and drops a session the run does not own', async () => {
       // #given a ledger that tracks one child
       const ledger = createOwnershipLedger()
       ledger.adopt(CHILD_SESSION_ID, 'child')
@@ -1245,7 +1245,7 @@ describe('subagent notice diagnostics', () => {
       await result
 
       // #then
-      expect(tracker.eventTrail.entries.map(entry => entry.role)).toEqual(['child', 'other', 'root'])
+      expect(tracker.eventTrail.entries.map(entry => entry.role)).toEqual(['child', 'root'])
     })
 
     it('keeps no text, input or output from any frame', async () => {

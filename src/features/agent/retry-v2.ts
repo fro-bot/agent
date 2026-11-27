@@ -344,6 +344,7 @@ export async function runPromptAttemptV2(options: RunPromptAttemptV2Options): Pr
           ]
           const turnEvidence: TurnEvidence = {accepted: tracker.firstMeaningfulEventReceived}
           const reduced = reduceAttemptOutcome({settlement: {kind: 'failure-observed'}, failures}, null, turnEvidence)
+          stopDeadlineReport?.()
           await stopEventProcessor()
           // Only an accepted turn has real artifacts; otherwise the synthetic result already carries the failure.
           let merged = turnEvidence.accepted ? eventStreamResult : promptStartResult.eventStreamResult
@@ -397,6 +398,8 @@ export async function runPromptAttemptV2(options: RunPromptAttemptV2Options): Pr
       pollObservation,
     ])
 
+    // A result is chosen: from here a deadline is not what this attempt was waiting on, whatever the shutdown below takes.
+    stopDeadlineReport?.()
     const turnEvidence: TurnEvidence = {accepted: tracker.firstMeaningfulEventReceived}
     const reduced = reduceAttemptOutcome(winning, preservedSubmissionFailure, turnEvidence)
 
