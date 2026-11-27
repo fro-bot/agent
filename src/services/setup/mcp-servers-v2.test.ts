@@ -1,4 +1,4 @@
-import {resolveResponseDelivery} from '@fro-bot/runtime'
+import {KEY_PROXY_MCP_FORBIDDEN_HEADERS, resolveResponseDelivery} from '@fro-bot/runtime'
 import {describe, expect, it, vi} from 'vitest'
 import {createMockLogger, serializeLoggerCalls, unwrapErr, unwrapOk} from '../../shared/test-helpers.js'
 import {
@@ -1092,25 +1092,33 @@ describe('planMcpBrokerV2', () => {
       expect(refusalOf({x: withCanary({url})}).kind).toBe(kind)
     })
 
-    it('refuses a url that is not a string', () => {
+    it('refuses a url that is not a string, including one a URL parser would coerce into a valid URL', () => {
       expect(refusalOf({x: {type: 'remote', url: 5, headers: {A: CANARY}}}).kind).toBe('url-invalid')
+      expect(refusalOf({x: {...REMOTE, headers: {A: CANARY}, url: ['https://mcp.example.com/mcp']}}).kind).toBe(
+        'url-invalid',
+      )
     })
 
-    it.each([
-      ['Host', 'host'],
-      ['Connection', 'connection'],
-      ['Transfer-Encoding', 'transfer-encoding'],
-      ['TRANSFER-ENCODING', 'transfer-encoding'],
-      ['Content-Length', 'content-length'],
-      ['Accept-Encoding', 'accept-encoding'],
-      ['Upgrade', 'upgrade'],
-      ['Expect', 'expect'],
-      ['Proxy-Authorization', 'proxy-authorization'],
-    ])('refuses the header %s, which the forwarder owns', (name, lowered) => {
-      const refusal = refusalOf({x: withCanary({headers: {[name]: CANARY}})})
+    it('refuses a url longer than the frame carries', () => {
+      const long = `https://mcp.example.com/${'a'.repeat(2048)}`
 
-      expect(refusal.kind).toBe('header-forbidden')
-      expect(refusal.message).toContain(`"${lowered}"`)
+      expect(refusalOf({x: {...REMOTE, headers: {A: CANARY}, url: long}}).kind).toBe('url-invalid')
+    })
+
+    it.each([...KEY_PROXY_MCP_FORBIDDEN_HEADERS])(
+      'refuses the header %s, which the forwarder owns, whatever its case',
+      lowered => {
+        const refusal = refusalOf({x: withCanary({headers: {[lowered.toUpperCase()]: CANARY}})})
+
+        expect(refusal.kind).toBe('header-forbidden')
+        expect(refusal.message).toContain(`"${lowered}"`)
+      },
+    )
+
+    it('refuses the headers named for it in the plan: Host, Connection and Transfer-Encoding', () => {
+      for (const name of ['Host', 'Connection', 'Transfer-Encoding']) {
+        expect(refusalOf({x: withCanary({headers: {[name]: CANARY}})}).kind).toBe('header-forbidden')
+      }
     })
 
     it('refuses two header names that differ only in case, naming neither value', () => {

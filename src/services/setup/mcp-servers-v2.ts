@@ -599,14 +599,17 @@ function disabledStateOf(entry: Record<string, unknown>): DisabledState {
   return enabled === false || disabled === true ? 'disabled' : 'active'
 }
 
-/** A path the child can send upstream as it stands: printable ASCII, no `;` or `\`, no encoded structure, no empty or dot segment. */
+/**
+ * A path the child can send upstream as it stands, once `upstreamOf` has seen that URL parsing left it as written: that
+ * comparison already refuses a space, a control or non-ASCII character, a backslash and a dot segment (parsing encodes or
+ * resolves each). What it cannot see is left here: `;` (a router truncates a segment there), an encoded `/`, `\`, `.`, `;`
+ * or `%`, and an empty segment. A trailing slash is one empty final segment, which an upstream may require.
+ */
 function isCanonicalUpstreamPath(pathname: string): boolean {
-  if (!/^\/[\x21-\x7E]*$/.test(pathname)) return false
-  if (pathname.includes(';') || pathname.includes('\\') || STRUCTURAL_ENCODING.test(pathname)) return false
+  if (pathname.includes(';') || STRUCTURAL_ENCODING.test(pathname)) return false
   const segments = pathname.split('/').slice(1)
-  // One empty final segment is a trailing slash, which an upstream may require.
   const body = segments.at(-1) === '' ? segments.slice(0, -1) : segments
-  return body.every(segment => segment !== '' && segment !== '.' && segment !== '..')
+  return body.every(segment => segment !== '')
 }
 
 interface UpstreamProblem {

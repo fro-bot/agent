@@ -4,6 +4,7 @@ import {describe, expect, it} from 'vitest'
 import {
   encodeKeyProxyConfig,
   KEY_PROXY_MAX_CONFIG_BYTES,
+  KEY_PROXY_MCP_FORBIDDEN_HEADERS,
   parseKeyProxyChildLine,
   parseKeyProxyConfig,
   readKeyProxyFrameLength,
@@ -202,6 +203,24 @@ describe('MCP routes on the wire', () => {
 
     // #then it is refused with the fixed code, quoting nothing
     expect(parsed).toEqual({success: false, error: 'invalid-config'})
+  })
+
+  it('names the headers the forwarder owns: the hop-by-hop set, plus host, content-length, accept-encoding and expect', () => {
+    expect([...KEY_PROXY_MCP_FORBIDDEN_HEADERS].sort()).toEqual([
+      'accept-encoding',
+      'connection',
+      'content-length',
+      'expect',
+      'host',
+      'keep-alive',
+      'proxy-authenticate',
+      'proxy-authorization',
+      'proxy-connection',
+      'te',
+      'trailer',
+      'transfer-encoding',
+      'upgrade',
+    ])
   })
 
   it('refuses even an empty MCP list, so a field the child does not understand is never skipped', () => {
