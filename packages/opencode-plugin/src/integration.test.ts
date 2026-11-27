@@ -3,7 +3,7 @@
  * `dist/index.mjs` exists.
  */
 
-import type {FakeProvider, OtlpSink, RunningServer, SandboxPaths} from './integration.fixture.js'
+import type {FakeProvider, FakeStep, OtlpSink, RunningServer, SandboxPaths} from './integration.fixture.js'
 
 import {cpSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync} from 'node:fs'
 import os from 'node:os'
@@ -159,8 +159,8 @@ describe.skipIf(!runnable)('built plugin in a real opencode V2', () => {
     }
   }, 90_000)
 
-  it('rejects a subagent resume with the fixed text, then lets a fresh subagent run', async () => {
-    // #given a parent session
+  it('with no launcher variable, rejects a subagent resume with the fixed text, then lets a fresh subagent run', async () => {
+    // #given a server with no launcher variable, so no host the plugin admits a resume for, and a parent session
     const created = await server.api('POST', '/api/session', {body: {location: {directory: sandbox.repo}}})
     const sessionID = String(Reflect.get(Reflect.get(created.data as object, 'data') as object, 'id'))
 
@@ -352,4 +352,246 @@ describe.skipIf(!runnable)('the lazy tracing chunk in a real opencode V2', () =>
     expect(sink.requests.length).toBe(before)
     expect(existsSync(marker)).toBe(false)
   }, 90_000)
+})
+
+const launcherWorkspace: Record<string, string> = {
+  [TRACING_LAUNCHER_ENV]: JSON.stringify({version: 1, host: 'workspace', tracing: 'off'}),
+}
+
+/** An id that is well formed but names no session. */
+const UNKNOWN_SESSION_ID = 'ses_unknownchild000000000000'
+
+/** How long B's first reply waits for the test to install the parent's resume script. */
+const GATE_TIMEOUT_MS = 30_000
+
+/** The host's report text that rejected a resume. */
+const REFUSAL_MARKER = 'Session reuse is disabled'
+
+describe.skipIf(!runnable)('same-run subagent resume in a real opencode V2', () => {
+  interface Rig {
+    readonly provider: FakeProvider
+    readonly server: RunningServer
+    readonly sandbox: SandboxPaths
+  }
+
+  const rigs: Rig[] = []
+
+  /** A server with its own sandbox and provider, so one test's sessions never reach another's. */
+  const launch = async (env: Record<string, string>): Promise<Rig> => {
+    const sandbox = makeSandbox()
+    const provider = await startFakeProvider()
+    const rig: Rig = {
+      provider,
+      sandbox,
+      server: await startOpenCodeServer({
+        binary: binary ?? '',
+        sandbox,
+        pluginDir: packageDir,
+        providerBaseURL: provider.baseURL,
+        env,
+      }),
+    }
+    rigs.push(rig)
+    return rig
+  }
+
+  afterEach(async () => {
+    for (const rig of rigs.splice(0)) {
+      await rig.server.stop()
+      await rig.provider.stop()
+      removeSandbox(rig.sandbox)
+    }
+  }, 60_000)
+
+  const createSession = async (rig: Rig): Promise<string> => {
+    const created = await rig.server.api('POST', '/api/session', {body: {location: {directory: rig.sandbox.repo}}})
+    return String(Reflect.get(Reflect.get(created.data as object, 'data') as object, 'id'))
+  }
+
+  const childrenOf = async (rig: Rig, parentID: string): Promise<Record<string, unknown>[]> =>
+    records(dataOf(await rig.server.api('GET', `/api/session?parentID=${parentID}`)))
+
+  /**
+   * Sends the parent's first prompt. The model dispatches child B (`CHILD_ALPHA`). B's reply is held at a gate until
+   * `scriptResume(childID)` has been installed, so the parent's next request never races the script that answers it. The
+   * gate is bounded: if nothing releases it in `GATE_TIMEOUT_MS`, B's request fails with a message that names the gate.
+   */
+  const dispatchChild = async (
+    rig: Rig,
+    marker: string,
+    scriptResume: (childID: string) => readonly FakeStep[],
+  ): Promise<{parentID: string; childID: string}> => {
+    const parentID = await createSession(rig)
+    let release!: () => void
+    let abandon!: (error: Error) => void
+    const gate = new Promise<void>((resolve, reject) => {
+      release = resolve
+      abandon = reject
+    })
+    // The provider reads the rejection; this handler keeps an unread one from surfacing as an unhandled rejection.
+    gate.catch(() => {})
+    const timer = setTimeout(() => {
+      abandon(new Error(`B's reply gate was not released within ${String(GATE_TIMEOUT_MS)}ms`))
+    }, GATE_TIMEOUT_MS)
+    try {
+      rig.provider.script([
+        {
+          all: [marker],
+          none: ['"role":"tool"'],
+          tools: [
+            {name: 'subagent', args: {agent: 'general', description: 'first', prompt: 'CHILD_ALPHA first question'}},
+          ],
+        },
+        {all: ['CHILD_ALPHA'], none: [marker, 'CHILD_BETA'], text: 'CHILD_ALPHA_REPLY', gate},
+      ])
+      const sent = await rig.server.api('POST', `/api/session/${parentID}/prompt`, {body: {text: `${marker} start`}})
+      expect(sent.status).toBe(200)
+      const child = await waitFor('child B to exist', async () => (await childrenOf(rig, parentID))[0])
+      const childID = String(child.id)
+      rig.provider.script(scriptResume(childID))
+      release()
+      return {parentID, childID}
+    } catch (error) {
+      abandon(error instanceof Error ? error : new Error(String(error)))
+      throw error
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  const parentRequest = async (rig: Rig, ...needles: string[]) =>
+    waitFor(`a parent request containing ${needles.join(' and ')}`, async () =>
+      rig.provider.requests.find(request => needles.every(needle => request.body.includes(needle))),
+    )
+
+  /** Requests no parent sent: they carry `needle` but not the parent's marker, so a session other than the parent got it. */
+  const requestsToOthers = (rig: Rig, marker: string, needle: string) =>
+    rig.provider.requests.filter(request => request.body.includes(needle) && !request.body.includes(marker))
+
+  const settle = async (): Promise<void> => new Promise(resolve => setTimeout(resolve, SETTLE_MS))
+
+  it('on the Action host, lets the parent resume its own finished child and receives the second reply', async () => {
+    // #given an Action-hosted server and a parent whose child B has been dispatched
+    const rig = await launch(launcherOff)
+    const marker = 'RESUME_OWN'
+    // #when B reports, the parent resumes B by its actual id, and B answers a second time
+    const {parentID, childID} = await dispatchChild(rig, marker, id => [
+      {
+        all: [marker, 'CHILD_ALPHA_REPLY'],
+        none: ['CHILD_BETA_REPLY'],
+        tools: [
+          {
+            name: 'subagent',
+            args: {agent: 'general', description: 'again', prompt: 'CHILD_BETA second question', sessionID: id},
+          },
+        ],
+      },
+      {all: ['CHILD_BETA'], none: [marker], text: 'CHILD_BETA_REPLY'},
+      {all: [marker, 'CHILD_BETA_REPLY'], text: 'resume flow finished'},
+    ])
+
+    // #then B's second reply reached the parent as a report
+    const finalRequest = await parentRequest(rig, marker, 'CHILD_BETA_REPLY')
+    expect(finalRequest.body).toContain('CHILD_ALPHA_REPLY')
+
+    // #and the resume was admitted: B itself was prompted, and nothing was refused
+    expect(requestsToOthers(rig, marker, 'CHILD_BETA').length).toBeGreaterThan(0)
+    expect(rig.provider.requests.filter(request => request.body.includes(REFUSAL_MARKER))).toEqual([])
+
+    // #and there is still exactly one child session, with the id the parent resumed
+    await settle()
+    const children = await childrenOf(rig, parentID)
+    expect(children.map(child => child.id)).toEqual([childID])
+  }, 120_000)
+
+  it('on the Action host, refuses a foreign and an unknown id with the fixed text and prompts no session', async () => {
+    // #given an Action-hosted server, a parent, and a second top-level session the parent did not dispatch
+    const rig = await launch(launcherOff)
+    const marker = 'RESUME_FOREIGN'
+    const parentID = await createSession(rig)
+    const foreignID = await createSession(rig)
+
+    // #when the model tries to resume each, in one turn
+    rig.provider.script([
+      {
+        all: [marker],
+        none: ['"role":"tool"'],
+        tools: [
+          {
+            name: 'subagent',
+            args: {agent: 'general', description: 'foreign', prompt: 'FOREIGN_GAMMA question', sessionID: foreignID},
+          },
+          {
+            name: 'subagent',
+            args: {
+              agent: 'general',
+              description: 'unknown',
+              prompt: 'FOREIGN_GAMMA question',
+              sessionID: UNKNOWN_SESSION_ID,
+            },
+          },
+        ],
+      },
+      {all: [marker, REFUSAL_MARKER], text: 'foreign flow finished'},
+    ])
+    const sent = await rig.server.api('POST', `/api/session/${parentID}/prompt`, {body: {text: `${marker} start`}})
+    expect(sent.status).toBe(200)
+
+    // #then both calls got the fixed refusal, which carries no id and no argument
+    const afterRefusal = await parentRequest(rig, marker, REFUSAL_MARKER)
+    const refusals = afterRefusal.messages.filter(
+      message => message.role === 'tool' && JSON.stringify(message.content).includes(REFUSAL_MARKER),
+    )
+    expect(refusals).toHaveLength(2)
+    for (const refusal of refusals) {
+      const text = JSON.stringify(refusal.content)
+      expect(text).toContain(TASK_REUSE_REJECTION)
+      expect(text).not.toContain('ses_')
+      expect(text).not.toContain('FOREIGN_GAMMA')
+    }
+
+    // #and no prompt reached any session: the foreign session has no messages, the parent has no child, and no
+    // provider request came from a session other than the parent
+    await settle()
+    const foreignMessages = records(dataOf(await rig.server.api('GET', `/api/session/${foreignID}/message`)))
+    expect(foreignMessages).toEqual([])
+    expect(await childrenOf(rig, parentID)).toEqual([])
+    expect(requestsToOthers(rig, marker, 'FOREIGN_GAMMA')).toEqual([])
+  }, 120_000)
+
+  it('on the workspace host, dispatches a child and then refuses to resume it', async () => {
+    // #given a workspace-hosted server and a parent whose child B has been dispatched
+    const rig = await launch(launcherWorkspace)
+    const marker = 'RESUME_WORKSPACE'
+    // #when B reports and the parent tries to resume B by its actual id
+    const {parentID, childID} = await dispatchChild(rig, marker, id => [
+      {
+        all: [marker, 'CHILD_ALPHA_REPLY'],
+        none: [REFUSAL_MARKER],
+        tools: [
+          {
+            name: 'subagent',
+            args: {agent: 'general', description: 'again', prompt: 'CHILD_BETA second question', sessionID: id},
+          },
+        ],
+      },
+      {all: [marker, REFUSAL_MARKER], text: 'workspace flow finished'},
+    ])
+
+    // #then the fixed refusal came back
+    const afterRefusal = await parentRequest(rig, marker, REFUSAL_MARKER)
+    const refusal = afterRefusal.messages.find(
+      message => message.role === 'tool' && JSON.stringify(message.content).includes(REFUSAL_MARKER),
+    )
+    const text = JSON.stringify(refusal?.content)
+    expect(text).toContain(TASK_REUSE_REJECTION)
+    expect(text).not.toContain('ses_')
+    expect(text).not.toContain('CHILD_BETA')
+
+    // #and B was never prompted again, and there is still exactly one child
+    await settle()
+    expect(requestsToOthers(rig, marker, 'CHILD_BETA')).toEqual([])
+    const children = await childrenOf(rig, parentID)
+    expect(children.map(child => child.id)).toEqual([childID])
+  }, 120_000)
 })

@@ -130,7 +130,7 @@ The Action no longer runs V1. A V1 `opencode-version` (a stock 1.x version or a 
 
 `src/services/setup/opencode.ts` verifies stock V2 archives against the asset digests recorded in `packages/runtime/src/shared/opencode-v2-pin.json`. An unrecorded V2 version or missing digest fails closed, as does a mismatched download; V2 does not silently fall back to a V1 binary. Linux uses tar archives and macOS uses zip archives; the workspace image selects the matching Linux musl asset.
 
-V2 installs both Systematic and `@fro.bot/opencode-plugin` (`0.3.0`). The latter supplies the four session-history tools, the subagent-session reuse guard and, when `trace-endpoint` is set, the run's [trace](#tracing-a-run). `plugin-install-v2.ts` performs bounded preparation outside the real session database. `src/harness/phases/v2-server.ts` checks both exact plugin specs before every spawn. A warm plugin cache makes this a cheap check; a missing plugin uses the bounded installer before the shorter server-readiness deadline begins. Failed preparation or an inactive required plugin prevents execution.
+V2 installs both Systematic and `@fro.bot/opencode-plugin` (`0.3.0`). The latter supplies the four session-history tools, the same-run subagent resume guard and, when `trace-endpoint` is set, the run's [trace](#tracing-a-run). `plugin-install-v2.ts` performs bounded preparation outside the real session database. `src/harness/phases/v2-server.ts` checks both exact plugin specs before every spawn. A warm plugin cache makes this a cheap check; a missing plugin uses the bounded installer before the shorter server-readiness deadline begins. Failed preparation or an inactive required plugin prevents execution.
 
 Plugin activation has its own readiness gate in `packages/runtime/src/agent/server-v2.ts`. Since upstream 2.2.7, `/api/agent` can answer successfully while `/api/plugin` is still empty. The harness polls the plugin list for up to 60 seconds until every expected plugin is active; a listed failure stops the gate immediately. An HTTP-ready server is therefore not yet a runnable agent.
 
@@ -230,7 +230,7 @@ The same bearer used by the gateway to attach to the OpenCode proxy on port 9200
 
 ### Server-start task-reuse guard
 
-The `@fro.bot/opencode-plugin` guard rejects a `subagent` call that carries a `sessionID`, so each background job has its own child session, on the Action and on the workspace (loaded from the config content the workspace agent passes at spawn).
+The `@fro.bot/opencode-plugin` guard admits a `subagent` resume only for a child this run dispatched from the calling session, and only on the Action host; the workspace (loaded from the config content the workspace agent passes at spawn) refuses every resume. See [[Background Subagents and Ownership]].
 
 ## Tools Cache
 

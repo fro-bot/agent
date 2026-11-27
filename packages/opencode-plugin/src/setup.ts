@@ -1,4 +1,4 @@
-/** Plugin setup: registers the subagent session-reuse guard, then the four session tools. */
+/** Plugin setup: registers the subagent session-reuse guard (two hooks), then the four session tools. */
 
 import type {Plugin} from '@opencode/plugin'
 import type {PluginSessionApi} from './session-client.js'
@@ -8,8 +8,8 @@ import process from 'node:process'
 import {logPluginLine} from './log.js'
 import {createPluginSessionClient} from './session-client.js'
 import {createSessionTools} from './session-tools.js'
-import {rejectSubagentReuse} from './task-reuse-guard.js'
-import {resolveTracingSettings, type TracingSettings} from './tracing/settings.js'
+import {createSubagentResumeGuard} from './task-reuse-guard.js'
+import {readLauncherHost, resolveTracingSettings, type TracingSettings} from './tracing/settings.js'
 
 type ToolEditor = Parameters<Parameters<Plugin.Context['tool']['transform']>[0]>[0]
 type ToolInfo = Parameters<ToolEditor['add']>[0]
@@ -83,9 +83,15 @@ export async function setupFroBotPlugin(
   host: HostSurface,
   options: SetupOptions = {},
 ): Promise<PluginCleanup | undefined> {
-  // The guard goes first: if it cannot be registered the plugin fails before exposing any tool.
+  // The guard goes first: if it cannot be registered the plugin fails before exposing any tool. Its record of dispatched
+  // children lives in this closure, so a reload starts empty and refuses every resume until a new dispatch is seen.
+  const env = options.env ?? process.env
+  const guard = createSubagentResumeGuard({actionHost: readLauncherHost(env) === 'action'})
   await host.tool.hook('execute.before', async event => {
-    rejectSubagentReuse(event)
+    guard.before(event)
+  })
+  await host.tool.hook('execute.after', event => {
+    guard.after(event)
   })
 
   const tools = createSessionTools({
@@ -109,10 +115,10 @@ export async function setupFroBotPlugin(
   // Last, and never able to fail the registrations above. The settings decision lives outside the lazy chunk.
   const log = options.log ?? logPluginLine
   const settings = resolveTracingSettings({
-    env: options.env ?? process.env,
+    env,
     directory: host.location.directory,
     log,
   })
   if (settings.mode !== 'on') return undefined
-  return startTracing(host, settings, options.env ?? process.env, log)
+  return startTracing(host, settings, env, log)
 }

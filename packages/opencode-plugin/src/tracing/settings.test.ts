@@ -8,7 +8,9 @@ import {afterEach, beforeEach, describe, expect, it} from 'vitest'
 
 import {
   HEADLESS_MARKERS,
+  MAX_LAUNCHER_CHARS,
   MAX_SETTINGS_FILE_BYTES,
+  readLauncherHost,
   resolveTracingSettings,
   TRACING_LAUNCHER_ENV,
   userSettingsFilePath,
@@ -776,5 +778,112 @@ describe.skipIf(!isPosix)('local session', () => {
 
     // #then nothing in the checkout turned tracing on
     expect(settings).toEqual({mode: 'off', reason: 'no-settings-file'})
+  })
+})
+
+describe('readLauncherHost', () => {
+  const read = (value: string | undefined, extra: Record<string, string | undefined> = {}) =>
+    readLauncherHost({...extra, ...(value === undefined ? {} : {[TRACING_LAUNCHER_ENV]: value})})
+
+  it('names the Action host from a valid launcher', () => {
+    // #given / #when / #then
+    expect(read(launcher())).toBe('action')
+  })
+
+  it.each([
+    ['tracing off', {tracing: 'off'}],
+    ['an unknown tracing mode', {tracing: 'maybe'}],
+    ['no tracing field', {tracing: undefined}],
+    ['an invalid relay', {relay: 'http://203.0.113.9:4318/v1/traces'}],
+    ['no relay', {relay: undefined}],
+    ['an invalid identity', {identity: {repository: ''}}],
+    ['no identity', {identity: undefined}],
+    ['an invalid run link', {rootSpan: {traceId: 'nope', spanId: 'nope'}}],
+    ['an unknown extra field', {extra: 1}],
+  ])('still names the Action host with %s: tracing and relay fields do not matter', (_label, overrides) => {
+    // #given a launcher whose host and version are valid and whose other fields are not
+    const value = JSON.stringify({...JSON.parse(launcher()), ...overrides})
+
+    // #when / #then
+    expect(read(value)).toBe('action')
+  })
+
+  it('names the Action host from a minimal document', () => {
+    // #given / #when / #then
+    expect(read(JSON.stringify({version: 1, host: 'action'}))).toBe('action')
+  })
+
+  it.each([
+    ['a missing variable', undefined],
+    ['an empty variable', ''],
+    ['malformed JSON', '{"version":1,"host":"action"'],
+    ['a string literal', JSON.stringify('action')],
+    ['null', 'null'],
+    ['an array', JSON.stringify([{version: 1, host: 'action'}])],
+    ['a number', '1'],
+    ['the workspace host', launcher({host: 'workspace'})],
+    ['an unknown host', launcher({host: 'local'})],
+    ['a differently cased host', launcher({host: 'Action'})],
+    ['a missing host', JSON.stringify({version: 1, tracing: 'on'})],
+    ['a host that is not a string', launcher({host: ['action']})],
+    ['an unsupported version', launcher({version: 2})],
+    ['a version that is a string', launcher({version: '1'})],
+    ['a missing version', JSON.stringify({host: 'action', tracing: 'off'})],
+  ])('does not name the Action host for %s', (_label, value) => {
+    // #given / #when / #then
+    expect(read(value)).toBeUndefined()
+  })
+
+  it('does not name the Action host for a document over the size cap', () => {
+    // #given an otherwise valid document padded past the launcher ceiling
+    const padded = JSON.stringify({version: 1, host: 'action', pad: 'x'.repeat(MAX_LAUNCHER_CHARS)})
+    expect(padded.length).toBeGreaterThan(MAX_LAUNCHER_CHARS)
+
+    // #when / #then
+    expect(read(padded)).toBeUndefined()
+  })
+
+  it('accepts a document exactly at the size cap', () => {
+    // #given
+    const base = JSON.stringify({version: 1, host: 'action', pad: ''})
+    const exact = JSON.stringify({version: 1, host: 'action', pad: 'x'.repeat(MAX_LAUNCHER_CHARS - base.length)})
+    expect(exact.length).toBe(MAX_LAUNCHER_CHARS)
+
+    // #when / #then
+    expect(read(exact)).toBe('action')
+  })
+
+  it('reads only the launcher variable: a user file or headless marker never names the Action host', () => {
+    // #given a user file that would turn tracing on locally, and headless markers
+    writeSettings()
+
+    // #when / #then neither is the Action
+    expect(
+      readLauncherHost({
+        HOME: home,
+        XDG_CONFIG_HOME: configHome,
+        OPENCODE_PASSWORD: 'x',
+        OPENCODE_CONFIG_CONTENT: '{}',
+      }),
+    ).toBeUndefined()
+  })
+
+  it('leaves the tracing decision for the same variable unchanged', () => {
+    // #given a launcher that says tracing is off on the Action host
+    const value = launcher({tracing: 'off'})
+
+    // #when / #then the host reader and the settings resolver each answer their own question
+    expect(read(value)).toBe('action')
+    expect(resolve({[TRACING_LAUNCHER_ENV]: value})).toEqual({mode: 'off', reason: 'action-off'})
+    expect(lines).toEqual([])
+  })
+
+  it('never logs or throws on a hostile value', () => {
+    // #given a prototype-poisoning-shaped document
+    const value = '{"version":1,"host":"action","__proto__":{"host":"workspace"}}'
+
+    // #when / #then the host is read from the document's own fields only, and no line is written
+    expect(() => read(value)).not.toThrow()
+    expect(lines).toEqual([])
   })
 })

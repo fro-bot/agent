@@ -282,6 +282,9 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
   const unattributed = new Map<string, V2DomainEvent[]>()
   // A notice can precede the dispatch result on the stream; the child or shell is then settled the moment it is adopted.
   const noticedChildIds = new Set<string>()
+  // `subagent` calls (by call key) whose progress already reopened their child: a replayed frame reopens only once.
+  // `settleOnFailure` is set when the entry was settled before the reopen: only then does a failed call put it back.
+  const resumedCalls = new Map<string, {readonly childSessionId: string; readonly settleOnFailure: boolean}>()
   const noticedShellIds = new Set<string>()
   // Diagnostic only: nothing below reads it back, so it cannot change what settles.
   const noticeLog = createSubagentNoticeLog({logger, rootSessionId: sessionId})
@@ -332,6 +335,49 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
     const held = unattributed.get(childSessionId)
     unattributed.delete(childSessionId)
     for (const event of held ?? []) handle(event)
+  }
+
+  /**
+   * A `subagent` call whose input names the child it resumes (`sessionID`) has been admitted: its progress frame names that
+   * same child, and upstream emits progress only after the plugin guard let the call through (a refused call has a
+   * `tool_called` and no progress). The child's next report is owed, so reopen its entry and forget that it was noticed:
+   * the sticky `noticedChildIds` entry would otherwise settle it again on adoption. Once per call id.
+   *
+   * Upstream emits the progress BEFORE it submits the prompt, so a call can fail after progress and no report ever comes
+   * (`settleResumeOnFailure`).
+   */
+  const reopenResumedChild = (
+    key: string,
+    input: Readonly<Record<string, unknown>> | null | undefined,
+    childSessionId: string,
+  ): void => {
+    if (ownershipLedger === undefined || childSessionId === sessionId) return
+    if (stringInput(input, 'sessionID') !== childSessionId || resumedCalls.has(key)) return
+    resumedCalls.set(key, {
+      childSessionId,
+      settleOnFailure: readLedgerState(ownershipLedger, childSessionId) === 'settled',
+    })
+    ownershipLedger.resume(childSessionId)
+    noticedChildIds.delete(childSessionId)
+    logger.debug('Subagent resume observed; reopened in ownership ledger', {sessionId, childSessionId})
+  }
+
+  /**
+   * A resume call ended in error after its progress reopened the child: the prompt usually never reached it, so the report
+   * the reopen made owed may never come. If it did start, the directory gate still holds release while it runs. A direct child of the root is settled by reconcile, but a deeper one is not (the Action
+   * lists only the root's children), so the stream settles it. Only an entry that was settled before the reopen goes back;
+   * a child that was already running keeps the run it was in, whose report is still owed.
+   */
+  const settleResumeOnFailure = (key: string, outcome: 'failed' | 'success'): void => {
+    const resumed = resumedCalls.get(key)
+    resumedCalls.delete(key)
+    if (ownershipLedger === undefined || resumed === undefined || outcome !== 'failed' || !resumed.settleOnFailure)
+      return
+    ownershipLedger.settle(resumed.childSessionId)
+    logger.debug('Subagent resume failed after progress; settled again in ownership ledger', {
+      sessionId,
+      childSessionId: resumed.childSessionId,
+    })
   }
 
   const adoptShell = (shellId: string): void => {
@@ -466,8 +512,12 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
         // this run's tree from that moment, and what it starts (a background shell above all) belongs to the run.
         if (toolCalls.get(callKey(event))?.name === 'subagent') {
           const childSessionId = readSubagentSessionId(event.metadata)
-          if (childSessionId !== null)
-            adoptDescendant(childSessionId, subagentLabel(toolCalls.get(callKey(event))?.input))
+          if (childSessionId !== null) {
+            const info = toolCalls.get(callKey(event))
+            // Before adoption: adopting a noticed child settles it again.
+            reopenResumedChild(callKey(event), info?.input, childSessionId)
+            adoptDescendant(childSessionId, subagentLabel(info?.input))
+          }
         }
         return true
       }
@@ -477,6 +527,7 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
         tracker.firstMeaningfulEventReceived = true
         const info = toolCalls.get(callKey(event))
         toolCalls.delete(callKey(event))
+        settleResumeOnFailure(callKey(event), event.outcome)
         const callShellId = readToolShellId(event.metadata) ?? shellByCall.get(callKey(event)) ?? null
         shellByCall.delete(callKey(event))
         const name = info?.name ?? null

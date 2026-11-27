@@ -204,4 +204,101 @@ describe('createOwnershipLedger', () => {
     // #then
     expect(ledger.snapshot()).toEqual([{sessionId: 'session-1', label: 'reviewer-subagent', state: 'outstanding'}])
   })
+
+  describe('resume', () => {
+    it('reopens a settled entry as outstanding, so the drain is not complete', () => {
+      // #given — an adopted child that settled
+      const ledger = createOwnershipLedger()
+      ledger.adopt('session-1', 'reviewer-subagent')
+      ledger.settle('session-1')
+      expect(ledger.isDrainComplete()).toBe(true)
+
+      // #when — the parent resumes it
+      ledger.resume('session-1')
+
+      // #then — the run waits for the child's next report, and the label survives
+      expect(ledger.snapshot()).toEqual([{sessionId: 'session-1', label: 'reviewer-subagent', state: 'outstanding'}])
+      expect(ledger.outstanding()).toBe(1)
+      expect(ledger.isDrainComplete()).toBe(false)
+      expect(ledger.isPersistenceSafe()).toBe(false)
+    })
+
+    it('reopens an unknown entry as outstanding, not unknown', () => {
+      // #given
+      const ledger = createOwnershipLedger()
+      ledger.adopt('session-1', 'reviewer-subagent')
+      ledger.markUnknown('session-1')
+
+      // #when
+      ledger.resume('session-1')
+
+      // #then
+      expect(ledger.outstanding()).toBe(1)
+      expect(ledger.unknown()).toBe(0)
+    })
+
+    it('leaves an outstanding entry outstanding', () => {
+      // #given
+      const ledger = createOwnershipLedger()
+      ledger.adopt('session-1', 'reviewer-subagent')
+
+      // #when
+      ledger.resume('session-1')
+      ledger.resume('session-1')
+
+      // #then — one entry, one outstanding
+      expect(ledger.snapshot()).toEqual([{sessionId: 'session-1', label: 'reviewer-subagent', state: 'outstanding'}])
+      expect(ledger.outstanding()).toBe(1)
+    })
+
+    it('does nothing for a child that was never adopted', () => {
+      // #given
+      const ledger = createOwnershipLedger()
+      ledger.adopt('session-1', 'reviewer-subagent')
+
+      // #when
+      ledger.resume('session-never-adopted')
+
+      // #then — no entry is created, and the others are untouched
+      expect(ledger.isTracked('session-never-adopted')).toBe(false)
+      expect(ledger.snapshot()).toEqual([{sessionId: 'session-1', label: 'reviewer-subagent', state: 'outstanding'}])
+    })
+
+    it('does nothing for a released entry', () => {
+      // #given
+      const ledger = createOwnershipLedger()
+      ledger.adopt('session-1', 'reviewer-subagent')
+      ledger.release('session-1')
+
+      // #when
+      ledger.resume('session-1')
+
+      // #then
+      expect(ledger.snapshot()).toEqual([])
+    })
+
+    it('touches only the named child, and the child settles again as usual', () => {
+      // #given — two settled children
+      const ledger = createOwnershipLedger()
+      ledger.adopt('session-1', 'a')
+      ledger.adopt('session-2', 'b')
+      ledger.settle('session-1')
+      ledger.settle('session-2')
+
+      // #when
+      ledger.resume('session-1')
+
+      // #then
+      expect(ledger.snapshot()).toEqual([
+        {sessionId: 'session-1', label: 'a', state: 'outstanding'},
+        {sessionId: 'session-2', label: 'b', state: 'settled'},
+      ])
+
+      // #when — the next report settles it
+      ledger.settle('session-1')
+
+      // #then
+      expect(ledger.isDrainComplete()).toBe(true)
+    })
+  })
 })
