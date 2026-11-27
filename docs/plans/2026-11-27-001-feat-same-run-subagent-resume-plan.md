@@ -81,7 +81,7 @@ The guard exists because a resumed child used to go untracked (#1759, #1769). `a
 
 ## Implementation Units
 
-- [ ] **Unit 1: Plugin admission**
+- [x] **Unit 1: Plugin admission**
 
 **Goal:** The guard admits a resume of a recorded child of the caller on the Action host, and refuses everything else.
 
@@ -108,7 +108,7 @@ The guard exists because a resumed child used to go untracked (#1759, #1769). `a
 
 **Verification:** Guard, settings and bundle tests pass, and the refusal text is byte-identical.
 
-- [ ] **Unit 2: Ledger resume**
+- [x] **Unit 2: Ledger resume**
 
 **Goal:** A resume reopens the settled child so the run waits for its next report.
 
@@ -132,7 +132,7 @@ The guard exists because a resumed child used to go untracked (#1759, #1769). `a
 
 **Verification:** Ledger and streaming suites pass, and existing assertions are unchanged.
 
-- [ ] **Unit 3: Real-host proof and docs**
+- [x] **Unit 3: Real-host proof and docs**
 
 **Goal:** Show the flow on the pinned binary, and correct the guard docs.
 
@@ -158,6 +158,7 @@ The guard exists because a resumed child used to go untracked (#1759, #1769). `a
 | --- | --- |
 | A resume that joins a running child, or overlapping resumes, produces one report for several reopen calls. | The entry is already outstanding, so a join changes nothing. Overlap is a documented residual, and the directory gate holds release while the child runs. |
 | The stream misses the resume's progress frame (SSE gap), so the settled entry stays settled. | The directory gate holds release while the child is active. This is the same exposure a missed fresh dispatch has today. |
+| Upstream emits the resume's progress before it prompts the child, so a prompt that fails afterwards reopens a child that never reports. | The existing reconcile pass settles an outstanding child that is not live (`ledger-reconcile.ts:262-267`), so the run does not wait for the deadline. |
 | A plugin reload drops the record and refuses a legitimate resume. | The guard fails closed, and the model can dispatch a fresh child. |
 | A future pin changes report delivery to two paths. | Recheck the "delivered once" assumption on the next pin bump, before relying on it. |
 

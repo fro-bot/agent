@@ -278,7 +278,7 @@ Per-repo S3 conditional-write locks (`If-None-Match` / `If-Match`) built by `get
 
 - Root `session.idle` with a non-empty ledger enters drain. The drain-completion gate (`execute/drain-completion-v2.ts`) releases the run only when the ledger is drained, every queued notice has been delivered, root idle evidence is current, and the run's directory has stayed quiet. Reconciliation settles tracked entries only; it never adopts.
 - Teardown settles through `settleOwnedSessionsV2`; an unconfirmed root or child means `quarantined` (held lock, no slot hand-off).
-- The `@fro.bot/opencode-plugin` guard rejects a `subagent` call carrying a `sessionID`, so each background job has its own child session.
+- The `@fro.bot/opencode-plugin` guard refuses every `subagent` resume on the workspace server, so each background job has its own child session.
 - A run is admitted only when the workspace's `/readyz` `opencodeVersion` is major 2 or higher; the image refuses to build or start on anything else.
 
 > See also: [Background Subagents and Ownership](docs/wiki/Background%20Subagents%20and%20Ownership.md#background-subagent-ownership-ledger-gateway)
@@ -289,7 +289,7 @@ Per-repo S3 conditional-write locks (`If-None-Match` / `If-Match`) built by `get
 
 - `runDrain` runs between execute and review reconciliation: reconcile, poll `isDrainComplete()` to the shared deadline, then abort whatever is not `settled`. `runCleanup` consumes `isPersistenceSafe()` (`ownership-declined`).
 - `buildCIConfigV2` (`src/services/setup/ci-config-v2.ts`) strips `subagent_depth` from the operator config with a warning.
-- On V2 the `@fro.bot/opencode-plugin` guard rejects `task_id` reuse, so each background job has its own child session.
+- On V2 the `@fro.bot/opencode-plugin` guard admits a `subagent` resume only for a child this run dispatched from the calling session, on the Action host, and refuses every other `sessionID`.
 - The subagent notice log (`src/features/agent/subagent-notice-log.ts`) is diagnostic only and never an input to settlement. Notice bodies and descriptions are untrusted and never logged.
 
 > See also: [Background Subagents and Ownership](docs/wiki/Background%20Subagents%20and%20Ownership.md#reconciliation-and-notices)
