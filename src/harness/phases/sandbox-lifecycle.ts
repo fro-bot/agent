@@ -32,13 +32,17 @@ import {
   admitLaunch,
   buildRunAsSandboxArgv,
   createAttachmentDirExclusive,
+  createOpencodeCliShim,
   createSandboxAccount,
   deleteSandboxAccount,
   GATE_ERR_FILE,
   GATE_GO_FILE,
   GATE_NS_FILE,
   isWithin,
+  OPENCODE_CLI_SHIM_FILE,
   parseMountInfo,
+  prependPathDirectory,
+  readCliShimProbe,
   SANDBOX_VIEW_TEMP_MOUNTS,
   stopLaunch,
   stopSandboxProcesses,
@@ -237,6 +241,12 @@ export interface SandboxLifecycleOptions {
    * nothing else provides it and never shadows a tool from an earlier step. Null or absent when the path is unknown.
    */
   readonly opencodeDirectory?: string | null
+  /**
+   * The OpenCode binary itself (absolute). The agent's `PATH` starts with a guard directory whose `opencode` runs this binary
+   * for `--version` and `--help` only and refuses everything else, so the agent's CLI cannot autostart a second server
+   * (fro-bot/agent#2369). Null or absent when the path is unknown: the run then has no guard, and says so.
+   */
+  readonly opencodeBinaryPath?: string | null
   /** The run-scoped response directory, or null when the delivery has none. */
   readonly responseDir: string | null
   /** The run-scoped attachment directory (created here so default ACLs cover files the runner writes later). */
@@ -306,6 +316,8 @@ export interface SandboxLifecycleDeps {
    * anywhere else. `left` means something else is there and was not touched.
    */
   readonly removeLink: (target: string, expected: string) => Promise<'absent' | 'left' | 'removed'>
+  /** The guard for the agent's `opencode` command (fro-bot/agent#2369): a fresh runner-owned directory holding one script. */
+  readonly createCliShim: typeof createOpencodeCliShim
 }
 
 /** What `inspectEntry` found. `unreadable` is anything but a clean "no such entry" (a file where a parent should be, say). */
@@ -385,6 +397,7 @@ const defaultDeps: SandboxLifecycleDeps = {
     await fs.unlink(target)
     return 'removed'
   },
+  createCliShim: createOpencodeCliShim,
 }
 
 /** Where the view's old root is moved before it is unmounted. An empty directory on every supported image. */
@@ -512,6 +525,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   // OpenCode directory. The trusted runner-side `PATH`s (trusted git, `TRUSTED_TOOL_DIRS`) are separate and unchanged.
   const {runnerPath} = options
   const opencodeDirectory = options.opencodeDirectory ?? null
+  const opencodeBinaryPath = options.opencodeBinaryPath ?? null
   const viewLauncher = options.viewLauncher ?? {
     nodePath: process.execPath,
     builderPath: fileURLToPath(new URL('./sandbox-view.js', import.meta.url)),
@@ -557,6 +571,8 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
   // The `opencode` link this lifecycle made inside `agentStateHome` (where it is, and where it points), removed once the files
   // are back. Set only after the link command succeeded, so an entry this run did not make is never recorded. Null when none.
   let agentStateLink: {readonly path: string; readonly target: string} | null = null
+  // The directory holding the agent's `opencode` guard (fro-bot/agent#2369), removed once the files are back. Null when none.
+  let cliShim: {readonly directory: string; readonly remove: () => void} | null = null
   const closeAdmission = (): void => {
     admissionClosed = true
     for (const controller of pendingLaunches.values()) controller.abort()
@@ -823,6 +839,12 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
           error: toErrorMessage(error),
         })
       }
+    }
+    // Same rule as the link: from a restored tree only. The guard is the runner's own, written and never writable by the sandbox.
+    if (restore.status === 'restored' && cliShim !== null) {
+      const guard = cliShim
+      cliShim = null
+      guard.remove()
     }
     const timedOutDuringTakeBack = timedOut()
     if (timedOutDuringTakeBack !== null) {
@@ -1117,6 +1139,17 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
         logger.debug('OpenCode directory is unknown; the agent PATH does not get it', {})
       }
       const agentPath = buildSandboxPath(runnerPath, deps.isDirectory, opencodeDirectory)
+      // The guard (#2369) is made now, so the handoff grants the sandbox read and execute on it like any other read grant.
+      // No server runs without it: a failure here fails the preparation.
+      if (opencodeBinaryPath === null) {
+        logger.warning('The OpenCode binary path is unknown; the agent gets no OpenCode CLI guard', {})
+      } else {
+        const made = deps.createCliShim({binaryPath: opencodeBinaryPath, parentDirectory: runnerTemp})
+        if (!made.success)
+          return await failAndRelease(`isolate-agent could not make its OpenCode CLI guard: ${made.error}`)
+        cliShim = made.data
+        readable.add(made.data.directory)
+      }
       const installRoots = await deps.resolveToolRoots({
         runnerHome,
         runnerUid: ids.uid,
@@ -1184,11 +1217,42 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
             boundRoots.some(root => isWithin(root, resolved)))
         toolLocations.push([name, visible ? resolved : ''])
       }
+      // First on the PATH, ahead of everything the runner and the OpenCode directory provide.
+      const guardedPath = cliShim === null ? agentPath : prependPathDirectory(cliShim.directory, agentPath)
       const reachable = await reachableDirectories([
-        ...agentPath.split(path.delimiter),
+        ...guardedPath.split(path.delimiter),
         ...toolLocations.flatMap(([, resolved]) => (resolved === '' ? [] : [resolved])),
       ])
-      const launchPath = reachablePath(agentPath, reachable, input.traceSpan)
+      // A guard the account cannot enter would be dropped from the PATH below, and the agent would run without it.
+      if (cliShim !== null && !reachable.has(cliShim.directory)) {
+        return await failAndRelease('isolate-agent: the sandbox user cannot enter its OpenCode CLI guard directory')
+      }
+      // And it must run: a `noexec` RUNNER_TEMP (or any mount the sandbox user cannot execute from) would leave an entry on the
+      // PATH that only fails. Run it once as the sandbox user with an argument it refuses. A guard that does not run is left
+      // off the PATH with one warning, and the run goes on without it, as it did before the guard existed.
+      let guardRuns = cliShim !== null
+      if (cliShim !== null) {
+        const ran = await run(
+          buildRunAsSandboxArgv(account, tools, [path.join(cliShim.directory, OPENCODE_CLI_SHIM_FILE), 'api']),
+        )
+        // A probe that outlived its budget was killed, not finished: like any privileged timeout it is not known to have stopped, so
+        // the run fails closed here (`run` already marked it unsafe), before a launch spec exists. Only a probe that exited may
+        // fall back to going on without the guard.
+        if (ran.timedOutAfterMs !== undefined) {
+          return await failAndRelease('isolate-agent: the OpenCode CLI guard probe timed out')
+        }
+        const read = readCliShimProbe({exitCode: ran.exitCode, stderr: ran.stderr ?? ''})
+        if (!read.success) {
+          guardRuns = false
+          logger.warning(
+            'The OpenCode CLI guard cannot run as the sandbox user, so the agent PATH is left without it',
+            {
+              reason: read.error,
+            },
+          )
+        }
+      }
+      const launchPath = reachablePath(guardRuns ? guardedPath : agentPath, reachable, input.traceSpan)
       const passedToolLocations = Object.fromEntries(toolLocations.filter(([, resolved]) => reachable.has(resolved)))
       const droppedToolLocations = toolLocations
         .filter(([, resolved]) => !reachable.has(resolved))

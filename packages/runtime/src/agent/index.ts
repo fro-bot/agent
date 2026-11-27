@@ -6,6 +6,18 @@ export {
   SKILLS_EDIT_DENY_PATTERN_V1,
 } from './bundled-skills-dir.js'
 export {
+  buildOpencodeCliShimScript,
+  createOpencodeCliShim,
+  OPENCODE_CLI_SHIM_ALLOWED_ARGUMENTS,
+  OPENCODE_CLI_SHIM_EXIT_CODE,
+  OPENCODE_CLI_SHIM_FILE,
+  OPENCODE_CLI_SHIM_REFUSAL,
+  prependPathDirectory,
+  probeOpencodeCliShim,
+  readCliShimProbe,
+} from './cli-shim.js'
+export type {CliShimProbeOutcome, CreateOpencodeCliShimOptions, OpencodeCliShim} from './cli-shim.js'
+export {
   boundedCredentialRequest,
   credentialFailure,
   modelProviderId,

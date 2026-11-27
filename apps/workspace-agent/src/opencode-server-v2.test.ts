@@ -7,7 +7,17 @@ import type {SpawnConfig} from './opencode-credentials-v2.js'
 import type {RunSupervisedOpencodeV2Options, SupervisedStatusRef} from './opencode-server-v2.js'
 import type {Logger} from './types.js'
 
-import {mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync} from 'node:fs'
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
@@ -16,6 +26,7 @@ import {
   DEFAULT_SYSTEMATIC_VERSION,
   FRO_BOT_PLUGIN_ID,
   resolveSystematicSkillsDirsV2,
+  startOpenCodeV2Server,
   SYSTEMATIC_V2_PLUGIN_ID,
   verifyPermissionRules,
   WORKSPACE_TRACING_HOST,
@@ -219,6 +230,54 @@ describe('buildOpencodeV2Env', () => {
 
     // #then
     expect(env).not.toHaveProperty('OPENCODE_DISABLE_FILEWATCHER')
+  })
+})
+
+describe('the OpenCode CLI guard on the workspace PATH (#2369)', () => {
+  const roots: string[] = []
+
+  afterEach(() => {
+    for (const root of roots.splice(0)) rmSync(root, {recursive: true, force: true})
+  })
+
+  const runtimeLogger = {
+    debug: () => undefined,
+    info: () => undefined,
+    warning: () => undefined,
+    error: () => undefined,
+  }
+
+  it('starts the child PATH with the guard directory, ahead of the trusted directories that hold the real opencode', async () => {
+    // #given a binary that records the PATH it was given and exits, so the start fails after the spawn
+    const root = mkdtempSync(path.join(os.tmpdir(), 'ws-guard-'))
+    roots.push(root)
+    const recorded = path.join(root, 'path.txt')
+    const binary = path.join(root, 'fake-opencode')
+    writeFileSync(binary, `#!/bin/sh\nprintf '%s' "$PATH" > '${recorded}'\nexit 3\n`)
+    chmodSync(binary, 0o755)
+    const base = path.join(root, 'db')
+    mkdirSync(base)
+
+    // #when the real runtime start is given what the workspace gives it: its allowlist environment and its guard parent
+    const result = await startOpenCodeV2Server(
+      {
+        binaryPath: binary,
+        directory: root,
+        expectedPluginIds: [],
+        tracingHost: WORKSPACE_TRACING_HOST,
+        env: buildOpencodeV2Env(process.env, path.join(base, 'spawn-x', 'opencode.db')),
+        cliShimParentDirectory: base,
+        timeouts: {listenTimeoutMs: 5000},
+      },
+      runtimeLogger,
+    )
+
+    // #then the child saw the guard first and the workspace's fixed PATH, unchanged, after it
+    expect(result.success).toBe(false)
+    const seen = readFileSync(recorded, 'utf8').split(':')
+    expect(seen.slice(1)).toEqual(['/usr/local/bin', '/usr/bin', '/bin'])
+    expect(path.dirname(seen[0] ?? '')).toBe(base)
+    expect(path.basename(seen[0] ?? '').startsWith('fro-bot-opencode-cli-')).toBe(true)
   })
 })
 
@@ -498,6 +557,10 @@ describe('runSupervisedOpencodeV2', () => {
     )
     expect(start?.env?.OPENCODE_DB).toBe(dbPaths[0])
     expect(start?.env?.HTTPS_PROXY).toBe('http://mitmproxy:8080')
+    // The guard for the agent's `opencode` command (#2369) is made beside the database, in the root-owned base directory
+    // the agent can traverse but not write; this is a plain spawn, not a sandbox launch, which makes its own.
+    expect(start?.cliShimParentDirectory).toBe('/db')
+    expect(start?.sandbox).toBeUndefined()
 
     controller.abort()
     await done
