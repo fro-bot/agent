@@ -2631,26 +2631,29 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
       },
     )
 
-    it('refuses a provider named `mcp` when MCP routes exist, because it would own the `/mcp/` prefix', async () => {
-      const deps = depsFor(fakeServer())
-      const opencodeConfig = JSON.stringify({
-        provider: {mcp: {npm: '@ai-sdk/openai-compatible', options: {baseURL: 'https://gw.example/v1'}}},
-        mcp: {search: REMOTE},
-      })
+    it.each(['mcp', 'MCP'])(
+      'refuses a provider named `%s` when MCP routes exist, because it would own the `/mcp/` prefix',
+      async providerId => {
+        const deps = depsFor(fakeServer())
+        const opencodeConfig = JSON.stringify({
+          provider: {[providerId]: {npm: '@ai-sdk/openai-compatible', options: {baseURL: 'https://gw.example/v1'}}},
+          mcp: {search: REMOTE},
+        })
 
-      const result = await startMcp(fakeSandbox().sandbox, deps, {
-        opencodeConfig,
-        authJson: JSON.stringify({mcp: {type: 'api', key: CANARY}}),
-      })
+        const result = await startMcp(fakeSandbox().sandbox, deps, {
+          opencodeConfig,
+          authJson: JSON.stringify({[providerId]: {type: 'api', key: CANARY}}),
+        })
 
-      const error = unwrapErr(result)
-      expect(error.stage).toBe('config')
-      expect(error.message).toContain('provider "mcp"')
-      expect(error.message).toContain('Fix: ')
-      expect(error.message).not.toContain(TOKEN)
-      expect(error.message).not.toContain(CANARY)
-      expect(deps.startKeyProxy).not.toHaveBeenCalled()
-    })
+        const error = unwrapErr(result)
+        expect(error.stage).toBe('config')
+        expect(error.message).toContain(`provider "${providerId}"`)
+        expect(error.message).toContain('Fix: ')
+        expect(error.message).not.toContain(TOKEN)
+        expect(error.message).not.toContain(CANARY)
+        expect(deps.startKeyProxy).not.toHaveBeenCalled()
+      },
+    )
 
     it('allows a provider named `mcp` when no MCP route exists', async () => {
       const deps = depsFor(fakeServer())

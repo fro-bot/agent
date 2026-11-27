@@ -930,8 +930,7 @@ describe('planMcpBrokerV2', () => {
   describe('definitively disabled servers', () => {
     it.each([
       ['enabled: false', {enabled: false}],
-      ['disabled: true', {disabled: true}],
-      ['both spellings agreeing', {enabled: false, disabled: true}],
+      ['`enabled: false` beside a `disabled: true` that the client ignores', {enabled: false, disabled: true}],
     ])('strips the headers and plans no route for %s', (_label, flags) => {
       const plan = unwrapOk(planMcpBrokerV2({off: credentialed(flags)}))
 
@@ -952,6 +951,42 @@ describe('planMcpBrokerV2', () => {
         {name: 'off', layout: 'native'},
         {name: 'dead', layout: 'legacy'},
       ])
+    })
+
+    it.each([
+      [
+        'a flat `disabled: true`, which the 2.4.2 client ignores',
+        (flags: object) => ({off: credentialed(flags)}),
+        {disabled: true},
+      ],
+      [
+        'a native `enabled: false`, which the 2.4.2 client ignores',
+        (flags: object) => ({servers: {off: credentialed(flags)}}),
+        {enabled: false},
+      ],
+    ])('brokers %s, because the server stays active', (_label, layout, flags) => {
+      // #given an entry whose flag the client does not honour in its layout
+      const plan = unwrapOk(planMcpBrokerV2(layout(flags)))
+
+      // #then it is routed and masked like any active server, and nothing is stripped
+      expect(plan.routes).toHaveLength(1)
+      expect(plan.stripped).toEqual([])
+      expect(plan.secrets.map(secret => secret.value)).toContain(BEARER)
+    })
+
+    it.each([
+      ['a flat `enabled: false`', (flags: object) => ({off: credentialed(flags)}), {enabled: false}, 'legacy'],
+      [
+        'a native `disabled: true`',
+        (flags: object) => ({servers: {off: credentialed(flags)}}),
+        {disabled: true},
+        'native',
+      ],
+    ])('strips %s, the one disabled form of its layout', (_label, layout, flags, kind) => {
+      const plan = unwrapOk(planMcpBrokerV2(layout(flags)))
+
+      expect(plan.routes).toEqual([])
+      expect(plan.stripped).toEqual([{name: 'off', layout: kind}])
     })
 
     it('brokers an entry that says `enabled: true`', () => {

@@ -586,8 +586,13 @@ function blockRefusal(kind: McpBrokerRefusalKind, problem: string, fix: string):
 
 type DisabledState = 'active' | 'conflict' | 'disabled' | 'unresolved'
 
-/** `enabled: false` (flat) and `disabled: true` (native) both disable; each must be a literal boolean, and agree. */
-function disabledStateOf(entry: Record<string, unknown>): DisabledState {
+/**
+ * What OpenCode 2.4.2 does with the flags, recorded against the pinned binary: a flat entry (`mcp.<name>`) is read by the V1
+ * schema, so only `enabled: false` disables it and `disabled` is ignored; a native entry (`mcp.servers.<name>`) only
+ * honours `disabled: true` and ignores `enabled`. An entry the client leaves active must be brokered, not stripped, or it
+ * would connect straight to its upstream. Each flag must still be a literal boolean, and the two must not contradict.
+ */
+function disabledStateOf(entry: Record<string, unknown>, origin: 'legacy' | 'native'): DisabledState {
   const {enabled, disabled} = entry
   if (
     (enabled !== undefined && typeof enabled !== 'boolean') ||
@@ -596,7 +601,8 @@ function disabledStateOf(entry: Record<string, unknown>): DisabledState {
     return 'unresolved'
   }
   if (enabled !== undefined && disabled !== undefined && enabled === disabled) return 'conflict'
-  return enabled === false || disabled === true ? 'disabled' : 'active'
+  const off = origin === 'legacy' ? enabled === false : disabled === true
+  return off ? 'disabled' : 'active'
 }
 
 /**
@@ -827,7 +833,7 @@ export function planMcpBrokerV2(mcp: unknown): Result<McpBrokerPlanV2, McpBroker
         'write `type` out literally',
       )
     }
-    const state = disabledStateOf(value)
+    const state = disabledStateOf(value, layoutOrigin)
     if (state === 'unresolved') {
       return brokerRefusal(
         'unresolved-flag',
