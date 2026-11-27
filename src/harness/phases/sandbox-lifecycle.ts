@@ -39,8 +39,10 @@ import {
   GATE_GO_FILE,
   GATE_NS_FILE,
   isWithin,
+  OPENCODE_CLI_SHIM_FILE,
   parseMountInfo,
   prependPathDirectory,
+  readCliShimProbe,
   SANDBOX_VIEW_TEMP_MOUNTS,
   stopLaunch,
   stopSandboxProcesses,
@@ -1225,7 +1227,26 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       if (cliShim !== null && !reachable.has(cliShim.directory)) {
         return await failAndRelease('isolate-agent: the sandbox user cannot enter its OpenCode CLI guard directory')
       }
-      const launchPath = reachablePath(guardedPath, reachable, input.traceSpan)
+      // And it must run: a `noexec` RUNNER_TEMP (or any mount the sandbox user cannot execute from) would leave an entry on the
+      // PATH that only fails. Run it once as the sandbox user with an argument it refuses. A guard that does not run is left
+      // off the PATH with one warning, and the run goes on without it, as it did before the guard existed.
+      let guardRuns = cliShim !== null
+      if (cliShim !== null) {
+        const ran = await run(
+          buildRunAsSandboxArgv(account, tools, [path.join(cliShim.directory, OPENCODE_CLI_SHIM_FILE), 'api']),
+        )
+        const read = readCliShimProbe({exitCode: ran.exitCode, stderr: ran.stderr ?? ''})
+        if (!read.success) {
+          guardRuns = false
+          logger.warning(
+            'The OpenCode CLI guard cannot run as the sandbox user, so the agent PATH is left without it',
+            {
+              reason: read.error,
+            },
+          )
+        }
+      }
+      const launchPath = reachablePath(guardRuns ? guardedPath : agentPath, reachable, input.traceSpan)
       const passedToolLocations = Object.fromEntries(toolLocations.filter(([, resolved]) => reachable.has(resolved)))
       const droppedToolLocations = toolLocations
         .filter(([, resolved]) => !reachable.has(resolved))

@@ -9,12 +9,13 @@ import {randomBytes} from 'node:crypto'
 import {readFileSync} from 'node:fs'
 import net from 'node:net'
 import os from 'node:os'
+import path from 'node:path'
 import process from 'node:process'
 import {sleep} from '../shared/async.js'
 import {FRO_BOT_TRACING_LAUNCHER_ENV} from '../shared/constants.js'
 import {toErrorMessage} from '../shared/errors.js'
 import {err, ok} from '../shared/types.js'
-import {createOpencodeCliShim, prependPathDirectory} from './cli-shim.js'
+import {createOpencodeCliShim, OPENCODE_CLI_SHIM_FILE, prependPathDirectory, probeOpencodeCliShim} from './cli-shim.js'
 import {filterAgentEnv} from './filter-env.js'
 import {buildSetprivDropArgs} from './sandbox-identity.js'
 import {GATE_ERR_FILE, GATE_GO_FILE, GATE_NS_FILE, rootChainReport, rootChainTail} from './sandbox-namespace.js'
@@ -170,6 +171,14 @@ export interface OpenCodeV2ServerHandle {
 export interface OpenCodeV2Deps {
   /** Signal the child's process group. Default: `process.kill(-pid, signal)`. */
   readonly killGroup: (pid: number, signal: NodeJS.Signals) => void
+  /**
+   * Runs the made CLI guard once as the identity the server will run as (`identity`: the spawn's uid and gid; absent: the
+   * caller's own). Default: `probeOpencodeCliShim`. A guard that cannot run, as on a `noexec` mount, is left off the `PATH`.
+   */
+  readonly probeCliShim: (
+    shimFile: string,
+    identity?: {readonly uid: number; readonly gid: number},
+  ) => Result<null, string>
 }
 
 /**
@@ -611,7 +620,7 @@ export async function startOpenCodeV2Server(
   logger: Logger,
 ): Promise<Result<OpenCodeV2ServerHandle, OpenCodeV2StartError>> {
   const timeouts: OpenCodeV2Timeouts = {...DEFAULT_OPENCODE_V2_TIMEOUTS, ...options.timeouts}
-  const deps: OpenCodeV2Deps = {killGroup: killProcessGroup, ...options.deps}
+  const deps: OpenCodeV2Deps = {killGroup: killProcessGroup, probeCliShim: probeOpencodeCliShim, ...options.deps}
   const {signal} = options
 
   if (options.port !== undefined && !isValidPort(options.port)) {
@@ -686,8 +695,22 @@ export async function startOpenCodeV2Server(
       logger.warning('OpenCode V2 server start failed', {kind: failure.kind})
       return err(failure)
     }
-    cliShim = made.data
-    childEnv.PATH = prependPathDirectory(cliShim.directory, childEnv.PATH)
+    // The guard must run as whoever runs the server: a `noexec` RUNNER_TEMP, or a directory that identity cannot enter, would
+    // put an entry on the PATH that only fails. That is no better than no guard, and it must not fail the run: warn once and
+    // leave the PATH as it was.
+    const probed = deps.probeCliShim(
+      path.join(made.data.directory, OPENCODE_CLI_SHIM_FILE),
+      options.uid === undefined || options.gid === undefined ? undefined : {uid: options.uid, gid: options.gid},
+    )
+    if (probed.success) {
+      cliShim = made.data
+      childEnv.PATH = prependPathDirectory(cliShim.directory, childEnv.PATH)
+    } else {
+      made.data.remove()
+      logger.warning('The OpenCode CLI guard cannot run here, so the agent PATH is left without it', {
+        reason: probed.error,
+      })
+    }
   }
 
   const serveArgs = ['serve', '--stdio', '--hostname', LOOPBACK, '--port', String(port)]

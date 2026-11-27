@@ -13,6 +13,7 @@ import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import {afterEach, describe, expect, expectTypeOf, it, vi} from 'vitest'
+import {err, ok} from '../shared/types.js'
 import {buildOpencodeCliShimScript, OPENCODE_CLI_SHIM_FILE} from './cli-shim.js'
 import {createFixture} from './server-v2-test-kit.js'
 import {DEFAULT_OPENCODE_V2_TIMEOUTS, startOpenCodeV2Server} from './server-v2.js'
@@ -790,6 +791,60 @@ describe('startOpenCodeV2Server', () => {
       expect(errorOf(result)?.kind).toBe('spawn-failed')
       await waitFor(() => guardDirectories(parent).length === 0)
       expect(guardDirectories(parent)).toEqual([])
+    })
+
+    it('leaves the PATH as it was, warns once, and removes the guard when the launch identity cannot run it (noexec)', async () => {
+      // #given a guard the probe reports as unrunnable, as on a noexec RUNNER_TEMP
+      const created = fixture()
+      const parent = guardParent()
+      const warnings: string[] = []
+      const logger: Logger = {
+        debug: () => undefined,
+        info: () => undefined,
+        warning: message => {
+          warnings.push(message)
+        },
+        error: () => undefined,
+      }
+      const probeCliShim = vi.fn(() => err('the shim exited 126, not as a refusal'))
+
+      // #when started
+      const result = await start(
+        created,
+        {env: {PATH: '/opt/real:/usr/bin'}, cliShimParentDirectory: parent, deps: {probeCliShim}},
+        logger,
+      )
+
+      // #then it fails open: the server runs with the PATH it was given, and no guard is left behind
+      expect(result.success).toBe(true)
+      expect(probeCliShim).toHaveBeenCalledTimes(1)
+      expect(created.readRecord().env.PATH).toBe('/opt/real:/usr/bin')
+      expect(guardDirectories(parent)).toEqual([])
+      // #and the operator is told once
+      expect(warnings.filter(message => message.includes('CLI guard'))).toHaveLength(1)
+    })
+
+    it('probes the shim file it made, as the uid and gid the child is given', async () => {
+      // #given the current identity, which an unprivileged process may always take
+      const uid = process.getuid?.()
+      const gid = process.getgid?.()
+      if (uid === undefined || gid === undefined) return
+      const created = fixture()
+      const parent = guardParent()
+      const probeCliShim = vi.fn((_file: string, _identity?: {readonly uid: number; readonly gid: number}) => ok(null))
+
+      // #when started with that identity, and again without one
+      await start(created, {env: {PATH: '/usr/bin'}, cliShimParentDirectory: parent, uid, gid, deps: {probeCliShim}})
+      const bare = fixture()
+      await start(bare, {env: {PATH: '/usr/bin'}, cliShimParentDirectory: parent, deps: {probeCliShim}})
+
+      // #then the probe ran the made file, as the given identity first and as the caller (no identity) second
+      expect(probeCliShim).toHaveBeenCalledTimes(2)
+      const [first, second] = probeCliShim.mock.calls
+      expect(path.basename(first?.[0] ?? '')).toBe(OPENCODE_CLI_SHIM_FILE)
+      expect(path.dirname(path.dirname(first?.[0] ?? ''))).toBe(parent)
+      expect(first?.[1]).toEqual({uid, gid})
+      expect(second?.[1]).toBeUndefined()
     })
 
     it('does not start the server when the guard cannot be made, so an unguarded server never runs', async () => {

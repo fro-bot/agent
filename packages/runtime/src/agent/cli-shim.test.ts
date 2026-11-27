@@ -25,6 +25,8 @@ import {
   OPENCODE_CLI_SHIM_FILE,
   OPENCODE_CLI_SHIM_REFUSAL,
   prependPathDirectory,
+  probeOpencodeCliShim,
+  readCliShimProbe,
 } from './cli-shim.js'
 
 const roots: string[] = []
@@ -282,5 +284,76 @@ describe('prependPathDirectory', () => {
 
   it('keeps one copy of the directory, at the front, when it was already listed', () => {
     expect(prependPathDirectory('/shim', '/usr/bin:/shim:/opt')).toBe('/shim:/usr/bin:/opt')
+  })
+})
+
+describe('readCliShimProbe', () => {
+  it('accepts exit 2 with the refusal line, and nothing else', () => {
+    expect(readCliShimProbe({exitCode: 2, stderr: `${OPENCODE_CLI_SHIM_REFUSAL}\n`}).success).toBe(true)
+    expect(readCliShimProbe({exitCode: 2, stderr: OPENCODE_CLI_SHIM_REFUSAL}).success).toBe(true)
+  })
+
+  it.each([
+    [{exitCode: 0, stderr: `${OPENCODE_CLI_SHIM_REFUSAL}\n`}],
+    [{exitCode: 1, stderr: `${OPENCODE_CLI_SHIM_REFUSAL}\n`}],
+    [{exitCode: 126, stderr: 'permission denied'}],
+    [{exitCode: 2, stderr: ''}],
+    [{exitCode: 2, stderr: 'sh: opencode: not found'}],
+    [{exitCode: null, stderr: ''}],
+  ])('refuses %j: the shim did not run as written', outcome => {
+    expect(readCliShimProbe(outcome).success).toBe(false)
+  })
+})
+
+function shimFor(root: string): string {
+  const {file} = fakeBinary(root)
+  const created = createOpencodeCliShim({binaryPath: file, parentDirectory: root})
+  if (!created.success) throw new Error(created.error)
+  return path.join(created.data.directory, OPENCODE_CLI_SHIM_FILE)
+}
+
+describe('probeOpencodeCliShim', () => {
+  it('passes for a shim the caller can run', () => {
+    // #given a shim just made
+    const shim = shimFor(tempRoot())
+
+    // #when probed
+    // #then it ran, refused the probe argument, and said so
+    expect(probeOpencodeCliShim(shim).success).toBe(true)
+  })
+
+  it("passes with the caller's own uid and gid, which an unprivileged process may always take", () => {
+    const uid = process.getuid?.()
+    const gid = process.getgid?.()
+    if (uid === undefined || gid === undefined) return
+    expect(probeOpencodeCliShim(shimFor(tempRoot()), {uid, gid}).success).toBe(true)
+  })
+
+  it('fails when the file cannot be executed, as on a noexec mount', () => {
+    // #given a shim that lost its execute bit (the same EACCES a noexec mount gives)
+    const shim = shimFor(tempRoot())
+    chmodSync(shim, 0o644)
+
+    // #when probed
+    const probed = probeOpencodeCliShim(shim)
+
+    // #then it fails with a reason and never echoes the path
+    expect(probed.success).toBe(false)
+    expect(JSON.stringify(probed)).not.toContain(shim)
+  })
+
+  it('fails when the file is not the shim: it runs but does not refuse', () => {
+    // #given an executable that exits 0 and prints nothing
+    const root = tempRoot()
+    const impostor = path.join(root, 'opencode')
+    writeFileSync(impostor, '#!/bin/sh\nexit 0\n', {mode: 0o755})
+
+    // #when probed
+    // #then
+    expect(probeOpencodeCliShim(impostor).success).toBe(false)
+  })
+
+  it('fails when the file is missing', () => {
+    expect(probeOpencodeCliShim(path.join(tempRoot(), 'nope')).success).toBe(false)
   })
 })

@@ -1,4 +1,5 @@
 import type {Result} from '@bfra.me/es/result'
+import {spawnSync} from 'node:child_process'
 import {chmodSync, mkdtempSync, rmSync, writeFileSync} from 'node:fs'
 import path from 'node:path'
 import {toErrorMessage} from '../shared/errors.js'
@@ -130,4 +131,49 @@ export function createOpencodeCliShim(options: CreateOpencodeCliShimOptions): Re
 export function prependPathDirectory(directory: string, existing: string | undefined): string {
   const rest = (existing ?? '').split(path.delimiter).filter(entry => entry.length > 0 && entry !== directory)
   return [directory, ...rest].join(path.delimiter)
+}
+
+/** The argument a probe passes: any argument outside the allowlist, so the shim refuses it without touching the real binary. */
+const PROBE_ARGUMENT = 'api'
+const PROBE_TIMEOUT_MS = 5000
+
+/** What a probe run reports, without the process machinery: an exit status (null when none) and what it wrote to stderr. */
+export interface CliShimProbeOutcome {
+  readonly exitCode: number | null
+  readonly stderr: string
+}
+
+/**
+ * Whether a probe run of the shim did what the shim does: exit 2 with exactly the refusal line. Anything else (a file that
+ * cannot be executed, as on a `noexec` mount, a missing interpreter, some other program) means the guard does not work for
+ * whoever ran it. The result names the exit status only, never output or a path.
+ */
+export function readCliShimProbe(outcome: CliShimProbeOutcome): Result<null, string> {
+  if (outcome.exitCode === OPENCODE_CLI_SHIM_EXIT_CODE && outcome.stderr.trim() === OPENCODE_CLI_SHIM_REFUSAL) {
+    return ok(null)
+  }
+  return err(`the shim exited ${outcome.exitCode === null ? 'without a status' : outcome.exitCode}, not as a refusal`)
+}
+
+/**
+ * Runs the shim once with a refused argument, as the identity that will run the server (`identity`, when the spawn drops
+ * to a uid and gid; the caller's own otherwise), and reads the result. A directory on a `noexec` mount, or one that identity
+ * cannot enter, fails here instead of leaving a PATH entry the agent cannot use. Synchronous, like the creation.
+ */
+export function probeOpencodeCliShim(
+  shimFile: string,
+  identity?: {readonly uid: number; readonly gid: number},
+): Result<null, string> {
+  const ran = spawnSync(shimFile, [PROBE_ARGUMENT], {
+    encoding: 'utf8',
+    timeout: PROBE_TIMEOUT_MS,
+    env: {},
+    stdio: ['ignore', 'ignore', 'pipe'],
+    ...(identity === undefined ? {} : {uid: identity.uid, gid: identity.gid}),
+  })
+  if (ran.error !== undefined) {
+    const code = (ran.error as NodeJS.ErrnoException).code
+    return err(`the shim could not be run${code === undefined ? '' : ` (${code})`}`)
+  }
+  return readCliShimProbe({exitCode: ran.status, stderr: ran.stderr})
 }

@@ -13,8 +13,10 @@ export {
   OPENCODE_CLI_SHIM_FILE,
   OPENCODE_CLI_SHIM_REFUSAL,
   prependPathDirectory,
+  probeOpencodeCliShim,
+  readCliShimProbe,
 } from './cli-shim.js'
-export type {CreateOpencodeCliShimOptions, OpencodeCliShim} from './cli-shim.js'
+export type {CliShimProbeOutcome, CreateOpencodeCliShimOptions, OpencodeCliShim} from './cli-shim.js'
 export {
   boundedCredentialRequest,
   credentialFailure,

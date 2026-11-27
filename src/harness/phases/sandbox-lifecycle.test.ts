@@ -91,6 +91,10 @@ interface Harness {
   readonly gateRemovals: string[]
   /** The CLI guard directories whose `remove` ran. */
   readonly shimRemovals: string[]
+  /** What running the guard as the sandbox user reports (the probe). Default: a refusal, as the real shim gives. */
+  readonly shimProbe: {exitCode: number | null; stderr: string}
+  /** The argv of every probe of the guard, as the sandbox user. */
+  readonly shimProbes: string[][]
   /** What the runner wrote into gate directories. */
   readonly gateWrites: string[]
   readonly gateFiles: Map<string, string>
@@ -107,6 +111,11 @@ function createHarness(): Harness {
   const viewRootRemovals: string[] = []
   const gateRemovals: string[] = []
   const shimRemovals: string[] = []
+  const shimProbe: {exitCode: number | null; stderr: string} = {
+    exitCode: 2,
+    stderr: "opencode: this run's OpenCode server is managed by Fro Bot; the CLI cannot start or reach a server here\n",
+  }
+  const shimProbes: string[][] = []
   const gateWrites: string[] = []
   const gateFiles = new Map<string, string>()
   let gates = 0
@@ -162,6 +171,11 @@ function createHarness(): Harness {
     exec: vi.fn(async () => 0),
     getExecOutput: vi.fn(async (command: string, args: string[] = []) => {
       sudoCalls.push([command, ...args])
+      // The guard's probe: the made shim run once with a refused argument, as the sandbox user.
+      if (args.at(-1) === 'api' && args.at(-2)?.endsWith('/fro-bot-opencode-cli-x/opencode') === true) {
+        shimProbes.push(args)
+        return {exitCode: shimProbe.exitCode ?? 126, stdout: '', stderr: shimProbe.stderr}
+      }
       const isGitGlobal = args[0] === 'config' && args[1] === '--global'
       // The account's PATH check prints the directories it can enter: here, every one not named `unreachable`.
       const script = args.findIndex(arg => arg.startsWith('for d do'))
@@ -185,7 +199,19 @@ function createHarness(): Harness {
       readHostNamespace: async () => 'mnt:[4026531832]',
     },
   } as unknown as SandboxLifecycleDeps
-  return {deps, mocks, exec, sudoCalls, viewRootRemovals, gateRemovals, shimRemovals, gateWrites, gateFiles}
+  return {
+    deps,
+    mocks,
+    exec,
+    sudoCalls,
+    viewRootRemovals,
+    gateRemovals,
+    shimRemovals,
+    shimProbe,
+    shimProbes,
+    gateWrites,
+    gateFiles,
+  }
 }
 
 function alive(pid: number): boolean {
@@ -2222,6 +2248,46 @@ describe('createSandboxLifecycle', () => {
       expect(prepared.success).toBe(false)
       expect(prepared.success ? '' : prepared.error).toMatch(/CLI guard/)
     })
+
+    it('runs the guard once as the sandbox user, with a refused argument, before it goes on the PATH', async () => {
+      // #given an isolated run
+      const harness = createHarness()
+
+      // #when prepared
+      const prepared = await guarded(harness).prepare(prepareInput)
+
+      // #then the made file was run once under the sandbox identity (setpriv drop), with an argument it refuses
+      expect(prepared.success).toBe(true)
+      expect(harness.shimProbes).toHaveLength(1)
+      const argv = harness.shimProbes[0] ?? []
+      expect(argv).toEqual(expect.arrayContaining(['/usr/bin/setpriv', '--reuid=998', '--regid=997']))
+      expect(argv.slice(-2)).toEqual([`${temp}/fro-bot-opencode-cli-x/opencode`, 'api'])
+    })
+
+    it.each([
+      ['a noexec mount (126)', {exitCode: 126, stderr: 'sudo: unable to execute: Permission denied'}],
+      ['no status at all', {exitCode: null, stderr: ''}],
+      ['a file that runs but does not refuse', {exitCode: 0, stderr: ''}],
+    ])(
+      'leaves the guard off the PATH, warns once and does not fail the run when it cannot run: %s',
+      async (_name, probe) => {
+        // #given a guard the sandbox user cannot run
+        const harness = createHarness()
+        harness.shimProbe.exitCode = probe.exitCode
+        harness.shimProbe.stderr = probe.stderr
+        const logger = createMockLogger()
+
+        // #when prepared
+        const prepared = await guarded(harness, {logger}).prepare(prepareInput)
+
+        // #then the preparation succeeds with the PATH it always had, and the operator is told once
+        expect(prepared.success).toBe(true)
+        if (!prepared.success) return
+        expect(prepared.data.path).toBe(`/opt/hostedtoolcache/node/24/x64/bin:/usr/bin:/usr/local/bin:/bin:${OPENCODE}`)
+        const warned = vi.mocked(logger.warning).mock.calls.filter(call => String(call[0]).includes('CLI guard'))
+        expect(warned).toHaveLength(1)
+      },
+    )
 
     it('removes the guard once the files are back, and not before', async () => {
       // #given a prepared run
