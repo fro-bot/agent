@@ -196,13 +196,64 @@ describe('MCP routes on the wire', () => {
     expect((JSON.parse(frame.subarray(4).toString('utf8')) as {mcp: unknown}).mcp).toEqual([route])
   })
 
-  it('refuses a config that carries MCP routes: the child cannot serve them yet, so it must not start without them', () => {
-    // #given a valid provider config plus MCP routes
+  it('parses a config that carries MCP routes, keeping them exactly as sent', () => {
+    // #given a valid provider config plus an MCP route
     // #when the child parses it
     const parsed = parseKeyProxyConfig({...validConfig(), mcp: [route]})
 
-    // #then it is refused with the fixed code, quoting nothing
-    expect(parsed).toEqual({success: false, error: 'invalid-config'})
+    // #then the route comes through unchanged
+    expect(parsed.success && parsed.data.mcp).toEqual([route])
+  })
+
+  it('parses an MCP-only config with no providers, and an empty MCP list', () => {
+    expect(parseKeyProxyConfig({version: 1, providers: [], mcp: [route]}).success).toBe(true)
+    const empty = parseKeyProxyConfig({...validConfig(), mcp: []})
+    expect(empty.success).toBe(true)
+  })
+
+  it('copies only the known route fields', () => {
+    // #given a route with a header map the parser must copy, not alias
+    const input = {...route, headers: {...route.headers}}
+    const parsed = parseKeyProxyConfig({...validConfig(), mcp: [input]})
+    if (!parsed.success) throw new Error('fixture')
+
+    // #when the input is changed afterwards
+    input.headers.Authorization = 'changed'
+
+    // #then the parsed route keeps the value it was given
+    expect(parsed.data.mcp?.[0]?.headers.Authorization).toBe(HEADER_CANARY)
+  })
+
+  it.each([
+    ['a non-array mcp', 'x'],
+    ['an mcp object', {}],
+    ['a non-object route', [5]],
+    ['a route with an unknown field', [{...route, extra: 1}]],
+    ['a route with no origin', [{id: 's1', path: '/mcp', headers: {}}]],
+    ['a route with no headers field', [{id: 's1', origin: route.origin, path: '/mcp'}]],
+    ['a route with an empty id', [{...route, id: ''}]],
+    ['a route id with a slash', [{...route, id: 'a/b'}]],
+    ['a route id that is a dot segment', [{...route, id: '..'}]],
+    ['a path with a query', [{...route, path: '/mcp?x=1'}]],
+    ['a path with a fragment', [{...route, path: '/mcp#x'}]],
+    ['a path that is not absolute', [{...route, path: 'mcp'}]],
+    ['a path with a space', [{...route, path: '/a b'}]],
+    ['a path with a line break', [{...route, path: '/a\r\nb'}]],
+    ['a path over the bound', [{...route, path: `/${'a'.repeat(2048)}`}]],
+    ['a header map that is an array', [{...route, headers: ['x']}]],
+    ['a non-string header value', [{...route, headers: {'X-A': 5}}]],
+    ['a header value with a line break', [{...route, headers: {'X-A': 'a\r\nX-B: b'}}]],
+    ['a header value over the bound', [{...route, headers: {'X-A': 'a'.repeat(4097)}}]],
+    ['a header name that is not a token', [{...route, headers: {'bad name': 'x'}}]],
+    ['a forbidden header name', [{...route, headers: {Host: 'x'}}]],
+    ['two header names that differ only in case', [{...route, headers: {'X-A': '1', 'x-a': '2'}}]],
+    [
+      'more than 32 headers',
+      [{...route, headers: Object.fromEntries(Array.from({length: 33}, (_u, i) => [`X-${i}`, 'v']))}],
+    ],
+    ['more than 64 routes', Array.from({length: 65}, (_u, i) => ({...route, id: `s${i}`}))],
+  ])('refuses %s without quoting the input', (_name, mcp) => {
+    expect(parseKeyProxyConfig({...validConfig(), mcp})).toEqual({success: false, error: 'invalid-config'})
   })
 
   it('names the headers the forwarder owns: the hop-by-hop set, plus host, content-length, accept-encoding and expect', () => {
@@ -223,8 +274,11 @@ describe('MCP routes on the wire', () => {
     ])
   })
 
-  it('refuses even an empty MCP list, so a field the child does not understand is never skipped', () => {
-    expect(parseKeyProxyConfig({...validConfig(), mcp: []})).toEqual({success: false, error: 'invalid-config'})
+  it('still refuses a field the child does not know, so nothing the Action sent is silently skipped', () => {
+    expect(parseKeyProxyConfig({...validConfig(), mcpRoutes: [route]})).toEqual({
+      success: false,
+      error: 'invalid-config',
+    })
   })
 })
 

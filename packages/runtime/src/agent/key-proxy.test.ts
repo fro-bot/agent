@@ -1,7 +1,9 @@
 import type {IncomingHttpHeaders} from 'node:http'
 import type {Logger} from '../shared/logger.js'
 import type {RecordedRequest, TlsUpstream, UpstreamHandler} from './key-proxy-test-kit.js'
+import type {KeyProxyMcpRouteConfig} from './key-proxy-wire.js'
 import type {KeyProxyLimits, KeyProxyProviderConfig, KeyProxyServer} from './key-proxy.js'
+import type {RecordedMcpExchange} from './mcp-wire.fixtures.js'
 import {Buffer} from 'node:buffer'
 import http from 'node:http'
 import net from 'node:net'
@@ -11,6 +13,12 @@ import {afterEach, describe, expect, it, vi} from 'vitest'
 import {buildKeyProxyUpstream} from './key-proxy-routes.js'
 import {startTlsUpstream} from './key-proxy-test-kit.js'
 import {startKeyProxy} from './key-proxy.js'
+import {MCP_SESSION_EXPIRED_BODY} from './mcp-routes.js'
+import {
+  MCP_2025_STATEFUL_EXCHANGES,
+  MCP_2026_STATELESS_EXCHANGES,
+  MCP_SESSION_EXPIRED_SENTINEL,
+} from './mcp-wire.fixtures.js'
 
 const PLACEHOLDER = 'placeholder-0123456789abcdefghijklmnopqrstuvwxyz'
 const ANTHROPIC_KEY = 'sk-ant-REAL-CANARY-0001'
@@ -55,6 +63,8 @@ async function setup(
   options: {
     readonly limits?: Partial<KeyProxyLimits>
     readonly providers?: (origin: string) => KeyProxyProviderConfig[]
+    /** Brokered MCP routes, built from the recording upstream's origin. */
+    readonly mcp?: (origin: string) => KeyProxyMcpRouteConfig[]
     /** Leave the upstream's self-signed certificate out of the proxy's trust. */
     readonly untrusted?: boolean
   } = {},
@@ -81,6 +91,7 @@ async function setup(
   const {logger, lines} = recordingLogger()
   const started = await startKeyProxy({
     providers: (options.providers ?? defaultProviders)(upstream.origin),
+    ...(options.mcp === undefined ? {} : {mcp: options.mcp(upstream.origin)}),
     logger,
     ...(options.untrusted === true ? {} : {ca: upstream.ca}),
     ...(options.limits === undefined ? {} : {limits: options.limits}),
@@ -1264,5 +1275,826 @@ describe('key proxy: start', () => {
     const h = await setup(okJson)
     await h.proxy.close()
     await expect(h.send('/openai/models', {method: 'GET'})).rejects.toThrow()
+  })
+})
+
+const MCP_TOKEN = 'Bearer mcp-CANARY-0001-abcdefgh'
+const MCP_SESSION = 'sess-test-1'
+
+function mcpRoute(origin: string, overrides: Partial<KeyProxyMcpRouteConfig> = {}): KeyProxyMcpRouteConfig[] {
+  return [{id: 's1', origin, path: '/mcp', headers: {Authorization: MCP_TOKEN, 'X-Tenant': 'tenant-7'}, ...overrides}]
+}
+
+/** A proxy with one MCP route and no provider, unless the test asks for more. */
+async function setupMcp(
+  handler: UpstreamHandler,
+  options: {
+    readonly limits?: Partial<KeyProxyLimits>
+    readonly route?: Partial<KeyProxyMcpRouteConfig>
+    readonly withProviders?: boolean
+    readonly untrusted?: boolean
+  } = {},
+): Promise<Harness> {
+  return setup(handler, {
+    mcp: origin => mcpRoute(origin, options.route),
+    ...(options.withProviders === true ? {} : {providers: () => []}),
+    ...(options.limits === undefined ? {} : {limits: options.limits}),
+    ...(options.untrusted === true ? {untrusted: true} : {}),
+  })
+}
+
+async function sendMcp(h: Harness, init: Omit<SendInit, 'credential'> = {}, path = '/mcp/s1'): Promise<Reply> {
+  return h.send(path, {...init, credential: 'none'})
+}
+
+/** Answers each upstream request with the next recorded response, in order. */
+function replayUpstream(exchanges: readonly RecordedMcpExchange[]): UpstreamHandler {
+  let index = 0
+  return (_request, res) => {
+    const exchange = exchanges[index]
+    index += 1
+    if (exchange === undefined) {
+      res.writeHead(500)
+      res.end('recording exhausted')
+      return
+    }
+    const {status, headers, body} = exchange.response
+    res.writeHead(status, headers)
+    if (headers['content-type']?.includes('text/event-stream') !== true) {
+      res.end(body)
+      return
+    }
+    // A recorded stream is replayed event by event, so the order the client sees is the order the upstream wrote.
+    const events = body.split(/(?<=\n\n)/).filter(event => event !== '')
+    const next = (): void => {
+      const event = events.shift()
+      if (event === undefined) {
+        res.end()
+        return
+      }
+      res.write(event)
+      setTimeout(next, 5)
+    }
+    next()
+  }
+}
+
+/** The headers the recorded client sent that the proxy owns or rewrites, so a replay does not compare them. */
+const REPLAY_SKIPPED_HEADERS: ReadonlySet<string> = new Set(['content-length', 'host', 'accept-encoding'])
+
+async function replayRecording(exchanges: readonly RecordedMcpExchange[]) {
+  const h = await setupMcp(replayUpstream(exchanges))
+  const replies: Reply[] = []
+  for (const exchange of exchanges) {
+    const {method, headers, body} = exchange.request
+
+    replies.push(await sendMcp(h, {method, headers, ...(body === '' ? {} : {body})}))
+  }
+  return {h, replies}
+}
+
+describe('key proxy: MCP routes, replaying what OpenCode 2.4.2 sent', () => {
+  it('relays the recorded 2025 stateful flow: initialize, notification, GET stream, list, call, expiry, reconnect, DELETE', async () => {
+    // #given the exchanges recorded against the pinned binary, replayed through the proxy one by one
+    const {h, replies} = await replayRecording(MCP_2025_STATEFUL_EXCHANGES)
+
+    // #then the upstream saw each request once, on the fixed path, with the client's protocol headers intact
+    expect(h.upstream.requests).toHaveLength(MCP_2025_STATEFUL_EXCHANGES.length)
+    MCP_2025_STATEFUL_EXCHANGES.forEach((exchange, index) => {
+      const seen = h.upstream.requests[index]
+      expect(seen?.method).toBe(exchange.request.method)
+      expect(seen?.url).toBe('/mcp')
+      expect(seen?.body.toString()).toBe(exchange.request.body)
+      const compared = Object.entries(exchange.request.headers).filter(([name]) => !REPLAY_SKIPPED_HEADERS.has(name))
+      expect(Object.fromEntries(compared.map(([name]) => [name, headerOf(seen, name)]))).toEqual(
+        Object.fromEntries(compared),
+      )
+      // #then the configured headers were added to every request
+      expect(headerOf(seen, 'authorization')).toBe(MCP_TOKEN)
+      expect(headerOf(seen, 'x-tenant')).toBe('tenant-7')
+    })
+
+    // #then each reply keeps the upstream's status and, on a success, its body, type and session id
+    const recordedReply = (status: number, body: string, type?: unknown, session?: unknown) =>
+      status < 300 ? {status, body, type, session} : {status}
+    expect(
+      replies.map(reply =>
+        recordedReply(
+          reply.status,
+          reply.body.toString(),
+          reply.headers['content-type'],
+          reply.headers['mcp-session-id'],
+        ),
+      ),
+    ).toEqual(
+      MCP_2025_STATEFUL_EXCHANGES.map(({response: r}) =>
+        recordedReply(r.status, r.body, r.headers['content-type'], r.headers['mcp-session-id']),
+      ),
+    )
+  })
+
+  it('relays the recorded 2026 stateless flow, with the Mcp-Method, Mcp-Name and Mcp-Param headers intact', async () => {
+    // #given the 2026 exchanges recorded against the pinned binary
+    const {h, replies} = await replayRecording(MCP_2026_STATELESS_EXCHANGES)
+
+    // #then every request arrived upstream with its protocol headers
+    const call = h.upstream.requests.find(request => headerOf(request, 'mcp-method') === 'tools/call')
+    expect(headerOf(call, 'mcp-param-text')).toBe('hi1')
+    expect(headerOf(call, 'mcp-name')).toBe('echo')
+    expect(headerOf(call, 'mcp-protocol-version')).toBe('2026-07-28')
+    expect(h.upstream.requests.every(request => request.method === 'POST')).toBe(true)
+
+    // #then the SSE result of a tool call arrives whole
+    const index = MCP_2026_STATELESS_EXCHANGES.findIndex(e => e.request.headers['mcp-method'] === 'tools/call')
+    expect(MCP_2026_STATELESS_EXCHANGES[index]?.response.body).toContain('echo:hi1')
+    expect(replies[index]?.body.toString()).toBe(MCP_2026_STATELESS_EXCHANGES[index]?.response.body)
+  })
+
+  it('answers the recorded session-bearing 400 with the fixed session-expired body, and the probe 400 with a generic one', async () => {
+    const {replies} = await replayRecording(MCP_2025_STATEFUL_EXCHANGES)
+
+    // #given the two recorded 400s: the first probe has no session, the expired call has one
+    const expired = MCP_2025_STATEFUL_EXCHANGES.findIndex(
+      e => e.response.status === 400 && e.request.headers['mcp-session-id'] !== undefined,
+    )
+    const probe = MCP_2025_STATEFUL_EXCHANGES.findIndex(
+      e => e.response.status === 400 && e.request.headers['mcp-session-id'] === undefined,
+    )
+
+    // #then the expired call carries the text OpenCode looks for, and the probe's own body is gone
+    expect(MCP_2025_STATEFUL_EXCHANGES[expired]?.response.body).toContain(MCP_SESSION_EXPIRED_SENTINEL)
+    expect(replies[expired]?.body.toString()).toBe(MCP_SESSION_EXPIRED_BODY)
+    expect(replies[expired]?.body.toString()).toContain(MCP_SESSION_EXPIRED_SENTINEL)
+    expect(replies[probe]?.body.toString()).not.toContain('Session-Id')
+    expect(JSON.parse(replies[probe]?.body.toString() ?? '{}')).toEqual({
+      error: {type: 'proxy_error', message: 'The upstream returned an error.'},
+    })
+  })
+})
+
+describe('key proxy: MCP routes, request side', () => {
+  it('sets the configured headers and none of the client credentials, whatever their case', async () => {
+    // #given a client that sends its own credential, cookie, tenant and forwarding headers
+    const h = await setupMcp(okJson)
+
+    // #when it posts to the route
+    await sendMcp(h, {
+      body: '{}',
+      headers: {
+        Authorization: 'Bearer client-secret',
+        Cookie: 'sid=client',
+        'Proxy-Authorization': 'Basic Y2xpZW50',
+        'X-TENANT': 'tenant-attacker',
+        'X-Forwarded-For': '203.0.113.9',
+        Forwarded: 'for=203.0.113.9',
+        'Content-Type': 'application/json',
+      },
+    })
+
+    // #then the upstream saw the configured values only, and no cookie, proxy credential or forwarding header
+    const seen = h.upstream.requests[0]
+    expect(headerOf(seen, 'authorization')).toBe(MCP_TOKEN)
+    expect(headerOf(seen, 'x-tenant')).toBe('tenant-7')
+    expect(headerOf(seen, 'content-type')).toBe('application/json')
+    for (const name of ['cookie', 'proxy-authorization', 'x-forwarded-for', 'forwarded']) {
+      expect(headerOf(seen, name)).toBeUndefined()
+    }
+    expect(JSON.stringify(seen?.headers)).not.toContain('client-secret')
+    expect(JSON.stringify(seen?.headers)).not.toContain('tenant-attacker')
+  })
+
+  it('forwards no client Authorization when the route does not configure one', async () => {
+    // #given a route that authenticates with a different header
+    const h = await setupMcp(okJson, {route: {headers: {'X-Api-Key': 'only-key-12345678'}}})
+
+    // #when the client sends its own Authorization
+    await sendMcp(h, {body: '{}', headers: {Authorization: 'Bearer client-secret'}})
+
+    // #then the upstream sees the configured key and no Authorization at all
+    expect(headerOf(h.upstream.requests[0], 'x-api-key')).toBe('only-key-12345678')
+    expect(headerOf(h.upstream.requests[0], 'authorization')).toBeUndefined()
+  })
+
+  it('sets one authorization when the client repeats the header', async () => {
+    const h = await setupMcp(okJson)
+    const raw = await rawExchange(
+      h.proxy.port,
+      'POST /mcp/s1 HTTP/1.1\r\nHost: x\r\nAuthorization: a\r\nauthorization: b\r\nContent-Length: 2\r\n\r\n{}',
+    )
+    expect(raw).toMatch(/^HTTP\/1\.1 200/)
+    expect(h.upstream.requests[0]?.headers.authorization).toBe(MCP_TOKEN)
+  })
+
+  it('sets the upstream Host and asks for identity encoding whatever the client sends', async () => {
+    const h = await setupMcp(okJson)
+    await sendMcp(h, {body: '{}', headers: {Host: 'evil.example', 'Accept-Encoding': 'gzip'}})
+    const seen = h.upstream.requests[0]
+    expect(headerOf(seen, 'host')).toBe(new URL(h.upstream.origin).host)
+    expect(headerOf(seen, 'accept-encoding')).toBe('identity')
+  })
+
+  it('drops a header the client names in Connection and keeps the others', async () => {
+    const h = await setupMcp(okJson)
+    const raw = await rawExchange(
+      h.proxy.port,
+      'POST /mcp/s1 HTTP/1.1\r\nHost: x\r\nConnection: close, X-Hop\r\nX-Hop: 1\r\nMcp-Session-Id: s\r\nContent-Length: 2\r\n\r\n{}',
+    )
+    expect(raw).toMatch(/^HTTP\/1\.1 200/)
+    expect(headerOf(h.upstream.requests[0], 'x-hop')).toBeUndefined()
+    expect(headerOf(h.upstream.requests[0], 'mcp-session-id')).toBe('s')
+  })
+
+  it('passes the query through and keeps the configured path byte for byte', async () => {
+    // #given a route whose configured path ends in a slash
+    const h = await setupMcp(okJson, {route: {path: '/v1/mcp/'}})
+
+    // #when the client adds the Code Mode query the 2.4.2 client appends to non-loopback servers
+    await sendMcp(h, {body: '{}'}, '/mcp/s1?codemode=false&a=b%20c')
+
+    // #then the upstream path is the fixed one plus the raw query
+    expect(h.upstream.requests[0]?.url).toBe('/v1/mcp/?codemode=false&a=b%20c')
+  })
+
+  it.each(['POST', 'GET', 'DELETE'])('forwards %s and its body', async method => {
+    const h = await setupMcp(okJson)
+    const body = method === 'POST' ? '{"jsonrpc":"2.0"}' : undefined
+    const reply = await sendMcp(h, {
+      method,
+      headers: {'mcp-session-id': MCP_SESSION},
+      ...(body === undefined ? {} : {body}),
+    })
+    expect(reply.status).toBe(200)
+    expect(h.upstream.requests[0]?.method).toBe(method)
+    expect(h.upstream.requests[0]?.body.toString()).toBe(body ?? '')
+  })
+
+  it.each([
+    ['PUT', '/mcp/s1'],
+    ['PATCH', '/mcp/s1'],
+    ['OPTIONS', '/mcp/s1'],
+    ['HEAD', '/mcp/s1'],
+    ['POST', '/mcp/s9'],
+    ['POST', '/mcp'],
+    ['POST', '/mcp/'],
+    ['POST', '/mcp/s1/'],
+    ['POST', '/mcp/s1/tools'],
+    ['POST', '/mcp/%2e%2e/s1'],
+    ['POST', '/mcp/s1;x'],
+    ['POST', '/mcp/s1#x'],
+    ['POST', '//mcp/s1'],
+    ['POST', '/mcp/constructor'],
+    ['POST', '/MCP/s1'],
+  ])('refuses %s %s locally, with no contact upstream', async (method, path) => {
+    const h = await setupMcp(okJson)
+    const reply = await sendMcp(h, {method, body: '{}'}, path)
+    expect(reply.status).toBe(404)
+    expect(h.upstream.requests).toHaveLength(0)
+  })
+
+  it('refuses Expect and Upgrade on an MCP route, with no contact upstream', async () => {
+    const h = await setupMcp(okJson)
+    expect((await sendMcp(h, {body: '{}', headers: {Expect: '100-continue'}})).status).toBe(417)
+    expect((await sendMcp(h, {body: '{}', headers: {Upgrade: 'websocket', Connection: 'Upgrade'}})).status).toBe(404)
+    expect(h.upstream.requests).toHaveLength(0)
+  })
+
+  it('stops a body over the bound before the upstream sees it', async () => {
+    const h = await setupMcp(okJson, {limits: {maxRequestBodyBytes: 8}})
+    const reply = await sendMcp(h, {body: '0123456789abcdef'})
+    expect(reply.status).toBe(413)
+    expect(h.upstream.requests).toHaveLength(0)
+  })
+})
+
+describe('key proxy: MCP routes, response side', () => {
+  it.each([301, 302, 303, 307, 308])(
+    'turns an upstream %i to the same origin into a 502 with no Location and no second request',
+    async status => {
+      // #given an upstream that redirects to its own origin
+      const h = await setupMcp((_request, res) => {
+        res.writeHead(status, {location: '/elsewhere'})
+        res.end()
+      })
+
+      // #when the route is called
+      const reply = await sendMcp(h, {body: '{}'})
+
+      // #then the client gets a 502 without a Location, and the upstream saw one request only
+      expect(reply.status).toBe(502)
+      expect(reply.headers.location).toBeUndefined()
+      expect(h.upstream.requests).toHaveLength(1)
+    },
+  )
+
+  it('answers a bounded 502 when the upstream answers 101, and keeps serving', async () => {
+    let first = true
+    const h = await setupMcp((request, res, req) => {
+      if (first) {
+        first = false
+        req.socket.end('HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n')
+        return
+      }
+      okJson(request, res, req)
+    })
+    const started = Date.now()
+    const reply = await sendMcp(h, {body: '{}'})
+    expect(reply.status).toBe(502)
+    expect(reply.body.toString()).toBe('Bad Gateway\n')
+    expect(reply.headers.upgrade).toBeUndefined()
+    expect(Date.now() - started).toBeLessThan(5000)
+    expect((await sendMcp(h, {body: '{}'})).status).toBe(200)
+  })
+
+  it('keeps the status of an upstream 401, drops the challenge and replaces a body that holds the credential', async () => {
+    // #given an upstream that rejects the credential and echoes it, with a challenge and a delay
+    const h = await setupMcp((request, res) => {
+      res.writeHead(401, {
+        'content-type': 'application/json',
+        'www-authenticate': 'Bearer resource_metadata="https://auth.example/.well-known/oauth-protected-resource"',
+        'retry-after': '30',
+        'set-cookie': 'sid=upstream',
+        'x-leak': 'upstream-detail',
+      })
+      res.end(JSON.stringify({error: 'bad token', echoed: request.headers.authorization}))
+    })
+
+    // #when the route is called
+    const reply = await sendMcp(h, {body: '{}'})
+
+    // #then the status stays, the challenge and cookie are gone, the delay is kept, and the body is fixed text
+    expect(reply.status).toBe(401)
+    expect(reply.headers['www-authenticate']).toBeUndefined()
+    expect(reply.headers['set-cookie']).toBeUndefined()
+    expect(reply.headers['x-leak']).toBeUndefined()
+    expect(reply.headers['retry-after']).toBe('30')
+    expect(reply.body.toString()).not.toContain('mcp-CANARY')
+    expect(reply.body.toString()).not.toContain('bad token')
+    expect(JSON.parse(reply.body.toString())).toEqual({
+      error: {type: 'proxy_error', message: 'The upstream returned an error.'},
+    })
+  })
+
+  it.each([
+    ['an HTTP date', 'Wed, 21 Oct 2026 07:28:00 GMT'],
+    ['the credential', MCP_TOKEN],
+    ['a delay with a unit', '30s'],
+  ])('drops a Retry-After that is %s', async (_name, value) => {
+    const h = await setupMcp((_request, res) => {
+      res.writeHead(429, {'retry-after': value})
+      res.end('slow down')
+    })
+    const reply = await sendMcp(h, {body: '{}'})
+    expect(reply.status).toBe(429)
+    expect(reply.headers['retry-after']).toBeUndefined()
+  })
+
+  it.each([404, 405, 429, 500, 502, 503])('keeps an upstream %i and replaces its body', async status => {
+    const h = await setupMcp((_request, res) => {
+      res.writeHead(status, {'content-type': 'text/plain'})
+      res.end(`detail ${MCP_TOKEN}`)
+    })
+    const reply = await sendMcp(h, {body: '{}'})
+    expect(reply.status).toBe(status)
+    expect(reply.body.toString()).not.toContain('detail')
+    expect(reply.body.toString()).not.toContain(MCP_TOKEN)
+  })
+
+  describe('a session that the upstream no longer knows', () => {
+    const lost = (status: number, body: string, headers: Record<string, string> = {}): UpstreamHandler => {
+      return (_request, res) => {
+        res.writeHead(status, {'content-type': 'application/json', ...headers})
+        res.end(body)
+      }
+    }
+
+    it.each([
+      ['the wording the TypeScript SDK server uses', 'Bad Request: Server not initialized'],
+      [
+        'a JSON-RPC error that carries the text',
+        '{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"Server not initialized"}}',
+      ],
+      ['the text with the credential echoed beside it', `Server not initialized (${MCP_TOKEN})`],
+    ])(
+      'answers a session-bearing 400 that says so (%s) with the fixed body OpenCode reconnects on',
+      async (_name, body) => {
+        // #given an upstream that has lost the session
+        const h = await setupMcp(lost(400, body))
+
+        // #when the client calls with its session id
+        const reply = await sendMcp(h, {body: '{}', headers: {'mcp-session-id': MCP_SESSION}})
+
+        // #then the status is kept and the body is the fixed text, with nothing of the upstream's own in it
+        expect(reply.status).toBe(400)
+        expect(reply.body.toString()).toBe(MCP_SESSION_EXPIRED_BODY)
+        expect(reply.body.toString()).toContain(MCP_SESSION_EXPIRED_SENTINEL)
+        expect(reply.body.toString()).not.toContain(MCP_TOKEN)
+      },
+    )
+
+    it('does not use the fixed body for a 400 that carried no session id', async () => {
+      const h = await setupMcp(lost(400, 'Bad Request: Server not initialized'))
+      const reply = await sendMcp(h, {body: '{}'})
+      expect(reply.status).toBe(400)
+      expect(reply.body.toString()).not.toContain(MCP_SESSION_EXPIRED_SENTINEL)
+    })
+
+    it('does not use the fixed body for a session-bearing 400 that says something else', async () => {
+      const h = await setupMcp(lost(400, 'Bad Request: Invalid params'))
+      const reply = await sendMcp(h, {body: '{}', headers: {'mcp-session-id': MCP_SESSION}})
+      expect(reply.status).toBe(400)
+      expect(reply.body.toString()).not.toContain(MCP_SESSION_EXPIRED_SENTINEL)
+      expect(reply.body.toString()).not.toContain('Invalid params')
+    })
+
+    it.each([401, 403, 404, 409, 500])(
+      'does not use the fixed body for a %i, which the client reads by status',
+      async status => {
+        const h = await setupMcp(lost(status, 'Bad Request: Server not initialized'))
+        const reply = await sendMcp(h, {body: '{}', headers: {'mcp-session-id': MCP_SESSION}})
+        expect(reply.status).toBe(status)
+        expect(reply.body.toString()).not.toContain(MCP_SESSION_EXPIRED_SENTINEL)
+      },
+    )
+
+    it('does not trust a compressed body to say so', async () => {
+      // #given a body that says so in plain text under a content-encoding the proxy never decodes
+      const h = await setupMcp(lost(400, 'Server not initialized', {'content-encoding': 'gzip'}))
+      const reply = await sendMcp(h, {body: '{}', headers: {'mcp-session-id': MCP_SESSION}})
+      expect(reply.status).toBe(400)
+      expect(reply.body.toString()).not.toContain(MCP_SESSION_EXPIRED_SENTINEL)
+    })
+
+    it('does not read a body over the bound', async () => {
+      const h = await setupMcp(lost(400, `Server not initialized${'x'.repeat(500)}`), {limits: {maxErrorBodyBytes: 64}})
+      const reply = await sendMcp(h, {body: '{}', headers: {'mcp-session-id': MCP_SESSION}})
+      expect(reply.status).toBe(400)
+      expect(reply.body.toString()).not.toContain(MCP_SESSION_EXPIRED_SENTINEL)
+    })
+
+    it('answers at once when the declared length is over the bound, without waiting for the body', async () => {
+      // #given an upstream that declares a large body, sends the text and then goes quiet
+      const h = await setupMcp(
+        (_request, res) => {
+          res.writeHead(400, {'content-type': 'text/plain', 'content-length': '100000'})
+          res.write('Server not initialized')
+        },
+        {limits: {maxErrorBodyBytes: 64}},
+      )
+
+      // #when the client calls with its session id
+      const reply = await sendMcp(h, {body: '{}', headers: {'mcp-session-id': MCP_SESSION}})
+
+      // #then the reply is the generic error, with no wait for the rest of the body
+      expect(reply.status).toBe(400)
+      expect(reply.body.toString()).not.toContain(MCP_SESSION_EXPIRED_SENTINEL)
+    })
+
+    it('does not read a chunked body that grows past the bound, however it is split', async () => {
+      const h = await setupMcp(
+        (_request, res) => {
+          res.writeHead(400, {'content-type': 'text/plain'})
+          res.write('Server not ')
+          res.write('x'.repeat(200))
+          res.write('initialized')
+          res.end()
+        },
+        {limits: {maxErrorBodyBytes: 64}},
+      )
+      const reply = await sendMcp(h, {body: '{}', headers: {'mcp-session-id': MCP_SESSION}})
+      expect(reply.status).toBe(400)
+      expect(reply.body.toString()).not.toContain(MCP_SESSION_EXPIRED_SENTINEL)
+    })
+  })
+
+  it('copies only the allowlisted headers of a success, and keeps the session id and the stream type', async () => {
+    const h = await setupMcp((_request, res) => {
+      res.writeHead(200, {
+        'content-type': 'application/json',
+        'mcp-session-id': MCP_SESSION,
+        'cache-control': 'no-store',
+        'set-cookie': 'sid=upstream',
+        'www-authenticate': 'Bearer realm="x"',
+        location: 'https://elsewhere.example/',
+        'x-custom': 'upstream-detail',
+      })
+      res.end('{"ok":true}')
+    })
+    const reply = await sendMcp(h, {body: '{}'})
+    expect(reply.status).toBe(200)
+    expect(reply.headers['mcp-session-id']).toBe(MCP_SESSION)
+    expect(reply.headers['content-type']).toBe('application/json')
+    expect(reply.headers['cache-control']).toBe('no-store')
+    for (const name of ['set-cookie', 'www-authenticate', 'location', 'x-custom']) {
+      expect(reply.headers[name]).toBeUndefined()
+    }
+  })
+
+  it('relays an empty 202 and an empty 200 to a DELETE', async () => {
+    const h = await setupMcp((request, res) => {
+      res.writeHead(request.method === 'DELETE' ? 200 : 202)
+      res.end()
+    })
+    const accepted = await sendMcp(h, {body: '{"method":"notifications/initialized"}'})
+    const deleted = await sendMcp(h, {method: 'DELETE', headers: {'mcp-session-id': MCP_SESSION}})
+    expect([accepted.status, accepted.body.length]).toEqual([202, 0])
+    expect([deleted.status, deleted.body.length]).toEqual([200, 0])
+  })
+
+  it('streams SSE events in order, with the gaps the upstream leaves', async () => {
+    const frames = [
+      'id: 1\ndata: a\n\n',
+      'id: 2\nevent: message\ndata: b\n\n',
+      ': keep-alive\n\n',
+      'id: 3\ndata: c\n\n',
+    ]
+    const h = await setupMcp((_request, res) => sse(res, frames, 20))
+    const reply = await sendMcp(h, {method: 'GET', headers: {accept: 'text/event-stream', 'last-event-id': '0'}})
+    expect(reply.body.toString()).toBe(frames.join(''))
+    expect(headerOf(h.upstream.requests[0], 'last-event-id')).toBe('0')
+  })
+
+  it('does not hold a GET stream back for its next event: the first frame arrives while the stream is open', async () => {
+    // #given an upstream that writes one frame and keeps the stream open
+    let release: () => void = () => undefined
+    const hold = new Promise<void>(resolve => {
+      release = resolve
+    })
+    const h = await setupMcp((_request, res) => {
+      res.writeHead(200, {'content-type': 'text/event-stream'})
+      res.write(': stream open\n\n')
+      hold.then(
+        () => res.end(),
+        () => undefined,
+      )
+    })
+
+    // #when the client reads the first frame
+    const first = await new Promise<string>((resolve, reject) => {
+      const req = http.request({host: '127.0.0.1', port: h.proxy.port, path: '/mcp/s1', method: 'GET'}, res => {
+        res.once('data', (chunk: Buffer) => resolve(chunk.toString()))
+      })
+      req.on('error', reject)
+      req.end()
+      setTimeout(() => reject(new Error('no first frame')), 5000).unref()
+    })
+    release()
+
+    // #then it was there before the upstream ended the stream
+    expect(first).toBe(': stream open\n\n')
+  })
+
+  it('passes backpressure to the upstream when the client reads slowly', async () => {
+    // #given an upstream that writes up to 128 MiB as fast as its socket takes it, and counts what it wrote
+    const chunk = Buffer.alloc(64 * 1024, 97)
+    const total = 2048
+    let written = 0
+    const h = await setupMcp((_request, res) => {
+      res.writeHead(200, {'content-type': 'text/event-stream'})
+      const pump = (): void => {
+        while (written < total) {
+          written += 1
+          if (!res.write(chunk)) {
+            res.once('drain', pump)
+            return
+          }
+        }
+        res.end()
+      }
+      pump()
+    })
+
+    // #when the client stops reading at once
+    const received = await new Promise<number>((resolve, reject) => {
+      const req = http.request({host: '127.0.0.1', port: h.proxy.port, path: '/mcp/s1', method: 'GET'}, res => {
+        let bytes = 0
+        res.pause()
+        setTimeout(() => {
+          // #then the upstream is held back by the buffers in between: it has not written everything
+          expect(written).toBeLessThan(total)
+          res.resume()
+        }, 600)
+        res.on('data', (data: Buffer) => {
+          bytes += data.length
+        })
+        res.on('end', () => resolve(bytes))
+        res.on('error', reject)
+      })
+      req.on('error', reject)
+      req.end()
+    })
+
+    // #then once it reads, every byte arrives
+    expect(received).toBe(chunk.length * total)
+  }, 60_000)
+
+  it('does not cut a quiet GET stream before the idle limit, and ends one that goes idle past it', async () => {
+    // #given a stream that pauses 300 ms between frames under a 700 ms idle limit, then stalls
+    let closedUpstream: () => void = () => undefined
+    const closed = new Promise<void>(resolve => {
+      closedUpstream = resolve
+    })
+    const h = await setupMcp(
+      (_request, res) => {
+        res.writeHead(200, {'content-type': 'text/event-stream'})
+        res.on('close', closedUpstream)
+        res.write(': a\n\n')
+        setTimeout(() => res.write(': b\n\n'), 300)
+        setTimeout(() => res.write(': c\n\n'), 600)
+      },
+      {limits: {idleTimeoutMs: 700}},
+    )
+
+    // #when it is read to its end
+    const outcome = await new Promise<{readonly text: string; readonly complete: boolean}>(resolve => {
+      const req = http.request({host: '127.0.0.1', port: h.proxy.port, path: '/mcp/s1', method: 'GET'}, res => {
+        let text = ''
+        res.on('data', (data: Buffer) => {
+          text += data.toString()
+        })
+        res.on('close', () => resolve({text, complete: res.complete}))
+        res.on('error', () => undefined)
+      })
+      req.on('error', () => undefined)
+      req.end()
+    })
+
+    // #then every frame before the stall arrived, the stall ended the stream, and the upstream saw it close
+    expect(outcome.text).toBe(': a\n\n: b\n\n: c\n\n')
+    expect(outcome.complete).toBe(false)
+    await closed
+  })
+
+  it('destroys the upstream request when the client drops a GET stream', async () => {
+    let upstreamClosed: () => void = () => undefined
+    const closed = new Promise<void>(resolve => {
+      upstreamClosed = resolve
+    })
+    const h = await setupMcp((_request, res) => {
+      res.writeHead(200, {'content-type': 'text/event-stream'})
+      res.write(': open\n\n')
+      res.on('close', upstreamClosed)
+    })
+    await new Promise<void>((resolve, reject) => {
+      const req = http.request({host: '127.0.0.1', port: h.proxy.port, path: '/mcp/s1', method: 'GET'}, res => {
+        res.once('data', () => {
+          req.destroy()
+          resolve()
+        })
+      })
+      req.on('error', () => undefined)
+      req.end()
+      setTimeout(() => reject(new Error('no first frame')), 5000).unref()
+    })
+    await closed
+    expect(h.upstream.requests).toHaveLength(1)
+  })
+
+  it('counts an open stream against the connection cap shared with every route', async () => {
+    // #given a cap of one connection, held by a GET stream
+    const h = await setupMcp(
+      (_request, res) => {
+        res.writeHead(200, {'content-type': 'text/event-stream'})
+        res.write(': open\n\n')
+      },
+      {limits: {maxConnections: 1}},
+    )
+    const stream = http.request({host: '127.0.0.1', port: h.proxy.port, path: '/mcp/s1', method: 'GET', agent: false})
+    await new Promise<void>((resolve, reject) => {
+      stream.on('response', res => {
+        res.once('data', () => resolve())
+      })
+      stream.on('error', reject)
+      stream.end()
+    })
+
+    // #when another connection arrives
+    const second = await rawExchange(h.proxy.port, 'GET /mcp/s1 HTTP/1.1\r\nHost: x\r\n\r\n', 200)
+
+    // #then it is dropped without an answer
+    expect(second).toBe('')
+    stream.destroy()
+  })
+
+  it('refuses an upstream whose certificate it does not trust, with no request sent', async () => {
+    const h = await setupMcp(okJson, {untrusted: true})
+    const reply = await sendMcp(h, {body: '{}'})
+    expect(reply.status).toBe(502)
+    expect(h.upstream.requests).toHaveLength(0)
+  })
+
+  it('answers a failed upstream connection with a fixed 502 that never names the host', async () => {
+    const h = await setupMcp(okJson, {route: {origin: 'https://127.0.0.1:1'}})
+    const reply = await sendMcp(h, {body: '{}'})
+    expect(reply.status).toBe(502)
+    expect(reply.body.toString()).toBe('Bad Gateway\n')
+  })
+
+  it('answers a stalled upstream (no response headers) with a fixed 504', async () => {
+    const h = await setupMcp(() => undefined, {limits: {headersTimeoutMs: 200}})
+    expect((await sendMcp(h, {body: '{}'})).status).toBe(504)
+  })
+})
+
+describe('key proxy: MCP routes beside provider routes', () => {
+  it('serves a provider and an MCP route from one proxy without sharing a credential or a table', async () => {
+    // #given a proxy with both route classes on one upstream
+    const h = await setupMcp(okJson, {withProviders: true})
+
+    // #when each is called
+    const provider = await h.send('/openai/chat/completions', {body: '{}'})
+    const mcp = await sendMcp(h, {body: '{}'})
+    const crossed = await h.send('/mcp/chat/completions', {body: '{}'})
+    const providerAsMcp = await sendMcp(h, {body: '{}'}, '/openai/s1')
+
+    // #then each reached its own upstream path with its own credential, and the table paths did not cross
+    expect(provider.status).toBe(200)
+    expect(mcp.status).toBe(200)
+    const [first, second] = h.upstream.requests
+    expect(first?.url).toBe('/v1/chat/completions')
+    expect(headerOf(first, 'authorization')).toBe(`Bearer ${OPENAI_KEY}`)
+    expect(headerOf(first, 'x-tenant')).toBeUndefined()
+    expect(second?.url).toBe('/mcp')
+    expect(headerOf(second, 'authorization')).toBe(MCP_TOKEN)
+    expect(crossed.status).toBe(404)
+    expect(providerAsMcp.status).toBe(404)
+    expect(h.upstream.requests).toHaveLength(2)
+  })
+
+  it('serves a provider named mcp as before when there are no MCP routes', async () => {
+    const h = await setup(okJson, {
+      providers: origin => {
+        const built = buildKeyProxyUpstream({providerId: 'mcp', baseUrl: `${origin}/v1`, protocols: ['openai-chat']})
+        if (!built.success) throw new Error('fixture')
+        return [{id: 'mcp', key: OPENAI_KEY, origin: built.data.origin, routes: built.data.routes}]
+      },
+    })
+    const reply = await h.send('/mcp/chat/completions', {body: '{}'})
+    expect(reply.status).toBe(200)
+    expect(headerOf(h.upstream.requests[0], 'authorization')).toBe(`Bearer ${OPENAI_KEY}`)
+  })
+
+  it('refuses to start when a provider is named mcp and MCP routes exist', async () => {
+    const {logger} = recordingLogger()
+    const started = await startKeyProxy({
+      providers: [{id: 'mcp', key: OPENAI_KEY, origin: 'https://api.openai.com', routes: []}],
+      mcp: mcpRoute('https://mcp.example.com'),
+      logger,
+    })
+    expect(started.success).toBe(false)
+    expect(started.success ? '' : started.error).not.toContain(OPENAI_KEY)
+  })
+
+  it('logs no header value, path, query or body for an MCP route', async () => {
+    // #given calls that succeed, fail upstream and miss the route table
+    const h = await setupMcp((_request, res) => {
+      res.writeHead(400, {'content-type': 'application/json'})
+      res.end(`{"echo":"${MCP_TOKEN}"}`)
+    })
+    await sendMcp(
+      h,
+      {body: '{"secret":"prompt-text"}', headers: {'x-custom': 'hdr-value', 'mcp-session-id': MCP_SESSION}},
+      '/mcp/s1?codemode=false',
+    )
+    await sendMcp(h, {body: '{}'}, '/mcp/nope')
+
+    // #then nothing request-derived or secret is in the log
+    const log = h.lines.join('\n')
+    for (const needle of [
+      MCP_TOKEN,
+      'mcp-CANARY',
+      'tenant-7',
+      'prompt-text',
+      'hdr-value',
+      MCP_SESSION,
+      'codemode',
+      '/mcp',
+      'nope',
+      'Bearer',
+    ]) {
+      expect(log).not.toContain(needle)
+    }
+  })
+})
+
+describe('key proxy: MCP routes at start', () => {
+  const start = async (mcp: KeyProxyMcpRouteConfig[]) =>
+    startKeyProxy({providers: [], mcp, logger: recordingLogger().logger})
+
+  it.each([
+    ['a plain-http origin', mcpRoute('http://mcp.example.com')],
+    ['an origin with a path', mcpRoute('https://mcp.example.com/mcp')],
+    ['a metadata-service origin', mcpRoute('https://169.254.169.254')],
+    ['a repeated id', [...mcpRoute('https://a.example.com'), ...mcpRoute('https://b.example.com')]],
+    ['a forbidden header', mcpRoute('https://mcp.example.com', {headers: {Host: 'x'}})],
+  ])('refuses to start with %s, naming no header value', async (_name, mcp) => {
+    const started = await start(mcp)
+    expect(started.success).toBe(false)
+    expect(started.success ? '' : started.error).not.toContain(MCP_TOKEN)
+  })
+
+  it('starts with MCP routes and no provider', async () => {
+    const started = await start(mcpRoute('https://mcp.example.com'))
+    expect(started.success).toBe(true)
+    if (started.success) await started.data.close()
   })
 })

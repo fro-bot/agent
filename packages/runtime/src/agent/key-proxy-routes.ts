@@ -185,3 +185,20 @@ export function matchKeyProxyRoute(
 ): KeyProxyRoute | undefined {
   return routes.find(route => route.method === method && route.path === path && route.queries.includes(query))
 }
+
+/** A parsed `https://host[:port]` upstream origin: the pieces `https.request` and the `Host` header need. */
+export interface UpstreamOrigin {
+  readonly hostname: string
+  readonly port: number
+  readonly host: string
+}
+
+/** The plain https origin (no path, no userinfo, no metadata-service address) as its parts, or null. */
+export function parseUpstreamOrigin(origin: string): UpstreamOrigin | null {
+  const validated = validateUpstreamUrl(origin)
+  if (!validated.success) return null
+  const url = validated.data
+  if (url.pathname !== '/' || url.origin !== origin) return null
+  const hostname = url.hostname.startsWith('[') ? url.hostname.slice(1, -1) : url.hostname
+  return {hostname, port: url.port === '' ? 443 : Number(url.port), host: url.host}
+}

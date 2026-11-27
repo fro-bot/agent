@@ -519,17 +519,45 @@ process.stdin.resume()`,
       })
 
       it.skipIf(BUN === null)(
-        'fails the start with the real child, which cannot serve MCP routes yet, and leaves it stopped',
+        'starts the real child with MCP routes only, and it adds the configured header to a request',
         async () => {
-          // #given the real child and a start that carries a route
-          // #when it is started
-          const {started, logger} = await startWith(realLauncher(), {mcpRoutes: [MCP_ROUTE]})
+          // #given an HTTPS upstream and a start that carries one route and no provider
+          const upstream = await startTlsUpstream((_request, res) => {
+            res.writeHead(200, {'content-type': 'application/json'})
+            res.end('{}')
+          })
+          cleanups.push(upstream.close)
 
-          // #then the child refused its configuration: the start failed, with no port and no value in the message
-          expect(started.success).toBe(false)
-          const error = unwrapErr(started)
-          expect(error.kind).toBe('child-error')
-          expect(error.message).not.toContain(HEADER_VALUE)
+          // #when the real child is started
+          const {started, logger} = await startWith(realLauncher(), {
+            providers: [],
+            mcpRoutes: [{...MCP_ROUTE, origin: upstream.origin}],
+            testing: {upstreamCa: upstream.ca},
+          })
+          if (!started.success) throw new Error(started.error.message)
+
+          // #when a request reaches the route with no credential of its own
+          const status = await new Promise<number>((resolve, reject) => {
+            const req = http.request(
+              {
+                host: '127.0.0.1',
+                port: started.data.port,
+                path: new URL(started.data.mcpUrl('s1')).pathname,
+                method: 'POST',
+              },
+              res => {
+                res.resume()
+                res.on('end', () => resolve(res.statusCode ?? 0))
+              },
+            )
+            req.on('error', reject)
+            req.end('{}')
+          })
+
+          // #then the upstream saw the configured header, and nothing in the logs holds it
+          expect(status).toBe(200)
+          expect(upstream.requests[0]?.url).toBe('/mcp')
+          expect(upstream.requests[0]?.headers.authorization).toBe(HEADER_VALUE)
           expect(serializeLoggerCalls(logger)).not.toContain(HEADER_VALUE)
         },
       )

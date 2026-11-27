@@ -2561,8 +2561,8 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
       expect(sandbox.release).toHaveBeenCalledTimes(1)
     })
 
-    it('fails the run, quoting no value, with the real child, which cannot serve MCP routes yet', async () => {
-      // #given the real supervisor and the real child, which refuses a frame that carries MCP routes
+    it('starts the real child with the route and points the server config at it, with no value anywhere', async () => {
+      // #given the real supervisor and the real child, which now serves MCP routes
       const bun = (() => {
         try {
           return execFileSync('which', ['bun'], {encoding: 'utf8'}).trim()
@@ -2583,16 +2583,19 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
 
       // #when the run starts with a credentialed remote
       const result = await startMcp(sandbox.sandbox, deps, {logger})
+      const proxy = sandbox.log.proxyReports[0]?.proxy as KeyProxyProcess | undefined
 
-      // #then the child refused its configuration, so the run failed before the server or the sandbox account existed
-      const error = unwrapErr(result)
-      expect(error.stage).toBe('key-proxy')
-      expect(error.message).toContain('refused its configuration')
-      expect(error.message).not.toContain(TOKEN)
-      expect(serializeLoggerCalls(logger)).not.toContain(TOKEN)
-      expect(deps.startServer).not.toHaveBeenCalled()
-      expect(sandbox.prepare).not.toHaveBeenCalled()
-      expect(sandbox.release).toHaveBeenCalledTimes(1)
+      try {
+        // #then the child started and the server was launched against its loopback route, with no value in the config
+        expect(result.success).toBe(true)
+        expect(spawnedConfig(deps).mcp).toEqual({
+          search: {type: 'remote', url: proxy?.mcpUrl('s1'), oauth: false},
+        })
+        expect(JSON.stringify(spawnedConfig(deps))).not.toContain(TOKEN)
+        expect(serializeLoggerCalls(logger)).not.toContain(TOKEN)
+      } finally {
+        await proxy?.stop()
+      }
     })
 
     it.each([

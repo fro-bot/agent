@@ -76,13 +76,13 @@ async function configFor(origin: string, ca: string): Promise<KeyProxyWireConfig
   }
 }
 
-async function post(port: number): Promise<number> {
+async function post(port: number, path = '/openai/chat/completions'): Promise<number> {
   return new Promise<number>((resolve, reject) => {
     const req = http.request(
       {
         host: '127.0.0.1',
         port,
-        path: '/openai/chat/completions',
+        path,
         method: 'POST',
       },
       res => {
@@ -196,10 +196,13 @@ describe('runKeyProxyChild', () => {
     expect(r.output()).toBe('{"error":"invalid-config"}\n')
   })
 
-  it('exits 64 and never prints ready when the frame carries MCP routes it cannot serve, quoting nothing', async () => {
-    // #given a valid provider config that also carries a brokered MCP route with a header value
+  it('serves a brokered MCP route next to a provider, adds the configured header and prints one ready line', async () => {
+    // #given a provider and an MCP route that point at one recording upstream
     const HEADER_VALUE = 'Bearer child-mcp-CANARY-0009'
-    const upstream = await startTlsUpstream((_request, res) => res.end('{}'))
+    const upstream = await startTlsUpstream((_request, res) => {
+      res.writeHead(200, {'content-type': 'application/json'})
+      res.end('{"ok":true}')
+    })
     cleanups.push(upstream.close)
     const r = run()
     const config = await configFor(upstream.origin, upstream.ca)
@@ -208,8 +211,57 @@ describe('runKeyProxyChild', () => {
     r.stdin.write(
       encodeKeyProxyConfig({
         ...config,
-        mcp: [{id: 's1', origin: 'https://mcp.example.com', path: '/mcp', headers: {Authorization: HEADER_VALUE}}],
+        mcp: [{id: 's1', origin: upstream.origin, path: '/mcp', headers: {Authorization: HEADER_VALUE}}],
       }),
+    )
+    const line = await r.waitForLine()
+    const ready = JSON.parse(line) as {ready: boolean; port: number}
+
+    // #then the MCP route reaches the upstream with the configured header, and the provider route still works
+    expect(ready.ready).toBe(true)
+    expect(await post(ready.port, '/mcp/s1')).toBe(200)
+    expect(upstream.requests[0]?.url).toBe('/mcp')
+    expect(upstream.requests[0]?.headers.authorization).toBe(HEADER_VALUE)
+    expect(await post(ready.port)).toBe(200)
+    expect(upstream.requests[1]?.headers.authorization).toBe(`Bearer ${REAL_KEY}`)
+    expect(r.output()).toBe(`${JSON.stringify({ready: true, port: ready.port})}\n`)
+    expect(r.output()).not.toContain(HEADER_VALUE)
+  })
+
+  it('starts with MCP routes only, when no provider has a key', async () => {
+    const upstream = await startTlsUpstream((_request, res) => res.end('{}'))
+    cleanups.push(upstream.close)
+    const r = run()
+    r.stdin.write(
+      encodeKeyProxyConfig({
+        version: 1,
+        providers: [],
+        mcp: [{id: 's1', origin: upstream.origin, path: '/mcp', headers: {'X-Key': 'only-mcp-key'}}],
+        ca: upstream.ca,
+      }),
+    )
+    const ready = JSON.parse(await r.waitForLine()) as {ready: boolean; port: number}
+    expect(await post(ready.port, '/mcp/s1')).toBe(200)
+    expect(upstream.requests[0]?.headers['x-key']).toBe('only-mcp-key')
+  })
+
+  it.each([
+    ['an MCP route that is malformed', {id: 's1', origin: 'https://mcp.example.com', path: 'no-slash', headers: {}}],
+    [
+      'an MCP route with a forbidden header',
+      {id: 's1', origin: 'https://mcp.example.com', path: '/mcp', headers: {Host: 'x'}},
+    ],
+  ])('exits 64 and never prints ready for %s, quoting nothing', async (_name, route) => {
+    // #given a valid provider config that also carries the bad route and a header value
+    const HEADER_VALUE = 'Bearer child-mcp-CANARY-0010'
+    const upstream = await startTlsUpstream((_request, res) => res.end('{}'))
+    cleanups.push(upstream.close)
+    const r = run()
+    const config = await configFor(upstream.origin, upstream.ca)
+
+    // #when the frame arrives
+    r.stdin.write(
+      encodeKeyProxyConfig({...config, mcp: [{...route, headers: {...route.headers, Authorization: HEADER_VALUE}}]}),
     )
 
     // #then the child refuses the config with the fixed line and exits 64: no port was ever announced
@@ -217,6 +269,19 @@ describe('runKeyProxyChild', () => {
     expect(r.output()).toBe('{"error":"invalid-config"}\n')
     expect(r.output()).not.toContain(HEADER_VALUE)
     expect(r.output()).not.toContain('ready')
+  })
+
+  it('exits 65 and never prints ready when an MCP route upstream is not a plain https origin', async () => {
+    const r = run()
+    r.stdin.write(
+      encodeKeyProxyConfig({
+        version: 1,
+        providers: [],
+        mcp: [{id: 's1', origin: 'http://mcp.example.com', path: '/mcp', headers: {}}],
+      }),
+    )
+    expect(await r.waitForExit()).toBe(65)
+    expect(r.output()).toBe('{"error":"start-failed"}\n')
   })
 
   it('exits 65 with a fixed line when the proxy refuses to start', async () => {

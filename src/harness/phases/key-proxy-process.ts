@@ -65,7 +65,7 @@ export interface StartKeyProxyProcessOptions {
   readonly providers: readonly KeyProxyProviderInput[]
   /**
    * Brokered remote MCP servers (`planMcpBrokerV2`): sent to the child in the same frame, header values and all. Absent or
-   * empty leaves the frame as it was. A child that cannot serve them refuses the frame, which fails the start.
+   * empty leaves the frame as it was. A child that refuses the frame fails the start.
    */
   readonly mcpRoutes?: readonly KeyProxyMcpRouteConfig[]
   readonly logger: Logger
