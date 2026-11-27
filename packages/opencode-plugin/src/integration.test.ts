@@ -428,6 +428,8 @@ describe.skipIf(!runnable)('same-run subagent resume in a real opencode V2', () 
       release = resolve
       abandon = reject
     })
+    // The provider reads the rejection; this handler keeps an unread one from surfacing as an unhandled rejection.
+    gate.catch(() => {})
     const timer = setTimeout(() => {
       abandon(new Error(`B's reply gate was not released within ${String(GATE_TIMEOUT_MS)}ms`))
     }, GATE_TIMEOUT_MS)
