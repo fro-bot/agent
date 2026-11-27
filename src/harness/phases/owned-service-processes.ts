@@ -19,10 +19,35 @@ import process from 'node:process'
 
 export const SERVICE_NEEDLE = 'serve --service'
 
-/** The ids of every process whose command line contains `needle`, from `pgrep -f`. Not evidence of ownership. */
-export function listMatchingProcesses(needle: string = SERVICE_NEEDLE, uid?: number): readonly number[] {
-  const args = [...(uid === undefined ? [] : ['-u', String(uid)]), '-f', needle]
-  const found = spawnSync('pgrep', args, {encoding: 'utf8'})
+/** What the scan reports: `spawnSync`'s own result shape, narrowed to what is read. */
+export interface ScanOutcome {
+  readonly status: number | null
+  readonly stdout: string
+  readonly error?: Error | undefined
+}
+
+function runPgrep(args: readonly string[]): ScanOutcome {
+  return spawnSync('pgrep', [...args], {encoding: 'utf8'})
+}
+
+/**
+ * The ids of every process whose command line contains `needle`, from `pgrep -f`. Not evidence of ownership.
+ *
+ * `pgrep` exits 0 with matches and 1 with none. Anything else (a bad pattern, a fatal error, a kill by signal, no `pgrep`)
+ * is a scan that did not happen, and reading it as "no service" would let a test pass without having looked, so it throws.
+ */
+export function listMatchingProcesses(
+  needle: string = SERVICE_NEEDLE,
+  uid?: number,
+  scan: (args: readonly string[]) => ScanOutcome = runPgrep,
+): readonly number[] {
+  const found = scan([...(uid === undefined ? [] : ['-u', String(uid)]), '-f', needle])
+  if (found.error !== undefined || (found.status !== 0 && found.status !== 1)) {
+    const code = found.error === undefined ? undefined : (found.error as NodeJS.ErrnoException).code
+    throw new Error(
+      `pgrep failed, so the process scan did not run (${found.status === null ? `no status${code === undefined ? '' : `, ${code}`}` : `exit ${found.status}`})`,
+    )
+  }
   return found.stdout
     .split('\n')
     .map(line => Number(line.trim()))

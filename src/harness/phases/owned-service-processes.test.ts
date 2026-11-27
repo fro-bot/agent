@@ -110,4 +110,35 @@ describe('owned service processes', () => {
     expect(findServicesOfAccount(process.getuid?.() ?? 1)).toEqual([])
     expect(findServicesOfAccount(Number.NaN)).toEqual([])
   })
+
+  describe('a failed scan is never read as "no service"', () => {
+    const scanned =
+      (status: number | null, stdout = '', error?: Error) =>
+      () => ({status, stdout, stderr: '', error})
+
+    it('reads exit 1 as no match and exit 0 as the listed ids', () => {
+      expect(listMatchingProcesses('x', undefined, scanned(1))).toEqual([])
+      expect(listMatchingProcesses('x', undefined, scanned(0, '12\n34\n'))).toEqual([12, 34])
+    })
+
+    it.each([
+      ['a usage or regex error (2)', scanned(2)],
+      ['a fatal error (3)', scanned(3)],
+      ['a kill by signal (no status)', scanned(null)],
+      ['a missing pgrep', scanned(null, '', Object.assign(new Error('spawn pgrep ENOENT'), {code: 'ENOENT'}))],
+    ])('throws for %s, instead of returning an empty list', (_name, scan) => {
+      expect(() => listMatchingProcesses('x', undefined, scan)).toThrow(/pgrep/)
+    })
+
+    it('reaches every caller: neither ownership scan can report "none" from a scan that failed', () => {
+      const failing = (): readonly number[] => {
+        throw new Error('pgrep failed')
+      }
+      expect(() => findServicesOwnedByState('/tmp/state', {list: failing})).toThrow(/pgrep failed/)
+    })
+
+    it('throws for a real pgrep given an invalid pattern, which exits 2', () => {
+      expect(() => listMatchingProcesses('(')).toThrow(/pgrep/)
+    })
+  })
 })
