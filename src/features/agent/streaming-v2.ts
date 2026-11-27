@@ -25,6 +25,7 @@ import {
 import {extractCommitShas, extractGithubUrls} from '../../services/github/urls.js'
 import {outputTextContent, outputToolExecution} from '../../shared/console.js'
 import {toErrorMessage} from '../../shared/errors.js'
+import {createEventTrailV2, recordFrameV2, type EventTrailV2} from './deadline-diagnostics-v2.js'
 import {classifyNoticeSettlement, createSubagentNoticeLog, readLedgerState} from './subagent-notice-log.js'
 import {toolArgumentV2} from './tool-argument-v2.js'
 
@@ -92,6 +93,12 @@ export interface ActivityTrackerV2 {
    * missed it, so the poll path reads the persisted state instead.
    */
   idleHintWithoutTerminal: boolean
+  /**
+   * The last raw SSE event types seen for the run, and any compaction in flight: what the deadline line reports when the
+   * run is still open at the deadline. Fed before the event mapper, which drops most of these events. Content-free and
+   * bounded (`deadline-diagnostics-v2.ts`).
+   */
+  readonly eventTrail: EventTrailV2
 }
 
 export function createActivityTrackerV2(): ActivityTrackerV2 {
@@ -105,6 +112,7 @@ export function createActivityTrackerV2(): ActivityTrackerV2 {
     rootRevision: 0,
     streamBlind: false,
     idleHintWithoutTerminal: false,
+    eventTrail: createEventTrailV2(),
   }
 }
 
@@ -363,7 +371,16 @@ export async function processEventStreamV2(options: ProcessEventStreamV2Options)
     options.onRootTerminal?.(terminal)
   }
 
-  const events = mapV2EventStream(stream, {logger, isOwnedSession: isOwned})
+  // Taps the RAW frames, ahead of the mapper: it maps the compaction family (and most step events) to nothing, and a
+  // compaction that never ends is exactly what a stalled root looks like. Records the type and session only.
+  async function* trailFrames(frames: AsyncIterable<unknown>): AsyncGenerator<unknown> {
+    for await (const frame of frames) {
+      recordFrameV2(tracker.eventTrail, frame, {rootSessionId: sessionId, isOwned, nowMs: Date.now()})
+      yield frame
+    }
+  }
+
+  const events = mapV2EventStream(trailFrames(stream), {logger, isOwnedSession: isOwned})
 
   const snapshot = (): EventStreamResult => {
     const failure = getObservedFailureV2(tracker)

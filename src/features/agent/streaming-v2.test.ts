@@ -1202,6 +1202,70 @@ describe('subagent notice diagnostics', () => {
       expect([...tracker.queuedNoticeInboxIds]).toEqual(['msg_notice_1'])
     })
   })
+
+  describe('the event trail the deadline line reads', () => {
+    const SECRET = 'CANARY-trail-payload-3c1f'
+
+    it('records events the mapper drops, and a compaction that started and never ended', async () => {
+      // #given a root turn that began a compaction (a family the mapper maps to nothing) and then went quiet
+      const {result, tracker} = run([
+        SERVER_CONNECTED_FRAME,
+        EXECUTION_STARTED_FRAME,
+        frame('session.step.started', {sessionID: TEXT_SESSION_ID}),
+        frame('session.compaction.started', {sessionID: TEXT_SESSION_ID, reason: 'auto'}),
+      ])
+
+      // #when
+      await result
+
+      // #then
+      expect(tracker.eventTrail.entries.map(entry => [entry.type, entry.role])).toEqual([
+        ['server.connected', 'server'],
+        ['session.execution.started', 'root'],
+        ['session.step.started', 'root'],
+        ['session.compaction.started', 'root'],
+      ])
+      expect(tracker.eventTrail.rootCompaction).toMatchObject({role: 'root', reason: 'auto'})
+    })
+
+    it('tells a tracked child from the root, and drops a session the run does not own', async () => {
+      // #given a ledger that tracks one child
+      const ledger = createOwnershipLedger()
+      ledger.adopt(CHILD_SESSION_ID, 'child')
+      const {result, tracker} = run(
+        [
+          frame('session.reasoning.delta', {sessionID: CHILD_SESSION_ID}),
+          frame('session.reasoning.delta', {sessionID: 'ses_stranger'}),
+          frame('session.reasoning.delta', {sessionID: TEXT_SESSION_ID}),
+        ],
+        {ownershipLedger: ledger},
+      )
+
+      // #when
+      await result
+
+      // #then
+      expect(tracker.eventTrail.entries.map(entry => entry.role)).toEqual(['child', 'root'])
+    })
+
+    it('keeps no text, input or output from any frame', async () => {
+      // #given frames that carry model text, tool input and output, and compaction text
+      const {result, tracker} = run([
+        frame('session.text.delta', {sessionID: TEXT_SESSION_ID, ordinal: 0, delta: SECRET}),
+        frame('session.tool.called', {sessionID: TEXT_SESSION_ID, callID: 'c1', input: {command: SECRET}}),
+        frame('session.compaction.delta', {sessionID: TEXT_SESSION_ID, text: SECRET}),
+        frame('session.compaction.ended', {sessionID: TEXT_SESSION_ID, reason: 'auto', text: SECRET}),
+      ])
+
+      // #when
+      await result
+
+      // #then
+      expect(JSON.stringify({...tracker, queuedNoticeInboxIds: [...tracker.queuedNoticeInboxIds]})).not.toContain(
+        SECRET,
+      )
+    })
+  })
 })
 
 describe('classifyV2Error', () => {

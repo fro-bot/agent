@@ -12,6 +12,7 @@ OpenCode V2 execution with GitHub context injection, multi-section prompt constr
 | **Polling**   | `session-poll-v2.ts` | Completion observation, event processor shutdown |
 | **Streaming** | `streaming-v2.ts`  | V2 event stream processing, artifact detection |
 | **Notice log** | `subagent-notice-log.ts` | Diagnostic log of subagent notices (`<subagent>` / `<background-result kind="subagent">`; ids, tag/metadata states, classification); never feeds settlement |
+| **Deadline line** | `deadline-diagnostics-v2.ts` | Bounded, content-free event trail on the tracker (raw SSE types, compaction state); logs and traces what the root was doing when the deadline fires; diagnostic only |
 | **Context**   | `context.ts`       | Gathers event data from NormalizedEvent, diff, hydrated context         |
 | **UX**        | `reactions.ts`     | Emojis (👀/🎉/😕), `agent: working` label state machine (140 L)         |
 | **Prompt**    | `prompt.ts`        | Multi-section prompt with response protocol and output contract (420 L) |
