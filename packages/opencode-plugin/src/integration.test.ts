@@ -3,7 +3,7 @@
  * `dist/index.mjs` exists.
  */
 
-import type {FakeProvider, OtlpSink, RunningServer, SandboxPaths} from './integration.fixture.js'
+import type {FakeProvider, FakeStep, OtlpSink, RunningServer, SandboxPaths} from './integration.fixture.js'
 
 import {cpSync, existsSync, mkdirSync, readdirSync, rmSync, writeFileSync} from 'node:fs'
 import os from 'node:os'
@@ -361,6 +361,9 @@ const launcherWorkspace: Record<string, string> = {
 /** An id that is well formed but names no session. */
 const UNKNOWN_SESSION_ID = 'ses_unknownchild000000000000'
 
+/** How long B's first reply waits for the test to install the parent's resume script. */
+const GATE_TIMEOUT_MS = 30_000
+
 /** The host's report text that rejected a resume. */
 const REFUSAL_MARKER = 'Session reuse is disabled'
 
@@ -409,25 +412,49 @@ describe.skipIf(!runnable)('same-run subagent resume in a real opencode V2', () 
     records(dataOf(await rig.server.api('GET', `/api/session?parentID=${parentID}`)))
 
   /**
-   * Sends the parent's first prompt. The model dispatches child B (`CHILD_ALPHA`), and B answers `CHILD_ALPHA_REPLY` after a
-   * delay, which leaves the caller time to script what the parent does with that report. Returns once B exists.
+   * Sends the parent's first prompt. The model dispatches child B (`CHILD_ALPHA`). B's reply is held at a gate until
+   * `scriptResume(childID)` has been installed, so the parent's next request never races the script that answers it. The
+   * gate is bounded: if nothing releases it in `GATE_TIMEOUT_MS`, B's request fails with a message that names the gate.
    */
-  const dispatchChild = async (rig: Rig, marker: string): Promise<{parentID: string; childID: string}> => {
+  const dispatchChild = async (
+    rig: Rig,
+    marker: string,
+    scriptResume: (childID: string) => readonly FakeStep[],
+  ): Promise<{parentID: string; childID: string}> => {
     const parentID = await createSession(rig)
-    rig.provider.script([
-      {
-        all: [marker],
-        none: ['"role":"tool"'],
-        tools: [
-          {name: 'subagent', args: {agent: 'general', description: 'first', prompt: 'CHILD_ALPHA first question'}},
-        ],
-      },
-      {all: ['CHILD_ALPHA'], none: [marker, 'CHILD_BETA'], text: 'CHILD_ALPHA_REPLY', delayMs: 1_500},
-    ])
-    const sent = await rig.server.api('POST', `/api/session/${parentID}/prompt`, {body: {text: `${marker} start`}})
-    expect(sent.status).toBe(200)
-    const child = await waitFor('child B to exist', async () => (await childrenOf(rig, parentID))[0])
-    return {parentID, childID: String(child.id)}
+    let release!: () => void
+    let abandon!: (error: Error) => void
+    const gate = new Promise<void>((resolve, reject) => {
+      release = resolve
+      abandon = reject
+    })
+    const timer = setTimeout(() => {
+      abandon(new Error(`B's reply gate was not released within ${String(GATE_TIMEOUT_MS)}ms`))
+    }, GATE_TIMEOUT_MS)
+    try {
+      rig.provider.script([
+        {
+          all: [marker],
+          none: ['"role":"tool"'],
+          tools: [
+            {name: 'subagent', args: {agent: 'general', description: 'first', prompt: 'CHILD_ALPHA first question'}},
+          ],
+        },
+        {all: ['CHILD_ALPHA'], none: [marker, 'CHILD_BETA'], text: 'CHILD_ALPHA_REPLY', gate},
+      ])
+      const sent = await rig.server.api('POST', `/api/session/${parentID}/prompt`, {body: {text: `${marker} start`}})
+      expect(sent.status).toBe(200)
+      const child = await waitFor('child B to exist', async () => (await childrenOf(rig, parentID))[0])
+      const childID = String(child.id)
+      rig.provider.script(scriptResume(childID))
+      release()
+      return {parentID, childID}
+    } catch (error) {
+      abandon(error instanceof Error ? error : new Error(String(error)))
+      throw error
+    } finally {
+      clearTimeout(timer)
+    }
   }
 
   const parentRequest = async (rig: Rig, ...needles: string[]) =>
@@ -445,17 +472,15 @@ describe.skipIf(!runnable)('same-run subagent resume in a real opencode V2', () 
     // #given an Action-hosted server and a parent whose child B has been dispatched
     const rig = await launch(launcherOff)
     const marker = 'RESUME_OWN'
-    const {parentID, childID} = await dispatchChild(rig, marker)
-
     // #when B reports, the parent resumes B by its actual id, and B answers a second time
-    rig.provider.script([
+    const {parentID, childID} = await dispatchChild(rig, marker, id => [
       {
         all: [marker, 'CHILD_ALPHA_REPLY'],
         none: ['CHILD_BETA_REPLY'],
         tools: [
           {
             name: 'subagent',
-            args: {agent: 'general', description: 'again', prompt: 'CHILD_BETA second question', sessionID: childID},
+            args: {agent: 'general', description: 'again', prompt: 'CHILD_BETA second question', sessionID: id},
           },
         ],
       },
@@ -536,17 +561,15 @@ describe.skipIf(!runnable)('same-run subagent resume in a real opencode V2', () 
     // #given a workspace-hosted server and a parent whose child B has been dispatched
     const rig = await launch(launcherWorkspace)
     const marker = 'RESUME_WORKSPACE'
-    const {parentID, childID} = await dispatchChild(rig, marker)
-
     // #when B reports and the parent tries to resume B by its actual id
-    rig.provider.script([
+    const {parentID, childID} = await dispatchChild(rig, marker, id => [
       {
         all: [marker, 'CHILD_ALPHA_REPLY'],
         none: [REFUSAL_MARKER],
         tools: [
           {
             name: 'subagent',
-            args: {agent: 'general', description: 'again', prompt: 'CHILD_BETA second question', sessionID: childID},
+            args: {agent: 'general', description: 'again', prompt: 'CHILD_BETA second question', sessionID: id},
           },
         ],
       },

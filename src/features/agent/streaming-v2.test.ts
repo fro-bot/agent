@@ -1,8 +1,6 @@
-import {ok} from '@bfra.me/es/result'
 import {
   createOwnershipLedger,
   createRemoteOpenCodeV2Client,
-  reconcileLedgerOnce,
   shellLedgerKey,
   V2_EVENT_FRAME_MAX_CHARS,
   V2_EVENT_FRAME_TOO_LARGE_ERROR_NAME,
@@ -1569,44 +1567,108 @@ describe('resuming a finished subagent', () => {
     expect(states).toEqual({[CHILD_SESSION_ID]: 'settled'})
   })
 
-  it('leaves a resumed child outstanding when the resume call fails after progress, until reconcile settles it', async () => {
-    // #given a settled child, a resume admitted (progress reopens it), then the call fails and no report ever arrives
-    const failedAfterProgress = frame('session.tool.failed', {
-      sessionID: PARENT_SESSION_ID,
-      id: 'call_r',
-      assistantMessageID: MSG,
+  /** The resume call fails after its progress: upstream emits progress before it submits the prompt. */
+  function failedAfterProgress(call: string, sessionID = PARENT_SESSION_ID, messageID = MSG): unknown {
+    return frame('session.tool.failed', {
+      sessionID,
+      id: call,
+      assistantMessageID: messageID,
       error: {type: 'tool.execution', message: 'prompt failed'},
       executed: true,
     })
+  }
+
+  it('settles a resumed child again when the resume call fails after progress, so no report is awaited', async () => {
+    // #given a settled child, a resume admitted (progress reopens it), then the call fails and no report ever arrives
     const {ledger, states} = await after([
       ...firstRound,
       started('call_r'),
       called('call_r', CHILD_SESSION_ID),
       progress('call_r'),
-      failedAfterProgress,
+      failedAfterProgress('call_r'),
     ])
 
-    // #then the stream alone cannot settle it: the entry is outstanding and blocks completion
+    // #then the failed call is the end of that resume: the entry is settled again and does not block completion
+    expect(states).toEqual({[CHILD_SESSION_ID]: 'settled'})
+    expect(ledger.outstanding()).toBe(0)
+    expect(ledger.isDrainComplete()).toBe(true)
+  })
+
+  it('settles a resumed grandchild again when its resume call fails after progress', async () => {
+    // #given a grandchild owned through an owned child: that child dispatches it, and the call ends `completed`
+    const GRANDCHILD = 'ses_grandchild_00000000000'
+    const CHILD_MSG = 'msg_resume_child'
+    const childCall = (id: string, input: Record<string, unknown>) => [
+      frame('session.tool.input.started', {
+        sessionID: CHILD_SESSION_ID,
+        id,
+        assistantMessageID: CHILD_MSG,
+        name: 'subagent',
+      }),
+      frame('session.tool.called', {sessionID: CHILD_SESSION_ID, id, assistantMessageID: CHILD_MSG, input}),
+      frame('session.tool.progress', {
+        sessionID: CHILD_SESSION_ID,
+        id,
+        assistantMessageID: CHILD_MSG,
+        metadata: {sessionID: GRANDCHILD, status: 'running'},
+      }),
+    ]
+    const dispatchInput = {agent: 'general', description: 'dig', prompt: 'dig deeper'}
+    const grandchildRound = [
+      ...childCall('call_g', dispatchInput),
+      frame('session.tool.success', {
+        sessionID: CHILD_SESSION_ID,
+        id: 'call_g',
+        assistantMessageID: CHILD_MSG,
+        content: [{type: 'text', text: 'done'}],
+        metadata: {sessionID: GRANDCHILD, status: 'completed', truncated: false},
+        executed: false,
+      }),
+    ]
+
+    // #when the child resumes the grandchild and the call fails after progress
+    const {ledger, states} = await after([
+      ...firstRound,
+      ...grandchildRound,
+      ...childCall('call_gr', {...dispatchInput, sessionID: GRANDCHILD}),
+      failedAfterProgress('call_gr', CHILD_SESSION_ID, CHILD_MSG),
+    ])
+
+    // #then the Action reconciles only the root's direct children, so the stream is the only thing that can settle it
+    expect(states).toEqual({[CHILD_SESSION_ID]: 'settled', [GRANDCHILD]: 'settled'})
+    expect(ledger.isDrainComplete()).toBe(true)
+  })
+
+  it('leaves the child outstanding when the resume call succeeds', async () => {
+    // #given a resume that returns `running` (the prompt was submitted)
+    const {ledger, states} = await after([
+      ...firstRound,
+      started('call_r'),
+      called('call_r', CHILD_SESSION_ID),
+      progress('call_r'),
+      succeeded('call_r'),
+    ])
+
+    // #then only a failed finish settles a resume again: the child's report is still owed
     expect(states).toEqual({[CHILD_SESSION_ID]: 'outstanding'})
     expect(ledger.outstanding()).toBe(1)
     expect(ledger.isDrainComplete()).toBe(false)
+  })
 
-    // #when a reconcile pass sees the child as a child of the parent that is no longer live
-    const result = await reconcileLedgerOnce({
-      ledger,
-      adapter: {
-        children: async () => ok([{id: CHILD_SESSION_ID}]),
-        liveSessionIds: async () => ok(new Set<string>()),
-      },
-      parentSessionId: PARENT_SESSION_ID,
-      logger: createMockLogger(),
-    })
+  it('does not settle a child that was already running when its resume call fails', async () => {
+    // #given a child with no report yet (still outstanding) that a resume joins, then the resume call fails
+    const {states} = await after([
+      started('call_d'),
+      called('call_d'),
+      progress('call_d'),
+      started('call_r'),
+      called('call_r', CHILD_SESSION_ID),
+      progress('call_r'),
+      failedAfterProgress('call_r'),
+    ])
 
-    // #then the ledger no longer blocks completion
-    expect(result.success).toBe(true)
-    expect(ledger.snapshot().map(entry => entry.state)).toEqual(['settled'])
-    expect(ledger.outstanding()).toBe(0)
-    expect(ledger.isDrainComplete()).toBe(true)
+    // #then the failed resume says nothing about the run it joined: that run's own report is still owed
+    expect(states).toEqual({[CHILD_SESSION_ID]: 'outstanding'})
   })
 
   it('reopens an entry the stream marked unknown', async () => {
