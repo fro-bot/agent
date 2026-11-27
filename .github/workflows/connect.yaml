@@ -16,7 +16,7 @@ jobs:
     permissions:
       contents: read
       issues: write
-    uses: marcusrbrown/systematic/.github/workflows/connect.yaml@1ddf1b838b7b09312e51c44530b52d5dd14cac14 # v3.38.3
+    uses: marcusrbrown/systematic/.github/workflows/connect.yaml@c645a44734899465ceea8f4ad87882a5354b0ba6 # v3.38.4
     with:
       projects: ${{ vars.FRO_BOT_CONNECT_PROJECTS }}
       parent-model: ${{ vars.FRO_BOT_MODEL }}

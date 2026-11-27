@@ -19,6 +19,7 @@ sources:
   - src/harness/phases/v1-import-wait.ts
   - src/features/agent/prompt-sender-v2.ts
   - src/features/agent/drain-v2.ts
+  - src/features/agent/deadline-diagnostics-v2.ts
   - packages/runtime/src/agent/bundled-skills-dir.ts
   - packages/runtime/src/shared/opencode-v2-pin.json
   - packages/gateway/src/execute/run-core-v2.ts
@@ -193,6 +194,8 @@ SDK failures now retain readable envelope details in diagnostics rather than col
 On the dashboard, V2 directory confirmation and unreadable directory observations map to `confirming-completion`, rather than disappearing as unknown wait reasons. Known background children or confirmed background shells can show `awaiting-background-task` before the root first succeeds; a foreground shell alone is not that signal. [[Operator Web Control Surface]] describes the status overlay.
 
 `v2 session wait bound elapsed with no answer; asking again` is a renewed 60-second long poll, not a resent prompt or an execution timeout. A real wait failure instead logs `v2 session wait failed; relying on the poll watchdog for completion`. The overall run deadline still applies. [[Prompt Architecture]] explains the observation and submission boundary.
+
+`Execution deadline diagnostics` follows `Execution timeout reached` and says what the root was doing, with no model text: what it was still waiting on, the last twenty event types of the root, its owned children and the server heartbeat (role, id suffix, milliseconds before the deadline; other sessions on the server are left out), outstanding children and shells, and whether a compaction started and never ended (`compaction.state: started-not-ended`, a root held by a stalled summary, upstream anomalyco/opencode#66766). A traced run gets the same fields as one `deadline.diagnostics` event on the `execution` span (`src/features/agent/deadline-diagnostics-v2.ts`).
 
 `Run release verdict` summarizes the Action's directory-release evidence: drain outcome, stop usage, quiet observations, stopped work, and unresolved ownership. It is emitted before final server shutdown, so `quiet: true` alone does not prove persistence succeeded. The shutdown result and `cache-save-result` complete that diagnosis; see [[Background Subagents and Ownership]].
 

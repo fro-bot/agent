@@ -42,7 +42,7 @@ fro-bot/agent/
 │   │       ├── operator-contract/ # Operator contract types
 │   │       └── redaction/      # PII/secret redaction gate
 │   ├── harness/                # @fro.bot/harness — patched-OpenCode build + publish pipeline
-│   ├── opencode-plugin/        # @fro.bot/opencode-plugin — OpenCode V2 plugin (session tools + subagent reuse guard)
+│   ├── opencode-plugin/        # @fro.bot/opencode-plugin — OpenCode V2 plugin (session tools + same-run subagent resume guard)
 │   └── runtime/                # @fro-bot/runtime — shared runtime primitives + version-pin constants
 │       └── src/
 │           ├── shared/         # Logger, types, constants (owns real version pins)
@@ -91,7 +91,7 @@ fro-bot/agent/
 - **`apps/workspace-agent/`** — Hono HTTP service that runs inside the workspace container (clone setup with staged root→agent ownership handoff, read-only `POST /inspect` checkout observation, `POST /update` checkout fast-forward, `POST /recover/preview`+`/recover` quarantine-and-replace, `GET`/`DELETE /backups` generations, bearer-gated control API, per-repo mutex and journal store, checkout-update git primitives, supervised unprivileged OpenCode); touch when adding workspace-side API endpoints. Serialize every mutating repo operation through `src/repo-mutex.ts` (also the sticky, restart-only maintenance hold) and record in-flight update/recovery state in `src/journal.ts`; real-git adversarial fixtures live in `src/update-fixtures/`. Import uid/gid/path constants from `src/identity.ts` (mirrored in `deploy/workspace.Dockerfile`) and run any git against an existing checkout through `src/git-safety.ts` as the agent uid — never as the root service. Checkout size/entry counts go through `src/agent-walk.ts`'s agent-uid or sealed-fd walker, never a root-owned path lookup. Checkout types in `src/types.ts` are mirrored in `packages/gateway/src/workspace-api/types.ts` and pinned by `scripts/checkout-types-drift-guard.test.ts` — change both sides together.
 - **`packages/gateway/`** — Discord-first daemon and operator web surface; the largest package, containing the mention loop, command handlers, approval gate, redaction pipeline, and the `web/ingress/` trusted-proxy client-address resolver that keys the unauthenticated operator-surface rate limits and OAuth bindings.
 - **`packages/harness/`** — Patched-OpenCode build and publish pipeline, retired from every runtime path (the Action and gateway run stock V2); its release workflows are removed and the source stays until the package is removed.
-- **`packages/opencode-plugin/`** — Fro Bot's OpenCode V2 plugin, published to npm: the `session_*` tools and the `subagent` session-reuse guard, bundled with the V2 session code from `@fro-bot/runtime/session-v2`; touch when changing what the plugin gives the agent. The V2 workspace image installs it from npm at build time and loads it at each OpenCode spawn.
+- **`packages/opencode-plugin/`** — Fro Bot's OpenCode V2 plugin, published to npm: the `session_*` tools and the same-run `subagent` resume guard, bundled with the V2 session code from `@fro-bot/runtime/session-v2`; touch when changing what the plugin gives the agent. The V2 workspace image installs it from npm at build time and loads it at each OpenCode spawn.
 - **`packages/runtime/`** — Shared runtime primitives consumed by both `src/` and `packages/gateway/`; owns the authoritative version-pin constants.
 - **`deploy/`** — Docker Compose stack, Dockerfiles, mitmproxy egress topology, and deploy validation scripts.
 - **`deploy/managed-config/`** — the root-owned managed OpenCode config (`opencode-v2.json`, copied to `/etc/opencode/opencode.json` in the workspace image); JSON, pinned by `deploy/scripts/managed-config.test.mjs`.
@@ -115,7 +115,7 @@ fro-bot/agent/
 | `@fro-bot/workspace-agent` | `apps/workspace-agent/` | Hono HTTP service in the workspace container |
 | `@fro-bot/gateway` | `packages/gateway/` | Discord daemon, operator web surface, mention loop, redaction |
 | `@fro.bot/harness` | `packages/harness/` | Patched-OpenCode build and publish pipeline; ships the `harness` and `opencode` commands |
-| `@fro.bot/opencode-plugin` | `packages/opencode-plugin/` | OpenCode V2 plugin: session tools and the subagent reuse guard; the `fro-bot.opencode-plugin` id |
+| `@fro.bot/opencode-plugin` | `packages/opencode-plugin/` | OpenCode V2 plugin: session tools and the same-run subagent resume guard; the `fro-bot.opencode-plugin` id |
 | `@fro-bot/runtime` | `packages/runtime/` | Shared runtime primitives; owns authoritative version-pin constants |
 
 ### CI Workflows

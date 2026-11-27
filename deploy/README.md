@@ -534,7 +534,7 @@ Both tools reach `registry.npmjs.org` through the existing egress allowlist.
 
 #### Reuse guard and managed config
 
-Gateway runs reject any `task` tool call that carries a non-empty `task_id` before the task executes (see [Background Subagents and Ownership](../docs/wiki/Background%20Subagents%20and%20Ownership.md#background-subagent-ownership-ledger-gateway) for why). The guard is the `task` reuse check in the `@fro.bot/opencode-plugin` the image installs (see [OpenCode V2](#opencode-v2)), loaded from the config content the workspace agent passes at each spawn.
+The workspace server refuses every `subagent` resume (a call that carries a `sessionID`) before it executes, so gateway runs always start a fresh child (see [Background Subagents and Ownership](../docs/wiki/Background%20Subagents%20and%20Ownership.md#background-subagent-ownership-ledger-gateway) for why). The guard is the resume check in the `@fro.bot/opencode-plugin` the image installs (see [OpenCode V2](#opencode-v2)), loaded from the config content the workspace agent passes at each spawn.
 
 `/etc/opencode/opencode.json` (source: `deploy/managed-config/opencode-v2.json`) is OpenCode's Linux **managed config** layer. It only disables self-update. It is merged LAST, so nothing written under `/home/opencode` or into a checkout can override it. The OpenCode child's environment is built from a fixed allowlist, so `OPENCODE_PURE` and `OPENCODE_TEST_MANAGED_CONFIG_DIR` cannot reach it. `deploy/tests/isolation-harness.sh` proves the agent uid cannot modify, replace, rename, chmod or delete the file (root can), and `deploy/scripts/managed-config.test.mjs` pins its path and ownership.
 

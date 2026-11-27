@@ -10,6 +10,7 @@ import type {
 import type {LiveObservationV2} from '../../features/agent/live-observation-v2.js'
 import type {ExecutionConfig, PromptOptions} from '../../features/agent/types.js'
 import type {MetricsCollector} from '../../features/observability/index.js'
+import type {LifecycleSpan} from '../../shared/lifecycle-tracer.js'
 import type {Logger} from '../../shared/logger.js'
 import type {OutputMode, ResolvedOutputMode, TokenUsage} from '../../shared/types.js'
 import type {BootstrapPhaseResult} from './bootstrap.js'
@@ -305,8 +306,11 @@ export async function runExecute(
   // Resolved once per invocation (run.ts) and shared with finalize; defaults to resolving here for callers
   // that do not thread it. Either way the prompt and the broker read the same decision.
   brokeredPushPlan: BrokeredPushPlan = resolveBrokeredPushPlan(bootstrap, routing),
+  // The `execution` phase's span. An execution deadline adds what the root was doing to it; the no-op span of an untraced
+  // run, or no span at all, makes that nothing.
+  traceSpan?: LifecycleSpan,
 ): Promise<ExecutePhaseResult> {
-  const backend = createExecutionBackendV2(cacheRestore)
+  const backend = createExecutionBackendV2(cacheRestore, traceSpan)
   const outputModeMigration = resolveOutputModeMigration(
     routing.triggerResult.context.eventType,
     bootstrap.inputs.outputMode,

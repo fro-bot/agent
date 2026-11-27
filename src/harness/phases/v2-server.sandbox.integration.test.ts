@@ -110,6 +110,7 @@ import {unwrapOk} from '../../shared/test-helpers.js'
 import {parseTraceInputs} from '../config/trace-inputs.js'
 import {startKeyProxyProcess, type KeyProxyProcess} from './key-proxy-process.js'
 import {snapshotLogDirectory} from './log-snapshot.js'
+import {findServicesOfAccount} from './owned-service-processes.js'
 import {createSandboxLifecycle} from './sandbox-lifecycle.js'
 import {startTraceRelayProcess, type TraceRelayProcess, type TraceRelayStopResult} from './trace-relay-process.js'
 import {
@@ -271,6 +272,8 @@ interface IsolatedRunOptions {
   readonly ghConfigDir?: string
   /** The directory of the Action's own OpenCode binary, which the agent's `PATH` gets last. */
   readonly opencodeDirectory?: string
+  /** The Action's own OpenCode binary: the guard in front of the agent's `opencode` runs it for `--version` (#2369). */
+  readonly opencodeBinaryPath?: string
   readonly repoSkills?: {readonly stagingRoot: string; readonly admittedDir: string | null}
   /** The `agent-state-home` input, resolved: an absolute directory inside `workspace`. */
   readonly agentStateHome?: string
@@ -300,6 +303,7 @@ async function runIsolated(options: IsolatedRunOptions): Promise<IsolatedRunResu
     env: options.env,
     runnerPath: options.env.PATH,
     opencodeDirectory: options.opencodeDirectory ?? null,
+    opencodeBinaryPath: options.opencodeBinaryPath ?? null,
     runnerHome,
     workspacePath: options.workspace,
     responseDir: options.responseDir,
@@ -2592,6 +2596,11 @@ describe.skipIf(!gated)("isolate-agent PATH mirrors the runner's", () => {
   const opencodeDirectory = path.dirname(BINARY ?? '')
 
   let result: IsolatedRunResult | undefined
+  // The sandbox account's `serve --service` processes, read before the run is released (the lifecycle stops everything the
+  // account owns at release, so nothing here is ever signalled). Only processes of that account's uid count: other services on
+  // the host are not this suite's.
+  let accountUid: number | undefined
+  let accountServices: readonly number[] = []
   const expected = {
     nodePath: pathTools.node ?? '',
     nodeVersion: gated ? runnerReports('node -v') : '',
@@ -2617,11 +2626,29 @@ describe.skipIf(!gated)("isolate-agent PATH mirrors the runner's", () => {
       cmd: 'p=$(command -v git); case "$p" in /*) R path_system WORKS "$p";; *) R path_system FAILED "git not found";; esac',
     },
     {
-      // Nothing on the runner's PATH provides `opencode`, so it resolves only through the Action's directory, appended last.
+      // Nothing on the runner's PATH provides `opencode`, so it resolves through the CLI guard first (#2369), which runs the
+      // Action's own binary for `--version`; the Action's directory is appended last.
       id: 'path_opencode',
       category: 'works',
       // The exit status must be zero: an executable that resolves but fails to start is not a working `opencode`.
       cmd: String.raw`if ! p=$(command -v opencode); then R path_opencode FAILED "not on PATH"; elif v=$(opencode --version 2>&1); then R path_opencode WORKS "$p $(printf "%s\n" "$v" | sed -n 1p)"; else R path_opencode FAILED "opencode --version failed"; fi`,
+    },
+    {
+      // The CLI would start a managed server on the agent's state (run 45877265561). The guard refuses, with exit 2 and one line.
+      id: 'path_opencode_api',
+      category: 'works',
+      cmd: 'out=$(opencode api get /global/health 2>&1 >/dev/null); rc=$?; if [ "$rc" = 2 ] && [ "$out" = "opencode: this run\'s OpenCode server is managed by Fro Bot; the CLI cannot start or reach a server here" ]; then R path_opencode_api WORKS "refused rc=$rc"; else R path_opencode_api FAILED "rc=$rc out=$out"; fi',
+    },
+    {
+      // The guard belongs to the runner: the agent can run it and cannot change it, or add beside it.
+      id: 'path_opencode_guard_readonly',
+      category: 'works',
+      cmd: 'd=$(dirname "$(command -v opencode)"); if [ -w "$d" ] || [ -w "$d/opencode" ] || ( : > "$d/planted" ) 2>/dev/null || ( : >> "$d/opencode" ) 2>/dev/null; then R path_opencode_guard_readonly FAILED "writable: $d"; elif [ -x "$d/opencode" ]; then R path_opencode_guard_readonly WORKS "read-only"; else R path_opencode_guard_readonly FAILED "not executable: $d"; fi',
+    },
+    {
+      id: 'path_opencode_serve',
+      category: 'works',
+      cmd: 'out=$(opencode serve --service 2>&1 >/dev/null); rc=$?; if [ "$rc" = 2 ]; then R path_opencode_serve WORKS "refused rc=$rc"; else R path_opencode_serve FAILED "rc=$rc out=$out"; fi',
     },
     {
       id: 'path_value',
@@ -2635,7 +2662,23 @@ describe.skipIf(!gated)("isolate-agent PATH mirrors the runner's", () => {
     fs.mkdirSync(responseDir, {recursive: true})
     const keyFile = writeKeyFile(keyDir)
     initWorkspace(workspace)
-    result = await runIsolated({tools, env, workspace, responseDir, keyFile, steps, logger, opencodeDirectory})
+    result = await runIsolated({
+      tools,
+      env,
+      workspace,
+      responseDir,
+      keyFile,
+      steps,
+      logger,
+      opencodeDirectory,
+      opencodeBinaryPath: BINARY ?? '',
+      onPrepared: launch => {
+        accountUid = launch.account.uid
+      },
+      beforeShutdown: async () => {
+        accountServices = accountUid === undefined ? [] : findServicesOfAccount(accountUid)
+      },
+    })
   }, 600_000)
 
   afterAll(() => {
@@ -2663,16 +2706,40 @@ describe.skipIf(!gated)("isolate-agent PATH mirrors the runner's", () => {
     expect(result?.rows.get('path_uv')?.[0]?.evidence).toBe(`${expected.uvVersion} ${expected.uvPath}`)
   })
 
-  it('finds the Action’s own opencode, last on the PATH, and it runs', () => {
+  it('finds opencode through the CLI guard, which is the first PATH entry, and `--version` runs the real binary', () => {
     // #given `command -v opencode` and `opencode --version` in the agent's shell, with the runner's PATH holding no opencode
     const evidence = result?.rows.get('path_opencode')?.[0]?.evidence ?? ''
     const agentPath = (result?.rows.get('path_value')?.[0]?.evidence ?? '').split(':')
+    const resolved = evidence.split(' ')[0] ?? ''
+    const guardDirectory = path.dirname(resolved)
 
-    // #then both succeed, it resolves into the Action's directory, and that directory is the final PATH entry
+    // #then both succeed, it resolves into the guard directory (first on the PATH, in the runner's temp directory), the
+    // version is the real binary's, and the Action's own directory is still the final entry
     expect(failuresFor(result?.rows ?? new Map(), 'path_opencode', 'WORKS')).toEqual([])
-    expect(evidence.startsWith(`${opencodeDirectory}/opencode `)).toBe(true)
-    expect(evidence.slice(`${opencodeDirectory}/opencode `.length)).toMatch(/\bv?\d+\.\d+\.\d+/)
+    expect(path.basename(resolved)).toBe('opencode')
+    expect(path.dirname(guardDirectory)).toBe(runnerTemp)
+    expect(path.basename(guardDirectory).startsWith('fro-bot-opencode-cli-')).toBe(true)
+    expect(evidence.slice(resolved.length + 1)).toMatch(/\bv?\d+\.\d+\.\d+/)
+    expect(agentPath[0]).toBe(guardDirectory)
     expect(agentPath.at(-1)).toBe(opencodeDirectory)
+  })
+
+  it('refuses `opencode api get` and `opencode serve` with exit 2, and starts no second server', () => {
+    // #given the agent's shell ran the CLI the way the agent did in run 45877265561
+    // #then both were refused with exit 2 and the one-line message
+    expect(failuresFor(result?.rows ?? new Map(), 'path_opencode_api', 'WORKS')).toEqual([])
+    expect(failuresFor(result?.rows ?? new Map(), 'path_opencode_serve', 'WORKS')).toEqual([])
+    // #and the agent can run the guard but cannot write it or plant beside it
+    expect(failuresFor(result?.rows ?? new Map(), 'path_opencode_guard_readonly', 'WORKS')).toEqual([])
+
+    // #and no `serve --service` process started, and no managed-server registration was written under the agent's state
+    expect(accountUid).toBeGreaterThan(0)
+    expect(accountServices).toEqual([])
+    const stateDirectory = path.join(xdgRoot, 'state', 'opencode')
+    const registrations = fs.existsSync(stateDirectory)
+      ? fs.readdirSync(stateDirectory).filter(name => /^service.*\.json$/.test(name))
+      : []
+    expect(registrations).toEqual([])
   })
 
   it('still resolves the system tools', () => {

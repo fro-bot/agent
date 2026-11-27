@@ -130,7 +130,7 @@ The Action no longer runs V1. A V1 `opencode-version` (a stock 1.x version or a 
 
 `src/services/setup/opencode.ts` verifies stock V2 archives against the asset digests recorded in `packages/runtime/src/shared/opencode-v2-pin.json`. An unrecorded V2 version or missing digest fails closed, as does a mismatched download; V2 does not silently fall back to a V1 binary. Linux uses tar archives and macOS uses zip archives; the workspace image selects the matching Linux musl asset.
 
-V2 installs both Systematic and `@fro.bot/opencode-plugin` (`0.3.0`). The latter supplies the four session-history tools, the subagent-session reuse guard and, when `trace-endpoint` is set, the run's [trace](#tracing-a-run). `plugin-install-v2.ts` performs bounded preparation outside the real session database. `src/harness/phases/v2-server.ts` checks both exact plugin specs before every spawn. A warm plugin cache makes this a cheap check; a missing plugin uses the bounded installer before the shorter server-readiness deadline begins. Failed preparation or an inactive required plugin prevents execution.
+V2 installs both Systematic and `@fro.bot/opencode-plugin` (`0.3.0`). The latter supplies the four session-history tools, the same-run subagent resume guard and, when `trace-endpoint` is set, the run's [trace](#tracing-a-run). `plugin-install-v2.ts` performs bounded preparation outside the real session database. `src/harness/phases/v2-server.ts` checks both exact plugin specs before every spawn. A warm plugin cache makes this a cheap check; a missing plugin uses the bounded installer before the shorter server-readiness deadline begins. Failed preparation or an inactive required plugin prevents execution.
 
 Plugin activation has its own readiness gate in `packages/runtime/src/agent/server-v2.ts`. Since upstream 2.2.7, `/api/agent` can answer successfully while `/api/plugin` is still empty. The harness polls the plugin list for up to 60 seconds until every expected plugin is active; a listed failure stops the gate immediately. An HTTP-ready server is therefore not yet a runnable agent.
 
@@ -220,7 +220,7 @@ The plugin install (`installPluginsV2`) runs unless `arePluginsCachedV2` finds b
 
 ## Configuration Assembly
 
-`buildCIConfigV2` (`src/services/setup/ci-config-v2.ts`) builds the server config when the server spawns. It is passed to the server at start and never written to disk. The ordered permissions, effective-rule verification, `update: disable` and `experimental.subagent_depth: 1` are described under [OpenCode V2 setup](#opencode-v2-setup). The operator's `opencode-config` is merged in, with `permission`, `tools`, `autoupdate` and `subagent_depth` stripped with a warning. Existing local `opencode.json` files are ignored.
+`buildCIConfigV2` (`src/services/setup/ci-config-v2.ts`) builds the server config when the server spawns. It is passed to the server at start and never written to disk, but the server receives it in its environment (`OPENCODE_CONFIG_CONTENT`) and the agent's shell inherits it, with or without `isolate-agent`, so the agent can read every value in `opencode-config`, including MCP `headers`, local-server `environment` and `{file:...}` references. Keep credentials out of it; provider keys belong in `auth-json`. The ordered permissions, effective-rule verification, `update: disable` and `experimental.subagent_depth: 1` are described under [OpenCode V2 setup](#opencode-v2-setup). The operator's `opencode-config` is merged in, with `permission`, `tools`, `autoupdate` and `subagent_depth` stripped with a warning. Existing local `opencode.json` files are ignored.
 
 ### Workspace identity and control API
 
@@ -230,7 +230,7 @@ The same bearer used by the gateway to attach to the OpenCode proxy on port 9200
 
 ### Server-start task-reuse guard
 
-The `@fro.bot/opencode-plugin` guard rejects a `subagent` call that carries a `sessionID`, so each background job has its own child session, on the Action and on the workspace (loaded from the config content the workspace agent passes at spawn).
+The `@fro.bot/opencode-plugin` guard admits a `subagent` resume only for a child this run dispatched from the calling session, and only on the Action host; the workspace (loaded from the config content the workspace agent passes at spawn) refuses every resume. See [[Background Subagents and Ownership]].
 
 ## Tools Cache
 
@@ -333,6 +333,8 @@ Treat everything the agent produces as untrusted, including restored session sta
 ### Environment scrubbing at agent spawn
 
 Independently of whether a credential is provisioned, the OpenCode child process is spawned under a **deny-by-default environment filter** (`packages/runtime/src/agent/filter-env.ts`, applied via `with-scrubbed-env.ts`). Only an enumerated allowlist of keys survives — GitHub Actions context, a handful of standard shell and locale variables, proxy/CA-bundle settings (including `NODE_EXTRA_CA_CERTS`, admitted by exact name), and the `OPENCODE_*`, `RUNNER_*`, `XDG_*`, and `LC_*` prefixes. No other `NODE_*` key is admitted. Anything ending in a credential-shaped suffix (`_TOKEN`, `_API_KEY`, `_SECRET`, `_KEY`, and similar), the `AWS_*` and `INPUT_*` prefixes, and `GITHUB_TOKEN`, `GH_TOKEN`, `OPENCODE_PURE`, and `NODE_OPTIONS` by exact name are stripped even if they would otherwise match. The reduction is scoped: the harness restores its own environment immediately after the spawn so it can still reach the S3 backend, and it fails closed — if the scrub cannot complete, the child is never spawned.
+
+The agent's `PATH` also starts with a guard directory holding an `opencode` command (`packages/runtime/src/agent/cli-shim.ts`), because the OpenCode 2.4 CLI otherwise starts a second, detached server on the run's state when the agent's shell runs `opencode api …` (#2369). The guard runs the real binary only for `--version`, `-v`, `version`, `--help`, `-h` and `help` given alone (the `ce:connect` host check runs `opencode --version`) and refuses everything else with exit 2 and one line on stderr. It is a runner-owned `0755` directory, made at server start under `RUNNER_TEMP` (the workspace: beside the per-spawn database; an `isolate-agent` run: granted to the sandbox user read-only like the other read grants) and removed when the server stops. The Action runs it once, as the user that will run the server, and leaves it off the `PATH` with one warning if it cannot run (a `noexec` `RUNNER_TEMP`, say); the run goes on without it. It is not a security boundary: the real binary can still be run by its absolute path, and without `isolate-agent` the agent runs as the same user and could rewrite the guard.
 
 ## Tracing a run
 

@@ -169,6 +169,8 @@ export function wrapLedgerWithHooks(
       if (statesEqual(before, after)) return
       onChange()
     },
+    // Pass-through: only the Action's stream resumes a child. The gateway never calls this, so no hook fires.
+    resume: sessionId => ledger.resume(sessionId),
     markUnknown: sessionId => {
       const before = snapshotStates(ledger)
       ledger.markUnknown(sessionId)

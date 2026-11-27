@@ -16,6 +16,12 @@ export interface ExecutionDeadline {
   readonly isExpired: () => boolean
   readonly isTimedOut: () => boolean
   readonly remainingMs: () => number
+  /**
+   * Runs `listener` once if the deadline fires, right after the `Execution timeout reached` line and before the abort, so
+   * it sees the run as it was at the deadline. Returns the unsubscribe. A listener added after the deadline fired is never
+   * called. A listener that throws is skipped; it never stops the abort or the listeners after it.
+   */
+  readonly onTimeout: (listener: () => void) => () => void
   readonly run: <T>(operation: () => Promise<T>, label: string) => Promise<T>
   readonly dispose: () => void
 }
@@ -25,11 +31,20 @@ export function createExecutionDeadline(timeoutMs: number, logger: Logger): Exec
   const deadlineAt = timeoutMs > 0 ? Date.now() + timeoutMs : null
   let timeoutId: ReturnType<typeof setTimeout> | null = null
   let timedOut = false
+  const timeoutListeners = new Set<() => void>()
 
   const latchTimeout = (): void => {
     if (timedOut) return
     timedOut = true
     logger.warning('Execution timeout reached', {timeoutMs})
+    for (const listener of [...timeoutListeners]) {
+      try {
+        listener()
+      } catch {
+        // Diagnostics only: the abort below is what ends the run.
+      }
+    }
+    timeoutListeners.clear()
     controller.abort()
   }
 
@@ -99,6 +114,13 @@ export function createExecutionDeadline(timeoutMs: number, logger: Logger): Exec
     isExpired,
     isTimedOut: () => timedOut,
     remainingMs,
+    onTimeout: listener => {
+      if (timedOut) return () => undefined
+      timeoutListeners.add(listener)
+      return () => {
+        timeoutListeners.delete(listener)
+      }
+    },
     run,
     dispose: () => {
       if (timeoutId != null) clearTimeout(timeoutId)

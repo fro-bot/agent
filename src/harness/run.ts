@@ -675,7 +675,16 @@ async function runWithTrace(trace: RunTrace, startTime: number, bootstrapLogger:
     let execution = await phase(
       'execution',
       async span => {
-        const executed = await runExecute(bootstrap, routing, cacheRestore, sessionPrep, metrics, brokeredPushPlan)
+        // The phase's span goes in so an execution deadline can add what the root was doing to it (a no-op when untraced).
+        const executed = await runExecute(
+          bootstrap,
+          routing,
+          cacheRestore,
+          sessionPrep,
+          metrics,
+          brokeredPushPlan,
+          span,
+        )
         // The agent's own failure text, as the error where it happened: scrubbed and capped at export, never the prompt or output.
         if (!executed.success && executed.error != null) span.recordException(new Error(executed.error))
         return executed

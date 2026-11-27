@@ -1,4 +1,5 @@
 import type {ActionOpenCodeV2Client, ErrorInfo, OpenCodeV2ServerHandle, OwnershipLedger} from '@fro-bot/runtime'
+import type {LifecycleSpan} from '../../shared/lifecycle-tracer.js'
 import type {Logger} from '../../shared/logger.js'
 import type {AgentResultV2, AttemptResultV2, LiveObservationV2} from './live-observation-v2.js'
 import type {EventStreamResult, FormAskV2, PermissionAskV2} from './streaming-v2.js'
@@ -159,6 +160,9 @@ export async function executeOpenCodeV2(
   serverHandle: OpenCodeV2ServerHandle,
   ownershipLedger?: OwnershipLedger,
   client: ActionOpenCodeV2Client = createActionClientV2(serverHandle),
+  // The `execution` phase's span: an execution deadline adds its diagnostics to it. Absent, or the no-op span of an
+  // untraced run, it does nothing.
+  traceSpan?: LifecycleSpan,
 ): Promise<AgentResultV2> {
   const startTime = Date.now()
   const timeoutMs = config?.timeoutMs ?? DEFAULT_TIMEOUT_MS
@@ -360,6 +364,7 @@ export async function executeOpenCodeV2(
               void interruptRootSession(client, activeSessionId, logger)
             },
             ...(ownershipLedger === undefined ? {} : {ownershipLedger}),
+            ...(traceSpan === undefined ? {} : {traceSpan}),
           })
         } finally {
           if (!deadline.isExpired()) {

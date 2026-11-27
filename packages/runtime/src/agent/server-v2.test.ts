@@ -8,8 +8,13 @@ import type {
 } from './server-v2.js'
 import {Buffer} from 'node:buffer'
 import {getEventListeners} from 'node:events'
+import {existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync} from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import process from 'node:process'
 import {afterEach, describe, expect, expectTypeOf, it, vi} from 'vitest'
+import {err, ok} from '../shared/types.js'
+import {buildOpencodeCliShimScript, OPENCODE_CLI_SHIM_FILE} from './cli-shim.js'
 import {createFixture} from './server-v2-test-kit.js'
 import {DEFAULT_OPENCODE_V2_TIMEOUTS, startOpenCodeV2Server} from './server-v2.js'
 import {
@@ -53,6 +58,10 @@ function createCapturingLogger(): CapturingLogger {
 
 function errorOf(result: Awaited<ReturnType<typeof startOpenCodeV2Server>>): OpenCodeV2StartError | undefined {
   return result.success ? undefined : result.error
+}
+
+function guardDirectories(parent: string): string[] {
+  return readdirSync(parent).filter(name => name.startsWith('fro-bot-opencode-cli-'))
 }
 
 function isAlive(pid: number): boolean {
@@ -646,6 +655,210 @@ describe('startOpenCodeV2Server', () => {
       expect(result.success).toBe(false)
       expect(errorOf(result)?.kind).toBe('aborted')
       expect(isAlive(created.readRecord().pid)).toBe(false)
+    })
+  })
+
+  describe('the OpenCode CLI guard (#2369)', () => {
+    const parents: string[] = []
+
+    function guardParent(): string {
+      const parent = mkdtempSync(path.join(os.tmpdir(), 'cli-guard-parent-'))
+      parents.push(parent)
+      return parent
+    }
+
+    afterEach(() => {
+      for (const parent of parents.splice(0)) rmSync(parent, {recursive: true, force: true})
+    })
+
+    it('puts a guard directory first on the child PATH, ahead of the directory that holds the real binary', async () => {
+      // #given a job PATH that lists the real OpenCode directory first
+      const created = fixture()
+      const parent = guardParent()
+      const realDirectory = path.dirname(created.binaryPath)
+      const env = {PATH: `${realDirectory}:/usr/local/bin:/usr/bin:/bin`}
+
+      // #when started
+      const result = await start(created, {env, cliShimParentDirectory: parent})
+
+      // #then the child's PATH starts with one fresh directory under the parent, and the old PATH follows unchanged
+      expect(result.success).toBe(true)
+      const childPath = created.readRecord().env.PATH ?? ''
+      const entries = childPath.split(':')
+      const [guard] = entries
+      expect(path.dirname(guard ?? '')).toBe(parent)
+      expect(entries.slice(1)).toEqual([realDirectory, '/usr/local/bin', '/usr/bin', '/bin'])
+      expect(entries.indexOf(guard ?? '')).toBeLessThan(entries.indexOf(realDirectory))
+      expect(guardDirectories(parent)).toEqual([path.basename(guard ?? '')])
+    })
+
+    it('guards a child that was given no PATH at all', async () => {
+      // #given an environment without PATH
+      const created = fixture()
+      const parent = guardParent()
+
+      // #when started
+      const result = await start(created, {env: {HOME: '/home/agent'}, cliShimParentDirectory: parent})
+
+      // #then the PATH is the guard alone
+      expect(result.success).toBe(true)
+      const [guard] = guardDirectories(parent)
+      expect(created.readRecord().env.PATH).toBe(path.join(parent, guard ?? ''))
+    })
+
+    it('holds one 0755 shim for the real binary, owned by the caller and not writable by anyone else', async () => {
+      // #given a started server
+      const created = fixture()
+      const parent = guardParent()
+      const result = await start(created, {env: {PATH: '/usr/bin'}, cliShimParentDirectory: parent})
+      expect(result.success).toBe(true)
+
+      // #when the guard directory is read
+      const [directory] = guardDirectories(parent)
+      const guard = path.join(parent, directory ?? '')
+      const file = path.join(guard, OPENCODE_CLI_SHIM_FILE)
+
+      // #then it holds exactly the shim, for exactly this binary, with exact modes and the caller as owner
+      expect(readdirSync(guard)).toEqual([OPENCODE_CLI_SHIM_FILE])
+      expect(readFileSync(file, 'utf8')).toBe(buildOpencodeCliShimScript(created.binaryPath))
+      expect(statSync(guard).mode & 0o7777).toBe(0o755)
+      expect(statSync(file).mode & 0o7777).toBe(0o755)
+      expect(statSync(guard).uid).toBe(process.getuid?.())
+      expect(statSync(file).uid).toBe(process.getuid?.())
+    })
+
+    it('removes the guard when the server shuts down', async () => {
+      // #given a running server with a guard
+      const created = fixture()
+      const parent = guardParent()
+      const result = await start(created, {env: {PATH: '/usr/bin'}, cliShimParentDirectory: parent})
+      expect(result.success).toBe(true)
+      if (!result.success) return
+      expect(guardDirectories(parent)).toHaveLength(1)
+
+      // #when it shuts down
+      await result.data.shutdown()
+      await waitFor(() => guardDirectories(parent).length === 0)
+
+      // #then the guard is gone
+      expect(guardDirectories(parent)).toEqual([])
+    })
+
+    it('removes the guard when the server exits on its own', async () => {
+      // #given a running server with a guard
+      const created = fixture()
+      const parent = guardParent()
+      const result = await start(created, {env: {PATH: '/usr/bin'}, cliShimParentDirectory: parent})
+      expect(result.success).toBe(true)
+      if (!result.success) return
+
+      // #when the server process is killed from outside
+      process.kill(result.data.pid, 'SIGKILL')
+      await result.data.exited
+      await waitFor(() => guardDirectories(parent).length === 0)
+
+      // #then the guard is gone
+      expect(guardDirectories(parent)).toEqual([])
+    })
+
+    it('removes the guard when the start fails after the spawn', async () => {
+      // #given a server that exits before it listens
+      const created = fixture({exitBeforeListen: 3})
+      const parent = guardParent()
+
+      // #when started
+      const result = await start(created, {env: {PATH: '/usr/bin'}, cliShimParentDirectory: parent})
+
+      // #then the start failed and left no guard
+      expect(result.success).toBe(false)
+      await waitFor(() => guardDirectories(parent).length === 0)
+      expect(guardDirectories(parent)).toEqual([])
+    })
+
+    it('removes the guard when the binary cannot be spawned at all', async () => {
+      // #given a binary that is not there
+      const created = fixture()
+      const parent = guardParent()
+
+      // #when started
+      const result = await start(created, {
+        binaryPath: `${created.dir}/does-not-exist`,
+        env: {PATH: '/usr/bin'},
+        cliShimParentDirectory: parent,
+      })
+
+      // #then the spawn failed and no guard stays behind
+      expect(errorOf(result)?.kind).toBe('spawn-failed')
+      await waitFor(() => guardDirectories(parent).length === 0)
+      expect(guardDirectories(parent)).toEqual([])
+    })
+
+    it('leaves the PATH as it was, warns once, and removes the guard when the launch identity cannot run it (noexec)', async () => {
+      // #given a guard the probe reports as unrunnable, as on a noexec RUNNER_TEMP
+      const created = fixture()
+      const parent = guardParent()
+      const warnings: string[] = []
+      const logger: Logger = {
+        debug: () => undefined,
+        info: () => undefined,
+        warning: message => {
+          warnings.push(message)
+        },
+        error: () => undefined,
+      }
+      const probeCliShim = vi.fn(() => err('the shim exited 126, not as a refusal'))
+
+      // #when started
+      const result = await start(
+        created,
+        {env: {PATH: '/opt/real:/usr/bin'}, cliShimParentDirectory: parent, deps: {probeCliShim}},
+        logger,
+      )
+
+      // #then it fails open: the server runs with the PATH it was given, and no guard is left behind
+      expect(result.success).toBe(true)
+      expect(probeCliShim).toHaveBeenCalledTimes(1)
+      expect(created.readRecord().env.PATH).toBe('/opt/real:/usr/bin')
+      expect(guardDirectories(parent)).toEqual([])
+      // #and the operator is told once
+      expect(warnings.filter(message => message.includes('CLI guard'))).toHaveLength(1)
+    })
+
+    it('probes the shim file it made, as the uid and gid the child is given', async () => {
+      // #given the current identity, which an unprivileged process may always take
+      const uid = process.getuid?.()
+      const gid = process.getgid?.()
+      if (uid === undefined || gid === undefined) return
+      const created = fixture()
+      const parent = guardParent()
+      const probeCliShim = vi.fn((_file: string, _identity?: {readonly uid: number; readonly gid: number}) => ok(null))
+
+      // #when started with that identity, and again without one
+      await start(created, {env: {PATH: '/usr/bin'}, cliShimParentDirectory: parent, uid, gid, deps: {probeCliShim}})
+      const bare = fixture()
+      await start(bare, {env: {PATH: '/usr/bin'}, cliShimParentDirectory: parent, deps: {probeCliShim}})
+
+      // #then the probe ran the made file, as the given identity first and as the caller (no identity) second
+      expect(probeCliShim).toHaveBeenCalledTimes(2)
+      const [first, second] = probeCliShim.mock.calls
+      expect(path.basename(first?.[0] ?? '')).toBe(OPENCODE_CLI_SHIM_FILE)
+      expect(path.dirname(path.dirname(first?.[0] ?? ''))).toBe(parent)
+      expect(first?.[1]).toEqual({uid, gid})
+      expect(second?.[1]).toBeUndefined()
+    })
+
+    it('does not start the server when the guard cannot be made, so an unguarded server never runs', async () => {
+      // #given a parent directory that does not exist
+      const created = fixture()
+      const parent = path.join(guardParent(), 'missing')
+
+      // #when started
+      const result = await start(created, {env: {PATH: '/usr/bin'}, cliShimParentDirectory: parent})
+
+      // #then the start fails closed and the server was never spawned
+      expect(errorOf(result)?.kind).toBe('spawn-failed')
+      expect(errorOf(result)?.message).toMatch(/CLI guard/)
+      expect(existsSync(created.logPath)).toBe(false)
     })
   })
 

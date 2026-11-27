@@ -1,4 +1,5 @@
 import type {ActionOpenCodeV2Client, OwnershipLedger, V2CallError, V2PromptFile} from '@fro-bot/runtime'
+import type {LifecycleSpan} from '../../shared/lifecycle-tracer.js'
 import type {Logger} from '../../shared/logger.js'
 import type {AttemptOutcome, AttemptResult} from './attempt-outcome.js'
 import type {ExecutionDeadline} from './execution-deadline.js'
@@ -90,6 +91,8 @@ export interface SendPromptV2Options {
   readonly onFatal?: (cause: 'session_moved') => void
   readonly ownershipLedger?: OwnershipLedger
   readonly poll?: RunPromptAttemptV2Options['poll']
+  /** The `execution` phase's span, for the deadline's diagnostics event. */
+  readonly traceSpan?: LifecycleSpan
 }
 
 export async function sendPromptToSessionV2(options: SendPromptV2Options): Promise<AttemptResultV2> {
@@ -167,6 +170,7 @@ export async function sendPromptToSessionV2(options: SendPromptV2Options): Promi
       ...(options.onFatal === undefined ? {} : {onFatal: options.onFatal}),
       ...(options.ownershipLedger === undefined ? {} : {ownershipLedger: options.ownershipLedger}),
       ...(options.poll === undefined ? {} : {poll: options.poll}),
+      ...(options.traceSpan === undefined ? {} : {traceSpan: options.traceSpan}),
     })
     kept = attempt.liveObservation !== undefined
     return attempt

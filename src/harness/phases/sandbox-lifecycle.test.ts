@@ -83,11 +83,18 @@ interface Harness {
     readonly isProcessAlive: Mock<SandboxLifecycleDeps['isProcessAlive']>
     readonly isDirectory: Mock<SandboxLifecycleDeps['isDirectory']>
     readonly resolveToolRoots: Mock<SandboxLifecycleDeps['resolveToolRoots']>
+    readonly createCliShim: Mock<SandboxLifecycleDeps['createCliShim']>
   }
   /** What `remove` of the view root was called with, in order. */
   readonly viewRootRemovals: string[]
   /** The gate directories whose `remove` ran. */
   readonly gateRemovals: string[]
+  /** The CLI guard directories whose `remove` ran. */
+  readonly shimRemovals: string[]
+  /** What running the guard as the sandbox user reports (the probe). Default: a refusal, as the real shim gives. */
+  readonly shimProbe: {exitCode: number | null; stderr: string}
+  /** The argv of every probe of the guard, as the sandbox user. */
+  readonly shimProbes: string[][]
   /** What the runner wrote into gate directories. */
   readonly gateWrites: string[]
   readonly gateFiles: Map<string, string>
@@ -103,6 +110,12 @@ const REALPATHS: Readonly<Record<string, string>> = {
 function createHarness(): Harness {
   const viewRootRemovals: string[] = []
   const gateRemovals: string[] = []
+  const shimRemovals: string[] = []
+  const shimProbe: {exitCode: number | null; stderr: string} = {
+    exitCode: 2,
+    stderr: "opencode: this run's OpenCode server is managed by Fro Bot; the CLI cannot start or reach a server here\n",
+  }
+  const shimProbes: string[][] = []
   const gateWrites: string[] = []
   const gateFiles = new Map<string, string>()
   let gates = 0
@@ -143,12 +156,26 @@ function createHarness(): Harness {
     // Links resolve to themselves, except the fixtures that model links into or out of the view's private /tmp.
     realpath: vi.fn(async (target: string) => REALPATHS[target] ?? target),
     resolveToolRoots: vi.fn(async (): Promise<ToolRootResult> => ({granted: [], skipped: []})),
+    createCliShim: vi.fn((input: {readonly binaryPath: string; readonly parentDirectory: string}) => {
+      const directory = `${input.parentDirectory}/fro-bot-opencode-cli-x`
+      return ok({
+        directory,
+        remove: () => {
+          shimRemovals.push(directory)
+        },
+      })
+    }),
   }
   const sudoCalls: string[][] = []
   const exec: ExecAdapter = {
     exec: vi.fn(async () => 0),
     getExecOutput: vi.fn(async (command: string, args: string[] = []) => {
       sudoCalls.push([command, ...args])
+      // The guard's probe: the made shim run once with a refused argument, as the sandbox user.
+      if (args.at(-1) === 'api' && args.at(-2)?.endsWith('/fro-bot-opencode-cli-x/opencode') === true) {
+        shimProbes.push(args)
+        return {exitCode: shimProbe.exitCode ?? 126, stdout: '', stderr: shimProbe.stderr}
+      }
       const isGitGlobal = args[0] === 'config' && args[1] === '--global'
       // The account's PATH check prints the directories it can enter: here, every one not named `unreachable`.
       const script = args.findIndex(arg => arg.startsWith('for d do'))
@@ -172,7 +199,19 @@ function createHarness(): Harness {
       readHostNamespace: async () => 'mnt:[4026531832]',
     },
   } as unknown as SandboxLifecycleDeps
-  return {deps, mocks, exec, sudoCalls, viewRootRemovals, gateRemovals, gateWrites, gateFiles}
+  return {
+    deps,
+    mocks,
+    exec,
+    sudoCalls,
+    viewRootRemovals,
+    gateRemovals,
+    shimRemovals,
+    shimProbe,
+    shimProbes,
+    gateWrites,
+    gateFiles,
+  }
 }
 
 function alive(pid: number): boolean {
@@ -2084,6 +2123,273 @@ describe('createSandboxLifecycle', () => {
           dropped: [unreachable],
         })
       })
+    })
+  })
+
+  describe('the OpenCode CLI guard (#2369)', () => {
+    const prepareInput = {keyFilePaths: [], ghConfigDir: null, repoSkills: null}
+    const OPENCODE = '/opt/hostedtoolcache/opencode/2.4.1/x64'
+    const BINARY = `${OPENCODE}/opencode`
+
+    function guarded(harness: Harness, overrides: Partial<Parameters<typeof createSandboxLifecycle>[0]> = {}) {
+      return create(harness, {
+        env: {HOME: '/home/runner', RUNNER_TEMP: temp},
+        runnerPath: '/opt/hostedtoolcache/node/24/x64/bin:/usr/bin',
+        opencodeDirectory: OPENCODE,
+        opencodeBinaryPath: BINARY,
+        signals: fakeHost(),
+        ...overrides,
+      })
+    }
+
+    it('makes the guard for the real binary under RUNNER_TEMP', async () => {
+      // #given an isolated run that knows the OpenCode binary
+      const harness = createHarness()
+
+      // #when prepared
+      const prepared = await guarded(harness).prepare(prepareInput)
+
+      // #then one guard is made, for that binary, in the runner's own temp directory
+      expect(prepared.success).toBe(true)
+      expect(harness.mocks.createCliShim).toHaveBeenCalledTimes(1)
+      expect(harness.mocks.createCliShim).toHaveBeenCalledWith({binaryPath: BINARY, parentDirectory: temp})
+    })
+
+    it('puts the guard first on the agent PATH, ahead of the OpenCode directory and every runner entry', async () => {
+      // #given an isolated run whose PATH also carries the real OpenCode directory (last) and earlier steps' entries
+      const harness = createHarness()
+
+      // #when prepared
+      const prepared = await guarded(harness).prepare(prepareInput)
+
+      // #then the guard is the first entry, and the order after it is the one the agent always had
+      expect(prepared.success).toBe(true)
+      if (!prepared.success) return
+      expect(prepared.data.path).toBe(
+        `${temp}/fro-bot-opencode-cli-x:/opt/hostedtoolcache/node/24/x64/bin:/usr/bin:/usr/local/bin:/bin:${OPENCODE}`,
+      )
+    })
+
+    it('hands the guard to the sandbox read-only: a read grant, never a writable or handed-over root', async () => {
+      // #given an isolated run
+      const harness = createHarness()
+
+      // #when prepared
+      const prepared = await guarded(harness).prepare(prepareInput)
+
+      // #then the handoff grants the sandbox read and execute on it, and nothing grants write
+      expect(prepared.success).toBe(true)
+      if (!prepared.success) return
+      const guard = `${temp}/fro-bot-opencode-cli-x`
+      const manifest = harness.mocks.handOff.mock.calls[0]?.[0] as unknown as {
+        readable: string[]
+        handedOver: string[]
+        traverseOnly: string[]
+      }
+      expect(manifest.readable).toContain(guard)
+      expect(manifest.handedOver).not.toContain(guard)
+      // #and the view binds it read-only
+      expect(prepared.data.view?.policy.readOnly).toContain(guard)
+      expect(prepared.data.view?.policy.writable).not.toContain(guard)
+    })
+
+    it('does not change the tool roots the resolver is asked about', async () => {
+      // #given an isolated run
+      const harness = createHarness()
+
+      // #when prepared
+      const prepared = await guarded(harness).prepare(prepareInput)
+
+      // #then the resolver sees the agent's PATH without the guard, which is not a tool install
+      expect(prepared.success).toBe(true)
+      const input = harness.mocks.resolveToolRoots.mock.calls[0]?.[0]
+      expect(input?.agentPath.split(':')).not.toContain(`${temp}/fro-bot-opencode-cli-x`)
+    })
+
+    it('makes no guard, and says so, when the OpenCode binary path is unknown', async () => {
+      // #given no binary path
+      const harness = createHarness()
+      const logger = createMockLogger()
+
+      // #when prepared
+      const prepared = await guarded(harness, {opencodeBinaryPath: null, logger}).prepare(prepareInput)
+
+      // #then preparation succeeds with the PATH it always had, and the missing guard is logged
+      expect(prepared.success).toBe(true)
+      expect(harness.mocks.createCliShim).not.toHaveBeenCalled()
+      expect(logger.warning).toHaveBeenCalledWith(expect.stringContaining('CLI guard'), expect.anything())
+      expect(prepared.success && prepared.data.path.startsWith(temp)).toBe(false)
+    })
+
+    it('fails the preparation, and takes everything back, when the guard cannot be made', async () => {
+      // #given a guard that cannot be written
+      const harness = createHarness()
+      harness.mocks.createCliShim.mockReturnValue(err('no space left'))
+
+      // #when prepared
+      const prepared = await guarded(harness).prepare(prepareInput)
+
+      // #then no server can be launched without the guard: the preparation failed, before anything was handed over
+      expect(prepared.success).toBe(false)
+      expect(prepared.success ? '' : prepared.error).toMatch(/CLI guard/)
+      expect(harness.mocks.handOff).not.toHaveBeenCalled()
+      expect(harness.mocks.deleteAccount).toHaveBeenCalled()
+    })
+
+    it('fails the preparation when the sandbox user cannot enter the guard, so it is never silently left off the PATH', async () => {
+      // #given a guard directory the account's reachability check reports as unreachable
+      const harness = createHarness()
+      harness.mocks.createCliShim.mockReturnValue(ok({directory: `${temp}/unreachable-guard`, remove: () => undefined}))
+
+      // #when prepared
+      const prepared = await guarded(harness).prepare(prepareInput)
+
+      // #then it fails rather than launching with the guard dropped from the PATH
+      expect(prepared.success).toBe(false)
+      expect(prepared.success ? '' : prepared.error).toMatch(/CLI guard/)
+    })
+
+    it('runs the guard once as the sandbox user, with a refused argument, before it goes on the PATH', async () => {
+      // #given an isolated run
+      const harness = createHarness()
+
+      // #when prepared
+      const prepared = await guarded(harness).prepare(prepareInput)
+
+      // #then the made file was run once under the sandbox identity (setpriv drop), with an argument it refuses
+      expect(prepared.success).toBe(true)
+      expect(harness.shimProbes).toHaveLength(1)
+      const argv = harness.shimProbes[0] ?? []
+      expect(argv).toEqual(expect.arrayContaining(['/usr/bin/setpriv', '--reuid=998', '--regid=997']))
+      expect(argv.slice(-2)).toEqual([`${temp}/fro-bot-opencode-cli-x/opencode`, 'api'])
+    })
+
+    it.each([
+      ['a noexec mount (126)', {exitCode: 126, stderr: 'sudo: unable to execute: Permission denied'}],
+      ['no status at all', {exitCode: null, stderr: ''}],
+      ['a file that runs but does not refuse', {exitCode: 0, stderr: ''}],
+    ])(
+      'leaves the guard off the PATH, warns once and does not fail the run when it cannot run: %s',
+      async (_name, probe) => {
+        // #given a guard the sandbox user cannot run
+        const harness = createHarness()
+        harness.shimProbe.exitCode = probe.exitCode
+        harness.shimProbe.stderr = probe.stderr
+        const logger = createMockLogger()
+
+        // #when prepared
+        const prepared = await guarded(harness, {logger}).prepare(prepareInput)
+
+        // #then the preparation succeeds with the PATH it always had, and the operator is told once
+        expect(prepared.success).toBe(true)
+        if (!prepared.success) return
+        expect(prepared.data.path).toBe(`/opt/hostedtoolcache/node/24/x64/bin:/usr/bin:/usr/local/bin:/bin:${OPENCODE}`)
+        const warned = vi.mocked(logger.warning).mock.calls.filter(call => String(call[0]).includes('CLI guard'))
+        expect(warned).toHaveLength(1)
+      },
+    )
+
+    it('fails closed when the guard probe itself times out: unsafe, nothing launched, nothing taken back', async () => {
+      // #given a real privileged-command budget that the probe outlives (not an exit status: the command never exits), with
+      // every other command answering as in the other tests
+      const harness = createHarness()
+      const states: string[] = []
+      const probeCalls: string[] = []
+      const exec: ExecAdapter = {
+        ...harness.exec,
+        execWithTimeout: vi.fn(
+          async (_command: string, args: string[] | undefined, _timeoutMs: number, options?: ExecOptions) => {
+            const argv = args ?? []
+            // The account's PATH check prints the directories it can enter.
+            const script = argv.findIndex(arg => arg.startsWith('for d do'))
+            if (script !== -1) {
+              options?.listeners?.stdout?.(
+                Buffer.from(
+                  argv
+                    .slice(script + 2)
+                    .map(dir => `${dir}\n`)
+                    .join(''),
+                ),
+              )
+              return 0
+            }
+            if (argv.at(-1) === 'api' && argv.at(-2)?.endsWith('/fro-bot-opencode-cli-x/opencode') === true) {
+              probeCalls.push(argv.join(' '))
+              return 'timed-out' as const
+            }
+            return 0
+          },
+        ),
+      }
+      const lifecycle = guarded(harness, {exec, recordState: state => states.push(state)})
+
+      // #when prepared
+      const prepared = await lifecycle.prepare(prepareInput)
+
+      // #then the probe ran and timed out, the preparation failed, and it recorded unsafe (a caller that never releases must
+      // not read pending, and the launch spec was never published)
+      expect(probeCalls).toHaveLength(1)
+      expect(prepared.success).toBe(false)
+      expect(prepared.success ? '' : prepared.error).toMatch(/timed out|guard/i)
+      expect(states.at(-1)).toBe('unsafe')
+
+      // #and no launch is admitted
+      const spawn = vi.fn(async () => ({value: 'x', unconfirmed: false}))
+      const launched = await lifecycle.launch(spawn)
+      expect(launched.success).toBe(false)
+      expect(spawn).not.toHaveBeenCalled()
+      expect(harness.mocks.admit).not.toHaveBeenCalled()
+
+      // #and release keeps the account and takes nothing back, as for any other privileged timeout
+      const released = await lifecycle.release()
+      expect(released.restore).toBe('unsafe')
+      expect(harness.mocks.takeBack).not.toHaveBeenCalled()
+      expect(harness.mocks.deleteAccount).not.toHaveBeenCalled()
+      expect(states).not.toContain('restored')
+    })
+
+    it('removes the guard once the files are back, and not before', async () => {
+      // #given a prepared run
+      const harness = createHarness()
+      const lifecycle = guarded(harness)
+      await lifecycle.prepare(prepareInput)
+      expect(harness.shimRemovals).toEqual([])
+
+      // #when released
+      const released = await lifecycle.release()
+
+      // #then take-back ran first and the guard is gone
+      expect(released.restore).toBe('restored')
+      expect(harness.shimRemovals).toEqual([`${temp}/fro-bot-opencode-cli-x`])
+    })
+
+    it('removes the guard when a later preparation step fails', async () => {
+      // #given a handoff that fails after the guard was made
+      const harness = createHarness()
+      harness.mocks.handOff.mockResolvedValue(err('boom'))
+      const lifecycle = guarded(harness)
+
+      // #when prepared
+      const prepared = await lifecycle.prepare(prepareInput)
+
+      // #then the preparation failed and the guard did not stay behind
+      expect(prepared.success).toBe(false)
+      expect(harness.shimRemovals).toEqual([`${temp}/fro-bot-opencode-cli-x`])
+    })
+
+    it('leaves the guard alone when take-back is unsafe: nothing in that tree is touched', async () => {
+      // #given a take-back that cannot be trusted
+      const harness = createHarness()
+      harness.mocks.takeBack.mockResolvedValue({status: 'unsafe', reason: 'a leftover'})
+      const lifecycle = guarded(harness)
+      await lifecycle.prepare(prepareInput)
+
+      // #when released
+      const released = await lifecycle.release()
+
+      // #then
+      expect(released.restore).toBe('unsafe')
+      expect(harness.shimRemovals).toEqual([])
     })
   })
 
