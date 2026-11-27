@@ -1268,6 +1268,326 @@ describe('subagent notice diagnostics', () => {
   })
 })
 
+/** The child's report to the parent, as a distinct inbox item so each one is its own notice. */
+function report(inboxId: string): unknown {
+  return frame('session.inbox.enqueued', {
+    inboxID: inboxId,
+    sessionID: PARENT_SESSION_ID,
+    item: {
+      type: 'synthetic',
+      payload: {
+        text: SUBAGENT_NOTICE_MESSAGE.text,
+        description: SUBAGENT_NOTICE_MESSAGE.description,
+        metadata: SUBAGENT_NOTICE_MESSAGE.metadata,
+      },
+      delivery: 'steer',
+    },
+  })
+}
+
+/** Run `items` against a fresh ledger on a stream that stays open, and return the ledger and its entry states. */
+async function after(items: readonly unknown[]) {
+  const ledger = createOwnershipLedger()
+  const open = openRun(items, {ownershipLedger: ledger}, PARENT_SESSION_ID)
+  await open.settled
+  open.controller.abort()
+  await open.result
+  return {
+    ledger,
+    states: Object.fromEntries(ledger.snapshot().map(entry => [entry.sessionId, entry.state])),
+  }
+}
+
+/**
+ * A parent that resumes its own finished child (`subagent` with the child's `sessionID`, v2.4.1 `subagent.ts`). Frame shapes
+ * follow `subagent.ts`: the call's `input` carries `sessionID` only on a resume, and `context.progress({sessionID, status})`
+ * runs after the guard and before the prompt, so a progress frame is the proof that a resume was admitted.
+ */
+describe('resuming a finished subagent', () => {
+  const MSG = 'msg_resume_parent'
+  const OTHER_CHILD = 'ses_other_child_00000000000'
+
+  function started(call: string): unknown {
+    return frame('session.tool.input.started', {
+      sessionID: PARENT_SESSION_ID,
+      id: call,
+      assistantMessageID: MSG,
+      name: 'subagent',
+    })
+  }
+
+  function called(call: string, resumeSessionId?: string): unknown {
+    return frame('session.tool.called', {
+      sessionID: PARENT_SESSION_ID,
+      id: call,
+      assistantMessageID: MSG,
+      input: {
+        agent: 'general',
+        description: 'ask again',
+        prompt: 'one more question',
+        ...(resumeSessionId === undefined ? {} : {sessionID: resumeSessionId}),
+      },
+    })
+  }
+
+  function progress(call: string, childSessionId = CHILD_SESSION_ID): unknown {
+    return frame('session.tool.progress', {
+      sessionID: PARENT_SESSION_ID,
+      id: call,
+      assistantMessageID: MSG,
+      metadata: {sessionID: childSessionId, status: 'running'},
+    })
+  }
+
+  function succeeded(call: string, childSessionId = CHILD_SESSION_ID): unknown {
+    return frame('session.tool.success', {
+      sessionID: PARENT_SESSION_ID,
+      id: call,
+      assistantMessageID: MSG,
+      content: [{type: 'text', text: 'The subagent is working in the background.'}],
+      metadata: {sessionID: childSessionId, status: 'running', truncated: false},
+      executed: false,
+    })
+  }
+
+  function refused(call: string): unknown {
+    return frame('session.tool.failed', {
+      sessionID: PARENT_SESSION_ID,
+      id: call,
+      assistantMessageID: MSG,
+      error: {type: 'tool.execution', message: 'refused'},
+      executed: false,
+    })
+  }
+
+  /** Dispatch the child, and let its first report settle it. */
+  const firstRound = [started('call_d'), called('call_d'), progress('call_d'), succeeded('call_d'), report('msg_r1')]
+
+  it('characterizes the first round: a dispatched child settles from its report', async () => {
+    // #given / #when
+    const {states} = await after(firstRound)
+
+    // #then
+    expect(states).toEqual({[CHILD_SESSION_ID]: 'settled'})
+  })
+
+  it('characterizes the sticky notice: a report that precedes a fresh dispatch settles it on adoption', async () => {
+    // #given the report arrives before the dispatch's progress, and the dispatch carries no `sessionID`
+    const {states} = await after([report('msg_r0'), started('call_d'), called('call_d'), progress('call_d')])
+
+    // #then the sticky entry is still honored for a fresh dispatch
+    expect(states).toEqual({[CHILD_SESSION_ID]: 'settled'})
+  })
+
+  it('characterizes a progress frame without a resume: a settled child stays settled', async () => {
+    // #given a second progress for the same child from a call whose input has no `sessionID`
+    const {states} = await after([...firstRound, started('call_x'), called('call_x'), progress('call_x')])
+
+    // #then
+    expect(states).toEqual({[CHILD_SESSION_ID]: 'settled'})
+  })
+
+  it('reopens the settled child on the resume call progress, and no longer treats it as noticed', async () => {
+    // #given a settled child, then a resume call whose progress arrives
+    const {states} = await after([
+      ...firstRound,
+      started('call_r'),
+      called('call_r', CHILD_SESSION_ID),
+      progress('call_r'),
+    ])
+
+    // #then the sticky entry did not settle it again on that very frame
+    expect(states).toEqual({[CHILD_SESSION_ID]: 'outstanding'})
+  })
+
+  it('keeps the child outstanding through the resume call end', async () => {
+    // #given the resume call returns `running` (the child is working in the background)
+    const {states} = await after([
+      ...firstRound,
+      started('call_r'),
+      called('call_r', CHILD_SESSION_ID),
+      progress('call_r'),
+      succeeded('call_r'),
+    ])
+
+    // #then the dispatch path in `tool_finished` adopts again, and must not settle it
+    expect(states).toEqual({[CHILD_SESSION_ID]: 'outstanding'})
+  })
+
+  it('settles the reopened child from its next report, through the existing notice path', async () => {
+    // #given
+    const {states} = await after([
+      ...firstRound,
+      started('call_r'),
+      called('call_r', CHILD_SESSION_ID),
+      progress('call_r'),
+      succeeded('call_r'),
+      report('msg_r2'),
+    ])
+
+    // #then
+    expect(states).toEqual({[CHILD_SESSION_ID]: 'settled'})
+  })
+
+  it('settles the reopened child when its report arrives before the resume call returns', async () => {
+    // #given a quick child: progress, report, then the call result
+    const {states} = await after([
+      ...firstRound,
+      started('call_r'),
+      called('call_r', CHILD_SESSION_ID),
+      progress('call_r'),
+      report('msg_r2'),
+      succeeded('call_r'),
+    ])
+
+    // #then the sticky entry from the new report holds through the late call result
+    expect(states).toEqual({[CHILD_SESSION_ID]: 'settled'})
+  })
+
+  it('does not reopen a resume that never got progress (a refused call)', async () => {
+    // #given `tool_called` carries the model's `sessionID` before the guard runs, then the call fails
+    const {states} = await after([
+      ...firstRound,
+      started('call_r'),
+      called('call_r', CHILD_SESSION_ID),
+      refused('call_r'),
+    ])
+
+    // #then
+    expect(states).toEqual({[CHILD_SESSION_ID]: 'settled'})
+  })
+
+  it('does not reopen on `tool_called` alone', async () => {
+    // #given a resume call that is announced and then the stream goes quiet
+    const {states} = await after([...firstRound, started('call_r'), called('call_r', CHILD_SESSION_ID)])
+
+    // #then
+    expect(states).toEqual({[CHILD_SESSION_ID]: 'settled'})
+  })
+
+  it('reopens once per call id: a replayed progress frame does not undo a settlement', async () => {
+    // #given the resume's progress, the report, then the same progress frame again
+    const {states} = await after([
+      ...firstRound,
+      started('call_r'),
+      called('call_r', CHILD_SESSION_ID),
+      progress('call_r'),
+      report('msg_r2'),
+      progress('call_r'),
+    ])
+
+    // #then the replay did not reopen it
+    expect(states).toEqual({[CHILD_SESSION_ID]: 'settled'})
+  })
+
+  it('reopens again for a later resume call with its own call id', async () => {
+    // #given two resumes, each followed by its report
+    const second = [
+      started('call_r'),
+      called('call_r', CHILD_SESSION_ID),
+      progress('call_r'),
+      report('msg_r2'),
+      started('call_s'),
+      called('call_s', CHILD_SESSION_ID),
+      progress('call_s'),
+    ]
+
+    // #when
+    const {states} = await after([...firstRound, ...second])
+
+    // #then the second resume reopened it
+    expect(states).toEqual({[CHILD_SESSION_ID]: 'outstanding'})
+  })
+
+  it('leaves a running child as it is when a resume joins its current run', async () => {
+    // #given the child is still outstanding (no report yet) when the resume's progress arrives
+    const {states, ledger} = await after([
+      started('call_d'),
+      called('call_d'),
+      progress('call_d'),
+      started('call_r'),
+      called('call_r', CHILD_SESSION_ID),
+      progress('call_r'),
+      report('msg_r1'),
+    ])
+
+    // #then one report settles it, and there is still one entry
+    expect(states).toEqual({[CHILD_SESSION_ID]: 'settled'})
+    expect(ledger.snapshot()).toHaveLength(1)
+  })
+
+  it('reopens nothing when the progress names a different child than the input', async () => {
+    // #given the input names the child, but the progress frame names another session
+    const {states} = await after([
+      ...firstRound,
+      started('call_r'),
+      called('call_r', CHILD_SESSION_ID),
+      progress('call_r', OTHER_CHILD),
+    ])
+
+    // #then the settled child is untouched (the named session is adopted by the existing path, as before)
+    expect(states).toEqual({[CHILD_SESSION_ID]: 'settled', [OTHER_CHILD]: 'outstanding'})
+  })
+
+  it('records nothing for a resume call that was only announced (no progress)', async () => {
+    // #given a resume that names a child nobody dispatched, and the plugin refused it before any progress
+    const {ledger} = await after([started('call_r'), called('call_r', CHILD_SESSION_ID), refused('call_r')])
+
+    // #then
+    expect(ledger.snapshot()).toEqual([])
+  })
+
+  it('ignores a resume call from a session outside the run tree', async () => {
+    // #given a stranger's `subagent` resume of the run's settled child
+    const strangerFrames = [
+      frame('session.tool.input.started', {
+        sessionID: SHELL_SESSION_ID,
+        id: 'call_z',
+        assistantMessageID: MSG,
+        name: 'subagent',
+      }),
+      frame('session.tool.called', {
+        sessionID: SHELL_SESSION_ID,
+        id: 'call_z',
+        assistantMessageID: MSG,
+        input: {agent: 'general', description: 'x', prompt: 'y', sessionID: CHILD_SESSION_ID},
+      }),
+      frame('session.tool.progress', {
+        sessionID: SHELL_SESSION_ID,
+        id: 'call_z',
+        assistantMessageID: MSG,
+        metadata: {sessionID: CHILD_SESSION_ID, status: 'running'},
+      }),
+    ]
+
+    // #when
+    const {states} = await after([...firstRound, ...strangerFrames])
+
+    // #then
+    expect(states).toEqual({[CHILD_SESSION_ID]: 'settled'})
+  })
+
+  it('reopens an entry the stream marked unknown', async () => {
+    // #given a child adopted, then lost to a failed turn (`unknown`), then resumed
+    const failedTurn = frame('session.execution.failed', {
+      sessionID: CHILD_SESSION_ID,
+      error: {type: 'provider.internal', message: 'x'},
+    })
+    const {states} = await after([
+      started('call_d'),
+      called('call_d'),
+      progress('call_d'),
+      failedTurn,
+      started('call_r'),
+      called('call_r', CHILD_SESSION_ID),
+      progress('call_r'),
+    ])
+
+    // #then
+    expect(states).toEqual({[CHILD_SESSION_ID]: 'outstanding'})
+  })
+})
+
 describe('classifyV2Error', () => {
   const base = {status: null, retryAfterMs: null} as const
 

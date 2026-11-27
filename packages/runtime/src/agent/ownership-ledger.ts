@@ -57,6 +57,13 @@ export interface OwnershipLedger {
    */
   readonly settle: (sessionId: string) => void
   /**
+   * Reopen the entry for `sessionId` as outstanding: its parent resumed the child, so the child's next report is owed.
+   * `settled` and `unknown` become `outstanding`; an `outstanding` entry stays as it is (a resume that joins a running
+   * child changes nothing). A no-op when the entry was never adopted (or was released): a resume never creates an entry,
+   * so only `adopt` decides what the run owns. `adopt` itself stays idempotent and does not reopen a settled entry.
+   */
+  readonly resume: (sessionId: string) => void
+  /**
    * Mark the entry for `sessionId` as unknown — reachable only from
    * `outstanding`. A no-op when the entry was never adopted or is already
    * settled (settled is terminal); marking an already-unknown entry again is
@@ -155,6 +162,13 @@ export function createOwnershipLedger(): OwnershipLedger {
       if (entry === undefined) return
       if (entry.state === 'settled') return
       entries.set(sessionId, {label: entry.label, state: 'settled'})
+    },
+
+    resume: (sessionId: string): void => {
+      const entry = entries.get(sessionId)
+      if (entry === undefined) return
+      if (entry.state === 'outstanding') return
+      entries.set(sessionId, {label: entry.label, state: 'outstanding'})
     },
 
     markUnknown: (sessionId: string): void => {
