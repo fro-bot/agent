@@ -2765,6 +2765,50 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
       expect(deps.startKeyProxy).not.toHaveBeenCalled()
     })
 
+    it.each(['{env:KEY}', '{file:./key}', 'a{env:K}b'])(
+      'refuses a top-level key built from a reference (%s), which could add MCP servers the broker never sees',
+      async key => {
+        // #given a provisioned isolated run whose config has a top-level key that holds a reference
+        const deps = depsFor(fakeServer())
+        const sandbox = fakeSandbox()
+
+        // #when
+        const result = await startMcp(sandbox.sandbox, deps, {
+          opencodeConfig: JSON.stringify({[key]: {x: {...REMOTE}}, mcp: {}}),
+        })
+
+        // #then it stops at the config stage, with a fix and no value, before any child or handoff
+        const error = unwrapErr(result)
+        expect(error.stage).toBe('config')
+        expect(error.message).toContain('top-level key built from a reference')
+        expect(error.message).toContain('Fix: ')
+        expect(error.message).not.toContain(TOKEN)
+        expect(error.message).not.toContain(key)
+        expect(deps.startKeyProxy).not.toHaveBeenCalled()
+        expect(sandbox.prepare).not.toHaveBeenCalled()
+      },
+    )
+
+    it('does not refuse a top-level key built from a reference on a non-isolated run', async () => {
+      const deps = depsFor(fakeServer())
+
+      const result = await startMcp(null, deps, {opencodeConfig: JSON.stringify({'{file:./key}': {a: 1}})})
+
+      expect(result.success).toBe(true)
+    })
+
+    it('leaves a withheld run as it was: the `{file:}` key is dropped, the run goes on', async () => {
+      const deps = depsFor(fakeServer())
+
+      const result = await startMcp(fakeSandbox().sandbox, deps, {
+        credential: 'withhold',
+        opencodeConfig: JSON.stringify({'{file:./key}': {a: 1}}),
+      })
+
+      expect(result.success).toBe(true)
+      expect(JSON.stringify(spawnedConfig(deps))).not.toContain('{file:./key}')
+    })
+
     it('keeps the entry exactly as written, and plans nothing, when isolation is off', async () => {
       // #given a non-isolated run with a credentialed remote the broker would refuse
       const entry = {...REMOTE, url: 'http://mcp.example.com/mcp'}
