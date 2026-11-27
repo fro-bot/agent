@@ -66,7 +66,7 @@ export interface OwnershipLedger {
   /**
    * Mark the entry for `sessionId` as unknown — reachable only from
    * `outstanding`. A no-op when the entry was never adopted or is already
-   * settled (settled is terminal); marking an already-unknown entry again is
+   * settled (it stays settled unless `resume` reopens it); marking an already-unknown entry again is
    * a safe no-op.
    */
   readonly markUnknown: (sessionId: string) => void

@@ -1,6 +1,8 @@
+import {ok} from '@bfra.me/es/result'
 import {
   createOwnershipLedger,
   createRemoteOpenCodeV2Client,
+  reconcileLedgerOnce,
   shellLedgerKey,
   V2_EVENT_FRAME_MAX_CHARS,
   V2_EVENT_FRAME_TOO_LARGE_ERROR_NAME,
@@ -1565,6 +1567,46 @@ describe('resuming a finished subagent', () => {
 
     // #then
     expect(states).toEqual({[CHILD_SESSION_ID]: 'settled'})
+  })
+
+  it('leaves a resumed child outstanding when the resume call fails after progress, until reconcile settles it', async () => {
+    // #given a settled child, a resume admitted (progress reopens it), then the call fails and no report ever arrives
+    const failedAfterProgress = frame('session.tool.failed', {
+      sessionID: PARENT_SESSION_ID,
+      id: 'call_r',
+      assistantMessageID: MSG,
+      error: {type: 'tool.execution', message: 'prompt failed'},
+      executed: true,
+    })
+    const {ledger, states} = await after([
+      ...firstRound,
+      started('call_r'),
+      called('call_r', CHILD_SESSION_ID),
+      progress('call_r'),
+      failedAfterProgress,
+    ])
+
+    // #then the stream alone cannot settle it: the entry is outstanding and blocks completion
+    expect(states).toEqual({[CHILD_SESSION_ID]: 'outstanding'})
+    expect(ledger.outstanding()).toBe(1)
+    expect(ledger.isDrainComplete()).toBe(false)
+
+    // #when a reconcile pass sees the child as a child of the parent that is no longer live
+    const result = await reconcileLedgerOnce({
+      ledger,
+      adapter: {
+        children: async () => ok([{id: CHILD_SESSION_ID}]),
+        liveSessionIds: async () => ok(new Set<string>()),
+      },
+      parentSessionId: PARENT_SESSION_ID,
+      logger: createMockLogger(),
+    })
+
+    // #then the ledger no longer blocks completion
+    expect(result.success).toBe(true)
+    expect(ledger.snapshot().map(entry => entry.state)).toEqual(['settled'])
+    expect(ledger.outstanding()).toBe(0)
+    expect(ledger.isDrainComplete()).toBe(true)
   })
 
   it('reopens an entry the stream marked unknown', async () => {
