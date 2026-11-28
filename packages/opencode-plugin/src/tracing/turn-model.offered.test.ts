@@ -3,7 +3,8 @@
 import {describe, expect, it} from 'vitest'
 
 import {omittedContent, snapshotRequest} from './snapshot.js'
-import {byCall, STEP, turn} from './turn-model.conventions.testing.js'
+import {byCall, STEP, toolsOf, turn, turnObservations} from './turn-model.conventions.testing.js'
+import {replay} from './turn-model.testing.js'
 
 const OFFERED = {tools: {read: {description: 'Read a file'}, grep: {description: 'Search'}}}
 
@@ -156,6 +157,72 @@ describe('whether a called tool was offered', () => {
     // #then the verdict taken earlier is not exported, whichever way it would have gone
     expect(byCall(records, 'c1')?.offered).toBeUndefined()
     expect(byCall(records, 'c2')?.offered).toBeUndefined()
+  })
+
+  it('is unset when the tool ended before a loss that landed before its step ended, whichever way the verdict would have gone', () => {
+    // #given calls that end (tool.called -> tool.ended) before a loss, and only then the step's end: one that would have been
+    // true and one that would have been false
+    const records = turn(
+      [
+        {id: 'c1', name: 'read', messageId: STEP, succeeded: true},
+        {id: 'c2', name: 'write', messageId: STEP, succeeded: false},
+      ],
+      {request: OFFERED, lossAfterCalls: true},
+    )
+
+    // #then both tool spans still export, with no verdict: the binding the verdict rested on was withheld before it settled
+    expect(byCall(records, 'c1')).toBeDefined()
+    expect(byCall(records, 'c2')).toBeDefined()
+    expect(byCall(records, 'c1')?.offered).toBeUndefined()
+    expect(byCall(records, 'c2')?.offered).toBeUndefined()
+  })
+
+  it('still gives true and false when nothing is lost between the tool ending and its step ending', () => {
+    // #given the same calls with a clean replay
+    const records = turn(
+      [
+        {id: 'c1', name: 'read', messageId: STEP, succeeded: true},
+        {id: 'c2', name: 'write', messageId: STEP, succeeded: false},
+      ],
+      {request: OFFERED},
+    )
+
+    // #then
+    expect(byCall(records, 'c1')?.offered).toBe(true)
+    expect(byCall(records, 'c2')?.offered).toBe(false)
+  })
+
+  it('exports the span without a verdict when the execution ends before its step does', () => {
+    // #given a call whose step never ends: the execution ends first
+    const observations = turnObservations([{id: 'c1', name: 'read', messageId: STEP, succeeded: true}], {
+      request: OFFERED,
+      omitStepEnd: true,
+    })
+    const records = replay(observations).records
+
+    // #then the tool span exported, and nothing settled its verdict
+    expect(byCall(records, 'c1')).toBeDefined()
+    expect(byCall(records, 'c1')?.offered).toBeUndefined()
+  })
+
+  it('exports every tool span, and a verdict only for as many as the hold allows, when the cap is hit', () => {
+    // #given more calls ending before their step than the model may hold
+    const calls = Array.from({length: 5}, (_, index) => ({
+      id: `c${index}`,
+      name: 'read',
+      messageId: STEP,
+      succeeded: true,
+    }))
+    const records = replay(turnObservations(calls, {request: OFFERED}), {limits: {maxHeldToolSpans: 2}}).records
+
+    // #then every span exported; the first two held their verdict, the rest exported without one
+    expect(
+      toolsOf(records)
+        .map(record => record.callId)
+        .toSorted(),
+    ).toEqual(['c0', 'c1', 'c2', 'c3', 'c4'])
+    expect(toolsOf(records).filter(record => record.offered === true)).toHaveLength(2)
+    expect(toolsOf(records).filter(record => record.offered === undefined)).toHaveLength(3)
   })
 
   it('is unset when the step could not be bound to its request', () => {

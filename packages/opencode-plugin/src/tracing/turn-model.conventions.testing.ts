@@ -22,6 +22,10 @@ export interface TurnOptions {
   readonly bindStep?: boolean
   /** An observation was lost after the step bound and before the calls: what the step carries can no longer be trusted. */
   readonly lossBeforeCalls?: boolean
+  /** An observation was lost after every call ended and before the step ended: the calls' request may no longer be their own. */
+  readonly lossAfterCalls?: boolean
+  /** The step never ends: the execution does. */
+  readonly omitStepEnd?: boolean
 }
 
 export interface Call {
@@ -40,7 +44,7 @@ export interface Call {
 }
 
 /** One primary request and its step, with the given calls made during the step. */
-export function turn(calls: readonly Call[], options: TurnOptions = {}): SpanRecord[] {
+export function turnObservations(calls: readonly Call[], options: TurnOptions = {}): Observation[] {
   const observations: Observation[] = []
   let at = 0
   const add = (observation: ObservationInput): void => {
@@ -66,7 +70,7 @@ export function turn(calls: readonly Call[], options: TurnOptions = {}): SpanRec
     sessionId: SES,
     messageId: STEP,
     started: options.bindStep === false ? undefined : hookAt,
-    agent: 'build',
+    agent: 'agent' in options ? options.agent : 'build',
     model: 'm',
     provider: 'p',
   })
@@ -100,9 +104,17 @@ export function turn(calls: readonly Call[], options: TurnOptions = {}): SpanRec
       ...(call.message === undefined ? {} : {message: call.message}),
     })
   }
-  add({kind: 'step.ended', sessionId: SES, messageId: STEP, finish: 'stop', rawFinish: 'stop'})
+  if (options.lossAfterCalls === true) add({kind: 'loss', sessionIds: [SES], reason: 'test'})
+  if (options.omitStepEnd !== true) {
+    add({kind: 'step.ended', sessionId: SES, messageId: STEP, finish: 'stop', rawFinish: 'stop'})
+  }
   add({kind: 'execution.ended', sessionId: SES, outcome: 'succeeded'})
-  return [...replay(observations).records]
+  return observations
+}
+
+/** `turnObservations`, replayed: the records the model gave. */
+export function turn(calls: readonly Call[], options: TurnOptions = {}): SpanRecord[] {
+  return [...replay(turnObservations(calls, options)).records]
 }
 
 export const toolsOf = (records: readonly SpanRecord[]): ToolRecord[] =>

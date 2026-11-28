@@ -24,6 +24,48 @@ describe('the agent of a tool span', () => {
     expect(byCall(records, 'c1')?.agent).toBe('plan')
   })
 
+  it('prefers the agent of the request that asked for the call over the session’s first agent, when the session switched agents', () => {
+    // #given one execution that ran a request as `build`, then switched to `plan`, whose call is refused before any hook runs
+    let time = 0
+    const at = (): number => (time += 1)
+    const observations: Observation[] = [
+      {kind: 'prompt', at: at(), sessionId: SES, messageId: 'm1', delivery: 'steer', content: 'hi'},
+      {kind: 'inbox.enqueued', at: at(), sessionId: SES, inboxId: 'm1', item: 'user'},
+      {kind: 'execution.started', at: at(), sessionId: SES},
+      {kind: 'inbox.delivered', at: at(), sessionId: SES, inboxId: 'm1'},
+    ]
+    const request = (agent: string, step: string): void => {
+      const hook = at()
+      observations.push(
+        {kind: 'request', at: hook, sessionId: SES, requestKind: 'primary', agent, model: 'm', provider: 'p'},
+        {kind: 'step.started', at: at(), sessionId: SES, messageId: step, started: hook, agent},
+      )
+    }
+    request('build', 's1')
+    observations.push({
+      kind: 'step.ended',
+      at: at(),
+      sessionId: SES,
+      messageId: 's1',
+      finish: 'stop',
+      rawFinish: 'stop',
+    })
+    request('plan', 's2')
+    observations.push(
+      {kind: 'tool.named', at: at(), sessionId: SES, callId: 'c-plan', tool: 'write'},
+      {kind: 'tool.called', at: at(), sessionId: SES, callId: 'c-plan', messageId: 's2', executed: false},
+      {kind: 'tool.ended', at: at(), sessionId: SES, callId: 'c-plan', succeeded: false},
+      {kind: 'step.ended', at: at(), sessionId: SES, messageId: 's2', finish: 'stop', rawFinish: 'stop'},
+      {kind: 'execution.ended', at: at(), sessionId: SES, outcome: 'succeeded'},
+    )
+
+    // #when
+    const refused = byCall(replay(observations).records, 'c-plan')
+
+    // #then the span names the agent of the request that asked, not the session's first agent
+    expect(refused?.agent).toBe('plan')
+  })
+
   it('stays unset when neither the hook nor the session has an agent', () => {
     // #given a request that named no agent
     const records = turn([{id: 'c1', name: 'write', messageId: STEP, succeeded: false}], {agent: undefined})

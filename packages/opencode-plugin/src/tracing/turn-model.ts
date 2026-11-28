@@ -198,6 +198,11 @@ export interface TurnModelLimits {
    * whose hook was dropped finds no hook at all and binds nothing; it never falls through to an older one.
    */
   readonly maxHookTimes: number
+  /**
+   * Tool spans held at once, across the model, for a request whose step has not ended: a tool's `offered` verdict is provisional
+   * until its request settles (a loss before then withholds the binding). Past it a span exports at once, with no verdict.
+   */
+  readonly maxHeldToolSpans: number
 }
 
 export const DEFAULT_LIMITS: TurnModelLimits = {
@@ -223,6 +228,7 @@ export const DEFAULT_LIMITS: TurnModelLimits = {
   toolNoteWaitMs: 10_000,
   tombstoneTtlMs: 24 * 60 * 60_000,
   maxHookTimes: 64,
+  maxHeldToolSpans: 256,
 }
 
 export interface TurnModelStats {
@@ -315,6 +321,21 @@ interface PendingItem {
   claimed: boolean
 }
 
+/**
+ * Where a request stands, shared with the tool calls that took its offered list. Their verdict is provisional until the request's
+ * step ends with the binding still certain: a loss before then withholds the binding, and the verdict goes with it.
+ */
+interface Settlement {
+  /** The binding is still certain. Turns false once, when the request becomes uncertain. */
+  certain: boolean
+  /** The request's own step ended (`step.ended`), with the binding certain. */
+  stepEnded: boolean
+  /** The request has been emitted: nothing more will settle it. */
+  closed: boolean
+  /** Tool spans that ended before it settled, waiting for the verdict to be settled. */
+  held: ToolRecord[]
+}
+
 interface RequestState {
   readonly spanId: string
   readonly trace: TraceState
@@ -352,8 +373,8 @@ interface RequestState {
    * an incomplete outcome and its hook-time metadata.
    */
   bindUncertain: boolean
-  /** Shared with every tool call that took this request's offered list: cleared when the request becomes uncertain. */
-  readonly certainty: {certain: boolean}
+  /** Shared with every tool call that took this request's offered list: when its step ended, and whether it stayed certain. */
+  readonly certainty: Settlement
 }
 
 interface ToolState {
@@ -365,12 +386,14 @@ interface ToolState {
   tool: string
   readonly start: number
   agent: string | undefined
-  /** The agent of the session that owns the call, when the span opened: what a call that no hook reached falls back to. */
+  /** The agent of the session that owns the call, when the span opened: the last thing a call that no hook reached falls back to. */
   readonly ownerAgent: string | undefined
+  /** The agent of the request (or its step) that asked for the call, when that binding was certain: before the session's agent. */
+  askedAgent: string | undefined
   /** The names the asking request offered, when that request is known and its list was captured. Shared, never copied. */
   offeredNames: ReadonlySet<string> | undefined
   /** The asking request's certainty token, shared with it: it turns uncertain if the request later does, and the verdict goes with it. */
-  offerBasis: {certain: boolean} | undefined
+  offerBasis: Settlement | undefined
   input: unknown
   /** The call event's arguments, kept until a hook's replace them. */
   callInput: unknown
@@ -503,6 +526,8 @@ export function createTurnModel(options: {
   const releasedChildren = new Set<string>()
   /** Characters of model output held by open requests, against `maxHeldOutputChars`. */
   let heldOutputChars = 0
+  /** Tool spans held across the model, against `maxHeldToolSpans`. */
+  let heldToolSpans = 0
 
   /** Snapshots dropped with no span to carry them, until `takeDiscarded` hands them back. */
   let discarded: unknown[] = []
@@ -705,6 +730,9 @@ export function createTurnModel(options: {
   ): void {
     if (request.closed) return
     request.closed = true
+    // Settles the tool spans that ended before this request did: their verdict stands only if its step ended with the binding certain.
+    request.certainty.closed = true
+    releaseHeld(request.certainty)
     const hook = sessions.get(request.sessionId)?.hooks.find(candidate => candidate.request === request)
     if (hook !== undefined) hook.request = undefined
     // The request's output moves into its record: it no longer counts against what open requests hold.
@@ -764,7 +792,7 @@ export function createTurnModel(options: {
   ): void {
     tool.trace.openSpans = Math.max(0, tool.trace.openSpans - 1)
     const failed = outcome !== 'success'
-    emit({
+    const record: ToolRecord = {
       kind: 'execute_tool',
       spanId: tool.spanId,
       traceId: tool.trace.id,
@@ -776,7 +804,7 @@ export function createTurnModel(options: {
       error: failed ? {type: extra.errorType ?? 'tool.execution', message: extra.message} : undefined,
       sessionId: tool.sessionId,
       rootSessionId: tool.trace.rootSessionId,
-      agent: tool.agent ?? tool.ownerAgent,
+      agent: tool.agent ?? tool.askedAgent ?? tool.ownerAgent,
       gaps: [...tool.gaps],
       marks: [...(extra.marks ?? [])],
       tool: tool.tool,
@@ -790,7 +818,31 @@ export function createTurnModel(options: {
       providerExecuted: tool.providerExecuted,
       offered: offeredFlag(tool),
       discarded: tool.discarded,
-    })
+    }
+    const basis = tool.offerBasis
+    // The verdict is provisional until the request that asked for the call settles. A settled request (its step ended, still
+    // certain) lets it stand. One that is still open holds the span, boundedly; the span never waits past the request's close. In
+    // every other case (uncertain, closed unsettled, no room) the span exports at once with no verdict. It always exports.
+    if (record.offered !== undefined && basis !== undefined && !(basis.certain && basis.stepEnded)) {
+      if (basis.certain && !basis.closed && heldToolSpans < limits.maxHeldToolSpans) {
+        basis.held.push(record)
+        heldToolSpans += 1
+        return
+      }
+      emit({...record, offered: undefined})
+      return
+    }
+    emit(record)
+  }
+
+  /** Exports the tool spans waiting on a request: with their verdict if it settled certain, else without one. */
+  function releaseHeld(basis: Settlement): void {
+    const held = basis.held
+    if (held.length === 0) return
+    basis.held = []
+    heldToolSpans = Math.max(0, heldToolSpans - held.length)
+    const trusted = basis.certain && basis.stepEnded
+    for (const record of held) emit(trusted ? record : {...record, offered: undefined})
   }
 
   // ------------------------------------------------------------------ closing
@@ -1247,7 +1299,7 @@ export function createTurnModel(options: {
       marks: new Set(),
       closed: false,
       bindUncertain: false,
-      certainty: {certain: true},
+      certainty: {certain: true, stepEnded: false, closed: false, held: []},
       stepAgent: undefined,
       stepModel: undefined,
       stepProvider: undefined,
@@ -1347,6 +1399,7 @@ export function createTurnModel(options: {
       request.bindUncertain = true
       // Tool calls that already took this request's offered list lose the verdict with the certainty.
       request.certainty.certain = false
+      releaseHeld(request.certainty)
       for (const call of request.toolCalls) discard(call.input)
       request.toolCalls = []
     }
@@ -1486,6 +1539,8 @@ export function createTurnModel(options: {
     const node = sessions.get(o.sessionId)
     const request = node?.stepOwner.get(o.messageId)
     if (node === undefined || request === undefined) return
+    // Settled: held tool spans keep their verdict if the binding was certain all the way here (emitRequest releases them).
+    request.certainty.stepEnded = request.certainty.certain
     request.finishReason = o.finish
     request.rawFinishReason = o.rawFinish
     request.usage = o.usage
@@ -1608,6 +1663,7 @@ export function createTurnModel(options: {
       start: at,
       agent: undefined,
       ownerAgent: node.agent,
+      askedAgent: undefined,
       offeredNames: undefined,
       offerBasis: undefined,
       input: undefined,
@@ -1674,6 +1730,7 @@ export function createTurnModel(options: {
     if (asked !== undefined && !asked.bindUncertain) {
       tool.offeredNames = offeredToolNames(asked.request)
       tool.offerBasis = asked.certainty
+      tool.askedAgent = asked.agent ?? asked.stepAgent
     }
     if (!tool.inputFromHook) tool.input = o.input
     else if (o.input !== undefined) tool.discarded.push(o.input)
