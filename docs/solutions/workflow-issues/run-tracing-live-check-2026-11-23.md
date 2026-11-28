@@ -37,7 +37,7 @@ Run tracing has two halves: the Fro Bot OpenCode plugin captures spans, and in t
 
 This check loads a local build of the plugin. A session on a registry install of the published plugin has not been checked yet.
 
-- Trace a local session through the TUI or a plain `opencode serve`, driven over its HTTP API. `opencode run` starts a private `serve --stdio` when no service is running, and the plugin treats that as a headless host and stays off. It traces only when `run` attaches to a running service.
+- Trace a local session through the TUI or a plain `opencode serve`, driven over its HTTP API. `opencode run` starts a private `serve --stdio` when no service is running, and the plugin treats that as a headless host and stays off. It traces only when `run` attaches to a running service. (2026-11-28: since #2413 a stdio server with no launcher variable and no headless marker traces under the user file. That covers `opencode run` and the app with `--standalone`.)
 - Run on the OpenCode profile's own config dir and `HOME`, with the plugin and the tracing settings added on top. When provider credentials are OAuth connections served by auth plugins, those plugins load only from that config, so a bare temporary config sends requests with no valid bearer.
 - The settings file is consent for the whole machine. Remove it after the check.
 - Read the plugin's own lines: `tracing on, destination host …` at start and `tracing stopped, exported N spans, dropped M` at stop. A session that fails before the model answers still exports its root and the failed request, so a small span count with `dropped 0` usually means the model call failed, not the export. Check the server log for the session's error.

@@ -34,7 +34,6 @@ function resolve(configHome: string, env: Record<string, string> = {}): ReturnTy
     log: line => lines.push(line),
     platform: 'linux',
     uid,
-    argv: ['node', '/usr/bin/opencode'],
     hostname: () => MACHINE,
   })
   return settings
