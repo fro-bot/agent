@@ -30,6 +30,7 @@ import {
   KEY_PROXY_MCP_PATH_PREFIX,
   modelProviderId,
   resolveSystematicSkillsDirsV2,
+  SANDBOX_TMP_DIRECTORY,
   spawnConfigFromConfig,
   startOpenCodeV2Server,
   SYSTEMATIC_V2_PLUGIN_ID,
@@ -494,7 +495,10 @@ export async function startActionOpenCodeV2(
       ...(options.env.FRO_BOT_INTEGRATION_WORK_DIR === undefined
         ? {}
         : {integrationWorkDir: options.env.FRO_BOT_INTEGRATION_WORK_DIR}),
-      ...(options.sandbox == null ? {providerKeyFiles: keyFiles} : {proxiedProviders: proxied}),
+      ...(options.sandbox == null
+        ? {providerKeyFiles: keyFiles}
+        : // The account (and so its TMPDIR) does not exist yet: the path is fixed and checked at the launch (`prepare`).
+          {proxiedProviders: proxied, agentTmpDirectory: SANDBOX_TMP_DIRECTORY}),
       ...(brokeredMcp === undefined ? {} : {brokeredMcp}),
       bundledSkillsDirectories,
       ...(repoSkillsDirectory === undefined ? {} : {repoSkillsDirectory}),

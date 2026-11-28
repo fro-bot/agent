@@ -17,6 +17,16 @@ import {err, ok} from '../shared/types.js'
 
 export const SANDBOX_ACCOUNT_NAME = 'fro-bot-sandbox'
 
+/** The sandbox account's home. Fixed, because `createSandboxAccount` passes it to `useradd --home-dir`. */
+export const SANDBOX_ACCOUNT_HOME = `/home/${SANDBOX_ACCOUNT_NAME}`
+
+/**
+ * The agent's private `TMPDIR` (the launch's `tmpdir`, made 0700 under the account's home). The permission rules are built
+ * before the account exists, so they name this path from here; the lifecycle refuses a launch whose `tmpdir` differs, so a
+ * rule and a `TMPDIR` can never disagree.
+ */
+export const SANDBOX_TMP_DIRECTORY = `${SANDBOX_ACCOUNT_HOME}/tmp`
+
 /** Bound on the kill/verify loop. A stubborn survivor past this makes the run decline persistence and publication. */
 export const DEFAULT_SANDBOX_STOP_BOUND_MS = 15_000
 const DEFAULT_STOP_POLL_MS = 100
@@ -166,7 +176,7 @@ export async function createSandboxAccount(
   deps: SandboxIdentityDeps,
 ): Promise<Result<SandboxAccount, SandboxAccountError>> {
   const name = SANDBOX_ACCOUNT_NAME
-  const home = `/home/${name}`
+  const home = SANDBOX_ACCOUNT_HOME
   const [passwdText, groupText] = await Promise.all([deps.readText('/etc/passwd'), deps.readText('/etc/group')])
   if (passwdText === null || groupText === null) {
     return err({
