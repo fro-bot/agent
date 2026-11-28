@@ -112,7 +112,7 @@ export interface KeyProxyServer {
   readonly close: () => Promise<void>
 }
 
-/** Connections one MCP route may hold beyond the provider limit: its GET stream, and a few calls in flight. */
+/** Shared headroom each MCP route adds to the connection cap: for its GET stream and a few calls in flight. */
 const MCP_CONNECTIONS_PER_ROUTE = 4
 
 const LOOPBACK = '127.0.0.1'
@@ -450,9 +450,13 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
     res: ServerResponse,
     names: readonly string[],
     control: RelayControl,
+    flushHeaders: boolean,
   ): void => {
     copyHeaders(res, upstreamRes.headers, names)
     res.statusCode = status
+    // An MCP stream may sit silent for a long time after its headers: the client waits on them (the 2025 GET stream, a tool
+    // call's SSE), so they go out now rather than with the first byte of the body.
+    if (flushHeaders) res.flushHeaders()
     pipeline(upstreamRes, res)
       .catch(() => {
         // The upstream died or the client left. The head is out, so the only honest ending is an aborted stream.
@@ -613,6 +617,12 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
 
     if (target.kind === 'mcp') {
       const {route, query} = target
+      // Node adds no chunked framing to an outbound GET or DELETE, so a body the client sent would be cut short or left on the
+      // upstream's connection. Neither method has a body in the protocol: refuse it here, with nothing sent.
+      if (hasBody && (req.method === 'GET' || req.method === 'DELETE')) {
+        res.setHeader('connection', 'close')
+        return refuse(res, 400, 'body-on-bodyless-method', label)
+      }
       relay(req, res, {
         label,
         hostname: route.hostname,
@@ -625,7 +635,7 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
           if (status >= 400) {
             const scope: ErrorScope = {label, secrets: mcpSecrets.get(route.id) ?? [], retryAfter: 'seconds'}
             forwardError(upstreamRes, status, scope, res, control.stop)
-          } else streamSuccess(upstreamRes, status, res, MCP_SUCCESS_RESPONSE_HEADERS, control)
+          } else streamSuccess(upstreamRes, status, res, MCP_SUCCESS_RESPONSE_HEADERS, control, true)
         },
       })
       return
@@ -644,7 +654,7 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
         if (status >= 400) {
           const scope: ErrorScope = {label, secrets: matched.provider.secrets, retryAfter: 'raw'}
           forwardError(upstreamRes, status, scope, res, control.stop)
-        } else streamSuccess(upstreamRes, status, res, SUCCESS_RESPONSE_HEADERS, control)
+        } else streamSuccess(upstreamRes, status, res, SUCCESS_RESPONSE_HEADERS, control, false)
       },
     })
   }
@@ -657,8 +667,9 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
       refuse(res, 500, 'internal')
     }
   })
-  // Every connection counts, and an MCP route holds a stream open for the whole run: each gets headroom of its own, so the
-  // providers keep their full limit.
+  // One cap for every connection, provider or MCP. An MCP route holds a stream open for the whole run, so the cap carries
+  // shared headroom of a few connections per route on top of the provider limit. It is shared, not reserved: nothing stops
+  // MCP connections from using more than their route's share, or providers from using headroom the MCP routes leave.
   server.maxConnections = limits.maxConnections + MCP_CONNECTIONS_PER_ROUTE * mcpById.size
   server.requestTimeout = limits.requestTimeoutMs
   server.headersTimeout = Math.min(30_000, limits.requestTimeoutMs)

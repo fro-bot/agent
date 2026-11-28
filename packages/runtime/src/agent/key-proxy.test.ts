@@ -1551,6 +1551,39 @@ describe('key proxy: MCP routes, request side', () => {
     expect(h.upstream.requests[0]?.url).toBe('/v1/mcp/?codemode=false&a=b%20c')
   })
 
+  it.each([
+    ['GET', 'Content-Length: 5\r\n\r\nhello'],
+    ['DELETE', 'Content-Length: 5\r\n\r\nhello'],
+    ['GET', 'Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n'],
+    ['DELETE', 'Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n'],
+    ['GET', 'Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n'],
+  ])('refuses a %s that carries a body (%s) with a 400 and no upstream request', async (method, framing) => {
+    // #given an MCP route and a request whose framing says a body follows a method Node cannot frame one for
+    const h = await setupMcp(okJson)
+
+    // #when it is sent
+    const reply = await rawExchange(
+      h.proxy.port,
+      `${method} /mcp/s1 HTTP/1.1\r\nHost: x\r\nMcp-Session-Id: ${MCP_SESSION}\r\n${framing}`,
+    )
+
+    // #then it is answered 400 locally and nothing is sent upstream
+    expect(reply.startsWith('HTTP/1.1 400')).toBe(true)
+    expect(h.upstream.requests).toHaveLength(0)
+  })
+
+  it.each(['GET', 'DELETE'])('still forwards a %s with an explicit zero Content-Length', async method => {
+    const h = await setupMcp(okJson)
+
+    const reply = await rawExchange(
+      h.proxy.port,
+      `${method} /mcp/s1 HTTP/1.1\r\nHost: x\r\nMcp-Session-Id: ${MCP_SESSION}\r\nContent-Length: 0\r\n\r\n`,
+    )
+
+    expect(reply.startsWith('HTTP/1.1 200')).toBe(true)
+    expect(h.upstream.requests).toHaveLength(1)
+  })
+
   it.each(['POST', 'GET', 'DELETE'])('forwards %s and its body', async method => {
     const h = await setupMcp(okJson)
     const body = method === 'POST' ? '{"jsonrpc":"2.0"}' : undefined
@@ -1889,6 +1922,39 @@ describe('key proxy: MCP routes, response side', () => {
     expect(headerOf(h.upstream.requests[0], 'last-event-id')).toBe('0')
   })
 
+  it('sends the response headers of a stream as soon as the upstream does, before its first event', async () => {
+    // #given an upstream that opens an SSE stream and then sends nothing for a while
+    const h = await setupMcp((_request, res) => {
+      res.writeHead(200, {'content-type': 'text/event-stream', 'mcp-session-id': MCP_SESSION})
+      res.flushHeaders()
+      setTimeout(() => res.end(': late\n\n'), 800)
+    })
+
+    // #when the client opens the stream
+    const started = Date.now()
+    const outcome = await new Promise<{
+      readonly headAfterMs: number
+      readonly type: unknown
+      readonly session: unknown
+    }>((resolve, reject) => {
+      const req = http.request({host: '127.0.0.1', port: h.proxy.port, path: '/mcp/s1', method: 'GET'}, res => {
+        resolve({
+          headAfterMs: Date.now() - started,
+          type: res.headers['content-type'],
+          session: res.headers['mcp-session-id'],
+        })
+        res.resume()
+      })
+      req.on('error', reject)
+      req.end()
+    })
+
+    // #then the head reached it well before the first event, with the stream's type and session id
+    expect(outcome.headAfterMs).toBeLessThan(500)
+    expect(outcome.type).toBe('text/event-stream')
+    expect(outcome.session).toBe(MCP_SESSION)
+  })
+
   it('does not hold a GET stream back for its next event: the first frame arrives while the stream is open', async () => {
     // #given an upstream that writes one frame and keeps the stream open
     let release: () => void = () => undefined
@@ -2030,7 +2096,7 @@ describe('key proxy: MCP routes, response side', () => {
     }, 200)
   }
 
-  it('caps connections at the provider limit plus four per MCP route', async () => {
+  it('caps connections at the provider limit plus the shared headroom of four per MCP route', async () => {
     // #given a provider limit of 1 and one MCP route, so the cap is 5
     const h = await setupMcp(holdOpen, {limits: {maxConnections: 1}})
 
@@ -2043,7 +2109,7 @@ describe('key proxy: MCP routes, response side', () => {
     for (const stream of streams) stream.destroy()
   })
 
-  it('leaves the provider limit whole while MCP streams are held', async () => {
+  it('serves providers while the streams an MCP route is expected to hold are open', async () => {
     // #given a provider limit of 2, one MCP route and four held MCP streams
     const h = await setupMcp(holdOpen, {limits: {maxConnections: 2}, withProviders: true})
     const streams = await Promise.all(Array.from({length: 4}, async () => holdStream(h.proxy.port)))

@@ -2561,6 +2561,45 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
       expect(sandbox.release).toHaveBeenCalledTimes(1)
     })
 
+    it('aborts the server signal when the MCP-only child exits after ready, so the run fails and its session is not saved', async () => {
+      // #given the real supervisor and child serving one MCP route and no provider, with the server started against it
+      const bun = (() => {
+        try {
+          return execFileSync('which', ['bun'], {encoding: 'utf8'}).trim()
+        } catch {
+          return ''
+        }
+      })()
+      if (bun === '') return
+      const deps = depsFor(fakeServer(), {
+        startKeyProxy: startKeyProxyProcess,
+        keyProxyOptions: {
+          launcher: {command: bun, args: [path.resolve(import.meta.dirname, '../../../apps/action/src/key-proxy.ts')]},
+          timeouts: {readyMs: 5000, exitGraceMs: 1500, killConfirmMs: 1500},
+        },
+      })
+      const sandbox = fakeSandbox()
+      const result = await startMcp(sandbox.sandbox, deps, {})
+      const proxy = sandbox.log.proxyReports[0]?.proxy as KeyProxyProcess | undefined
+      if (!result.success || proxy === undefined) throw new Error('the start should have succeeded')
+
+      try {
+        // #when the child exits on its own after it said ready
+        const signal = vi.mocked(deps.startServer).mock.calls[0]?.[0].signal
+        expect(signal?.aborted).toBe(false)
+        const aborted = new Promise<void>(resolve => signal?.addEventListener('abort', () => resolve(), {once: true}))
+        process.kill(proxy.pid, 'SIGKILL')
+        await aborted
+
+        // #then the server's own signal fired, and the proxy reports the exit as a crash: the lifecycle turns that into
+        // `proxy: 'crashed'`, which the run answers by failing and declining to save the session
+        expect(signal?.aborted).toBe(true)
+        expect((await proxy.stop()).crashed).toBe(true)
+      } finally {
+        await proxy.stop()
+      }
+    })
+
     it('starts the real child with the route and points the server config at it, with no value anywhere', async () => {
       // #given the real supervisor and the real child, which now serves MCP routes
       const bun = (() => {
@@ -2695,6 +2734,54 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
       expect(deps.startServer).not.toHaveBeenCalled()
       expect(sandbox.release).toHaveBeenCalledTimes(1)
       expect(serializeLoggerCalls(logger)).not.toContain(TOKEN)
+    })
+
+    it.each([
+      ['the whole header value', `Bearer ${TOKEN}`],
+      ['the token behind its scheme', TOKEN],
+      ['a value that embeds the token', `prefix-${TOKEN}-suffix`],
+    ])('refuses the run, before any handoff, when %s is in an inherited OPENCODE_ variable', async (_label, value) => {
+      // #given the credential also set in a variable the environment filter admits by its prefix
+      const deps = depsFor(fakeServer())
+      const sandbox = fakeSandbox()
+      const logger = createMockLogger()
+
+      // #when the isolated run starts
+      const result = await startMcp(sandbox.sandbox, deps, {
+        logger,
+        env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome, OPENCODE_EXTRA_HEADER: value},
+      })
+
+      // #then it stops at the config stage naming the server and the variable, never the value, with nothing handed over
+      const error = unwrapErr(result)
+      expect(error.stage).toBe('config')
+      expect(error.message).toContain('MCP server "search"')
+      expect(error.message).toContain('OPENCODE_EXTRA_HEADER')
+      expect(error.message).toContain('Fix: ')
+      expect(error.message).not.toContain(TOKEN)
+      expect(serializeLoggerCalls(logger)).not.toContain(TOKEN)
+      expect(sandbox.prepare).not.toHaveBeenCalled()
+      expect(deps.startServer).not.toHaveBeenCalled()
+      expect(sandbox.release).toHaveBeenCalledTimes(1)
+    })
+
+    it('does not refuse a variable the environment filter drops, or one that holds something else', async () => {
+      // #given the token in a variable the sandbox never inherits, and an admitted variable with another value
+      const deps = depsFor(fakeServer())
+
+      // #when
+      const result = await startMcp(fakeSandbox().sandbox, deps, {
+        env: {
+          RUNNER_TEMP: runnerTemp,
+          PATH: '/usr/bin',
+          XDG_CACHE_HOME: cacheHome,
+          SEARCH_API_TOKEN: TOKEN,
+          OPENCODE_FLAG: 'unrelated-value',
+        },
+      })
+
+      // #then the run starts
+      expect(result.success).toBe(true)
     })
 
     it('scans both config variants for the header values, and hands the scan every value it masked', async () => {

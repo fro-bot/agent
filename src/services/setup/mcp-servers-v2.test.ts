@@ -1143,6 +1143,17 @@ describe('planMcpBrokerV2', () => {
         {x: withCanary({enabled: false, disabled: false})},
         'conflicting-flags',
       ],
+      [
+        'a header value with leading whitespace',
+        {x: {...REMOTE, headers: {Authorization: `  Bearer ${CANARY}`}}},
+        'header-value-padded',
+      ],
+      [
+        'a header value with trailing whitespace',
+        {x: {...REMOTE, headers: {Authorization: `Bearer ${CANARY}\t`}}},
+        'header-value-padded',
+      ],
+      ['a header value that is only whitespace', {x: {...REMOTE, headers: {'X-Key': ' '}}}, 'header-value-padded'],
       ['an `enabled` flag that is a reference', {x: withCanary({enabled: '{env:ON}'})}, 'unresolved-flag'],
       ['a `disabled` flag that is not a boolean', {x: withCanary({disabled: 'yes'})}, 'unresolved-flag'],
       [

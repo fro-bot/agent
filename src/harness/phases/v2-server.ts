@@ -25,6 +25,7 @@ import {err, ok} from '@bfra.me/es/result'
 import {
   ACTION_TRACING_OFF,
   clearHeldClaims,
+  filterAgentEnv,
   FRO_BOT_PLUGIN_ID,
   KEY_PROXY_MCP_PATH_PREFIX,
   modelProviderId,
@@ -44,7 +45,11 @@ import {
   resolveCredentialBaseDir,
   writeCredentialFilesV2,
 } from '../../services/setup/credential-files-v2.js'
-import {checkConfigForKeys, resolveKeyProxyProviders} from '../../services/setup/key-proxy-providers.js'
+import {
+  checkConfigForKeys,
+  checkEnvForMcpSecrets,
+  resolveKeyProxyProviders,
+} from '../../services/setup/key-proxy-providers.js'
 import {planMcpBrokerV2} from '../../services/setup/mcp-servers-v2.js'
 import {
   arePluginsCachedV2,
@@ -537,6 +542,13 @@ export async function startActionOpenCodeV2(
         ],
       })
       if (!clean.success) return stageError('config', clean.error)
+
+      // The environment the server inherits is a second way in: the filter admits `OPENCODE_*` by prefix, and the spawn's own
+      // settings go on top. Its config is replaced by the one checked above, and `GH_CONFIG_DIR` is the provisioned path.
+      const inherited = filterAgentEnv(withoutKey(options.env, 'GH_CONFIG_DIR'))
+      delete inherited.OPENCODE_CONFIG_CONTENT
+      const envClean = checkEnvForMcpSecrets({mcpSecrets: brokerPlan.secrets, env: inherited})
+      if (!envClean.success) return stageError('config', envClean.error)
     }
 
     // --- 4. Held claims ----------------------------------------------------------------------------------------

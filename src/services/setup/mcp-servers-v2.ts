@@ -544,6 +544,7 @@ export type McpBrokerRefusalKind =
   | 'header-forbidden'
   | 'header-name-invalid'
   | 'header-value-invalid'
+  | 'header-value-padded'
   | 'header-value-too-long'
   | 'headers-invalid'
   | 'headers-too-large'
@@ -579,6 +580,9 @@ const MAX_BROKERED_HEADERS_PER_SERVER = 32
 const MAX_BROKERED_HEADER_VALUE_LENGTH = 4096
 const MAX_BROKERED_HEADER_BYTES = 256 * 1024
 const MAX_BROKERED_URL_LENGTH = 2048
+
+/** A space or tab at either end of a header value (HTTP optional whitespace). */
+const HEADER_VALUE_PADDING = /^[ \t]|[ \t]$/
 
 /** RFC 9110 `token`: the characters a header name may hold. */
 const HEADER_NAME_TOKEN = /^[!#$%&'*+\-.^\w`|~]+$/
@@ -761,6 +765,14 @@ function checkBrokeredHeaders(name: string, headers: unknown): HeadersCheck {
         name,
         `sets the header "${lowered}" to a value that is not a string of printable characters`,
         'use a single-line string value',
+      )
+    }
+    if (HEADER_VALUE_PADDING.test(headerValue)) {
+      return brokerRefusal(
+        'header-value-padded',
+        name,
+        `sets the header "${lowered}" to a value with a space or tab at either end, which the broker would not read as the scheme and token it holds`,
+        'remove the surrounding whitespace',
       )
     }
     if (headerValue.length > MAX_BROKERED_HEADER_VALUE_LENGTH) {

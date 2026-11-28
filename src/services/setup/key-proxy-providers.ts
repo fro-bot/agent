@@ -507,3 +507,28 @@ export function checkConfigForKeys(options: {
   }
   return ok(null)
 }
+
+/**
+ * The environment the sandboxed server will inherit, after the filter and the spawn's own settings: no brokered MCP header
+ * value may be in any variable. The filter admits names by prefix (`OPENCODE_*`), so a value an operator also put in one
+ * would reach the sandbox past the broker. By value, raw or JSON-escaped. The refusal names the server and the variable
+ * name, never the value.
+ */
+export function checkEnvForMcpSecrets(options: {
+  readonly mcpSecrets: readonly McpSecretToCheck[]
+  readonly env: NodeJS.ProcessEnv
+}): Result<null, string> {
+  for (const {server, value} of options.mcpSecrets) {
+    if (value.length === 0) continue
+    for (const [name, text] of Object.entries(options.env)) {
+      if (text !== undefined && appearsIn(value, text)) {
+        return err(
+          `isolate-agent: a header value of MCP server "${server}" appears in the environment variable ${name}, which the sandbox user inherits. ` +
+            'Fix: remove the value from that variable; the broker holds the header for the server, ' +
+            'but a second copy in the environment stays visible to the sandbox.',
+        )
+      }
+    }
+  }
+  return ok(null)
+}

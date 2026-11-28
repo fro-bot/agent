@@ -519,6 +519,36 @@ process.stdin.resume()`,
       })
 
       it.skipIf(BUN === null)(
+        'notices an MCP-only child that dies after ready: the owned signal fires, the route is refused, stop reports a crash',
+        async () => {
+          // #given the real child serving one MCP route and no provider
+          const {started} = await startWith(realLauncher(), {providers: [], mcpRoutes: [MCP_ROUTE]})
+          if (!started.success) throw new Error(started.error.message)
+          const proxy = started.data
+          const died = new Promise<void>(resolve => proxy.died.addEventListener('abort', () => resolve(), {once: true}))
+
+          // #when it is killed from outside after it said ready
+          process.kill(proxy.pid, 'SIGKILL')
+          await died
+
+          // #then the crash is latched, a request to the route fails, and stop calls it a crash, not a clean stop
+          expect(proxy.crashed()).toBe(true)
+          await expect(
+            new Promise<void>((resolve, reject) => {
+              const req = http.request(
+                {host: '127.0.0.1', port: proxy.port, path: new URL(proxy.mcpUrl('s1')).pathname, method: 'POST'},
+                () => resolve(),
+              )
+              req.on('error', reject)
+              req.end('{}')
+            }),
+          ).rejects.toThrow()
+          const stopped = await proxy.stop()
+          expect(stopped).toMatchObject({crashed: true, outcome: 'already-exited'})
+        },
+      )
+
+      it.skipIf(BUN === null)(
         'starts the real child with MCP routes only, and it adds the configured header to a request',
         async () => {
           // #given an HTTPS upstream and a start that carries one route and no provider
