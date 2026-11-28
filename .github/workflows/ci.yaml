@@ -191,6 +191,11 @@ jobs:
         run: |
           bun run --filter @fro.bot/opencode-plugin build
           bunx vitest run packages/opencode-plugin/src/integration.test.ts packages/opencode-plugin/src/tracing/tracing.integration.test.ts
+      - name: Run the CI permission rules' real-binary test
+        if: ${{ !cancelled() }}
+        env:
+          FRO_BOT_OPENCODE_V2_BIN: ${{ steps.opencode.outputs.binary }}
+        run: bunx vitest run src/services/setup/ci-config-v2.tmpdir.integration.test.ts
 
   test-action:
     if: >-
