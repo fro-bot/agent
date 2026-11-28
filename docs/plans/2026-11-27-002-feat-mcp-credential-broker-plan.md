@@ -21,7 +21,7 @@ The broker hides the credential. It does not limit what the credential can do. T
 
 - R1. On an isolated provisioning run, no remote MCP header value is in anything the Action hands the sandbox: the server config (traced and untraced), the environment, argv, files, logs or traces. An upstream that returns its own credential in a response is outside this promise. It is trusted with the credential, as provider upstreams are.
 - R2. Every brokered server still works. OpenCode 2.4.2 initializes, lists tools, calls tools, recovers an expired session and closes through the broker, and the upstream receives the configured headers.
-- R3. A run fails if the child can't start. If the child dies mid-run, the run ends unsafe and its session isn't saved, the same as the key proxy today. No run falls back to a direct connection.
+- R3. A run fails if the child can't start. If the child dies mid-run, the run fails with no response read and no session saved, the same as the key proxy today. No run falls back to a direct connection.
 - R4. Configurations the broker can't protect are refused before the sandbox starts.
 - R5. Provider routes, the key-proxy probe, per-trigger MCP filtering and non-isolated behaviour don't change.
 - R6. The docs state what is protected, what isn't, and how to fix each refusal.
@@ -347,7 +347,7 @@ Implementation changed these points from the plan:
 - **Interaction graph:** the config build (both trace variants), child start, the value scan, the sandbox handoff, the server's MCP client, the existing provider probe, and teardown.
 - **Error propagation:**
   - A refusal or a child start failure fails the run before launch.
-  - If the child dies mid-run, the existing latch ends the run unsafe and skips the session save.
+  - If the child dies mid-run, the existing latch fails the run and skips the session save.
   - An upstream error shows up only as that server being unavailable.
 - **State lifecycle risks:** a tool call that was in flight when the child died may already have run upstream. Nothing replays it.
 - **API surface parity:** the gateway and the workspace agent don't read `mcp`.
