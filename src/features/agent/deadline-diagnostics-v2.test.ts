@@ -302,6 +302,30 @@ describe('describeDeadlineStateV2', () => {
     })
   })
 
+  it('carries no compaction role, reason or start in the trace when no compaction is open', () => {
+    // #given a compaction that started and ended
+    const tracker = createActivityTrackerV2()
+    record(tracker.eventTrail, typed('session.compaction.started', ROOT, {reason: 'auto'}), 1)
+    record(tracker.eventTrail, typed('session.compaction.ended', ROOT, {reason: 'auto'}), 2)
+    const addEvent = vi.fn()
+
+    // #when
+    reportDeadlineDiagnosticsV2({
+      tracker,
+      rootSessionId: ROOT,
+      logger: createMockLogger(),
+      traceSpan: {addEvent} as unknown as LifecycleSpan,
+      nowMs: 3,
+    })
+
+    // #then
+    const attributes = addEvent.mock.calls[0]?.[1] as Record<string, unknown>
+    expect(attributes['fro_bot.compaction']).toBe('ended')
+    expect(attributes).not.toHaveProperty('fro_bot.compaction.role')
+    expect(attributes).not.toHaveProperty('fro_bot.compaction.reason')
+    expect(attributes).not.toHaveProperty('fro_bot.compaction.started_ms')
+  })
+
   it('says a notice turn is owed, and which inbox items are still queued', () => {
     // #given the root's turn succeeded, then a completion notice was queued for it
     const tracker = createActivityTrackerV2()
@@ -525,8 +549,33 @@ describe('reportDeadlineDiagnosticsV2', () => {
 
     // #then
     expect(addEvent.mock.calls[0]?.[1]).toMatchObject({
+      'fro_bot.compaction.role': 'root',
       'fro_bot.compaction.reason': 'auto',
       'fro_bot.compaction.started_ms': '-2000',
+    })
+  })
+
+  it('says in the trace when only a child is compacting', () => {
+    // #given a child that began compacting and never finished, and a root that did not compact
+    const tracker = createActivityTrackerV2()
+    record(tracker.eventTrail, typed('session.compaction.started', CHILD, {reason: 'manual'}), 1_000, [CHILD])
+    const addEvent = vi.fn()
+
+    // #when
+    reportDeadlineDiagnosticsV2({
+      tracker,
+      rootSessionId: ROOT,
+      logger: createMockLogger(),
+      traceSpan: {addEvent} as unknown as LifecycleSpan,
+      nowMs: 5_000,
+    })
+
+    // #then
+    expect(addEvent.mock.calls[0]?.[1]).toMatchObject({
+      'fro_bot.compaction': 'started-not-ended',
+      'fro_bot.compaction.role': 'child',
+      'fro_bot.compaction.reason': 'manual',
+      'fro_bot.compaction.started_ms': '-4000',
     })
   })
 

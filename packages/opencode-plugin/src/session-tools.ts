@@ -17,7 +17,7 @@ import {
   listSessionsV2,
   searchSessionsV2,
 } from '@fro-bot/runtime/session-v2'
-import {Schema} from 'effect'
+import {Schema, SchemaTransformation} from 'effect'
 
 const UNAVAILABLE_PREFIX = 'session store unavailable'
 const REASON_MAX_CHARS = 200
@@ -98,9 +98,9 @@ function parseEndOfDayDate(value: string | undefined): Date | undefined {
   return endOfDay
 }
 
-/** Any limit below 1 (including negative values) means "no limit". */
+/** Any limit below 1 (including negative values) means "no limit"; a fractional limit is floored. */
 function normalizeLimit(value: number | undefined): number | undefined {
-  return value == null || value < 1 ? undefined : value
+  return value == null || value < 1 ? undefined : Math.floor(value)
 }
 
 function formatTimestamp(ms: number): string {
@@ -148,8 +148,27 @@ function sessionHeader(session: SessionInfoV2): string[] {
 const CONTEXT_WINDOW_NOTE =
   "Covers the session's active context window: messages since its last compaction, plus the compaction summary."
 
+/**
+ * Models often send `limit` as a string ("15"), and OpenCode validates tool arguments with Effect Schema before the
+ * handler runs, so a plain `Schema.Number` rejects it. Accept a number or a plain decimal string and DECODE it to a
+ * number here: the handler's `asNumber` ignores strings, so a merely widened schema would run the read uncapped.
+ * Blank, malformed (hex, trailing junk) and non-finite strings stay schema errors.
+ *
+ * The `u` flag and no `i` flag are deliberate: Effect exports a regex's JSON Schema `pattern` only for flags in
+ * `/^[dg]*uy?$/`, and otherwise publishes the string branch as accepting anything.
+ */
+// eslint-disable-next-line regexp/use-ignore-case -- the `i` flag would drop the exported JSON Schema `pattern`
+const DECIMAL_STRING = /^\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\s*$/u
+
+const LimitInput = Schema.Union([
+  Schema.Number,
+  Schema.String.check(Schema.isPattern(DECIMAL_STRING)).pipe(
+    Schema.decodeTo(Schema.Finite, SchemaTransformation.numberFromString),
+  ),
+])
+
 const ListInput = Schema.Struct({
-  limit: Schema.optionalKey(Schema.Number).annotate({description: 'Maximum number of sessions to return.'}),
+  limit: Schema.optionalKey(LimitInput).annotate({description: 'Maximum number of sessions to return.'}),
   from_date: Schema.optionalKey(Schema.String).annotate({
     description: 'Only include sessions created on or after this date (YYYY-MM-DD).',
   }),
@@ -165,7 +184,7 @@ const ReadInput = Schema.Struct({
   session_id: Schema.String.annotate({description: 'The session id to read (required).'}),
   include_todos: Schema.optionalKey(Schema.Boolean).annotate({description: 'Include the session todo list.'}),
   include_transcript: Schema.optionalKey(Schema.Boolean).annotate({description: 'Include the message transcript.'}),
-  limit: Schema.optionalKey(Schema.Number).annotate({
+  limit: Schema.optionalKey(LimitInput).annotate({
     description: 'Maximum number of transcript messages to include.',
   }),
 })
@@ -174,7 +193,7 @@ const SearchInput = Schema.Struct({
   query: Schema.String.annotate({description: 'Text to search for (required).'}),
   session_id: Schema.optionalKey(Schema.String).annotate({description: 'Restrict the search to a single session id.'}),
   case_sensitive: Schema.optionalKey(Schema.Boolean).annotate({description: 'Match case-sensitively.'}),
-  limit: Schema.optionalKey(Schema.Number).annotate({description: 'Maximum number of matches to return.'}),
+  limit: Schema.optionalKey(LimitInput).annotate({description: 'Maximum number of matches to return.'}),
 })
 
 const InfoInput = Schema.Struct({

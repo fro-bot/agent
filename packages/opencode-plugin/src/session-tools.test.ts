@@ -1,6 +1,6 @@
 import type {SessionClientV2} from '@fro-bot/runtime/session-v2'
 
-import {Schema} from 'effect'
+import {Effect, Schema} from 'effect'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {createSessionTools, SESSION_TOOL_NAMES, TRANSCRIPT_CHAR_CAP} from './session-tools.js'
@@ -494,5 +494,155 @@ describe('error text', () => {
 
     // #when / #then
     expect(await t.list.run({})).toBe('session store unavailable: Session.NotFoundError')
+  })
+})
+
+/**
+ * The host's argument path (`validateInput` in OpenCode's tool runtime): `Schema.decodeUnknownEffect` with
+ * `errors: 'all'`, and the DECODED value is what `execute` receives. A string `limit` must arrive as a number.
+ */
+async function throughHost(
+  spec: {readonly input: Schema.Top & {readonly DecodingServices: never}; readonly run: (a: never) => Promise<string>},
+  raw: unknown,
+): Promise<string> {
+  const decoded = await Effect.runPromise(Schema.decodeUnknownEffect(spec.input)(raw, {errors: 'all'}))
+  return spec.run(decoded as never)
+}
+
+const rejectsAtSchema = async (spec: {readonly input: Schema.Top & {readonly DecodingServices: never}}, raw: unknown) =>
+  Effect.runPromise(Schema.decodeUnknownEffect(spec.input)(raw, {errors: 'all'}))
+
+describe('numeric-string limit (host argument validation)', () => {
+  it.each([1, '1'])('session_read caps the transcript to one message for limit %j', async limit => {
+    // #given
+    const t = tools()
+
+    // #when
+    const output = await throughHost(t.read, {session_id: 'ses_a', include_transcript: true, limit})
+
+    // #then
+    expect(output).toContain('Transcript:\n  [user] please fix the Flaky cache test')
+    expect(output).not.toContain('[assistant]')
+  })
+
+  it.each([1, '1'])('session_list returns one session for limit %j', async limit => {
+    // #given
+    const t = tools()
+
+    // #when
+    const output = await throughHost(t.list, {limit})
+
+    // #then exactly the most recently updated session, not "No sessions found." or a store error
+    expect(output).toBe('ses_c  Release notes  updated 2026-04-02T12:00:00.000Z')
+  })
+
+  it.each([1, '1'])('session_search returns one matching session for limit %j', async limit => {
+    // #given
+    const t = tools()
+
+    // #when
+    const output = await throughHost(t.search, {query: 'cache', limit})
+
+    // #then
+    expect(output.split('\n')).toHaveLength(2)
+  })
+
+  it.each([1.5, '1.5'])('floors a fractional limit %j so search keeps no header without a match', async limit => {
+    // #given two sessions match 'cache'; a limit of 1.5 must behave as 1
+    const t = tools()
+
+    // #when
+    const output = await throughHost(t.search, {query: 'cache', limit})
+
+    // #then one session header and one match, with no header left dangling for the second session
+    expect(output).toBe(await throughHost(t.search, {query: 'cache', limit: 1}))
+    expect(output.split('\n')).toHaveLength(2)
+  })
+
+  it('floors a fractional limit for list and read, and keeps a limit below 1 as no limit', async () => {
+    // #given
+    const t = tools()
+
+    // #when
+    const list = await throughHost(t.list, {limit: '1.9'})
+    const read = await throughHost(t.read, {session_id: 'ses_a', include_transcript: true, limit: 1.9})
+    const fraction = await throughHost(t.list, {limit: 0.5})
+
+    // #then
+    expect(list.split('\n')).toHaveLength(1)
+    expect(read).not.toContain('[assistant]')
+    expect(fraction.split('\n')).toHaveLength(3)
+  })
+
+  it('publishes the numeric-string pattern in the JSON Schema the host sends the model', () => {
+    // #given the three tools that take a limit
+    const t = tools()
+
+    for (const spec of [t.list, t.read, t.search]) {
+      // #when the host builds the tool's input schema (`toJsonSchema` in OpenCode's tool runtime)
+      const {schema} = Schema.toJsonSchemaDocument(spec.input, {onExcessProperty: 'error'})
+      const limit = (schema as {properties: {limit: unknown}}).properties.limit
+      const patterns: string[] = []
+      JSON.stringify(limit, (_key, value: unknown) => {
+        if (typeof value === 'object' && value !== null && typeof Reflect.get(value, 'pattern') === 'string') {
+          patterns.push(Reflect.get(value, 'pattern') as string)
+        }
+        return value
+      })
+
+      // #then a string branch carries a pattern, so the model sees that a blank or malformed string is invalid
+      expect(patterns).toHaveLength(1)
+      const published = new RegExp(patterns[0] ?? '')
+      for (const accepted of ['15', ' 15 ', '-3', '1.5', '.5', '1e3', '1E3'])
+        expect(published.test(accepted)).toBe(true)
+      for (const rejected of ['', '   ', 'abc', '1x', '0x10', 'NaN', 'Infinity'])
+        expect(published.test(rejected)).toBe(false)
+    }
+  })
+
+  it('decodes a numeric string to a number inside the schema', async () => {
+    // #given
+    const t = tools()
+
+    // #when
+    const decoded = await Effect.runPromise(
+      Schema.decodeUnknownEffect(t.read.input)({session_id: 'ses_a', limit: ' 15 '}),
+    )
+
+    // #then the handler never sees a string, so it cannot fall through to an uncapped read
+    expect(decoded.limit).toBe(15)
+  })
+
+  it('keeps an omitted limit omitted', async () => {
+    // #given
+    const t = tools()
+
+    // #when
+    const decoded = await Effect.runPromise(Schema.decodeUnknownEffect(t.list.input)({}))
+
+    // #then
+    expect(Object.hasOwn(decoded, 'limit')).toBe(false)
+  })
+
+  it.each(['', '   ', 'abc', '1x', 'NaN', 'Infinity', '-Infinity', '0x10', '1e999'])(
+    'rejects limit %j at the schema for every tool',
+    async limit => {
+      // #given
+      const t = tools()
+
+      // #when / #then
+      await expect(rejectsAtSchema(t.read, {session_id: 'ses_a', limit})).rejects.toThrow()
+      await expect(rejectsAtSchema(t.list, {limit})).rejects.toThrow()
+      await expect(rejectsAtSchema(t.search, {query: 'cache', limit})).rejects.toThrow()
+    },
+  )
+
+  it('still rejects non-numeric, non-string limits', async () => {
+    // #given
+    const t = tools()
+
+    // #when / #then
+    await expect(rejectsAtSchema(t.list, {limit: true})).rejects.toThrow()
+    await expect(rejectsAtSchema(t.list, {limit: null})).rejects.toThrow()
   })
 })

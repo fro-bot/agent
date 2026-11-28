@@ -3,6 +3,7 @@ import type {
   OpenCodeV2ServerHandle,
   OpenCodeV2ShutdownResult,
   OpenCodeV2TracingDecision,
+  PermissionRuleV2,
 } from '@fro-bot/runtime'
 import type {ActionTracingSource} from '../../services/setup/tracing.js'
 import type {KeyProxyProbeResult} from './key-proxy-probe.js'
@@ -15,7 +16,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import {DatabaseSync} from 'node:sqlite'
 import {err} from '@bfra.me/es/result'
-import {ACTION_TRACING_OFF, clearHeldClaims} from '@fro-bot/runtime'
+import {ACTION_TRACING_OFF, clearHeldClaims, evaluatePermissionV2, SANDBOX_TMP_DIRECTORY} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi, type Mock} from 'vitest'
 import {checkConfigForKeys} from '../../services/setup/key-proxy-providers.js'
 import {pluginCacheDir, resolvePluginSpecsV2} from '../../services/setup/plugin-install-v2.js'
@@ -1874,6 +1875,83 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
 
     // #then the spawn options are exactly the unisolated ones
     expect('sandbox' in (vi.mocked(deps.startServer).mock.calls[0]?.[0] ?? {})).toBe(false)
+  })
+
+  it('allows the sandbox TMPDIR, and only that directory, in the config the isolated child receives (fro-bot/agent#2404)', async () => {
+    // #given an isolated run, whose agent gets TMPDIR=<launch tmpdir>
+    const server = fakeServer()
+    const sandbox = fakeSandbox()
+    const deps = depsFor(server)
+
+    // #when started
+    const result = await run(sandbox.sandbox, deps)
+
+    // #then the config allows the directory the account's TMPDIR points at, and nothing wider
+    expect(result.success).toBe(true)
+    const spawned = vi.mocked(deps.startServer).mock.calls[0]?.[0]
+    const rules = (spawned?.config as {permissions: readonly {action: string; resource: string; effect: string}[]})
+      .permissions
+    expect(SANDBOX_TMP_DIRECTORY).toBe(LAUNCH.tmpdir)
+    expect(rules.filter(rule => rule.action === 'external_directory' && rule.effect === 'allow')).toContainEqual({
+      action: 'external_directory',
+      resource: `${LAUNCH.tmpdir}/*`,
+      effect: 'allow',
+    })
+    expect(evaluatePermissionV2('external_directory', `${LAUNCH.account.home}/*`, rules as never)).toBe('deny')
+    expect(evaluatePermissionV2('external_directory', '/tmp/*', rules as never)).toBe('deny')
+  })
+
+  it('allows the sandbox TMPDIR, and not its parent or a sibling, in the traced config the child receives too', async () => {
+    // #given an isolated run that traces, so the launch is given the traced config
+    const deps = depsFor(fakeServer())
+    const tracingOn: OpenCodeV2ActionTracingHost = {
+      host: 'action',
+      tracing: 'on',
+      relayPort: 43_210,
+      identity: {repository: 'owner/repo', runId: '42', attempt: '1', job: 'review', trigger: 'workflow_dispatch'},
+    }
+    const started = await startActionOpenCodeV2({
+      binaryPath: '/opt/opencode',
+      workspacePath: '/workspace',
+      authJson: JSON.stringify({anthropic: {type: 'api', key: CANARY}}),
+      opencodeConfig: null,
+      credential: 'provision',
+      systematicVersion: 'latest',
+      model: 'anthropic/claude-sonnet',
+      dbPath,
+      authPath,
+      env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
+      runId: 42,
+      runAttempt: 1,
+      tracing: tracingOn,
+      logger: createMockLogger(),
+      sandbox: fakeSandbox().sandbox,
+      deps,
+    })
+
+    // #when the spawn asks for its tracing decision
+    expect(started.success).toBe(true)
+    const decision = decisionOf(deps)
+
+    // #then it is the traced config, and its rules allow the scratch directory and nothing around it
+    expect(decision.host).toEqual(tracingOn)
+    const rules = (decision.config as {permissions: readonly PermissionRuleV2[]}).permissions
+    expect(evaluatePermissionV2('external_directory', `${LAUNCH.tmpdir}/*`, rules)).toBe('allow')
+    expect(evaluatePermissionV2('external_directory', `${LAUNCH.tmpdir}/nested/*`, rules)).toBe('allow')
+    expect(evaluatePermissionV2('external_directory', `${LAUNCH.account.home}/*`, rules)).toBe('deny')
+    expect(evaluatePermissionV2('external_directory', `${LAUNCH.tmpdir}-sibling/*`, rules)).toBe('deny')
+    expect(evaluatePermissionV2('external_directory', '/tmp/*', rules)).toBe('deny')
+  })
+
+  it('adds no temp-directory exception when isolation is off', async () => {
+    // #given no lifecycle
+    const deps = depsFor(fakeServer())
+
+    // #when started
+    await run(null, deps)
+
+    // #then the rules name no sandbox directory
+    expect(JSON.stringify(vi.mocked(deps.startServer).mock.calls[0]?.[0].config)).not.toContain(SANDBOX_TMP_DIRECTORY)
   })
 
   it('hands over only the provisioned gh config dir and drops an ambient one from the child env', async () => {

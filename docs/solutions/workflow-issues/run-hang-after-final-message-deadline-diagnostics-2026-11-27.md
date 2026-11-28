@@ -89,7 +89,7 @@ The pin PR that brought in 2.4.2 had passed CI. Pin bumps come from the Fro Bot 
 
 ## Why This Matters
 
-A blind deadline log turns every hang into a version hunt. The diff for this one named three suspects, and all three were wrong. With the snapshot, the held-compaction case reads straight off one line:
+A blind deadline log turns every hang into a version hunt. The diff for this one named three suspects. None of them showed a difference between versions in the scenarios tested, and the original cause is still unknown. With the snapshot, the held-compaction case reads straight off one line:
 
 ```
 Execution deadline diagnostics {waitingOn:["execution-not-ended"], rootRunning:true, compaction:{state:"started-not-ended", open:[{role:"root", reason:"auto", startedMs:-15614}]}, recentEvents:[…{type:"session.compaction.started", role:"root", session:"3aVL77", t:-15614}, {type:"server.heartbeat", t:-4986}]}
