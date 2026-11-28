@@ -71,6 +71,11 @@ export interface ActionRunContext {
   readonly rootSpan?: RootSpanContext | undefined
   readonly sessionId?: string | undefined
   readonly invocationId?: string | undefined
+  /**
+   * The GitHub server the run is on (`GITHUB_SERVER_URL`): an `https` origin with no path, query, fragment or credentials. The
+   * run's URL is built from it. A launcher written before the field existed does not carry it, and reads as it always has.
+   */
+  readonly serverUrl?: string | undefined
 }
 
 /**
@@ -233,9 +238,28 @@ function parseTextField(value: unknown): string | undefined {
   return hasControlCharacter(value) ? undefined : value
 }
 
+/**
+ * A GitHub server origin: exactly `https://<host>[:<port>]`, optionally with one trailing slash, no more. The text must be
+ * what the URL parser would write back, so nothing is rewritten or discarded on the way (a path, a query, a fragment,
+ * credentials, an upper-case host, a default port, a non-ASCII host all fail). Bounded like an identity field.
+ */
+function parseServerUrl(value: unknown): string | undefined {
+  if (typeof value !== 'string' || value.length === 0 || value.length > MAX_IDENTITY_FIELD_CHARS) return undefined
+  if (hasControlCharacter(value)) return undefined
+  let url: URL
+  try {
+    url = new URL(value)
+  } catch {
+    return undefined
+  }
+  if (url.protocol !== 'https:' || url.username !== '' || url.password !== '') return undefined
+  if (value !== url.origin && value !== `${url.origin}/`) return undefined
+  return url.origin
+}
+
 /** The launcher's optional run link fields. A field that is present and not acceptable refuses them all: `undefined`. */
 function parseRunContext(document: Record<string, unknown>): ActionRunContext | undefined {
-  const context: {rootSpan?: RootSpanContext; sessionId?: string; invocationId?: string} = {}
+  const context: {rootSpan?: RootSpanContext; sessionId?: string; invocationId?: string; serverUrl?: string} = {}
   if (Object.hasOwn(document, 'rootSpan')) {
     const rootSpan = parseRootSpan(document.rootSpan)
     if (rootSpan === undefined) return undefined
@@ -250,6 +274,11 @@ function parseRunContext(document: Record<string, unknown>): ActionRunContext | 
     const invocationId = parseTextField(document.invocationId)
     if (invocationId === undefined) return undefined
     context.invocationId = invocationId
+  }
+  if (Object.hasOwn(document, 'serverUrl')) {
+    const serverUrl = parseServerUrl(document.serverUrl)
+    if (serverUrl === undefined) return undefined
+    context.serverUrl = serverUrl
   }
   return context
 }
@@ -270,7 +299,11 @@ function resolveLauncher(raw: string): TracingSettings {
   if (document.tracing === 'off') return off('action-off')
   if (document.tracing !== 'on') return off('launcher-malformed')
   if (
-    !hasKeys(document, ['version', 'host', 'tracing', 'relay', 'identity'], ['rootSpan', 'sessionId', 'invocationId'])
+    !hasKeys(
+      document,
+      ['version', 'host', 'tracing', 'relay', 'identity'],
+      ['rootSpan', 'sessionId', 'invocationId', 'serverUrl'],
+    )
   ) {
     return off('launcher-malformed')
   }

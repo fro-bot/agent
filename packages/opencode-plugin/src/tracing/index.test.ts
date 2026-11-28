@@ -1,11 +1,15 @@
 import type {OnSettings} from './index.js'
 import type {ObserverHost} from './record-observations.js'
 
+import {readFileSync} from 'node:fs'
+
+import {buildTracingLauncherValue} from '@fro-bot/runtime'
 import {scrubSafeSessionId} from '@fro-bot/runtime/tracing/session-id'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 import {startOtlpSink, type OtlpSink} from '../integration.fixture.js'
 import {createScrubber} from './content.js'
 import {CLEANUP_BOUND_MS, DRAIN_BOUND_MS, startTracing} from './index.js'
+import {resolveTracingSettings, TRACING_LAUNCHER_ENV} from './settings.js'
 import {cpuMs, minCpuMs} from './timing.testing.js'
 
 /** A fake host: records every registered hook and exposes a pushable event stream. */
@@ -83,6 +87,12 @@ const ACTION = (url: string): OnSettings => ({
 })
 
 const SES = 'ses_root'
+/** The plugin's own version, read here the way the test expects the plugin to: from the manifest, not from a constant. */
+const PACKAGE_VERSION = (
+  JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')) as {version: string}
+).version
+const resourceOf = (attributes: {key: string; value: {stringValue?: string}}[]): Record<string, string | undefined> =>
+  Object.fromEntries(attributes.map(item => [item.key, item.value.stringValue]))
 /** The snapshot's CPU time over the CPU time of `JSON.stringify` on the same request. A real snapshot is a small fraction of it; a deep copy is about 1 or more. */
 const SNAPSHOT_RATIO_LIMIT = 0.2
 const event = (type: string, data: Record<string, unknown>, created: number): unknown => ({type, created, data})
@@ -188,8 +198,12 @@ describe('startTracing', () => {
         }[]
       }
     ).resourceSpans
-    expect(exported.map(resource => resource.resource.attributes)).toEqual([
-      [{key: 'service.name', value: {stringValue: 'fro-bot-opencode-plugin'}}],
+    expect(exported.map(resource => resourceOf(resource.resource.attributes))).toEqual([
+      {
+        'service.name': 'fro-bot-opencode-plugin',
+        'service.version': PACKAGE_VERSION,
+        'langfuse.release': PACKAGE_VERSION,
+      },
     ])
     expect(exported.flatMap(resource => resource.scopeSpans.map(scope => scope.scope.name))).toEqual([
       'fro-bot-opencode-plugin',
@@ -246,6 +260,190 @@ describe('startTracing', () => {
     expect(request?.headers.authorization).toBeUndefined()
     expect(request?.text).toContain('fro_bot.repository')
     expect(request?.text).toContain('fro-bot/agent')
+  })
+
+  describe('the run URL, from the launcher document to the export', () => {
+    it('exports the GitHub Enterprise URL of a re-run on a root span and on a child span', async () => {
+      // #given the launcher the Action's writer produces for an enterprise server and attempt 2, read by the plugin's own parser
+      const launcher = buildTracingLauncherValue({
+        host: 'action',
+        tracing: 'on',
+        relayPort: 43_210,
+        identity: {repository: 'fro-bot/agent', runId: '9001', attempt: '2', job: 'j', trigger: 'push'},
+        serverUrl: 'https://ghe.example.com',
+      })
+      const resolved = resolveTracingSettings({
+        env: {[TRACING_LAUNCHER_ENV]: launcher},
+        directory: '/work/checkout',
+        log: () => {},
+      })
+      expect(resolved).toMatchObject({mode: 'on', host: 'action', serverUrl: 'https://ghe.example.com'})
+      const target = await sink()
+      const settings = {...resolved, endpoint: target.url} as OnSettings
+      const fake = fakeObserverHost()
+      const handle = await startTracing(fake.host, settings, {env: {}, log: () => {}})
+
+      // #when a turn is exported
+      textTurn(fake)
+      await new Promise(resolve => setTimeout(resolve, 50))
+      await handle.stop()
+      fake.end()
+
+      // #then the root span and the model span (its child) carry the exact attempt URL and the run id
+      const spans = (
+        (target.accepted()[0]?.body ?? {resourceSpans: []}) as {
+          resourceSpans: {
+            scopeSpans: {
+              spans: {
+                name: string
+                parentSpanId?: string
+                attributes?: {key: string; value: {stringValue?: string}}[]
+              }[]
+            }[]
+          }[]
+        }
+      ).resourceSpans.flatMap(resource => resource.scopeSpans.flatMap(scope => scope.spans))
+      const attrs = (span: (typeof spans)[number]): Record<string, string | undefined> =>
+        Object.fromEntries((span.attributes ?? []).map(item => [item.key, item.value.stringValue]))
+      const root = spans.find(span => span.parentSpanId === undefined)
+      const child = spans.find(span => span.parentSpanId !== undefined)
+      const url = 'https://ghe.example.com/fro-bot/agent/actions/runs/9001/attempts/2'
+      expect(attrs(root ?? ({} as never))['cicd.pipeline.run.url.full']).toBe(url)
+      expect(attrs(child ?? ({} as never))['cicd.pipeline.run.url.full']).toBe(url)
+      expect(attrs(root ?? ({} as never))['cicd.pipeline.run.id']).toBe('9001')
+      expect(attrs(child ?? ({} as never))['cicd.pipeline.run.id']).toBe('9001')
+    })
+  })
+
+  describe('the versions on the resource and the root span', () => {
+    interface Wire {
+      readonly resourceSpans: {
+        readonly resource: {readonly attributes: {key: string; value: {stringValue?: string}}[]}
+        readonly scopeSpans: {
+          readonly spans: {
+            readonly name: string
+            readonly parentSpanId?: string
+            readonly attributes?: {key: string; value: {stringValue?: string}}[]
+          }[]
+        }[]
+      }[]
+    }
+
+    async function exportTurn(options: Partial<Parameters<typeof startTracing>[2]> = {}) {
+      const target = await sink()
+      const fake = fakeObserverHost()
+      const handle = await startTracing(fake.host, LOCAL(target.url), {env: {}, log: () => {}, ...options})
+      textTurn(fake)
+      await new Promise(resolve => setTimeout(resolve, 50))
+      await handle.stop()
+      fake.end()
+      const body = (target.accepted()[0]?.body ?? {resourceSpans: []}) as Wire
+      const spans = body.resourceSpans.flatMap(resource => resource.scopeSpans.flatMap(scope => scope.spans))
+      return {
+        resource: resourceOf(body.resourceSpans[0]?.resource.attributes ?? []),
+        spans: spans.map(span => ({
+          name: span.name,
+          root: span.parentSpanId === undefined,
+          attributes: resourceOf(span.attributes ?? []),
+        })),
+      }
+    }
+
+    it('carries the plugin version as service.version, and the host’s OpenCode version', async () => {
+      // #when a turn is exported by a host that says its version
+      const {resource} = await exportTurn({opencodeVersion: '2.4.2'})
+
+      // #then the resource names both
+      expect(resource).toEqual({
+        'service.name': 'fro-bot-opencode-plugin',
+        'service.version': PACKAGE_VERSION,
+        'langfuse.release': PACKAGE_VERSION,
+        'fro_bot.opencode.version': '2.4.2',
+      })
+    })
+
+    it('puts the plugin version on the resource as langfuse.release, so every span has it, and sets it on no span itself', async () => {
+      // #when
+      const {resource, spans} = await exportTurn({readVersion: () => '1.4.2'})
+
+      // #then Langfuse reads it from the resource for the root and the child alike
+      expect(resource['langfuse.release']).toBe('1.4.2')
+      expect(resource['service.version']).toBe('1.4.2')
+      expect(spans.map(span => span.name).toSorted()).toEqual(['chat m', 'invoke_agent build'])
+      expect(spans.every(span => span.attributes['langfuse.release'] === undefined)).toBe(true)
+    })
+
+    it('leaves both unset, and still exports, when the version cannot be read', async () => {
+      // #given a reader that finds nothing, and one that throws
+      for (const readVersion of [
+        () => undefined,
+        () => {
+          throw new Error('EACCES: /secret/path')
+        },
+      ]) {
+        // #when a turn is exported
+        const {resource, spans} = await exportTurn({readVersion})
+
+        // #then no version anywhere, and the spans arrived
+        expect(resource).toEqual({'service.name': 'fro-bot-opencode-plugin'})
+        expect(spans).toHaveLength(2)
+        expect(spans.every(span => span.attributes['langfuse.release'] === undefined)).toBe(true)
+      }
+    })
+
+    it.each([
+      ['an empty string', ''],
+      ['a string with spaces', '2.4 2'],
+      ['a string over 64 characters', `2.${'4'.repeat(70)}`],
+      ['a URL', 'https://evil.example/2.4.2'],
+    ])('leaves the OpenCode version unset for %s', async (_label, opencodeVersion) => {
+      // #when
+      const {resource} = await exportTurn({opencodeVersion})
+
+      // #then
+      expect(resource['fro_bot.opencode.version']).toBeUndefined()
+    })
+
+    it('sends neither version when the scrubber would change it, never an altered one', async () => {
+      // #given a scrubber that rewrites every string it sees
+      const rewriting = {
+        ...createScrubber(),
+        scrub: (text: string) => ({ok: true, text: `[REDACTED:${text.length}]`, redactions: 1}) as const,
+      }
+
+      // #when
+      const {resource, spans} = await exportTurn({
+        scrubber: rewriting,
+        opencodeVersion: '2.4.2',
+        readVersion: () => '1.4.2',
+      })
+
+      // #then the resource holds neither version nor release, and no span carries a release
+      expect(resource).toEqual({'service.name': 'fro-bot-opencode-plugin'})
+      expect(spans.every(span => span.attributes['langfuse.release'] === undefined)).toBe(true)
+    })
+
+    it('sends neither version when the scrubber cannot scrub it', async () => {
+      // #given a scrubber that refuses every string
+      const refusing = {...createScrubber(), scrub: () => ({ok: false, reason: 'scrub-failed'}) as const}
+
+      // #when
+      const {resource} = await exportTurn({scrubber: refusing, opencodeVersion: '2.4.2', readVersion: () => '1.4.2'})
+
+      // #then
+      expect(resource).toEqual({'service.name': 'fro-bot-opencode-plugin'})
+    })
+
+    it('sends neither version when it is a registered secret literal', async () => {
+      // #given an environment secret that happens to be the version text, which the safety net knows
+      const scrubber = createScrubber({env: {DEPLOY_TOKEN: '1.4.2-secret-literal'}})
+
+      // #when
+      const {resource} = await exportTurn({scrubber, readVersion: () => '1.4.2-secret-literal'})
+
+      // #then
+      expect(resource['service.version']).toBeUndefined()
+    })
   })
 
   describe('the run link from the launcher', () => {

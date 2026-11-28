@@ -53,6 +53,7 @@ const on = (
     rootSpan: {traceId: string; spanId: string}
     sessionId: string
     invocationId: string
+    serverUrl: string
   }> = {},
 ): OpenCodeV2TracingHost => ({
   host: 'action',
@@ -122,6 +123,27 @@ describe('the launcher document, as the runtime writes it and the plugin reads i
     })
     expect(full.lines).toEqual([])
     expect(Object.keys(bare.settings)).toEqual(['mode', 'host', 'endpoint', 'identity'])
+  })
+
+  it('reads the server the runtime writes as the same origin, and refuses on both sides a server the plugin would refuse', () => {
+    // #given an on host with a server, and hosts whose server the plugin would refuse
+    const given = resolve(on({serverUrl: 'https://ghe.example.com:8443'}))
+
+    // #then the plugin reads the origin as written
+    expect(given.settings).toMatchObject({mode: 'on', serverUrl: 'https://ghe.example.com:8443'})
+    expect(given.lines).toEqual([])
+
+    // #and a server it would refuse is never written: the runtime writes the Action's off, so the plugin never sees it
+    for (const serverUrl of [
+      'http://github.com',
+      'https://github.com/path',
+      'https://user@github.com',
+      'https://github.com?x=1',
+      'https://GitHub.com',
+      '',
+    ]) {
+      expect(resolve(on({serverUrl})).settings).toEqual({mode: 'off', reason: 'action-off'})
+    }
   })
 
   it('agrees on the longest session id and invocation id, with every other field at its limit, inside the document ceiling', () => {

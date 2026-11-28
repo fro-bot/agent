@@ -218,6 +218,38 @@ export function extractPromptMessage(prompt: unknown): Json | undefined {
   return text === undefined ? undefined : {role: 'user', parts: [{type: 'text', content: text}]}
 }
 
+const REPOSITORY_SLUG = /^[\w.-]+\/[\w.-]+$/
+const RUN_NUMBER = /^\d{1,20}$/
+const ONLY_DOTS = /^\.+$/
+
+/**
+ * The run's page on its GitHub server, in the form GitHub itself gives: `<server>/<owner>/<repo>/actions/runs/<run id>` for the
+ * first attempt (the API's `html_url` for attempt 1 has no `/attempts/` part, though GitHub serves it) and
+ * `<server>/<owner>/<repo>/actions/runs/<run id>/attempts/<attempt>` for a re-run. Built only from parts that cannot change its
+ * shape (an `owner/repo` slug that is not a dot path, and run and attempt numbers that are digits); anything else gives no URL,
+ * never a guessed one.
+ */
+export function pipelineRunUrl(serverUrl: string, identity: ActionIdentity): string | undefined {
+  const {repository, runId, attempt} = identity
+  if (!REPOSITORY_SLUG.test(repository) || repository.split('/').some(part => ONLY_DOTS.test(part))) return undefined
+  if (!RUN_NUMBER.test(runId) || !RUN_NUMBER.test(attempt)) return undefined
+  const run = `${serverUrl}/${repository}/actions/runs/${runId}`
+  return attempt === '1' ? run : `${run}/attempts/${attempt}`
+}
+
+/**
+ * OpenTelemetry's CI/CD attributes for the run (`cicd.pipeline.run.id` and `cicd.pipeline.run.url.full`, in the core
+ * conventions at release-candidate stability; the GenAI revision this plugin pins does not define them). The id is the run id
+ * the other identity attributes carry; the URL needs the launcher's server and is left out without it.
+ */
+function ciPipelineRunAttributes(identity: ActionIdentity, serverUrl: string | undefined): Record<string, string> {
+  const url = serverUrl === undefined ? undefined : pipelineRunUrl(serverUrl, identity)
+  return {
+    'cicd.pipeline.run.id': identity.runId,
+    ...(url === undefined ? {} : {'cicd.pipeline.run.url.full': url}),
+  }
+}
+
 /**
  * Identity the Action supplies, as the attributes every span of its runs carries: the `fro_bot.*` names, and a mirror of each
  * under `langfuse.trace.metadata.<key>`. Langfuse's OTLP ingestion (`extractMetadata` in langfuse/langfuse
@@ -232,6 +264,7 @@ export function extractPromptMessage(prompt: unknown): Json | undefined {
 export const actionIdentityAttributes = (
   identity: ActionIdentity,
   invocationId?: string | undefined,
+  serverUrl?: string | undefined,
 ): Record<string, string> => ({
   'fro_bot.repository': identity.repository,
   'fro_bot.run.id': identity.runId,
@@ -243,6 +276,7 @@ export const actionIdentityAttributes = (
   'langfuse.trace.metadata.run_attempt': identity.attempt,
   'langfuse.trace.metadata.job': identity.job,
   'langfuse.trace.metadata.trigger': identity.trigger,
+  ...ciPipelineRunAttributes(identity, serverUrl),
   ...(invocationId === undefined
     ? {}
     : {'fro_bot.invocation.id': invocationId, 'langfuse.trace.metadata.invocation_id': invocationId}),

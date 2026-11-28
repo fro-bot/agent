@@ -204,6 +204,28 @@ describe('what the exporter sends', () => {
     expect(body.resourceSpans[0]?.scopeSpans[0]?.scope.name).toBe('fro-bot-action')
   })
 
+  it('adds the resource attributes it was given after the service name, which they can never replace', async () => {
+    // #given an exporter given a version and an attempt to override the service name
+    const target = await sink()
+    const exporter = exporterFor({
+      url: target.url,
+      resourceAttributes: {'service.version': '1.2.3', 'service.name': 'someone-else'},
+    })
+    exporter.export(span())
+
+    // #when it is received
+    await exporter.close(3_000)
+
+    // #then the resource holds the service name it was built with and the extra attribute
+    const body = (target.accepted()[0] as SinkRequest).body as {
+      resourceSpans: {resource: {attributes: {key: string; value: {stringValue?: string}}[]}}[]
+    }
+    const resource = Object.fromEntries(
+      (body.resourceSpans[0]?.resource.attributes ?? []).map(item => [item.key, item.value.stringValue]),
+    )
+    expect(resource).toEqual({'service.name': 'fro-bot-opencode-plugin', 'service.version': '1.2.3'})
+  })
+
   it('carries a hand-built resource with no process arguments, host name or environment', async () => {
     // #given an exported span
     const target = await sink()

@@ -348,6 +348,32 @@ describe('the lazy tracing entry', () => {
     expect(stop).toHaveBeenCalledOnce()
   })
 
+  it('hands tracing the host’s OpenCode version when the host has one, and nothing when it has none', async () => {
+    // #given a tracing module, and hosts with and without an application version
+    const startTracing = vi.fn(
+      async (_host: Pick<HostSurface, 'session' | 'event' | 'tool'>, _settings: unknown, _deps: unknown) => ({
+        stop: async () => {},
+      }),
+    )
+    vi.doMock('./tracing/index.js', () => ({startTracing}))
+    const {setupFroBotPlugin: setup} = await freshSetup()
+    const env = {[TRACING_LAUNCHER_ENV]: ON}
+    const log = () => {}
+
+    // #when the plugin sets up under each
+    await setup({...fakeHost().host, app: {version: '2.4.2'}}, {env, log})
+    await setup({...fakeHost().host, app: {}}, {env, log})
+    await setup({...fakeHost().host, app: undefined}, {env, log})
+
+    // #then only the host that named a version handed one over
+    const deps = startTracing.mock.calls.map(call => call[2])
+    expect(deps).toEqual([
+      {env, log, opencodeVersion: '2.4.2'},
+      {env, log},
+      {env, log},
+    ])
+  })
+
   it('routes the observer hooks to the host, by name', async () => {
     // #given a tracing module that registers both tool hooks through the handed host
     const names: string[] = []

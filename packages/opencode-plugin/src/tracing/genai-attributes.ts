@@ -43,6 +43,7 @@ import {
   type Scrubber,
 } from './content.js'
 import {omittedReason} from './snapshot.js'
+import {toolDefinitionStats} from './tool-definitions.js'
 
 export const GENAI_SEMCONV_REVISION = 'open-telemetry/semantic-conventions-genai@76e0c19'
 
@@ -75,9 +76,24 @@ function identityAttributes(record: SpanRecord, options: AttributeOptions): Attr
   }
   set(attributes, 'gen_ai.agent.name', record.agent)
   if (options.identity !== undefined) {
-    Object.assign(attributes, actionIdentityAttributes(options.identity, options.invocationId))
+    Object.assign(attributes, actionIdentityAttributes(options.identity, options.invocationId, options.serverUrl))
   }
   return attributes
+}
+
+/**
+ * Langfuse's observation type, said outright. Its ingestion maps `gen_ai.operation.name` to a type only after
+ * `langfuse.observation.type`, and a type named here is not at the mercy of that mapping (which has changed between releases).
+ */
+const OBSERVATION_TYPE = {chat: 'generation', invoke_agent: 'agent', execute_tool: 'tool'} as const
+
+/**
+ * Langfuse's `cost_details`, as the JSON object it reads. Set only for a cost that is a positive, finite number: a supplied cost
+ * replaces the cost Langfuse works out from the usage and its price list, and OpenCode reports 0 for a model it has no price for,
+ * so a zero is "unknown" as often as "free" and would zero the cost Langfuse could have worked out.
+ */
+function costDetails(cost: number | undefined): string | undefined {
+  return cost !== undefined && Number.isFinite(cost) && cost > 0 ? JSON.stringify({total: cost}) : undefined
 }
 
 function outcomeAttributes(record: SpanRecord): Attributes {
@@ -139,6 +155,7 @@ function chatSpan(record: ChatRecord, options: AttributeOptions): PendingSpan {
   const preDropped: Record<string, number> = {}
   const attributes: Attributes = {
     'gen_ai.operation.name': 'chat',
+    'langfuse.observation.type': OBSERVATION_TYPE.chat,
     ...identityAttributes(record, options),
     ...outcomeAttributes(record),
     'fro_bot.request.kind': record.requestKind,
@@ -153,6 +170,7 @@ function chatSpan(record: ChatRecord, options: AttributeOptions): PendingSpan {
   set(attributes, 'gen_ai.response.finish_reasons', finishReasons(record))
   Object.assign(attributes, usageAttributes(record.usage))
   if (record.cost !== undefined) attributes['fro_bot.usage.cost_usd'] = record.cost
+  set(attributes, 'langfuse.observation.cost_details', costDetails(record.cost))
   if (record.followOnOf.length > 0) attributes['fro_bot.turn.follow_on_of'] = record.followOnOf
 
   // Content, in the order the span's budget is spent: the small values first, the long history last. The request is the
@@ -166,7 +184,14 @@ function chatSpan(record: ChatRecord, options: AttributeOptions): PendingSpan {
   const system = extractSystemInstructions(noting(request.system, 'gen_ai.system_instructions', omitted))
   if (system !== undefined)
     attributes['gen_ai.system_instructions'] = contentAttribute(system, CONTENT_MAX_CHARS.systemInstructions)
-  const definitions = extractToolDefinitions(noting(request.tools, 'gen_ai.tool.definitions', omitted))
+  const tools = noting(request.tools, 'gen_ai.tool.definitions', omitted)
+  const definitions = extractToolDefinitions(tools)
+  // How much of the request the tools are, when their list is known: the stats are worked out once per snapshot.
+  const sizes = toolDefinitionStats(tools)
+  if (sizes !== undefined) {
+    attributes['fro_bot.tool_definitions.count'] = sizes.count
+    attributes['fro_bot.tool_definitions.chars'] = sizes.chars
+  }
   if (definitions !== undefined)
     attributes['gen_ai.tool.definitions'] = contentAttribute(definitions, CONTENT_MAX_CHARS.toolDefinitions)
   const output = extractOutputMessages({texts: record.texts, reasoning: record.reasoning, toolCalls: record.toolCalls})
@@ -200,6 +225,7 @@ function chatSpan(record: ChatRecord, options: AttributeOptions): PendingSpan {
 function toolSpan(record: ToolRecord, options: AttributeOptions): PendingSpan {
   const attributes: Attributes = {
     'gen_ai.operation.name': 'execute_tool',
+    'langfuse.observation.type': OBSERVATION_TYPE.execute_tool,
     ...identityAttributes(record, options),
     ...outcomeAttributes(record),
     'gen_ai.tool.name': record.tool,
@@ -208,6 +234,8 @@ function toolSpan(record: ToolRecord, options: AttributeOptions): PendingSpan {
     'fro_bot.tool.outcome': record.outcome,
   }
   set(attributes, 'fro_bot.tool.error_type', record.errorType)
+  // Whether the called name was in the asking request's tool list: absent when that list is not known, never false by default.
+  set(attributes, 'fro_bot.tool.offered', record.offered)
   set(attributes, 'fro_bot.subagent.session_id', record.childSessionId)
   if (record.providerExecuted) attributes['fro_bot.tool.provider_executed'] = true
 
@@ -251,6 +279,7 @@ function invokeSpan(record: InvokeRecord, options: AttributeOptions): PendingSpa
   const omitted: string[] = []
   const attributes: Attributes = {
     'gen_ai.operation.name': 'invoke_agent',
+    'langfuse.observation.type': OBSERVATION_TYPE.invoke_agent,
     ...identityAttributes(record, options),
     ...outcomeAttributes(record),
     'fro_bot.agent.role': record.role,
@@ -276,7 +305,8 @@ function invokeSpan(record: InvokeRecord, options: AttributeOptions): PendingSpa
     traceId: record.traceId,
     spanId: record.spanId,
     parentSpanId: record.parentSpanId,
-    name: `invoke_agent ${record.agent ?? 'unknown'}`,
+    // The convention names the span `invoke_agent {agent}` when the name is readily available and plain `invoke_agent` when not.
+    name: record.agent === undefined || record.agent === '' ? 'invoke_agent' : `invoke_agent ${record.agent}`,
     kind: 'internal',
     startMs: record.start,
     endMs: record.end,

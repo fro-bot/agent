@@ -183,6 +183,39 @@ describe('a request snapshot', () => {
     expect(omittedReason(snapshot.tools)).toBe('snapshot-bound')
   })
 
+  it('says so when it dropped a tool from the list, so the list is never mistaken for the whole of what was offered', () => {
+    // #given a list with a complete tool, a null, a string, an array, and a tool whose reading throws
+    const hostile = {
+      description: 'd',
+      get input(): unknown {
+        throw new Error('boom')
+      },
+    }
+    const snapshot = snapshotRequest({
+      tools: {read: {description: 'Read'}, gone: null, text: 'not a tool', list: [], hostile},
+    })
+
+    // #then only what is an object was kept, and the snapshot says the list is incomplete
+    expect(Object.keys((snapshot.tools ?? {}) as object).toSorted()).toEqual(['hostile', 'read'])
+    expect(snapshot.toolsIncomplete).toBe(true)
+  })
+
+  it('says so when it dropped a tool named __proto__', () => {
+    // #given a list parsed from JSON, whose own key `__proto__` the snapshot refuses to copy
+    const tools: unknown = JSON.parse('{"read": {"description": "Read"}, "__proto__": {"description": "x"}}')
+
+    // #then
+    const snapshot = snapshotRequest({tools})
+    expect(Object.keys((snapshot.tools ?? {}) as object)).toEqual(['read'])
+    expect(snapshot.toolsIncomplete).toBe(true)
+  })
+
+  it('does not say the list is incomplete when every tool was kept, or when there is no list', () => {
+    expect(snapshotRequest({tools: {read: {description: 'Read'}, grep: {}}}).toolsIncomplete).toBeUndefined()
+    expect(snapshotRequest({tools: {}}).toolsIncomplete).toBeUndefined()
+    expect(snapshotRequest({messages: []}).toolsIncomplete).toBeUndefined()
+  })
+
   it('reads past a getter that throws and a field that is not content', () => {
     // #given a message whose role getter throws, and one with a function-valued text
     const hostile = {

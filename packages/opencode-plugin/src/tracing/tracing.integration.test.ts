@@ -8,7 +8,7 @@
 import type {FakeStep, OtlpSink, OtlpSinkOptions, RunningServer, SandboxPaths} from '../integration.fixture.js'
 import type {DecodedSpan} from './tracing.integration.fixture.js'
 
-import {existsSync, mkdirSync, writeFileSync} from 'node:fs'
+import {existsSync, mkdirSync, readFileSync, writeFileSync} from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
@@ -44,6 +44,9 @@ const binary = process.env.FRO_BOT_OPENCODE_V2_BIN
 const runnable =
   binary != null && binary.length > 0 && existsSync(binary) && existsSync(path.join(packageDir, 'dist/index.mjs'))
 const OUTLINE_DIR = process.env.FRO_BOT_TRACE_OUTLINE_DIR
+/** The version the plugin must report: what its own package.json says, read the way the plugin reads it. */
+const PACKAGE_VERSION = (JSON.parse(readFileSync(path.join(packageDir, 'package.json'), 'utf8')) as {version: string})
+  .version
 
 const NOT_TOOL = '"role":"tool"'
 const IDENTITY = {repository: 'fro-bot/agent', runId: '77', attempt: '1', job: 'it', trigger: 'workflow_dispatch'}
@@ -235,6 +238,24 @@ describe.skipIf(!runnable)('tracing in a real opencode V2', () => {
       expect(first.attrs['gen_ai.provider.name']).toBe('fake')
       expect(first.attrs['gen_ai.request.model']).toBe('fixture-model')
       expect(first.attrs['gen_ai.agent.name']).toBe('build')
+
+      // #and the conventions of #2403 hold on the real wire: the tool list's size, the versions, the observation types
+      expect(first.attrs['fro_bot.tool_definitions.count']).toBeGreaterThan(0)
+      expect(first.attrs['fro_bot.tool_definitions.chars']).toBeGreaterThan(0)
+      expect(first.resource['service.name']).toBe('fro-bot-opencode-plugin')
+      expect(first.resource['service.version']).toBe(PACKAGE_VERSION)
+      expect(first.resource['fro_bot.opencode.version']).toMatch(/^\d+\.\d+\.\d+/)
+      expect(first.resource['langfuse.release']).toBe(PACKAGE_VERSION)
+      expect(spans.filter(span => span.attrs['langfuse.release'] !== undefined)).toEqual([])
+      expect(first.attrs['langfuse.observation.type']).toBe('generation')
+      expect(root?.attrs['langfuse.observation.type']).toBe('agent')
+      expect(readSpan?.attrs['langfuse.observation.type']).toBe('tool')
+      expect(readSpan?.attrs['fro_bot.tool.offered']).toBe(true)
+      expect(readSpan?.attrs['gen_ai.agent.name']).toBe('build')
+      expect(root?.attrs['cicd.pipeline.run.id']).toBe(IDENTITY.runId)
+      expect(root?.attrs['cicd.pipeline.run.url.full']).toBeUndefined()
+      const title = chats.find(span => span.attrs['fro_bot.request.kind'] === 'title')
+      expect(title?.attrs['gen_ai.agent.name']).toBeUndefined()
       for (const name of [
         'gen_ai.system_instructions',
         'gen_ai.tool.definitions',
@@ -631,6 +652,31 @@ describe.skipIf(!runnable)('tracing in a real opencode V2', () => {
       expect(calls[0]?.attrs['fro_bot.tool.outcome']).toBe('rejected')
       expect(calls[0]?.attrs['fro_bot.tool.error_type']).toBe('plugin.reuse-guard')
       expect(h.spans().filter(span => span.name === 'invoke_agent general')).toHaveLength(0)
+      // #and the tool was in the request's list: refused by the guard, not for being unavailable
+      expect(calls[0]?.attrs['fro_bot.tool.offered']).toBe(true)
+    })
+  }, 90_000)
+
+  it('exports a call to a tool the request never offered with offered=false and the session’s agent', async () => {
+    // #given a model that calls a tool that does not exist, which OpenCode refuses before any hook can name the agent
+    const steps: FakeStep[] = [
+      {all: ['N-ONE'], none: [NOT_TOOL], tools: [{name: 'ghost_tool', args: {path: 'x'}}]},
+      {all: ['N-ONE', NOT_TOOL], text: 'refusal handled'},
+    ]
+    await run({steps}, async h => {
+      const session = await h.session()
+
+      // #when the turn runs and the server stops
+      await prompt(h.api, session, 'N-ONE call something that is not there')
+      await waitUntil('the root span', () => h.spans().some(isRoot), 30_000)
+      await h.stop()
+
+      // #then the span says the tool was not offered, is an error, and still names the agent
+      const calls = h.spans().filter(span => span.name === 'execute_tool ghost_tool')
+      expect(calls).toHaveLength(1)
+      expect(calls[0]?.attrs['fro_bot.tool.offered']).toBe(false)
+      expect(calls[0]?.attrs['fro_bot.tool.outcome']).toBe('error')
+      expect(calls[0]?.attrs['gen_ai.agent.name']).toBe('build')
     })
   }, 90_000)
 

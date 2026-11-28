@@ -117,6 +117,11 @@ export interface SpanExporterOptions {
   readonly url: string
   /** The resource's `service.name`, and the tracer's name: which sender a span came from. Fixed text, never content. */
   readonly serviceName: string
+  /**
+   * More resource attributes, fixed text the caller has already scrubbed (a version, never content). `service.name` is not
+   * replaceable: the resource always names the sender it was built for.
+   */
+  readonly resourceAttributes?: Readonly<Record<string, string>> | undefined
   readonly headers: Readonly<Record<string, string>>
   /** Action mode: send the running counts on every batch. Local mode: never. */
   readonly reportCounts: boolean
@@ -268,7 +273,7 @@ export function createSpanExporter(options: SpanExporterOptions): SpanExporter {
   }
   const provider = new BasicTracerProvider({
     // Hand-built: no detectors, so no process arguments, host name or environment-derived attributes.
-    resource: resourceFromAttributes({'service.name': options.serviceName}),
+    resource: resourceFromAttributes({...options.resourceAttributes, 'service.name': options.serviceName}),
     sampler: new AlwaysOnSampler(),
     idGenerator,
     spanLimits: SDK_SPAN_LIMITS,
