@@ -35,11 +35,20 @@
  *      header and the sandbox user's search of process environments and command lines, the runner's temp and step files, the
  *      checkout and the agent's home finds none; not isolated, the same search finds it (the control); no exported span holds
  *      it; no relay process is left and the sandbox restores; with tracing off no relay runs and nothing is sent.
+ *  14b. the MCP credential broker, once the pinned plugin traces (the trace sink is one of the places searched): one isolated run
+ *      through `startActionOpenCodeV2` with a remote MCP server whose `Authorization` header carries a unique canary. The real
+ *      key-proxy child holds the header; the sandbox user's search of every process environment and command line, the runner's
+ *      temp and step files, the checkout, the agent's home and OpenCode's storage finds no copy; the stand-in HTTPS upstream got it
+ *      on every request (the server's own and the agent shell's); neither final config, the spawn environment, the Action's logs
+ *      nor any exported span holds it. Beside it, each bypass shape the planner refuses (an unresolved `type`, an `enabled`-only
+ *      stub and a local entry, each with `headers`, and a top-level key built from a reference) fails at the config stage with
+ *      no child, no server and no account.
  *
  * Every suite runs through the read-only view, as the Action does: the launch has no other form.
  *
  *   FRO_BOT_SANDBOX_INTEGRATION=1 FRO_BOT_OPENCODE_V2_BIN=/path/to/opencode bun run test src/harness/phases/v2-server.sandbox
  */
+import type {OpenCodeV2ServerHandle} from '@fro-bot/runtime'
 import type {SandboxToolPaths} from '../../services/setup/sandbox-preflight.js'
 import type {Logger} from '../../shared/logger.js'
 import type {SandboxLifecycle, SandboxLifecycleDeps, SandboxReleaseResult, SignalHost} from './sandbox-lifecycle.js'
@@ -64,6 +73,7 @@ import {
   FRO_BOT_PLUGIN_PACKAGE,
   FRO_BOT_PLUGIN_VERSION,
   getSessionDbBasenames,
+  startOpenCodeV2Server,
 } from '@fro-bot/runtime'
 import {afterAll, beforeAll, describe, expect, it} from 'vitest'
 import {
@@ -106,13 +116,15 @@ import {getGitHubRunAttempt, getInvocationIdentity} from '../../shared/env.js'
 import {createLifecycleTracer, createRegistryScrubber} from '../../shared/lifecycle-tracer.js'
 import {createLogger} from '../../shared/logger.js'
 import {createSecretRegistry} from '../../shared/secret-registry.js'
-import {unwrapOk} from '../../shared/test-helpers.js'
+import {createMockLogger, serializeLoggerCalls, unwrapErr, unwrapOk} from '../../shared/test-helpers.js'
 import {parseTraceInputs} from '../config/trace-inputs.js'
 import {startKeyProxyProcess, type KeyProxyProcess} from './key-proxy-process.js'
 import {snapshotLogDirectory} from './log-snapshot.js'
+import {createMcpUpstream} from './mcp-upstream.fixture.js'
 import {findServicesOfAccount} from './owned-service-processes.js'
 import {createSandboxLifecycle} from './sandbox-lifecycle.js'
 import {startTraceRelayProcess, type TraceRelayProcess, type TraceRelayStopResult} from './trace-relay-process.js'
+import {startActionOpenCodeV2} from './v2-server.js'
 import {
   canaryForms,
   canaryShapedValue,
@@ -3758,6 +3770,431 @@ describe.skipIf(!tracingGated)('run tracing through the relay: isolated, not iso
     expect(off?.requests).toEqual([])
     expect(off?.relayStop).toBeNull()
     expect(off?.relayLeft).toBe('')
+  })
+})
+
+// --- 14b. The MCP credential broker ------------------------------------------------------------------------------------
+
+/** Unique per process, as the tracing canary is: any copy of it anywhere is this run's. The sandbox is only ever given its hash. */
+const MCP_CANARY = canaryShapedValue('sk-mcp-canary-', randomBytes(18).toString('hex'))
+const MCP_AUTHORIZATION = `Bearer ${MCP_CANARY}`
+/** The model's own key, so the isolated run has a provider the key proxy serves (a run with an unkeyed provider is refused). */
+const MCP_MODEL_KEY = canaryShapedValue('sk-mcp-model-', randomBytes(18).toString('hex'))
+
+// One isolated run with a brokered remote MCP server, as `startActionOpenCodeV2` plans it: the real key-proxy child holds the
+// header, the config the sandbox reads names the child's loopback route, and the sandbox user's search finds the canary nowhere.
+// The same suite then feeds the planner each bypass shape it must refuse; a regression there shows up as a refusal here,
+// never as a leak. Gated with the tracing suite: the trace sink is one of the places searched.
+describe.skipIf(!tracingGated)('isolate-agent MCP credential broker: a brokered header is never in the sandbox', () => {
+  const logger = createLogger({phase: 'sandbox-integration-mcp-broker'})
+  const actionLogger = createMockLogger()
+  const scratch = path.join(runnerTemp, `sandbox-it-mcp-broker-${process.pid}`)
+  const workspace = path.join(scratch, 'ws')
+  const responseDir = path.join(scratch, 'response')
+  const xdgRoot = path.join(scratch, 'xdg')
+  const stepFile = path.join(scratch, 'step', 'file_commands.txt')
+  const relayBundle = path.join(realDist, 'trace-relay.js')
+  const cleanups: (() => Promise<void> | void)[] = []
+  const scanSpec: ScanSpec = {
+    canary: MCP_CANARY,
+    liveControl: canaryShapedValue('sk-mcp-live-', randomBytes(18).toString('hex')),
+    xdgTextControl: canaryShapedValue('sk-mcp-xdgt-', randomBytes(18).toString('hex')),
+    xdgBinaryControl: canaryShapedValue('sk-mcp-xdgb-', randomBytes(18).toString('hex')),
+    longControl: canaryShapedValue('sk-mcp-long-', randomBytes(18).toString('hex')),
+    boundaryControl: canaryShapedValue('sk-mcp-edge-', randomBytes(18).toString('hex')),
+    chunkBytes: 1024 * 1024,
+    maxFileBytes: 128 * 1024 * 1024,
+    runnerTemp,
+    checkout: [workspace, responseDir],
+    // Where a runner's step files hold the action's inputs, `opencode-config` among them: opened by exact path as well.
+    knownPaths: [stepFile],
+  }
+  const fake = createMcpUpstream({authorization: MCP_AUTHORIZATION})
+  /** The Action's own words for the secrets it was asked to mask. */
+  const masked: string[] = []
+  /** What each spawn handed the server: the untraced config, and the traced one the spawn-time decision may pick instead. */
+  const finalConfigs: string[] = []
+  let spawnedEnv = ''
+  let tools: SandboxToolPaths | undefined
+  let upstream: TlsUpstream | undefined
+  let collector: TlsUpstream | undefined
+  let rows = new Map<string, Row[]>()
+  let released: SandboxReleaseResult | undefined
+  let routeUrl = ''
+
+  /** An `opencode-config` with the brokered server and the model's provider; `extra` adds a top-level key, `server` the MCP entries. */
+  function operatorConfig(
+    origin: string,
+    server: Record<string, unknown> = {},
+    extra: Record<string, unknown> = {},
+  ): string {
+    return JSON.stringify({
+      share: 'disabled',
+      mcp: {
+        broker: {type: 'remote', url: `${origin}/mcp`, headers: {Authorization: MCP_AUTHORIZATION}},
+        ...server,
+      },
+      provider: {
+        fake: {
+          npm: '@ai-sdk/openai-compatible',
+          name: 'Fake',
+          options: {baseURL: `${origin}/v1`},
+          models: {'fixture-model': {name: 'Fixture', tool_call: true, limit: {context: 100_000, output: 8000}}},
+        },
+      },
+      ...extra,
+    })
+  }
+
+  const steps = (): Probe[] => [
+    {
+      // The agent's own shell uses the route, as the model may: the child adds the header, the shell never held it.
+      id: 'mcp_route_works',
+      category: 'works',
+      cmd:
+        `c=$(curl -sS -o /dev/null --max-time 10 -w '%{http_code}' -X POST -H 'content-type: application/json' ` +
+        `-H 'accept: application/json, text/event-stream' ` +
+        `--data ${q('{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"1"}}}')} ` +
+        `${q(routeUrl)} 2>&1); [ "$c" = 200 ] && R mcp_route_works WORKS "$c" || R mcp_route_works FAILED "[$c]"`,
+    },
+    // By fingerprint: the sandbox was never given the canary (see `v2-server.sandbox.canary.ts`).
+    {id: 'canary_scan', category: 'blocked', cmd: scanCommand(scanSpec)},
+  ]
+
+  async function startCollector(): Promise<TlsUpstream> {
+    const started = await startTlsUpstream((_request, res) => {
+      res.writeHead(200, {'content-type': 'application/json'})
+      res.end('{}')
+    })
+    cleanups.push(async () => started.close())
+    return started
+  }
+
+  async function startRelay(sink: TlsUpstream): Promise<TraceRelayProcess> {
+    const parsed = parseTraceInputs(
+      {
+        endpoint: `${sink.origin}/v1/traces`,
+        headers: `Authorization: Bearer ${canaryShapedValue('sk-mcp-trace-', randomBytes(18).toString('hex'))}`,
+      },
+      {warning: () => undefined, notice: () => undefined, info: () => undefined, mask: () => undefined},
+    )
+    const request = relayRequestFromInputs(parsed)
+    if (request === null) throw new Error('the trace inputs were not accepted')
+    const caFile = path.join(scratch, 'collector-ca.pem')
+    fs.writeFileSync(caFile, sink.ca)
+    const relay = unwrapOk(
+      await startTraceRelayProcess({
+        config: request,
+        logger,
+        launcher: {command: '/usr/bin/env', args: [`NODE_EXTRA_CA_CERTS=${caFile}`, builderNode, relayBundle]},
+        timeouts: {readyMs: 15_000, exitGraceMs: 4_000, killConfirmMs: 2_000},
+      }),
+    )
+    cleanups.push(async () => {
+      await relay.stop()
+    })
+    return relay
+  }
+
+  /** A session, one prompt, and a wait until the scripted model has run its last probe. */
+  async function driveTurn(handle: OpenCodeV2ServerHandle, provider: ScriptedProvider): Promise<void> {
+    const created = (await (
+      await handle.fetch('/api/session', {
+        method: 'POST',
+        headers: {'content-type': 'application/json'},
+        // The Action creates its session on the `model` input, whatever the config says, so this does too.
+        body: JSON.stringify({location: {directory: workspace}, model: {id: 'fixture-model', providerID: 'fake'}}),
+      })
+    ).json()) as {data: {id: string}}
+    handle.registerOwnedSession(created.data.id)
+    await handle.fetch(`/api/session/${created.data.id}/prompt`, {
+      method: 'POST',
+      headers: {'content-type': 'application/json'},
+      body: JSON.stringify({text: 'run the probes'}),
+    })
+    const deadline = Date.now() + 240_000
+    while (!provider.state.done && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 500))
+  }
+
+  function newLifecycle(env: NodeJS.ProcessEnv): SandboxLifecycle {
+    if (tools === undefined) throw new Error('the preflight did not run')
+    const lifecycle = createSandboxLifecycle({
+      tools,
+      env,
+      runnerPath: env.PATH,
+      runnerHome,
+      workspacePath: workspace,
+      responseDir,
+      logger,
+      viewLauncher,
+    })
+    cleanups.push(async () => {
+      await lifecycle.release()
+    })
+    return lifecycle
+  }
+
+  beforeAll(async () => {
+    tools = await preflightTools(logger)
+    fs.mkdirSync(responseDir, {recursive: true})
+    cleanups.push(() => fs.rmSync(scratch, {recursive: true, force: true}))
+    initWorkspace(workspace)
+    // The runner's own copy of the input, as a step file holds it (private to the runner), and a runner process whose
+    // environment holds it: places the sandbox user's search must find closed to it.
+    fs.mkdirSync(path.dirname(stepFile), {recursive: true, mode: 0o700})
+    fs.writeFileSync(stepFile, `INPUT_OPENCODE-CONFIG=${operatorConfig('https://runner-input.invalid')}\n`, {
+      mode: 0o600,
+    })
+    const standIn = spawn(builderNode, ['-e', 'setInterval(() => {}, 1000)'], {
+      env: {PATH: process.env.PATH ?? '', 'INPUT_OPENCODE-CONFIG': operatorConfig('https://runner-input.invalid')},
+      stdio: 'ignore',
+    })
+    cleanups.push(async () => {
+      standIn.kill('SIGKILL')
+      await new Promise<void>(resolve =>
+        standIn.exitCode === null ? standIn.once('exit', () => resolve()) : resolve(),
+      )
+    })
+    // The runner's detector controls, where the sandbox reaches OpenCode's storage through links.
+    plantScanControls(xdgRoot, scanSpec)
+
+    const provider = await startScriptedProvider(steps)
+    cleanups.push(async () => provider.close())
+    const toModel = forwardToProvider(provider.port)
+    // One HTTPS upstream: `/mcp` is the MCP server, anything else is the model, reached through the child with its key.
+    upstream = await startTlsUpstream((request, res, raw) =>
+      request.url.startsWith('/mcp') ? fake.handler(request, res, raw) : toModel(request, res),
+    )
+    cleanups.push(async () => upstream?.close())
+    collector = await startCollector()
+    const relay = await startRelay(collector)
+    const identity = unwrapOk(
+      buildTracingRunIdentity({
+        repository: 'owner/repo',
+        runId: '4243',
+        attempt: 1,
+        job: 'sandbox-it-mcp-broker',
+        trigger: 'workflow_dispatch',
+      }),
+    )
+
+    const env = hostedEnv(workspace, xdgRoot)
+    const lifecycle = newLifecycle(env)
+    const started = await startActionOpenCodeV2({
+      binaryPath: BINARY ?? '',
+      workspacePath: workspace,
+      authJson: JSON.stringify({fake: {type: 'api', key: MCP_MODEL_KEY}}),
+      opencodeConfig: operatorConfig(upstream.origin),
+      credential: 'provision',
+      systematicVersion: 'latest',
+      model: 'fake/fixture-model',
+      dbPath: path.join(xdgRoot, 'data', 'opencode', 'opencode.db'),
+      authPath: path.join(xdgRoot, 'data', 'opencode', 'auth.json'),
+      env,
+      runId: 4243,
+      runAttempt: 1,
+      tracing: buildActionTracingHost(relay.port, identity),
+      logger: actionLogger,
+      sandbox: lifecycle,
+      maskSecret: value => masked.push(value),
+      deps: {
+        // The real child, run from source, trusting the stand-in upstream's certificate.
+        keyProxyOptions: {
+          launcher: {command: findBunOnPath(), args: [PROXY_SOURCE_ENTRY]},
+          testing: {upstreamCa: upstream.ca},
+        },
+        startServer: async (spawnOptions, spawnLogger) => {
+          finalConfigs.push(JSON.stringify(spawnOptions.config ?? null))
+          spawnedEnv = JSON.stringify(spawnOptions.env)
+          const source = spawnOptions.tracingHost
+          // The traced config is chosen at the spawn, so it is read where it is chosen.
+          const tracingHost =
+            typeof source === 'function'
+              ? () => {
+                  const decision = source()
+                  if (decision.config !== undefined) finalConfigs.push(JSON.stringify(decision.config))
+                  return decision
+                }
+              : source
+          return startOpenCodeV2Server(
+            {...spawnOptions, tracingHost, timeouts: {agentReadyTimeoutMs: 90_000}},
+            spawnLogger,
+          )
+        },
+      },
+    })
+    const handle = unwrapOk(started)
+    cleanups.push(async () => {
+      await handle.shutdown().catch(() => undefined)
+    })
+    const brokered = (JSON.parse(finalConfigs[0] ?? 'null') as {mcp?: {broker?: {url?: string}}} | null)?.mcp?.broker
+    routeUrl = brokered?.url ?? ''
+    await driveTurn(handle, provider)
+    // A turn is over when its root span is at the collector; stopping the server before that would race the last flush.
+    await waitUntil(
+      'the turn’s root span at the collector stand-in',
+      () => hasRootSpan(collector?.requests ?? []),
+      90_000,
+      () => `received ${collector?.requests.length ?? 0} requests`,
+    )
+    rows = parseRows(provider.state.results.join('\n'))
+    await handle.shutdown()
+    released = await lifecycle.release()
+    // The relay goes after the server and the sandbox, as the Action stops it.
+    await relay.stop()
+  }, 1_200_000)
+
+  afterAll(async () => {
+    for (const cleanup of cleanups.splice(0).reverse()) await cleanup()
+  }, 120_000)
+
+  const scanCountsOf = (): Map<string, string> =>
+    new Map(
+      (rows.get('canary_scan')?.[0]?.evidence ?? '')
+        .split(' ')
+        .filter(part => part.includes('='))
+        .map(part => part.split('=') as [string, string]),
+    )
+
+  it('finds the canary nowhere the sandbox user can look, and the detectors saw their own controls', () => {
+    // #given the sandbox user's search (by fingerprint) of every process environment and command line, the runner's temp and
+    // step files, the checkout, the agent's home and OpenCode's storage behind the links
+    expect(failuresFor(rows, 'canary_scan', 'BLOCKED')).toEqual([])
+    const counts = scanCountsOf()
+
+    // #then no copy of the canary, in any place
+    for (const group of ['environ', 'cmdline', 'temp', 'checkout', 'home', 'xdg', 'known']) {
+      expect(counts.get(`canary.${group}`)).toBe('0')
+    }
+    // #and the runner's step file, opened by its exact path, was refused (not absent, which would be a skip)
+    expect(counts.get('denied.known')).toBe('1')
+    expect(counts.get('read.known')).toBe('0')
+    expect(counts.get('skip.known')).toBe('0')
+    // #and the search looked where it counts: it read OpenCode's storage and the checkout
+    expect(Number(counts.get('read.xdg'))).toBeGreaterThanOrEqual(2)
+    expect(Number(counts.get('read.checkout'))).toBeGreaterThanOrEqual(1)
+  })
+
+  it('serves the agent’s own request to the route, and the upstream saw the canary on every request it received', () => {
+    // #given what the agent's shell did with the route
+    expect(failuresFor(rows, 'mcp_route_works', 'WORKS')).toEqual([])
+
+    // #then the server's connection and the shell's request both reached the upstream, each with the configured header
+    const received = (upstream?.requests ?? []).filter(request => request.url.startsWith('/mcp'))
+    expect(received.length).toBeGreaterThan(4)
+    expect(fake.state.initializes).toBeGreaterThanOrEqual(2)
+    expect(fake.state.unauthorized).toBe(0)
+    for (const request of received) expect(request.headers.authorization).toBe(MCP_AUTHORIZATION)
+  })
+
+  it('hands the server a route and no header, in both final configs and its environment', () => {
+    // #given the config the server got at each spawn: the untraced one, and the traced one the spawn-time decision picked
+    expect(finalConfigs.length).toBeGreaterThanOrEqual(2)
+    for (const text of finalConfigs) {
+      // #then it names the child's loopback route, holds no header, and carries no form of the canary
+      const entry = (JSON.parse(text) as {mcp: {broker: Record<string, unknown>}}).mcp.broker
+      expect(entry).toMatchObject({type: 'remote', oauth: false})
+      expect(entry).not.toHaveProperty('headers')
+      expect(String(entry.url)).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/mcp\/s1$/)
+      expect(canaryForms(Buffer.from(text), MCP_CANARY)).toEqual([])
+    }
+    // #and neither the environment the server was spawned with
+    expect(canaryForms(Buffer.from(spawnedEnv), MCP_CANARY)).toEqual([])
+  })
+
+  it('keeps the canary out of the Action’s logs and out of every span the collector received, after masking it', () => {
+    // #then the Action asked for it to be masked, and wrote it nowhere
+    expect(masked).toContain(MCP_CANARY)
+    expect(serializeLoggerCalls(actionLogger)).not.toContain(MCP_CANARY)
+
+    // #and the turn was traced (so the empty result is not a sink that heard nothing), with no form of it in any request
+    expect(hasRootSpan(collector?.requests ?? [])).toBe(true)
+    for (const request of collector?.requests ?? []) {
+      expect(canaryForms(request.body, MCP_CANARY)).toEqual([])
+      expect(JSON.stringify(request.headers)).not.toContain(MCP_CANARY)
+    }
+  })
+
+  it('stopped the sandbox and the child, and took everything back', () => {
+    expect(released).toMatchObject({stop: 'stopped', restore: 'restored', proxy: 'stopped'})
+  })
+
+  describe('refuses each shape that would carry the header past the broker, before the sandbox starts', () => {
+    const origin = 'https://mcp.example.invalid'
+    const bad = {Authorization: MCP_AUTHORIZATION}
+
+    it.each([
+      [
+        'a server whose type is built from a reference',
+        operatorConfig(origin, {bad: {type: '{env:MCP_BAD_TYPE}', url: `${origin}/bad`, headers: bad}}),
+        /builds its `type` from an `\{env:\}` or `\{file:\}` reference/,
+      ],
+      [
+        'an enabled-only stub with headers',
+        operatorConfig(origin, {bad: {enabled: true, headers: bad}}),
+        /`enabled`-only entry that also sets `headers`/,
+      ],
+      [
+        'a local server with headers',
+        operatorConfig(origin, {bad: {type: 'local', command: ['/bin/true'], headers: bad}}),
+        /local server that sets `headers`/,
+      ],
+      [
+        'a top-level key built from a reference',
+        operatorConfig(
+          origin,
+          {},
+          {'{env:MCP_BAD_KEY}': {mcp: {bad: {type: 'remote', url: `${origin}/bad`, headers: bad}}}},
+        ),
+        /top-level key built from a reference/,
+      ],
+    ] as const)('%s', async (_shape, opencodeConfig, reason) => {
+      // #given the shape, beside the working server, and counters on everything a start would do
+      const env = hostedEnv(workspace, xdgRoot)
+      const lifecycle = newLifecycle(env)
+      let childStarts = 0
+      let serverStarts = 0
+
+      // #when the run is started
+      const result = await startActionOpenCodeV2({
+        binaryPath: BINARY ?? '',
+        workspacePath: workspace,
+        authJson: JSON.stringify({fake: {type: 'api', key: MCP_MODEL_KEY}}),
+        opencodeConfig,
+        credential: 'provision',
+        systematicVersion: 'latest',
+        model: 'fake/fixture-model',
+        dbPath: path.join(xdgRoot, 'data', 'opencode', 'opencode.db'),
+        authPath: path.join(xdgRoot, 'data', 'opencode', 'auth.json'),
+        env,
+        runId: 4244,
+        runAttempt: 1,
+        tracing: buildActionTracingHost(null, null),
+        logger: createMockLogger(),
+        sandbox: lifecycle,
+        deps: {
+          startKeyProxy: async options => {
+            childStarts += 1
+            return startKeyProxyProcess(options)
+          },
+          startServer: async (spawnOptions, spawnLogger) => {
+            serverStarts += 1
+            return startOpenCodeV2Server(spawnOptions, spawnLogger)
+          },
+        },
+      })
+
+      // #then it failed at the config stage, naming the rule and no value
+      expect(result.success).toBe(false)
+      const failure = unwrapErr(result)
+      expect(failure.stage).toBe('config')
+      expect(failure.message).toMatch(reason)
+      expect(failure.message).not.toContain(MCP_CANARY)
+
+      // #and nothing was started: no child, no server, and the lifecycle never created an account
+      expect([childStarts, serverStarts]).toEqual([0, 0])
+      expect(await lifecycle.release()).toMatchObject({stop: 'never-started', restore: 'not-needed'})
+    })
   })
 })
 

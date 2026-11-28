@@ -97,6 +97,7 @@ export function runKeyProxyChild(io: KeyProxyChildIo): KeyProxyChild {
     }
     const started = await startKeyProxy({
       providers: config.data.providers,
+      ...(config.data.mcp === undefined ? {} : {mcp: config.data.mcp}),
       logger: SILENT_LOGGER,
       ...(config.data.ca === undefined ? {} : {ca: config.data.ca}),
     })

@@ -1,14 +1,19 @@
 import type {Buffer} from 'node:buffer'
 import type {ChildProcess} from 'node:child_process'
 import type {Result} from '@bfra.me/es/result'
-import type {KeyProxyProtocol, KeyProxyProviderConfig} from '@fro-bot/runtime'
+import type {KeyProxyMcpRouteConfig, KeyProxyProtocol, KeyProxyProviderConfig} from '@fro-bot/runtime'
 import type {Logger} from '../../shared/logger.js'
 import {spawn} from 'node:child_process'
 import {randomBytes} from 'node:crypto'
 import process from 'node:process'
 import {fileURLToPath} from 'node:url'
 import {err, ok} from '@bfra.me/es/result'
-import {buildKeyProxyUpstream, encodeKeyProxyConfig, parseKeyProxyChildLine} from '@fro-bot/runtime'
+import {
+  buildKeyProxyUpstream,
+  encodeKeyProxyConfig,
+  KEY_PROXY_MCP_PATH_PREFIX,
+  parseKeyProxyChildLine,
+} from '@fro-bot/runtime'
 
 /**
  * Runs the key proxy as a child process and supervises it.
@@ -58,6 +63,11 @@ const DEFAULT_TIMEOUTS: KeyProxyProcessTimeouts = {readyMs: 10_000, exitGraceMs:
 
 export interface StartKeyProxyProcessOptions {
   readonly providers: readonly KeyProxyProviderInput[]
+  /**
+   * Brokered remote MCP servers (`planMcpBrokerV2`): sent to the child in the same frame, header values and all. Absent or
+   * empty leaves the frame as it was. A child that refuses the frame fails the start.
+   */
+  readonly mcpRoutes?: readonly KeyProxyMcpRouteConfig[]
   readonly logger: Logger
   /** Defaults to {@link defaultKeyProxyLauncher}. */
   readonly launcher?: KeyProxyLauncher
@@ -97,6 +107,8 @@ export interface KeyProxyProcess {
   readonly placeholder: string
   /** The `baseURL` for a provider: `http://127.0.0.1:<port>/<providerId>`. */
   readonly baseUrl: (providerId: string) => string
+  /** The URL of a brokered MCP server's route: `http://127.0.0.1:<port>/mcp/<routeId>`. */
+  readonly mcpUrl: (routeId: string) => string
   /** Aborts when the child exits without being asked to. Latched. */
   readonly died: AbortSignal
   readonly crashed: () => boolean
@@ -156,9 +168,11 @@ export async function startKeyProxyProcess(
   if (!providers.success) return err(providers.error)
 
   const placeholder = randomBytes(32).toString('base64url')
+  const mcpRoutes = options.mcpRoutes ?? []
   const frame = encodeKeyProxyConfig({
     version: 1,
     providers: providers.data,
+    ...(mcpRoutes.length === 0 ? {} : {mcp: mcpRoutes}),
     ...(options.testing?.upstreamCa === undefined ? {} : {ca: options.testing.upstreamCa}),
   })
 
@@ -289,7 +303,11 @@ export async function startKeyProxyProcess(
   }
   const {port} = first
 
-  logger.info('Key proxy started', {providers: options.providers.map(provider => provider.providerId), pid})
+  logger.info('Key proxy started', {
+    providers: options.providers.map(provider => provider.providerId),
+    mcpRoutes: mcpRoutes.length,
+    pid,
+  })
 
   let stopped: Promise<KeyProxyStopResult> | undefined
   return ok({
@@ -297,6 +315,7 @@ export async function startKeyProxyProcess(
     port,
     placeholder,
     baseUrl: providerId => `http://127.0.0.1:${port}/${providerId}`,
+    mcpUrl: routeId => `http://127.0.0.1:${port}/${KEY_PROXY_MCP_PATH_PREFIX}/${routeId}`,
     died: died.signal,
     crashed: () => state.crashed,
     stop: async () => {

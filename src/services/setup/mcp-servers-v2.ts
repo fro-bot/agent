@@ -34,10 +34,11 @@
  */
 
 import type {Result} from '@bfra.me/es/result'
-import type {CredentialDisposition} from '@fro-bot/runtime'
+import type {CredentialDisposition, KeyProxyMcpRouteConfig} from '@fro-bot/runtime'
 import type {Logger} from './types.js'
 
 import {err, ok} from '@bfra.me/es/result'
+import {KEY_PROXY_MCP_FORBIDDEN_HEADERS, mcpHeaderSecrets, validateUpstreamUrl} from '@fro-bot/runtime'
 
 interface McpServerBase {
   /** The key as authored. */
@@ -237,12 +238,24 @@ interface McpLayout {
   readonly timeout: {readonly value: unknown} | undefined
 }
 
+/** What an `mcp` key holds: the native `servers` map, the `timeout` block, an `enabled`-only stub, or a server. */
+type McpKeyRole = 'native-servers' | 'server' | 'stub' | 'timeout'
+
+/** The one place that tells the `servers` and `timeout` keys from servers of those names. */
+function mcpKeyRole(key: string, value: unknown): McpKeyRole {
+  if (isEnabledOnly(value)) return 'stub'
+  if (key === 'servers' && !isDirectServer(value)) return 'native-servers'
+  if (key === 'timeout' && !isDirectServer(value)) return 'timeout'
+  return 'server'
+}
+
 /**
  * Split the operator's `mcp` value into its server entries and its `timeout` block, in both spellings and with the
  * `servers`/`timeout` name disambiguation. The one place that reads the layout: the strict parse and the withheld filter
- * both start here. Fails only when the layout itself cannot be read.
+ * both start here. Fails only when the layout itself cannot be read. An `enabled`-only stub is skipped, as upstream omits
+ * it, unless `keepStubs` asks for it as an entry: the broker must see a stub that also carries `headers`.
  */
-function readMcpLayout(mcp: unknown): Result<McpLayout, McpConfigError> {
+function readMcpLayout(mcp: unknown, options: {readonly keepStubs?: boolean} = {}): Result<McpLayout, McpConfigError> {
   if (!isRecord(mcp)) {
     return err({kind: 'not-an-object', server: null, message: 'opencode-config mcp must be a JSON object'})
   }
@@ -250,15 +263,19 @@ function readMcpLayout(mcp: unknown): Result<McpLayout, McpConfigError> {
   const entries: McpEntry[] = []
   let timeout: McpLayout['timeout']
   for (const [key, value] of Object.entries(mcp)) {
-    if (isEnabledOnly(value)) continue
-    if (key === 'servers' && !isDirectServer(value)) {
+    const role = mcpKeyRole(key, value)
+    if (role === 'stub') {
+      if (options.keepStubs === true) entries.push({name: key, value, origin: 'legacy'})
+      continue
+    }
+    if (role === 'native-servers') {
       if (!isRecord(value)) {
         return err({kind: 'not-an-object', server: null, message: 'opencode-config mcp.servers must be a JSON object'})
       }
       for (const [name, server] of Object.entries(value)) entries.push({name, value: server, origin: 'native'})
       continue
     }
-    if (key === 'timeout' && !isDirectServer(value)) {
+    if (role === 'timeout') {
       timeout = {value}
       continue
     }
@@ -320,6 +337,30 @@ function containsReference(value: unknown): boolean {
     return Object.entries(value).some(([key, entry]) => hasReferenceOpening(key) || containsReference(entry))
   }
   return false
+}
+
+/**
+ * Whether a key holds a reference, at any depth and in any entry. OpenCode resolves `{file:}` and `{env:}` in the config
+ * text before it reads it, so a key built from one can become `headers` (or any field) after the broker has classified
+ * the entry, and the file or variable can hold the credential.
+ */
+function hasReferenceKey(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(hasReferenceKey)
+  if (isRecord(value)) {
+    return Object.entries(value).some(([key, entry]) => hasReferenceOpening(key) || hasReferenceKey(entry))
+  }
+  return false
+}
+
+/** Adds the maskable strings of every string header value to `secrets`, first server wins. Reads what it is given as is. */
+function addHeaderSecrets(secrets: Map<string, McpBrokerSecretV2>, server: string, headers: unknown): void {
+  if (!isRecord(headers)) return
+  for (const header of Object.values(headers)) {
+    if (typeof header !== 'string') continue
+    for (const secret of mcpHeaderSecrets(header)) {
+      if (!secrets.has(secret)) secrets.set(secret, {server, value: secret})
+    }
+  }
 }
 
 const MAX_LOGGED_NAMES = 20
@@ -457,4 +498,522 @@ export function applyOperatorMcpV2(
       }),
     ),
   )
+}
+
+// --- The credential broker (`isolate-agent`) -------------------------------------------------------------------------
+//
+// Under `isolate-agent` the sandbox user reads the whole `OPENCODE_CONFIG_CONTENT`, so a remote server's `headers` would
+// hand its credential to the model. Instead every remote entry that has a `headers` key becomes a route on the key-proxy
+// child, which holds the headers and adds them to each request it forwards to the server's fixed HTTPS upstream; the
+// entry the sandbox reads points at the loopback route and has no headers. This section is the Action's half of that:
+// classify (`planMcpBrokerV2`), then rewrite (`applyBrokeredMcpV2`). Brokering is keyed on the presence of `headers`
+// alone: a header name is never used to guess which value is a credential.
+
+export type McpBrokerLayout = McpEntry['origin']
+
+/** Names one entry of the operator's `mcp`: the key as authored, in the spelling that declared it. */
+export interface McpBrokerEntryRef {
+  readonly name: string
+  readonly layout: McpBrokerLayout
+}
+
+/** One entry the child serves: what to rewrite (`name`, `layout`) and what the child is told (`route`). */
+export interface McpBrokerRouteV2 extends McpBrokerEntryRef {
+  readonly route: KeyProxyMcpRouteConfig
+}
+
+/** A header value the Action masks and scans for, with the sanitized name of the first server that holds it. */
+export interface McpBrokerSecretV2 {
+  readonly server: string
+  readonly value: string
+}
+
+export interface McpBrokerPlanV2 {
+  /** In config order. Their `route` values are what the child receives. */
+  readonly routes: readonly McpBrokerRouteV2[]
+  /** Definitively disabled entries: their `headers` are dropped and no route exists. */
+  readonly stripped: readonly McpBrokerEntryRef[]
+  /** Values of 8 characters or more, and the token after a `Bearer`, `Basic` or `Token` scheme, each once. */
+  readonly secrets: readonly McpBrokerSecretV2[]
+}
+
+export type McpBrokerRefusalKind =
+  | 'conflicting-flags'
+  | 'enabled-stub'
+  | 'header-duplicate'
+  | 'header-forbidden'
+  | 'header-name-invalid'
+  | 'header-value-invalid'
+  | 'header-value-padded'
+  | 'header-value-too-long'
+  | 'headers-invalid'
+  | 'headers-too-large'
+  | 'local-with-headers'
+  | 'oauth'
+  | 'reference'
+  | 'reference-key'
+  | 'too-many-headers'
+  | 'too-many-servers'
+  | 'unreadable-layout'
+  | 'unresolved-flag'
+  | 'unresolved-type'
+  | 'unsupported-type'
+  | 'url-fragment'
+  | 'url-invalid'
+  | 'url-not-https'
+  | 'url-path'
+  | 'url-query'
+  | 'url-unsafe-host'
+  | 'url-userinfo'
+
+export interface McpBrokerRefusal {
+  readonly kind: McpBrokerRefusalKind
+  /** The sanitized, bounded server name, or null when the refusal is about the whole block. */
+  readonly server: string | null
+  /** Names the rule and a fix. Never a configured value (a server name is sanitized, a header name echoed only as a token). */
+  readonly message: string
+}
+
+/** The most servers one run brokers, headers one server may carry, and bytes of header text the frame may hold. */
+const MAX_BROKERED_SERVERS = 64
+const MAX_BROKERED_HEADERS_PER_SERVER = 32
+const MAX_BROKERED_HEADER_VALUE_LENGTH = 4096
+const MAX_BROKERED_HEADER_BYTES = 256 * 1024
+const MAX_BROKERED_URL_LENGTH = 2048
+
+/** A space or tab at either end of a header value (HTTP optional whitespace). */
+const HEADER_VALUE_PADDING = /^[ \t]|[ \t]$/
+
+/** RFC 9110 `token`: the characters a header name may hold. */
+const HEADER_NAME_TOKEN = /^[!#$%&'*+\-.^\w`|~]+$/
+
+/** What Node accepts in a header value (`checkInvalidHeaderChar`): tab, printable ASCII and the Latin-1 supplement. */
+const HEADER_VALUE_CHARS = /^[\t\x20-\x7E\x80-\xFF]*$/
+
+const STRUCTURAL_ENCODING = /%(?:2f|5c|2e|3b|25)/i
+
+function brokerRefusal(
+  kind: McpBrokerRefusalKind,
+  name: string,
+  problem: string,
+  fix: string,
+): Result<never, McpBrokerRefusal> {
+  const server = mcpToolNamespace(name).slice(0, MAX_LOGGED_NAME_LENGTH)
+  return err({kind, server, message: `isolate-agent: MCP server "${server}" ${problem}. Fix: ${fix}.`})
+}
+
+function blockRefusal(kind: McpBrokerRefusalKind, problem: string, fix: string): Result<never, McpBrokerRefusal> {
+  return err({kind, server: null, message: `isolate-agent: ${problem}. Fix: ${fix}.`})
+}
+
+type DisabledState = 'active' | 'conflict' | 'disabled' | 'unresolved'
+
+/**
+ * What OpenCode 2.4.2 does with the flags, recorded against the pinned binary: a flat entry (`mcp.<name>`) is read by the V1
+ * schema, so only `enabled: false` disables it and `disabled` is ignored; a native entry (`mcp.servers.<name>`) only
+ * honours `disabled: true` and ignores `enabled`. An entry the client leaves active must be brokered, not stripped, or it
+ * would connect straight to its upstream. Each flag must still be a literal boolean, and the two must not contradict.
+ */
+function disabledStateOf(entry: Record<string, unknown>, origin: 'legacy' | 'native'): DisabledState {
+  const {enabled, disabled} = entry
+  if (
+    (enabled !== undefined && typeof enabled !== 'boolean') ||
+    (disabled !== undefined && typeof disabled !== 'boolean')
+  ) {
+    return 'unresolved'
+  }
+  if (enabled !== undefined && disabled !== undefined && enabled === disabled) return 'conflict'
+  const off = origin === 'legacy' ? enabled === false : disabled === true
+  return off ? 'disabled' : 'active'
+}
+
+/**
+ * A path the child can send upstream as it stands, once `upstreamOf` has seen that URL parsing left it as written: that
+ * comparison already refuses a space, a control or non-ASCII character, a backslash and a dot segment (parsing encodes or
+ * resolves each). What it cannot see is left here: `;` (a router truncates a segment there), an encoded `/`, `\`, `.`, `;`
+ * or `%`, and an empty segment. A trailing slash is one empty final segment, which an upstream may require.
+ */
+function isCanonicalUpstreamPath(pathname: string): boolean {
+  if (pathname.includes(';') || STRUCTURAL_ENCODING.test(pathname)) return false
+  const segments = pathname.split('/').slice(1)
+  const body = segments.at(-1) === '' ? segments.slice(0, -1) : segments
+  return body.every(segment => segment !== '')
+}
+
+interface UpstreamProblem {
+  readonly kind: McpBrokerRefusalKind
+  readonly problem: string
+  readonly fix: string
+}
+
+/** The fixed upstream of a brokered server, or what is wrong with its `url`. The configured text is never quoted. */
+function upstreamOf(raw: unknown): {readonly origin: string; readonly path: string} | UpstreamProblem {
+  const invalid = (problem: string): UpstreamProblem => ({
+    kind: 'url-invalid',
+    problem,
+    fix: 'set `url` to an absolute https URL written out in full',
+  })
+  if (typeof raw !== 'string' || raw.length > MAX_BROKERED_URL_LENGTH)
+    return invalid('has a `url` that is not a usable string')
+  let url: URL
+  try {
+    url = new URL(raw)
+  } catch {
+    return invalid('has a `url` that is not a valid URL')
+  }
+  if (url.protocol !== 'https:') {
+    return {
+      kind: 'url-not-https',
+      problem: 'has a `url` that is not https, so the broker could not keep its headers private on the wire',
+      fix: 'serve the MCP server over https and use that URL',
+    }
+  }
+  const prefix = /^https:\/\/([^/?#]*)/i.exec(raw)
+  if (prefix === null) return invalid('has a `url` that is not written as `https://host/path`')
+  if (prefix[1]?.includes('@') === true) {
+    return {
+      kind: 'url-userinfo',
+      problem: 'has a `url` with credentials in it',
+      fix: 'remove the user and password from the `url` and send them in a header the broker holds',
+    }
+  }
+  if (raw.includes('#')) {
+    return {kind: 'url-fragment', problem: 'has a `url` with a fragment', fix: 'remove the `#` and what follows it'}
+  }
+  if (raw.includes('?')) {
+    return {
+      kind: 'url-query',
+      problem: 'has a `url` with a query string, which the broker does not forward from the configured URL',
+      fix: 'remove the query from the `url`; a credential belongs in a header the broker holds',
+    }
+  }
+  if (!validateUpstreamUrl(raw).success) {
+    return {
+      kind: 'url-unsafe-host',
+      problem: 'has a `url` that targets a cloud metadata service',
+      fix: 'point `url` at the MCP server',
+    }
+  }
+  const written = raw.slice(prefix[0].length)
+  if ((written === '' ? '/' : written) !== url.pathname || !isCanonicalUpstreamPath(url.pathname)) {
+    return {
+      kind: 'url-path',
+      problem:
+        'has a `url` path the broker cannot send as written (a dot or empty segment, `;`, `\\`, an encoded `/` or `.`, or a character that URL parsing would change)',
+      fix: 'write the path in its plain, normalised form',
+    }
+  }
+  return {origin: url.origin, path: url.pathname}
+}
+
+type HeadersCheck = Result<
+  {readonly headers: Readonly<Record<string, string>>; readonly bytes: number},
+  McpBrokerRefusal
+>
+
+function checkBrokeredHeaders(name: string, headers: unknown): HeadersCheck {
+  if (!isRecord(headers)) {
+    return brokerRefusal(
+      'headers-invalid',
+      name,
+      'has `headers` that is not an object of strings',
+      'make `headers` an object of strings',
+    )
+  }
+  const entries = Object.entries(headers)
+  if (entries.length > MAX_BROKERED_HEADERS_PER_SERVER) {
+    return brokerRefusal(
+      'too-many-headers',
+      name,
+      `sets more than ${MAX_BROKERED_HEADERS_PER_SERVER} headers`,
+      'keep only the headers the server needs',
+    )
+  }
+  const seen = new Set<string>()
+  const checked: [string, string][] = []
+  let bytes = 0
+  for (const [headerName, headerValue] of entries) {
+    if (!HEADER_NAME_TOKEN.test(headerName)) {
+      return brokerRefusal(
+        'header-name-invalid',
+        name,
+        'sets a header whose name is empty or holds a character a header name cannot',
+        'use plain header names (letters, digits and `-`)',
+      )
+    }
+    const lowered = headerName.toLowerCase()
+    if (KEY_PROXY_MCP_FORBIDDEN_HEADERS.has(lowered)) {
+      return brokerRefusal(
+        'header-forbidden',
+        name,
+        `sets the header "${lowered}", which the key proxy sets or refuses itself`,
+        'remove it; the broker manages connection and framing headers',
+      )
+    }
+    if (seen.has(lowered)) {
+      return brokerRefusal(
+        'header-duplicate',
+        name,
+        `sets the header "${lowered}" twice, under names that differ only in case`,
+        'keep one of them',
+      )
+    }
+    seen.add(lowered)
+    if (typeof headerValue !== 'string' || !HEADER_VALUE_CHARS.test(headerValue)) {
+      return brokerRefusal(
+        'header-value-invalid',
+        name,
+        `sets the header "${lowered}" to a value that is not a string of printable characters`,
+        'use a single-line string value',
+      )
+    }
+    if (HEADER_VALUE_PADDING.test(headerValue)) {
+      return brokerRefusal(
+        'header-value-padded',
+        name,
+        `sets the header "${lowered}" to a value with a space or tab at either end, which the broker would not read as the scheme and token it holds`,
+        'remove the surrounding whitespace',
+      )
+    }
+    if (headerValue.length > MAX_BROKERED_HEADER_VALUE_LENGTH) {
+      return brokerRefusal(
+        'header-value-too-long',
+        name,
+        `sets the header "${lowered}" to a value longer than ${MAX_BROKERED_HEADER_VALUE_LENGTH} characters`,
+        'shorten it',
+      )
+    }
+    bytes += headerName.length + headerValue.length
+    checked.push([headerName, headerValue])
+  }
+  // `fromEntries` defines each name as an own key, so a header named `__proto__` is kept, not swallowed.
+  return ok({headers: Object.fromEntries(checked), bytes})
+}
+
+/**
+ * Classify the operator's `mcp` (after per-trigger filtering) for a run whose agent reads its whole config. Every entry
+ * that has a `headers` key must end as one of three things, or the run fails before anything starts:
+ *
+ * - a route, for an active remote server (`routes`): the child holds its headers, the entry is rewritten;
+ * - a stripped entry, for one that is definitively disabled (`stripped`): its headers are dropped, nothing serves it;
+ * - a refusal, for everything the broker cannot protect.
+ *
+ * Reads the original entries, not the parsed servers, because the parse skips `enabled`-only stubs and passes an
+ * unresolved `type` through, and either can carry `headers` into the sandbox. An entry with no `headers` key is not the
+ * broker's business and is never refused.
+ */
+export function planMcpBrokerV2(mcp: unknown): Result<McpBrokerPlanV2, McpBrokerRefusal> {
+  if (mcp === undefined) return ok({routes: [], stripped: [], secrets: []})
+  const layout = readMcpLayout(mcp, {keepStubs: true})
+  if (!layout.success) {
+    return blockRefusal(
+      'unreadable-layout',
+      'opencode-config `mcp` is not laid out as a map of servers',
+      'make `mcp` an object of servers',
+    )
+  }
+
+  const withHeaders = layout.data.entries.filter(({value}) => isRecord(value) && Object.keys(value).includes('headers'))
+  if (withHeaders.length > MAX_BROKERED_SERVERS) {
+    return blockRefusal(
+      'too-many-servers',
+      `opencode-config sets headers on more than ${MAX_BROKERED_SERVERS} MCP servers`,
+      'drop the servers the run does not use',
+    )
+  }
+
+  const routes: McpBrokerRouteV2[] = []
+  const stripped: McpBrokerEntryRef[] = []
+  const secrets = new Map<string, McpBrokerSecretV2>()
+  let headerBytes = 0
+
+  for (const {name, value, origin: layoutOrigin} of withHeaders) {
+    if (!isRecord(value)) continue
+    const ref: McpBrokerEntryRef = {name, layout: layoutOrigin}
+
+    if (hasReferenceOpening(name)) {
+      return brokerRefusal(
+        'reference-key',
+        name,
+        'is declared under a name that holds an `{env:}` or `{file:}` reference, which could resolve to another server',
+        'write the server name out literally',
+      )
+    }
+    if (isEnabledOnly(value)) {
+      return brokerRefusal(
+        'enabled-stub',
+        name,
+        'is an `enabled`-only entry that also sets `headers`, which the broker cannot attribute to a server',
+        'remove `headers` from it, or give the entry a `type` and a `url`',
+      )
+    }
+    if (isReference(value.type)) {
+      return brokerRefusal(
+        'unresolved-type',
+        name,
+        'builds its `type` from an `{env:}` or `{file:}` reference, so the broker cannot tell whether it can protect its headers',
+        'write `type` out literally',
+      )
+    }
+    const state = disabledStateOf(value, layoutOrigin)
+    if (state === 'unresolved') {
+      return brokerRefusal(
+        'unresolved-flag',
+        name,
+        'sets `enabled` or `disabled` to something other than a literal `true` or `false`',
+        'write the flag out as `true` or `false`',
+      )
+    }
+    if (state === 'conflict') {
+      return brokerRefusal(
+        'conflicting-flags',
+        name,
+        'sets `enabled` and `disabled` to contradictory values',
+        'keep one of them',
+      )
+    }
+    if (containsReference(value)) {
+      return brokerRefusal(
+        'reference',
+        name,
+        'holds an `{env:}` or `{file:}` reference, which the OpenCode server would resolve inside the sandbox, past the broker',
+        'write every value of the server out literally',
+      )
+    }
+    // A disabled entry loses its headers, but each value is still masked and scanned for: a copy elsewhere in the config would
+    // hand the sandbox the credential all the same.
+    const server = mcpToolNamespace(name).slice(0, MAX_LOGGED_NAME_LENGTH)
+    addHeaderSecrets(secrets, server, value.headers)
+    if (state === 'disabled') {
+      stripped.push(ref)
+      continue
+    }
+    if (value.type === 'local') {
+      return brokerRefusal(
+        'local-with-headers',
+        name,
+        'is a local server that sets `headers`, which the broker cannot protect',
+        'remove `headers` from the local server',
+      )
+    }
+    if (value.type !== 'remote') {
+      return brokerRefusal(
+        'unsupported-type',
+        name,
+        'sets `headers` on a server whose `type` is not `remote`',
+        'set `type` to `remote`, or remove `headers`',
+      )
+    }
+    if (value.oauth !== undefined && value.oauth !== false) {
+      return brokerRefusal(
+        'oauth',
+        name,
+        'sets `oauth` on a server with `headers`: the broker holds fixed headers and cannot run an OAuth login',
+        'remove `oauth` (or set it to `false`), or remove `headers`',
+      )
+    }
+    const upstream = upstreamOf(value.url)
+    if ('kind' in upstream) return brokerRefusal(upstream.kind, name, upstream.problem, upstream.fix)
+
+    const headers = checkBrokeredHeaders(name, value.headers)
+    if (!headers.success) return headers
+    headerBytes += headers.data.bytes
+    if (headerBytes > MAX_BROKERED_HEADER_BYTES) {
+      return blockRefusal(
+        'headers-too-large',
+        'the MCP headers in opencode-config are larger than the key proxy carries',
+        'drop headers the servers do not need',
+      )
+    }
+
+    routes.push({
+      ...ref,
+      route: {id: `s${routes.length + 1}`, origin: upstream.origin, path: upstream.path, headers: headers.data.headers},
+    })
+  }
+
+  if (hasReferenceKey(mcp)) {
+    return blockRefusal(
+      'reference-key',
+      'opencode-config `mcp` has a key that holds an `{env:}` or `{file:}` reference, which OpenCode would resolve into the config after the broker has read it',
+      'write every key under `mcp` out literally',
+    )
+  }
+
+  return ok({routes, stripped, secrets: [...secrets.values()]})
+}
+/** What to do to one entry of the operator's `mcp` once the child is up: point it at its route, or drop its headers. */
+export type BrokeredMcpServerV2 = McpBrokerEntryRef &
+  ({readonly action: 'route'; readonly url: string} | {readonly action: 'strip'})
+
+/**
+ * The rewrite of the config a brokered run delivers. Present (even with no servers) means the run is brokered, and the
+ * delivered config is then checked to hold no `headers` that the broker did not account for.
+ */
+export interface BrokeredMcpV2 {
+  readonly servers: readonly BrokeredMcpServerV2[]
+}
+
+function rewriteBrokeredEntry(entry: unknown, target: BrokeredMcpServerV2): Record<string, unknown> | null {
+  if (!isRecord(entry) || !Object.keys(entry).includes('headers')) return null
+  const rest = {...entry}
+  delete rest.headers
+  return target.action === 'route' ? {...rest, url: target.url, oauth: false} : rest
+}
+
+/**
+ * Apply the rewrite to the operator config: each brokered entry gets the loopback `url`, `oauth: false` and no `headers`;
+ * each stripped entry loses its `headers`. Every other entry and key is kept as written. Fails, naming the server and
+ * never a value, when a target is not in the config or has no `headers` to drop, or when any `headers` is left behind.
+ */
+export function applyBrokeredMcpV2(
+  operator: Record<string, unknown>,
+  brokered: BrokeredMcpV2,
+): Result<Record<string, unknown>, string> {
+  const mismatch = (name: string): Result<never, string> =>
+    err(
+      `MCP server "${mcpToolNamespace(name).slice(0, MAX_LOGGED_NAME_LENGTH)}" was planned for the broker but is not in the config as planned`,
+    )
+  const find = (layoutOrigin: McpBrokerLayout, name: string): BrokeredMcpServerV2 | undefined =>
+    brokered.servers.find(server => server.layout === layoutOrigin && server.name === name)
+
+  const used = new Set<BrokeredMcpServerV2>()
+  const rewriteOne = (layoutOrigin: McpBrokerLayout, name: string, entry: unknown): unknown => {
+    const target = find(layoutOrigin, name)
+    if (target === undefined) return entry
+    const rewritten = rewriteBrokeredEntry(entry, target)
+    if (rewritten === null) return entry
+    used.add(target)
+    return rewritten
+  }
+
+  const rewriteKey = (key: string, value: unknown): [string, unknown] => {
+    const role = mcpKeyRole(key, value)
+    if (role === 'native-servers' && isRecord(value)) {
+      return [
+        key,
+        Object.fromEntries(Object.entries(value).map(([name, entry]) => [name, rewriteOne('native', name, entry)])),
+      ]
+    }
+    if (role === 'server' || role === 'stub') return [key, rewriteOne('legacy', key, value)]
+    return [key, value]
+  }
+
+  const result = isRecord(operator.mcp)
+    ? {...operator, mcp: Object.fromEntries(Object.entries(operator.mcp).map(([key, value]) => rewriteKey(key, value)))}
+    : operator
+
+  const missing = brokered.servers.find(server => !used.has(server))
+  if (missing !== undefined) return mismatch(missing.name)
+
+  // Nothing may keep a `headers` the broker did not account for: classify what is delivered, and expect nothing to do.
+  const left = result.mcp === undefined ? ok({routes: [], stripped: [], secrets: []}) : planMcpBrokerV2(result.mcp)
+  if (!left.success) return err(left.error.message)
+  if (left.data.routes.length > 0 || left.data.stripped.length > 0) {
+    const first = left.data.routes[0] ?? left.data.stripped[0]
+    return err(
+      `MCP server "${mcpToolNamespace(first?.name ?? '').slice(0, MAX_LOGGED_NAME_LENGTH)}" still sets headers after the broker rewrite`,
+    )
+  }
+  return ok(result)
 }
