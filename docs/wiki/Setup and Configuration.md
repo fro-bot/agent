@@ -317,7 +317,41 @@ What the proxy does:
 
 Providers: `anthropic`, `openai` and `opencode-go` have built-in upstreams. A custom provider needs `provider.<id>.npm` (`@ai-sdk/openai-compatible`, `@ai-sdk/openai` or `@ai-sdk/anthropic`) and an `https` `options.baseURL`; the URL may not carry credentials, a query or a fragment, and may not be a cloud metadata address. Private and loopback addresses are allowed, because a gateway can sit on an internal network. Setup refuses, with the provider and a fix in the message: Bedrock, Vertex and Google generateContent providers; an `endpoint`, `api` or `baseURL` override anywhere but the provider's own base URL (at the provider, model or variant level, whatever its value type); `queryParams`; a `baseURL` built from `{env:}` or `{file:}`; and an operator provider with no `auth-json` key. To use any of those, set `isolate-agent: false`.
 
-Values written directly into `opencode-config` are not hidden by isolation; only `auth-json` keys are kept out of the sandbox. Setup compares the final config text with every `auth-json` key, raw and JSON-escaped, and stops the run, without printing the value, if one appears in it.
+Values written directly into `opencode-config` are not hidden by isolation. Only `auth-json` keys and remote MCP `headers` (next section) are kept out of the sandbox. Setup compares the final config text with every `auth-json` key, raw and JSON-escaped, and stops the run without printing the value if one appears in it.
+
+##### `isolate-agent`: remote MCP headers
+
+On `schedule` and `workflow_dispatch`, the only triggers that keep remote MCP servers, the same proxy also holds the `headers` of every remote MCP server. A server is brokered when it has a `headers` key, including `headers: {}`. The config the agent sees points such a server at `http://127.0.0.1:<port>/mcp/<id>`, with no `headers` and with `oauth: false`. The proxy sends each request to the server's own URL with the configured headers set last. Servers without `headers` connect directly, as before.
+
+What the proxy does for an MCP route:
+
+- It serves `POST`, `GET` and `DELETE` on that route's path and passes the query through. It forwards the request's headers except the client's `Authorization`, cookies, hop-by-hop and forwarding headers, so MCP protocol headers such as `Mcp-Session-Id` and `Mcp-Param-*` reach the server.
+- Responses stream through, including SSE. A redirect or protocol upgrade from the server becomes a local 502, and the client never follows it. In an error body, every copy of a configured header value, or of the token after `Bearer`, `Basic` or `Token`, is replaced with `[redacted]` when the value or token is 8 characters or more, and `WWW-Authenticate` is dropped.
+- MCP routes have no first-byte or idle timeout, so a long tool call is not cut. Streams end when the run ends.
+- An upstream 401, 403, 5xx or timeout makes only that server unavailable to the agent. The run goes on.
+
+What this does not protect:
+
+- **What the token can do.** The agent's shell can call any tool through the loopback route, so give the server a token scoped to what the run needs.
+- **An upstream that returns its own credential** in a response, for example a debug tool that echoes request headers. The server is trusted with its credential.
+- **Header values and scheme tokens shorter than 8 characters.** The proxy still holds them, but setup doesn't scan the config for copies of them, mask them in logs, or redact them from error bodies.
+- **Local servers' `environment`**, and anything else in `opencode-config`.
+- **Runs without `isolate-agent`.** There the agent can read every value, as described above.
+
+Setup refuses a config the proxy can't protect. The run fails before the sandbox starts, with the server named and no value printed:
+
+| Refused | Fix |
+| --- | --- |
+| A `{env:...}` or `{file:...}` reference anywhere in a server that has `headers` | Write the value literally in a secret-backed `opencode-config` |
+| A top-level key, or any key under `mcp`, whose name holds a reference | Name the key literally |
+| `oauth` set on a server that has `headers` | Remove `oauth` and use a static header, or drop `headers` and let OpenCode log in |
+| A URL that isn't `https`, or has credentials, a query, a fragment, a cloud metadata host or a non-canonical path | Use a plain `https://host/path` URL and move any secret into a header |
+| A header name that is invalid, framing or hop-by-hop (`Host`, `Connection`, `Transfer-Encoding`, ...), or that repeats another header's name in a different case | Remove it; the proxy sets framing itself |
+| A header value over 4,096 characters, more than 32 headers on one server, or headers on more than 64 servers | Trim the config |
+| `headers` on a local server, on a server whose `type` is a reference, or on an `enabled`-only entry | Remove `headers` or give the server a literal `type: remote` |
+| `enabled` or `disabled` that isn't a literal `true` or `false`, or the two set against each other | Use one literal flag: `enabled: false` (`mcp.<name>`) or `disabled: true` (`mcp.servers.<name>`) |
+| A provider named `mcp` | Rename the provider |
+| A header value that also appears elsewhere in the config | Remove the copy |
 
 The lifecycle owns the proxy. It starts it under the same signal handling as the sandbox, stops it after the sandbox is stopped and taken back, and treats an exit it can't confirm as `unsafe`. A proxy that died before the teardown fails the run: nothing is published and no session state is saved.
 

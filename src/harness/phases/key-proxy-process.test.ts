@@ -71,6 +71,27 @@ describe('key-proxy-process', () => {
     return {command: process.execPath, args: [file]}
   }
 
+  /** A child that writes the config frame it was sent to a file, then says it is ready. */
+  async function frameRecorder(): Promise<{
+    launcher: KeyProxyLauncher
+    read: () => Promise<Record<string, unknown>>
+  }> {
+    const frameFile = path.join(dir, 'frame.json')
+    const launcher = await fakeChild(
+      String.raw`import {writeFileSync} from 'node:fs'
+const chunks = []
+process.stdin.on('data', chunk => {
+chunks.push(chunk)
+const all = Buffer.concat(chunks)
+if (all.length < 4 || all.length < 4 + all.readUInt32BE(0)) return
+writeFileSync(${JSON.stringify(frameFile)}, all.subarray(4, 4 + all.readUInt32BE(0)).toString('utf8'))
+process.stdout.write('{"ready":true,"port":4321}\n')
+})
+process.stdin.resume()`,
+    )
+    return {launcher, read: async () => JSON.parse(await fs.readFile(frameFile, 'utf8')) as Record<string, unknown>}
+  }
+
   const realLauncher = (): KeyProxyLauncher => {
     if (BUN === null) throw new Error('bun is required for the real-child tests')
     return {command: BUN, args: [SOURCE_ENTRY]}
@@ -446,6 +467,130 @@ describe('key-proxy-process', () => {
       const error = unwrapErr(started)
       expect(error.kind).toBe('invalid-providers')
       expect(error.message).not.toContain(REAL_KEY)
+    })
+
+    describe('MCP routes', () => {
+      const HEADER_VALUE = 'Bearer supervisor-mcp-CANARY-0011'
+      const MCP_ROUTE = {
+        id: 's1',
+        origin: 'https://mcp.example.com',
+        path: '/mcp',
+        headers: {Authorization: HEADER_VALUE},
+      } as const
+
+      it('puts the routes, with their header values, in the frame the child reads and nowhere else', async () => {
+        // #given a child that records its frame
+        const recorder = await frameRecorder()
+
+        // #when the supervisor starts with one MCP route and no provider
+        const {started, logger} = await startWith(recorder.launcher, {providers: [], mcpRoutes: [MCP_ROUTE]})
+        if (!started.success) throw new Error(started.error.message)
+
+        // #then the frame carries the route, the URL helper names its loopback path, and no log line holds the value
+        const frame = await recorder.read()
+        expect(frame.mcp).toEqual([MCP_ROUTE])
+        expect(frame.providers).toEqual([])
+        expect(started.data.mcpUrl('s1')).toBe('http://127.0.0.1:4321/mcp/s1')
+        expect(serializeLoggerCalls(logger)).not.toContain(HEADER_VALUE)
+        await started.data.stop()
+      })
+
+      it('leaves the field out of the frame when there are no routes, so a provider-only run is unchanged', async () => {
+        const recorder = await frameRecorder()
+
+        const {started} = await startWith(recorder.launcher, {mcpRoutes: []})
+        if (!started.success) throw new Error(started.error.message)
+
+        expect('mcp' in (await recorder.read())).toBe(false)
+        await started.data.stop()
+      })
+
+      it('does not leak the header value into the child argv or environment', async () => {
+        const argvFile = path.join(dir, 'argv.json')
+        const launcher = await fakeChild(
+          String.raw`import {writeFileSync} from 'node:fs'; writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify([process.argv, process.env])); process.stdout.write('{"ready":true,"port":4321}\n'); process.stdin.resume(); setInterval(() => {}, 1000)`,
+        )
+
+        const {started} = await startWith(launcher, {mcpRoutes: [MCP_ROUTE]})
+        if (!started.success) throw new Error(started.error.message)
+
+        expect(await fs.readFile(argvFile, 'utf8')).not.toContain(HEADER_VALUE)
+        await started.data.stop()
+      })
+
+      it.skipIf(BUN === null)(
+        'notices an MCP-only child that dies after ready: the owned signal fires, the route is refused, stop reports a crash',
+        async () => {
+          // #given the real child serving one MCP route and no provider
+          const {started} = await startWith(realLauncher(), {providers: [], mcpRoutes: [MCP_ROUTE]})
+          if (!started.success) throw new Error(started.error.message)
+          const proxy = started.data
+          const died = new Promise<void>(resolve => proxy.died.addEventListener('abort', () => resolve(), {once: true}))
+
+          // #when it is killed from outside after it said ready
+          process.kill(proxy.pid, 'SIGKILL')
+          await died
+
+          // #then the crash is latched, a request to the route fails, and stop calls it a crash, not a clean stop
+          expect(proxy.crashed()).toBe(true)
+          await expect(
+            new Promise<void>((resolve, reject) => {
+              const req = http.request(
+                {host: '127.0.0.1', port: proxy.port, path: new URL(proxy.mcpUrl('s1')).pathname, method: 'POST'},
+                () => resolve(),
+              )
+              req.on('error', reject)
+              req.end('{}')
+            }),
+          ).rejects.toThrow()
+          const stopped = await proxy.stop()
+          expect(stopped).toMatchObject({crashed: true, outcome: 'already-exited'})
+        },
+      )
+
+      it.skipIf(BUN === null)(
+        'starts the real child with MCP routes only, and it adds the configured header to a request',
+        async () => {
+          // #given an HTTPS upstream and a start that carries one route and no provider
+          const upstream = await startTlsUpstream((_request, res) => {
+            res.writeHead(200, {'content-type': 'application/json'})
+            res.end('{}')
+          })
+          cleanups.push(upstream.close)
+
+          // #when the real child is started
+          const {started, logger} = await startWith(realLauncher(), {
+            providers: [],
+            mcpRoutes: [{...MCP_ROUTE, origin: upstream.origin}],
+            testing: {upstreamCa: upstream.ca},
+          })
+          if (!started.success) throw new Error(started.error.message)
+
+          // #when a request reaches the route with no credential of its own
+          const status = await new Promise<number>((resolve, reject) => {
+            const req = http.request(
+              {
+                host: '127.0.0.1',
+                port: started.data.port,
+                path: new URL(started.data.mcpUrl('s1')).pathname,
+                method: 'POST',
+              },
+              res => {
+                res.resume()
+                res.on('end', () => resolve(res.statusCode ?? 0))
+              },
+            )
+            req.on('error', reject)
+            req.end('{}')
+          })
+
+          // #then the upstream saw the configured header, and nothing in the logs holds it
+          expect(status).toBe(200)
+          expect(upstream.requests[0]?.url).toBe('/mcp')
+          expect(upstream.requests[0]?.headers.authorization).toBe(HEADER_VALUE)
+          expect(serializeLoggerCalls(logger)).not.toContain(HEADER_VALUE)
+        },
+      )
     })
 
     it('reports a launcher that cannot be spawned', async () => {

@@ -49,7 +49,7 @@ Another user or another file mode does not fix this. The agent needs authenticat
    if (childConfig !== undefined) childEnv.OPENCODE_CONFIG_CONTENT = JSON.stringify(childConfig)
    ```
 
-   Every tool process is a child of that server, so it inherits the variable. Under `isolate-agent` the launch keeps it with `sudo --preserve-env`, and the server and its tools run as the same sandbox user. Isolation separates the runner from the server, not the server from its tools. `filterAgentEnv` doesn't help either: it filters by variable name, and `OPENCODE_` names are allowed through. So every value in `opencode-config` is readable by the model, including remote MCP `headers` and local-server `environment`. Only a secret held by a runner-side child, as the provider keys are, stays out of reach. A matching proxy for MCP header credentials is proposed in #2371 and not built.
+   Every tool process is a child of that server, so it inherits the variable. Under `isolate-agent` the launch keeps it with `sudo --preserve-env`, and the server and its tools run as the same sandbox user. Isolation separates the runner from the server, not the server from its tools. `filterAgentEnv` doesn't help either: it filters by variable name, and `OPENCODE_` names are allowed through. So every value in `opencode-config` is readable by the model, including remote MCP `headers` and local-server `environment`. Only a secret held by a runner-side child stays out of reach. That is how provider keys are held, and since #2371 so are remote MCP `headers` under isolation: the same child serves `/mcp/<id>` routes, and setup refuses MCP entries it can't broker.
 
 What didn't work:
 
