@@ -292,7 +292,9 @@ export {
   deleteSandboxAccount,
   describePrivilegedFailure,
   SANDBOX_ACCOUNT_CREATE_TIMEOUT_MS,
+  SANDBOX_ACCOUNT_HOME,
   SANDBOX_ACCOUNT_NAME,
+  SANDBOX_TMP_DIRECTORY,
   stopSandboxProcesses,
 } from './sandbox-identity.js'
 export type {

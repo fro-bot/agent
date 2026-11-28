@@ -334,7 +334,7 @@ What this does not protect:
 
 - **What the token can do.** The agent's shell can call any tool through the loopback route, so give the server a token scoped to what the run needs.
 - **An upstream that returns its own credential** in a response, for example a debug tool that echoes request headers. The server is trusted with its credential.
-- **Header values and scheme tokens shorter than 8 characters.** The proxy still holds them, but setup doesn't scan the config for copies of them, mask them in logs, or redact them from error bodies.
+- **Header values and scheme tokens shorter than 8 characters.** The proxy still holds them, but setup doesn't look for copies of them in the config or in the environment the sandbox inherits, mask them in logs, or redact them from error bodies.
 - **Local servers' `environment`**, and anything else in `opencode-config`.
 - **Runs without `isolate-agent`.** There the agent can read every value, as described above.
 
@@ -351,7 +351,9 @@ Setup refuses a config the proxy can't protect. The run fails before the sandbox
 | `headers` on a local server, on a server whose `type` is a reference, or on an `enabled`-only entry | Remove `headers` or give the server a literal `type: remote` |
 | `enabled` or `disabled` that isn't a literal `true` or `false`, or the two set against each other | Use one literal flag: `enabled: false` (`mcp.<name>`) or `disabled: true` (`mcp.servers.<name>`) |
 | A provider named `mcp` | Rename the provider |
-| A header value that also appears elsewhere in the config | Remove the copy |
+| A header value with spaces or tabs at either end | Trim the value |
+| A header value or scheme token of 8 characters or more that also appears elsewhere in the config | Remove the copy |
+| A header value or scheme token of 8 characters or more that also appears in the step's environment, in a variable the sandbox inherits (such as an `OPENCODE_*` variable) | Remove the copy from the step's `env` |
 
 The lifecycle owns the proxy. It starts it under the same signal handling as the sandbox, stops it after the sandbox is stopped and taken back, and treats an exit it can't confirm as `unsafe`. A proxy that died before the teardown fails the run: nothing is published and no session state is saved.
 

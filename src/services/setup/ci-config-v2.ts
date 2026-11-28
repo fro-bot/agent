@@ -29,6 +29,13 @@ export interface CIConfigV2Inputs {
   readonly runAttempt: string | number
   readonly integrationWorkDir?: string
   /**
+   * `isolate-agent` runs: the agent's private `TMPDIR` (`SANDBOX_TMP_DIRECTORY`), a run-scoped directory under the sandbox
+   * account's home, outside the checkout. Becomes an authorized exception of the permission gate, so the agent's own
+   * scratch files are reachable (fro-bot/agent#2404). Exactly this directory: `/tmp`, the account's home and the runner's
+   * `RUNNER_TEMP` stay denied. Absent on a run that is not isolated, where no `TMPDIR` is set for the agent.
+   */
+  readonly agentTmpDirectory?: string
+  /**
    * The installed Systematic `skills/` directory (`resolveSystematicSkillsDirsV2`), so a skill can read its own
    * references and run its own scripts under the outside-checkout deny (fro-bot/agent#2009). Becomes an authorized
    * exception of the permission gate. Empty or absent when unresolved: nothing is added.
@@ -308,8 +315,8 @@ export function prepareOperatorConfigV2(
  * Build the V2 `OPENCODE_CONFIG_CONTENT` for an Action run, plus what the permission gate must find after spawn.
  *
  * Pure: the run identity and `RUNNER_TEMP` come in as inputs. The spawn sets `OPENCODE_DISABLE_PROJECT_CONFIG=1`.
- * The response-file and attachment directories are run-scoped and live outside the checkout, so a hostile checkout
- * cannot plant or read them; every other external directory stays denied. Fails when `RUNNER_TEMP`, the run identity or
+ * The response-file and attachment directories (and, when isolated, the agent's private temp directory) are run-scoped and
+ * live outside the checkout, so a hostile checkout cannot plant or read them; every other external directory stays denied. Fails when `RUNNER_TEMP`, the run identity or
  * the integration workdir would make an exception directory contain `*` or `?`, which the server reads as wildcards.
  */
 export function buildCIConfigV2(inputs: CIConfigV2Inputs, logger: Logger): Result<BuiltConfigV2, string> {
@@ -354,6 +361,9 @@ export function buildCIConfigV2(inputs: CIConfigV2Inputs, logger: Logger): Resul
   } else {
     logger.debug('Skipping response-file and attachment exceptions: RUNNER_TEMP is not set')
   }
+
+  // The isolated agent's own scratch directory, run-scoped like the response-file one and independent of RUNNER_TEMP.
+  if (inputs.agentTmpDirectory !== undefined) allowedDirectories.push(inputs.agentTmpDirectory)
 
   // The repo skills copy is a skills directory like the bundled ones: readable for its references and scripts, never
   // writable through the edit tools.
