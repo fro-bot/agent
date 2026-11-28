@@ -37,12 +37,16 @@ function usageOf(value: unknown): Usage | undefined {
   const input = asNumber(tokens.input)
   const output = asNumber(tokens.output)
   if (input === undefined || output === undefined) return undefined
+  // A sub-count OpenCode did not report stays absent: defaulting it to 0 would be indistinguishable from a reported 0.
+  const reasoning = asNumber(tokens.reasoning)
+  const cacheRead = asNumber(cache?.read)
+  const cacheWrite = asNumber(cache?.write)
   return {
     input,
     output,
-    reasoning: asNumber(tokens.reasoning) ?? 0,
-    cacheRead: asNumber(cache?.read) ?? 0,
-    cacheWrite: asNumber(cache?.write) ?? 0,
+    ...(reasoning === undefined ? {} : {reasoning}),
+    ...(cacheRead === undefined ? {} : {cacheRead}),
+    ...(cacheWrite === undefined ? {} : {cacheWrite}),
   }
 }
 

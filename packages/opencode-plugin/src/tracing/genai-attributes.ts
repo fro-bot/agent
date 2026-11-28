@@ -104,12 +104,13 @@ function eventsOf(record: SpanRecord): PendingSpan['events'] {
 function usageAttributes(usage: ChatRecord['usage']): Attributes {
   if (usage === undefined) return {}
   const attributes: Attributes = {
-    'gen_ai.usage.input_tokens': usage.input + usage.cacheRead + usage.cacheWrite,
-    'gen_ai.usage.output_tokens': usage.output + usage.reasoning,
+    'gen_ai.usage.input_tokens': usage.input + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0),
+    'gen_ai.usage.output_tokens': usage.output + (usage.reasoning ?? 0),
   }
-  if (usage.cacheRead > 0) attributes['gen_ai.usage.cache_read.input_tokens'] = usage.cacheRead
-  if (usage.cacheWrite > 0) attributes['gen_ai.usage.cache_write.input_tokens'] = usage.cacheWrite
-  if (usage.reasoning > 0) attributes['gen_ai.usage.reasoning.output_tokens'] = usage.reasoning
+  // A reported zero is data; only a sub-count OpenCode did not report is left off.
+  if (usage.cacheRead !== undefined) attributes['gen_ai.usage.cache_read.input_tokens'] = usage.cacheRead
+  if (usage.cacheWrite !== undefined) attributes['gen_ai.usage.cache_write.input_tokens'] = usage.cacheWrite
+  if (usage.reasoning !== undefined) attributes['gen_ai.usage.reasoning.output_tokens'] = usage.reasoning
   return attributes
 }
 

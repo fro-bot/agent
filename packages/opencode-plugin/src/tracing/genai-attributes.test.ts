@@ -154,7 +154,33 @@ describe('model spans', () => {
       'gen_ai.usage.reasoning.output_tokens': 7,
       'fro_bot.usage.cost_usd': 0.5,
     })
+    // #and a reported zero is kept, not dropped
+    expect(span.attributes['gen_ai.usage.cache_write.input_tokens']).toBe(0)
+  })
+
+  it('emits a reported zero for the cache and reasoning counts', () => {
+    // #given OpenCode reported every sub-count as 0
+    const span = exported(chat({usage: {input: 5, output: 2, reasoning: 0, cacheRead: 0, cacheWrite: 0}}))
+
+    // #then the zeros are data, and the totals are unchanged
+    expect(span.attributes).toMatchObject({
+      'gen_ai.usage.input_tokens': 5,
+      'gen_ai.usage.output_tokens': 2,
+      'gen_ai.usage.cache_read.input_tokens': 0,
+      'gen_ai.usage.cache_write.input_tokens': 0,
+      'gen_ai.usage.reasoning.output_tokens': 0,
+    })
+  })
+
+  it('keeps a sub-count the provider did not report absent, with the totals intact', () => {
+    // #given usage that reported only input and output
+    const span = exported(chat({usage: {input: 5, output: 2}}))
+
+    // #then
+    expect(span.attributes).toMatchObject({'gen_ai.usage.input_tokens': 5, 'gen_ai.usage.output_tokens': 2})
+    expect(span.attributes['gen_ai.usage.cache_read.input_tokens']).toBeUndefined()
     expect(span.attributes['gen_ai.usage.cache_write.input_tokens']).toBeUndefined()
+    expect(span.attributes['gen_ai.usage.reasoning.output_tokens']).toBeUndefined()
   })
 
   it('sets no attribute for a field that was not captured', () => {

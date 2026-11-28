@@ -10,13 +10,16 @@ export interface ErrorInfo {
   readonly status?: number | undefined
 }
 
-/** OpenCode's token split: `input` excludes cache reads, `output` excludes reasoning. Mapped to the convention later. */
+/**
+ * OpenCode's token split: `input` excludes cache reads, `output` excludes reasoning. Mapped to the convention later.
+ * A sub-count is absent when OpenCode did not report it, and 0 only when it reported 0.
+ */
 export interface Usage {
   readonly input: number
   readonly output: number
-  readonly reasoning: number
-  readonly cacheRead: number
-  readonly cacheWrite: number
+  readonly reasoning?: number | undefined
+  readonly cacheRead?: number | undefined
+  readonly cacheWrite?: number | undefined
 }
 
 export type RequestKind = 'primary' | 'compaction' | 'title' | 'generate'
