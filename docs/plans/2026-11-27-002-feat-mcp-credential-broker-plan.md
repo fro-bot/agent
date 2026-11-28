@@ -170,7 +170,7 @@ sequenceDiagram
 
 ## Implementation Units
 
-- [ ] **Unit 1: Classify, refuse, rewrite and start the child**
+- [x] **Unit 1: Classify, refuse, rewrite and start the child**
 
 **Goal:** On an isolated provisioning run, every `mcp` entry with `headers` either becomes a broker route plus a rewritten entry (loopback URL, no headers, `oauth: false`) or makes the run fail before handoff. The child starts whenever there are provider routes or MCP routes.
 
@@ -234,7 +234,7 @@ sequenceDiagram
 - No serialized final config contains any masked value.
 - Every refusal reason has a test.
 
-- [ ] **Unit 2: Serve MCP routes in the key-proxy child**
+- [x] **Unit 2: Serve MCP routes in the key-proxy child**
 
 **Goal:** The child relays each brokered route to its fixed upstream. It strips client credentials, sets the configured headers last, refuses redirects and upgrades, replaces error bodies, and keeps OpenCode's session recovery working.
 
@@ -272,7 +272,7 @@ sequenceDiagram
 **Verification:**
 - The provider route tests pass unchanged, and every response rule has a test.
 
-- [ ] **Unit 3: Prove it on a real runner and a real binary**
+- [x] **Unit 3: Prove it on a real runner and a real binary**
 
 **Goal:** Show end to end that R1 and R2 hold.
 
@@ -297,7 +297,7 @@ sequenceDiagram
 - The new row passes on both sandbox images in CI.
 - The real-binary test passes on the pinned version.
 
-- [ ] **Unit 4: Docs**
+- [x] **Unit 4: Docs**
 
 **Goal:** State the new boundary precisely.
 
@@ -325,6 +325,22 @@ List each refusal with its remedy. Don't suggest turning off isolation as a fix.
 
 **Verification:**
 - Every refusal reason from Unit 1 has a documented remedy.
+
+## As Built
+
+Implementation changed these points from the plan:
+
+- **Disabled entries.** An entry counts as disabled only in the two forms the 2.4.2 client honours: flat `enabled: false` and native `disabled: true`. Any other form on an entry with `headers` is brokered, or refused if it contradicts itself.
+- **Refused before handoff, in addition to the plan's list:**
+  - a top-level key built from a reference
+  - a provider named `mcp`, when MCP routes exist
+  - a cloud metadata host or a non-canonical path
+  - more than 32 headers on one server, a value over 4,096 characters, or headers on more than 64 servers
+- **Probe default.** The 2.4.2 client defaults to `auto`. It POSTs `server/discover` first and falls back to `initialize` on a non-modern 400. It never adds `?codemode=false` to a loopback URL.
+- **Error bodies.** They are redacted the way the key proxy redacts provider error bodies, not replaced. Every configured value of 8 characters or more, and every scheme token, becomes `[redacted]`, and the rest passes through. JSON-RPC errors and the `Bad Request: Server not initialized` recovery body therefore reach the client with no special case.
+- **Timeouts.** MCP routes have no first-byte or idle timeout, because a tool call can legitimately run long. Streams end at run teardown.
+- **Wire version.** It is not bumped. The previous parser already refused a frame carrying `mcp`.
+- **Files.** Unit 1 also changed `packages/runtime/src/agent/key-proxy-wire.ts`, `key-proxy-child.ts`, `index.ts` and `src/harness/phases/key-proxy-process.ts`. Unit 3 added `src/harness/phases/mcp-upstream.fixture.ts`.
 
 ## System-Wide Impact
 
