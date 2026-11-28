@@ -133,18 +133,19 @@ export function buildMcpRequestHeaders(
   hasBody: boolean,
 ): OutgoingHttpHeaders {
   const skipped = nominated(client)
-  const headers: OutgoingHttpHeaders = {}
+  // A Map, then `fromEntries`: a header named `__proto__` stays an own key, and a later set replaces an earlier one.
+  const headers = new Map<string, string | string[] | number>()
   for (const [name, raw] of Object.entries(client)) {
     const value = headerText(raw)
     if (value === undefined) continue
     if (NEVER_FORWARDED.has(name) || name.startsWith(FORWARDING_PREFIX) || skipped.has(name)) continue
-    headers[name] = value
+    headers.set(name, value)
   }
-  if (hasBody && client['content-length'] !== undefined) headers['content-length'] = client['content-length']
-  headers.host = route.host
-  headers['accept-encoding'] = 'identity'
-  for (const [name, value] of Object.entries(route.headers)) headers[name] = value
-  return headers
+  if (hasBody && client['content-length'] !== undefined) headers.set('content-length', client['content-length'])
+  headers.set('host', route.host)
+  headers.set('accept-encoding', 'identity')
+  for (const [name, value] of Object.entries(route.headers)) headers.set(name, value)
+  return Object.fromEntries(headers)
 }
 
 /** The `Retry-After` delay in seconds, or undefined when the value is anything else. */

@@ -339,6 +339,30 @@ function containsReference(value: unknown): boolean {
   return false
 }
 
+/**
+ * Whether a key holds a reference, at any depth and in any entry. OpenCode resolves `{file:}` and `{env:}` in the config
+ * text before it reads it, so a key built from one can become `headers` (or any field) after the broker has classified
+ * the entry, and the file or variable can hold the credential.
+ */
+function hasReferenceKey(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(hasReferenceKey)
+  if (isRecord(value)) {
+    return Object.entries(value).some(([key, entry]) => hasReferenceOpening(key) || hasReferenceKey(entry))
+  }
+  return false
+}
+
+/** Adds the maskable strings of every string header value to `secrets`, first server wins. Reads what it is given as is. */
+function addHeaderSecrets(secrets: Map<string, McpBrokerSecretV2>, server: string, headers: unknown): void {
+  if (!isRecord(headers)) return
+  for (const header of Object.values(headers)) {
+    if (typeof header !== 'string') continue
+    for (const secret of mcpHeaderSecrets(header)) {
+      if (!secrets.has(secret)) secrets.set(secret, {server, value: secret})
+    }
+  }
+}
+
 const MAX_LOGGED_NAMES = 20
 const MAX_LOGGED_NAME_LENGTH = 64
 
@@ -702,7 +726,7 @@ function checkBrokeredHeaders(name: string, headers: unknown): HeadersCheck {
     )
   }
   const seen = new Set<string>()
-  const checked: Record<string, string> = {}
+  const checked: [string, string][] = []
   let bytes = 0
   for (const [headerName, headerValue] of entries) {
     if (!HEADER_NAME_TOKEN.test(headerName)) {
@@ -748,9 +772,10 @@ function checkBrokeredHeaders(name: string, headers: unknown): HeadersCheck {
       )
     }
     bytes += headerName.length + headerValue.length
-    checked[headerName] = headerValue
+    checked.push([headerName, headerValue])
   }
-  return ok({headers: checked, bytes})
+  // `fromEntries` defines each name as an own key, so a header named `__proto__` is kept, not swallowed.
+  return ok({headers: Object.fromEntries(checked), bytes})
 }
 
 /**
@@ -843,6 +868,10 @@ export function planMcpBrokerV2(mcp: unknown): Result<McpBrokerPlanV2, McpBroker
         'write every value of the server out literally',
       )
     }
+    // A disabled entry loses its headers, but each value is still masked and scanned for: a copy elsewhere in the config would
+    // hand the sandbox the credential all the same.
+    const server = mcpToolNamespace(name).slice(0, MAX_LOGGED_NAME_LENGTH)
+    addHeaderSecrets(secrets, server, value.headers)
     if (state === 'disabled') {
       stripped.push(ref)
       continue
@@ -885,16 +914,18 @@ export function planMcpBrokerV2(mcp: unknown): Result<McpBrokerPlanV2, McpBroker
       )
     }
 
-    const server = mcpToolNamespace(name).slice(0, MAX_LOGGED_NAME_LENGTH)
-    for (const header of Object.values(headers.data.headers)) {
-      for (const secret of mcpHeaderSecrets(header)) {
-        if (!secrets.has(secret)) secrets.set(secret, {server, value: secret})
-      }
-    }
     routes.push({
       ...ref,
       route: {id: `s${routes.length + 1}`, origin: upstream.origin, path: upstream.path, headers: headers.data.headers},
     })
+  }
+
+  if (hasReferenceKey(mcp)) {
+    return blockRefusal(
+      'reference-key',
+      'opencode-config `mcp` has a key that holds an `{env:}` or `{file:}` reference, which OpenCode would resolve into the config after the broker has read it',
+      'write every key under `mcp` out literally',
+    )
   }
 
   return ok({routes, stripped, secrets: [...secrets.values()]})

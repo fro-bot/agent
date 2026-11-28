@@ -212,6 +212,17 @@ describe('MCP routes on the wire', () => {
     expect(empty.success).toBe(true)
   })
 
+  it('keeps a header named __proto__ as an own header', () => {
+    // #given a route frame whose header map has that name as an own key
+    const headers = JSON.parse('{"__proto__":"proto-value-0001"}') as Record<string, string>
+    const parsed = parseKeyProxyConfig({...validConfig(), mcp: [{...route, headers}]})
+
+    // #then the parser accepts it and keeps it as an own key, as the Action's planner does
+    const kept = parsed.success ? parsed.data.mcp?.[0]?.headers : undefined
+    expect(Object.keys(kept ?? {})).toEqual(['__proto__'])
+    expect(Object.getOwnPropertyDescriptor(kept, '__proto__')?.value).toBe('proto-value-0001')
+  })
+
   it('copies only the known route fields', () => {
     // #given a route with a header map the parser must copy, not alias
     const input = {...route, headers: {...route.headers}}

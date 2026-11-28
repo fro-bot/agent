@@ -112,6 +112,9 @@ export interface KeyProxyServer {
   readonly close: () => Promise<void>
 }
 
+/** Connections one MCP route may hold beyond the provider limit: its GET stream, and a few calls in flight. */
+const MCP_CONNECTIONS_PER_ROUTE = 4
+
 const LOOPBACK = '127.0.0.1'
 const REDACTED = '[REDACTED]'
 
@@ -654,7 +657,9 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
       refuse(res, 500, 'internal')
     }
   })
-  server.maxConnections = limits.maxConnections
+  // Every connection counts, and an MCP route holds a stream open for the whole run: each gets headroom of its own, so the
+  // providers keep their full limit.
+  server.maxConnections = limits.maxConnections + MCP_CONNECTIONS_PER_ROUTE * mcpById.size
   server.requestTimeout = limits.requestTimeoutMs
   server.headersTimeout = Math.min(30_000, limits.requestTimeoutMs)
   server.keepAliveTimeout = 60_000

@@ -158,18 +158,18 @@ function parseMcpHeaders(value: unknown): Readonly<Record<string, string>> | nul
   const entries = Object.entries(value)
   if (entries.length > MAX_MCP_HEADERS_PER_ROUTE) return null
   const seen = new Set<string>()
-  const headers: Record<string, string> = {}
+  const headers: [string, string][] = []
   for (const [name, headerValue] of entries) {
     const lowered = name.toLowerCase()
-    if (!MCP_HEADER_NAME.test(name) || KEY_PROXY_MCP_FORBIDDEN_HEADERS.has(lowered) || lowered === '__proto__')
-      return null
+    if (!MCP_HEADER_NAME.test(name) || KEY_PROXY_MCP_FORBIDDEN_HEADERS.has(lowered)) return null
     if (seen.has(lowered)) return null
     seen.add(lowered)
     if (typeof headerValue !== 'string' || headerValue.length > MAX_MCP_HEADER_VALUE_LENGTH) return null
     if (!MCP_HEADER_VALUE.test(headerValue)) return null
-    headers[name] = headerValue
+    headers.push([name, headerValue])
   }
-  return headers
+  // `fromEntries` defines each name as an own key, so a header named `__proto__` is kept, not swallowed.
+  return Object.fromEntries(headers)
 }
 
 /**

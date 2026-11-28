@@ -1331,6 +1331,19 @@ async function sendMcp(h: Harness, init: Omit<SendInit, 'credential'> = {}, path
   return h.send(path, {...init, credential: 'none'})
 }
 
+/** Opens a GET stream on the MCP route and resolves once its first frame has arrived; the request is left open. */
+async function holdStream(port: number): Promise<http.ClientRequest> {
+  const stream = http.request({host: '127.0.0.1', port, path: '/mcp/s1', method: 'GET', agent: false})
+  await new Promise<void>((resolve, reject) => {
+    stream.on('response', res => {
+      res.once('data', () => resolve())
+    })
+    stream.on('error', reject)
+    stream.end()
+  })
+  return stream
+}
+
 /** Answers each upstream request with the next recorded response, in order. */
 function replayUpstream(exchanges: readonly RecordedMcpExchange[]): UpstreamHandler {
   let index = 0
@@ -2005,30 +2018,45 @@ describe('key proxy: MCP routes, response side', () => {
     expect(h.upstream.requests).toHaveLength(1)
   })
 
-  it('counts an open stream against the connection cap shared with every route', async () => {
-    // #given a cap of one connection, held by a GET stream
-    const h = await setupMcp(
-      (_request, res) => {
-        res.writeHead(200, {'content-type': 'text/event-stream'})
-        res.write(': open\n\n')
-      },
-      {limits: {maxConnections: 1}},
-    )
-    const stream = http.request({host: '127.0.0.1', port: h.proxy.port, path: '/mcp/s1', method: 'GET', agent: false})
-    await new Promise<void>((resolve, reject) => {
-      stream.on('response', res => {
-        res.once('data', () => resolve())
-      })
-      stream.on('error', reject)
-      stream.end()
-    })
+  const holdOpen: UpstreamHandler = (request, res) => {
+    if (request.url === '/mcp') {
+      res.writeHead(200, {'content-type': 'text/event-stream'})
+      res.write(': open\n\n')
+      return
+    }
+    setTimeout(() => {
+      res.writeHead(200, {'content-type': 'application/json'})
+      res.end('{"ok":true}')
+    }, 200)
+  }
 
-    // #when another connection arrives
-    const second = await rawExchange(h.proxy.port, 'GET /mcp/s1 HTTP/1.1\r\nHost: x\r\n\r\n', 200)
+  it('caps connections at the provider limit plus four per MCP route', async () => {
+    // #given a provider limit of 1 and one MCP route, so the cap is 5
+    const h = await setupMcp(holdOpen, {limits: {maxConnections: 1}})
+
+    // #when five streams are held and a sixth connection arrives
+    const streams = await Promise.all(Array.from({length: 5}, async () => holdStream(h.proxy.port)))
+    const sixth = await rawExchange(h.proxy.port, 'GET /mcp/s1 HTTP/1.1\r\nHost: x\r\n\r\n', 200)
 
     // #then it is dropped without an answer
-    expect(second).toBe('')
-    stream.destroy()
+    expect(sixth).toBe('')
+    for (const stream of streams) stream.destroy()
+  })
+
+  it('leaves the provider limit whole while MCP streams are held', async () => {
+    // #given a provider limit of 2, one MCP route and four held MCP streams
+    const h = await setupMcp(holdOpen, {limits: {maxConnections: 2}, withProviders: true})
+    const streams = await Promise.all(Array.from({length: 4}, async () => holdStream(h.proxy.port)))
+
+    // #when two provider requests are in flight at once
+    const replies = await Promise.all([
+      h.send('/openai/chat/completions', {body: '{}'}),
+      h.send('/openai/chat/completions', {body: '{}'}),
+    ])
+
+    // #then both are served: the streams did not take the providers' connections
+    expect(replies.map(reply => reply.status)).toEqual([200, 200])
+    for (const stream of streams) stream.destroy()
   })
 
   it('refuses an upstream whose certificate it does not trust, with no request sent', async () => {

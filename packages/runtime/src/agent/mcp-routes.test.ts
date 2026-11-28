@@ -38,6 +38,21 @@ describe('buildMcpRoutes', () => {
     expect(routes.get('s2')?.headers).toEqual({'x-api-key': 'k-12345678', accept: 'text/plain'})
   })
 
+  it('keeps a header named __proto__ as an own header, in the table and on the request', () => {
+    // #given a route whose header name a plain object would swallow
+    const headers = JSON.parse('{"__proto__":"proto-value-0001"}') as Record<string, string>
+    const state = built([route({headers})]).get('s1')
+    if (state === undefined) throw new Error('fixture')
+
+    // #when a request is built for it
+    const out = buildMcpRequestHeaders({}, state, false)
+
+    // #then the name is an own key in both, with its value
+    expect(Object.keys(state.headers)).toEqual(['__proto__'])
+    expect(Object.getOwnPropertyDescriptor(out, '__proto__')?.value).toBe('proto-value-0001')
+    expect(state.secrets).toEqual(['proto-value-0001'])
+  })
+
   it('accepts an empty header map and a non-default port', () => {
     const routes = built([route({origin: 'https://mcp.example.com:8443', headers: {}})])
     expect(routes.get('s1')).toMatchObject({port: 8443, host: 'mcp.example.com:8443', headers: {}})
@@ -61,7 +76,6 @@ describe('buildMcpRoutes', () => {
     ['a header named Content-Length', {headers: {'Content-Length': '1'}}],
     ['two header names that differ only in case', {headers: {Authorization: 'a', authorization: 'b'}}],
     ['a header name that is not a token', {headers: {'bad name': 'x'}}],
-    ['a header named __proto__', {headers: JSON.parse('{"__proto__":"x"}') as Record<string, string>}],
     ['a header value with a line break', {headers: {'X-A': 'one\r\nX-B: two'}}],
     ['a header value with a control character', {headers: {'X-A': 'one\u0001two'}}],
     ['a header value above the byte range', {headers: {'X-A': 'one\u0100two'}}],

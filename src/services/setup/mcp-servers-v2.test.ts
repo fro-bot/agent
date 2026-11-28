@@ -936,7 +936,7 @@ describe('planMcpBrokerV2', () => {
 
       expect(plan.routes).toEqual([])
       expect(plan.stripped).toEqual([{name: 'off', layout: 'legacy'}])
-      expect(plan.secrets).toEqual([])
+      expect(plan.secrets.map(secret => secret.value)).toEqual([BEARER, TOKEN])
     })
 
     it('strips a disabled native entry, and a disabled local entry that carries headers', () => {
@@ -1033,8 +1033,43 @@ describe('planMcpBrokerV2', () => {
       expect(plan.secrets).toEqual([{server: 'one', value: 'shared-value-0001'}])
     })
 
-    it('does not mask the values of a disabled server, whose headers are only dropped', () => {
-      expect(unwrapOk(planMcpBrokerV2({off: credentialed({enabled: false})})).secrets).toEqual([])
+    it('masks and scans the values of a disabled server too, so a copy elsewhere is still found', () => {
+      // #given a flat and a native disabled entry, each with a long value and a short one
+      const flat = unwrapOk(
+        planMcpBrokerV2({off: credentialed({enabled: false, headers: {Authorization: BEARER, 'X-V': 'v1'}})}),
+      )
+      const native = unwrapOk(
+        planMcpBrokerV2({servers: {off: credentialed({disabled: true, headers: {'X-Key': 'native-value-0001'}})}}),
+      )
+
+      // #then the headers are only dropped, but the values of 8 characters or more and the scheme token are collected
+      expect(flat.routes).toEqual([])
+      expect(flat.secrets.map(secret => secret.value)).toEqual([BEARER, TOKEN])
+      expect(native.secrets.map(secret => secret.value)).toEqual(['native-value-0001'])
+    })
+
+    it('collects the values of a disabled entry whose headers are not all strings, without refusing it', () => {
+      const plan = unwrapOk(
+        planMcpBrokerV2({
+          off: credentialed({
+            enabled: false,
+            headers: {'X-A': 12_345_678, 'X-C': ['Bearer array-token-123'], 'X-B': 'string-value-1'},
+          }),
+        }),
+      )
+      expect(plan.secrets.map(secret => secret.value)).toEqual(['string-value-1'])
+    })
+
+    it('keeps a header named __proto__ as an own header of its route', () => {
+      // #given a header whose name a plain object would swallow
+      const headers = JSON.parse('{"__proto__":"proto-value-0001","X-Other":"other-value-1"}') as Record<string, string>
+      const plan = unwrapOk(planMcpBrokerV2({search: {...REMOTE, headers}}))
+
+      // #then it is on the route and its value is masked like any other
+      const route = plan.routes[0]?.route
+      expect(Object.keys(route?.headers ?? {})).toEqual(['__proto__', 'X-Other'])
+      expect(Object.getOwnPropertyDescriptor(route?.headers, '__proto__')?.value).toBe('proto-value-0001')
+      expect(plan.secrets.map(secret => secret.value)).toEqual(['proto-value-0001', 'other-value-1'])
     })
   })
 
@@ -1060,6 +1095,27 @@ describe('planMcpBrokerV2', () => {
     it.each([
       ['an entry under a key that holds a reference', {'{env:SERVER}': withCanary({})}, 'reference-key'],
       ['a `{file:}` key', {'{file:/x}': withCanary({})}, 'reference-key'],
+      [
+        'a reference key whose value has no headers of its own, which a file could supply',
+        {'{file:/tmp/k}': {Authorization: `Bearer ${CANARY}`}},
+        'reference-key',
+      ],
+      [
+        'a reference key inside a headerless flat entry',
+        {plain: {...REMOTE, '{file:/tmp/k}': {Authorization: `Bearer ${CANARY}`}}},
+        'reference-key',
+      ],
+      ['a reference key naming a native server', {servers: {'{env:NAME}': {...REMOTE}}}, 'reference-key'],
+      [
+        'a reference key deep inside a native entry',
+        {servers: {a: {...REMOTE, extra: {deep: [{'{file:/k}': CANARY}]}}}},
+        'reference-key',
+      ],
+      [
+        'a reference key beside a credentialed entry that is otherwise fine',
+        {search: withCanary({}), other: {...REMOTE, '{env:X}': 1}},
+        'reference-key',
+      ],
       [
         'an `enabled`-only stub that also sets headers',
         {stub: {enabled: false, headers: {Authorization: `Bearer ${CANARY}`}}},
