@@ -107,7 +107,9 @@ export async function startTracing(
     url: settings.endpoint,
     serviceName: PLUGIN_SERVICE_NAME,
     resourceAttributes: {
-      ...(version === undefined ? {} : {'service.version': version}),
+      // `service.version` feeds Langfuse's `version`; its `release` is read per observation from the span, then the resource, so
+      // the resource carries it and every span, root or child, has it.
+      ...(version === undefined ? {} : {'service.version': version, 'langfuse.release': version}),
       ...(opencodeVersion === undefined ? {} : {'fro_bot.opencode.version': opencodeVersion}),
     },
     headers: local ? settings.headers : {},
@@ -123,7 +125,6 @@ export async function startTracing(
     sink: exporter,
     scrubber,
     ledger,
-    ...(version === undefined ? {} : {release: version}),
     ...(settings.host === 'action'
       ? {
           identity: settings.identity,

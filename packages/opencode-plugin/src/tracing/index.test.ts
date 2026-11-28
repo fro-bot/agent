@@ -197,7 +197,11 @@ describe('startTracing', () => {
       }
     ).resourceSpans
     expect(exported.map(resource => resourceOf(resource.resource.attributes))).toEqual([
-      {'service.name': 'fro-bot-opencode-plugin', 'service.version': PACKAGE_VERSION},
+      {
+        'service.name': 'fro-bot-opencode-plugin',
+        'service.version': PACKAGE_VERSION,
+        'langfuse.release': PACKAGE_VERSION,
+      },
     ])
     expect(exported.flatMap(resource => resource.scopeSpans.map(scope => scope.scope.name))).toEqual([
       'fro-bot-opencode-plugin',
@@ -298,23 +302,20 @@ describe('startTracing', () => {
       expect(resource).toEqual({
         'service.name': 'fro-bot-opencode-plugin',
         'service.version': PACKAGE_VERSION,
+        'langfuse.release': PACKAGE_VERSION,
         'fro_bot.opencode.version': '2.4.2',
       })
     })
 
-    it('puts the plugin version on the root span as langfuse.release, and on no other span', async () => {
+    it('puts the plugin version on the resource as langfuse.release, so every span has it, and sets it on no span itself', async () => {
       // #when
-      const {spans} = await exportTurn({readVersion: () => '1.4.2'})
+      const {resource, spans} = await exportTurn({readVersion: () => '1.4.2'})
 
-      // #then the root has it and the model span does not
-      expect(
-        spans
-          .map(span => [span.name, span.root, span.attributes['langfuse.release']])
-          .toSorted((a, b) => String(a[0]).localeCompare(String(b[0]))),
-      ).toEqual([
-        ['chat m', false, undefined],
-        ['invoke_agent build', true, '1.4.2'],
-      ])
+      // #then Langfuse reads it from the resource for the root and the child alike
+      expect(resource['langfuse.release']).toBe('1.4.2')
+      expect(resource['service.version']).toBe('1.4.2')
+      expect(spans.map(span => span.name).toSorted()).toEqual(['chat m', 'invoke_agent build'])
+      expect(spans.every(span => span.attributes['langfuse.release'] === undefined)).toBe(true)
     })
 
     it('leaves both unset, and still exports, when the version cannot be read', async () => {
@@ -362,7 +363,7 @@ describe('startTracing', () => {
         readVersion: () => '1.4.2',
       })
 
-      // #then the resource holds neither, and no span carries a release
+      // #then the resource holds neither version nor release, and no span carries a release
       expect(resource).toEqual({'service.name': 'fro-bot-opencode-plugin'})
       expect(spans.every(span => span.attributes['langfuse.release'] === undefined)).toBe(true)
     })

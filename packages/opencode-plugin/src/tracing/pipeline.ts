@@ -70,8 +70,6 @@ export interface TracePipelineOptions extends ActionRunContext {
   readonly scrubber: Scrubber
   /** Action mode only. */
   readonly identity?: ActionIdentity | undefined
-  /** The plugin's own version, for `langfuse.release` on root spans. Absent when unknown. */
-  readonly release?: string | undefined
   /** Frees each snapshot as its span leaves the pipeline. Absent: nothing is counted. */
   readonly ledger?: SnapshotLedger | undefined
   readonly now?: () => number
@@ -223,7 +221,6 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
   })
   const attributeOptions: AttributeOptions = {
     identity: options.identity,
-    release: options.release,
     rootSpan: options.rootSpan,
     sessionId: options.sessionId,
     invocationId: options.invocationId,
