@@ -3,11 +3,13 @@ import type {ObserverHost} from './record-observations.js'
 
 import {readFileSync} from 'node:fs'
 
+import {buildTracingLauncherValue} from '@fro-bot/runtime'
 import {scrubSafeSessionId} from '@fro-bot/runtime/tracing/session-id'
 import {afterEach, describe, expect, it, vi} from 'vitest'
 import {startOtlpSink, type OtlpSink} from '../integration.fixture.js'
 import {createScrubber} from './content.js'
 import {CLEANUP_BOUND_MS, DRAIN_BOUND_MS, startTracing} from './index.js'
+import {resolveTracingSettings, TRACING_LAUNCHER_ENV} from './settings.js'
 import {cpuMs, minCpuMs} from './timing.testing.js'
 
 /** A fake host: records every registered hook and exposes a pushable event stream. */
@@ -258,6 +260,59 @@ describe('startTracing', () => {
     expect(request?.headers.authorization).toBeUndefined()
     expect(request?.text).toContain('fro_bot.repository')
     expect(request?.text).toContain('fro-bot/agent')
+  })
+
+  describe('the run URL, from the launcher document to the export', () => {
+    it('exports the GitHub Enterprise URL of a re-run on a root span and on a child span', async () => {
+      // #given the launcher the Action's writer produces for an enterprise server and attempt 2, read by the plugin's own parser
+      const launcher = buildTracingLauncherValue({
+        host: 'action',
+        tracing: 'on',
+        relayPort: 43_210,
+        identity: {repository: 'fro-bot/agent', runId: '9001', attempt: '2', job: 'j', trigger: 'push'},
+        serverUrl: 'https://ghe.example.com',
+      })
+      const resolved = resolveTracingSettings({
+        env: {[TRACING_LAUNCHER_ENV]: launcher},
+        directory: '/work/checkout',
+        log: () => {},
+      })
+      expect(resolved).toMatchObject({mode: 'on', host: 'action', serverUrl: 'https://ghe.example.com'})
+      const target = await sink()
+      const settings = {...resolved, endpoint: target.url} as OnSettings
+      const fake = fakeObserverHost()
+      const handle = await startTracing(fake.host, settings, {env: {}, log: () => {}})
+
+      // #when a turn is exported
+      textTurn(fake)
+      await new Promise(resolve => setTimeout(resolve, 50))
+      await handle.stop()
+      fake.end()
+
+      // #then the root span and the model span (its child) carry the exact attempt URL and the run id
+      const spans = (
+        (target.accepted()[0]?.body ?? {resourceSpans: []}) as {
+          resourceSpans: {
+            scopeSpans: {
+              spans: {
+                name: string
+                parentSpanId?: string
+                attributes?: {key: string; value: {stringValue?: string}}[]
+              }[]
+            }[]
+          }[]
+        }
+      ).resourceSpans.flatMap(resource => resource.scopeSpans.flatMap(scope => scope.spans))
+      const attrs = (span: (typeof spans)[number]): Record<string, string | undefined> =>
+        Object.fromEntries((span.attributes ?? []).map(item => [item.key, item.value.stringValue]))
+      const root = spans.find(span => span.parentSpanId === undefined)
+      const child = spans.find(span => span.parentSpanId !== undefined)
+      const url = 'https://ghe.example.com/fro-bot/agent/actions/runs/9001/attempts/2'
+      expect(attrs(root ?? ({} as never))['cicd.pipeline.run.url.full']).toBe(url)
+      expect(attrs(child ?? ({} as never))['cicd.pipeline.run.url.full']).toBe(url)
+      expect(attrs(root ?? ({} as never))['cicd.pipeline.run.id']).toBe('9001')
+      expect(attrs(child ?? ({} as never))['cicd.pipeline.run.id']).toBe('9001')
+    })
   })
 
   describe('the versions on the resource and the root span', () => {
