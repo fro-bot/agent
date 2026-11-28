@@ -3,15 +3,24 @@ import type {Duplex} from 'node:stream'
 import type {Logger} from '../shared/logger.js'
 import type {Result} from '../shared/types.js'
 import type {KeyProxyRoute} from './key-proxy-routes.js'
+import type {KeyProxyMcpRouteConfig} from './key-proxy-wire.js'
+import type {McpRouteState} from './mcp-routes.js'
 import {Buffer} from 'node:buffer'
 import http from 'node:http'
 import https from 'node:https'
 import {Transform} from 'node:stream'
 import {pipeline} from 'node:stream/promises'
-import {validateUpstreamUrl} from '../object-store/validation.js'
 import {err, ok} from '../shared/types.js'
 import {isForwardableTarget} from './forwardable-target.js'
-import {matchKeyProxyRoute} from './key-proxy-routes.js'
+import {matchKeyProxyRoute, parseUpstreamOrigin} from './key-proxy-routes.js'
+import {KEY_PROXY_MCP_PATH_PREFIX} from './key-proxy-wire.js'
+import {
+  buildMcpRequestHeaders,
+  buildMcpRoutes,
+  matchMcpRoute,
+  MCP_SUCCESS_RESPONSE_HEADERS,
+  sanitizeRetryAfter,
+} from './mcp-routes.js'
 
 /**
  * The key proxy: a loopback HTTP server that holds provider API keys and attaches one to a model request on its way to
@@ -34,6 +43,17 @@ import {matchKeyProxyRoute} from './key-proxy-routes.js'
  * 6. Response headers come from a short allowlist. Local error bodies are fixed text and never name the upstream.
  * 7. Nothing request-derived, and no key, is ever logged.
  * 8. Malformed or oversized input gets an error; the server keeps serving.
+ *
+ * It also serves brokered remote MCP servers at `/mcp/<id>` (see `mcp-routes.ts`), under the same invariants with these
+ * differences, because the agent's shell holds a route anyway and the recorded 2.4.2 client needs more than a provider does:
+ * - POST, GET and DELETE on the fixed local path, with the query passed through; request headers are forwarded except
+ *   credentials, cookies, hop-by-hop and forwarding headers, and the configured headers are set last (invariants 2 and 3).
+ * - A non-2xx body is forwarded as a provider's is (invariant 5), redacted of each configured header value of 8 characters
+ *   or more and of the token after a Bearer, Basic or Token scheme, so a modern JSON-RPC error and a session-expired reply
+ *   reach the client. `WWW-Authenticate` and cookies are dropped; `Retry-After` is kept as a plain delay in seconds.
+ * - Only the connect timeout applies: the client sets its own deadline for a tool call (12 hours by default), so there is no
+ *   first-byte or idle cut. The run's teardown closes every socket.
+ * - A 2xx streams through with backpressure; only a short response-header allowlist is copied (invariant 6).
  */
 
 export interface KeyProxyProviderConfig {
@@ -77,6 +97,8 @@ export const DEFAULT_KEY_PROXY_LIMITS: KeyProxyLimits = {
 
 export interface StartKeyProxyOptions {
   readonly providers: readonly KeyProxyProviderConfig[]
+  /** Brokered remote MCP servers, each served at `/mcp/<id>` (see `mcp-routes.ts`). Held apart from the providers. */
+  readonly mcp?: readonly KeyProxyMcpRouteConfig[]
   readonly logger: Logger
   /** Extra TLS trust for the upstream, PEM. Tests only: the supervisor sets it only through its own test options. */
   readonly ca?: string
@@ -89,6 +111,9 @@ export interface KeyProxyServer {
   /** Stops accepting, destroys every connection and aborts every upstream request. */
   readonly close: () => Promise<void>
 }
+
+/** Shared headroom each MCP route adds to the connection cap: for its GET stream and a few calls in flight. */
+const MCP_CONNECTIONS_PER_ROUTE = 4
 
 const LOOPBACK = '127.0.0.1'
 const REDACTED = '[REDACTED]'
@@ -134,12 +159,6 @@ const SUCCESS_RESPONSE_HEADERS: readonly string[] = [
   'content-type',
 ]
 
-/** Upstream response headers passed to the client on a non-2xx whose body is forwarded. */
-const ERROR_RESPONSE_HEADERS: readonly string[] = ['content-type', 'retry-after', 'retry-after-ms']
-
-/** Upstream response headers kept on the fixed generic error that replaces a compressed or oversized error body. */
-const GENERIC_ERROR_RESPONSE_HEADERS: readonly string[] = ['retry-after', 'retry-after-ms']
-
 /** Headers that only describe one hop. Named by RFC 9110 §7.6.1 and its relatives. */
 const HOP_BY_HOP: ReadonlySet<string> = new Set([
   'connection',
@@ -168,6 +187,45 @@ interface MatchedRoute {
   readonly provider: ProviderState
   readonly route: KeyProxyRoute
   readonly query: string
+}
+
+/** What a request resolved to: a provider route, or a brokered MCP route with the raw query to pass through. */
+type ResolvedTarget =
+  | {readonly kind: 'provider'; readonly matched: MatchedRoute}
+  | {readonly kind: 'mcp'; readonly route: McpRouteState; readonly query: string}
+
+/** Handed to the code that answers an upstream response: the live request, and the call that stops its timers. */
+interface RelayControl {
+  readonly upstream: ClientRequest
+  readonly stop: () => void
+}
+
+/** Whose credentials an error body is redacted of, how its retry hint is kept, and what its log lines are called. */
+interface ErrorScope {
+  readonly label: string
+  /** Each credential as it appears in a body: raw UTF-8, then JSON-escaped when that differs. */
+  readonly secrets: readonly Buffer[]
+  /** `raw` copies `Retry-After` and `Retry-After-Ms` as sent; `seconds` keeps `Retry-After` only as a plain delay. */
+  readonly retryAfter: 'raw' | 'seconds'
+}
+
+/** What one upstream request needs once the route is resolved; everything else is the same for both kinds of route. */
+interface RelaySpec {
+  /** For logs only: a provider id, or `mcp/<route id>`. Configured, never taken from the request. */
+  readonly label: string
+  readonly hostname: string
+  readonly port: number
+  /** The upstream path, with the query. */
+  readonly path: string
+  readonly headers: http.OutgoingHttpHeaders
+  readonly hasBody: boolean
+  /**
+   * `all`: the connect, first-byte and idle timeouts. `connect-only`: the connect timeout alone, for a route whose client
+   * sets its own deadline (a tool call may run for hours); the run's teardown closes every socket.
+   */
+  readonly timeouts: 'all' | 'connect-only'
+  /** Answers an upstream response that is not a redirect. */
+  readonly onResponse: (upstreamRes: IncomingMessage, status: number, control: RelayControl) => void
 }
 
 /** Set on the byte counter when the request body outgrows the bound. */
@@ -210,15 +268,6 @@ function nominatedHeaders(headers: IncomingHttpHeaders): ReadonlySet<string> {
   )
 }
 
-function parseOrigin(origin: string): {readonly hostname: string; readonly port: number; readonly host: string} | null {
-  const validated = validateUpstreamUrl(origin)
-  if (!validated.success) return null
-  const url = validated.data
-  if (url.pathname !== '/' || url.origin !== origin) return null
-  const hostname = url.hostname.startsWith('[') ? url.hostname.slice(1, -1) : url.hostname
-  return {hostname, port: url.port === '' ? 443 : Number(url.port), host: url.host}
-}
-
 function buildProviders(providers: readonly KeyProxyProviderConfig[]): Result<Map<string, ProviderState>, string> {
   const states = new Map<string, ProviderState>()
   for (const provider of providers) {
@@ -226,7 +275,7 @@ function buildProviders(providers: readonly KeyProxyProviderConfig[]): Result<Ma
       return err('a provider id is empty, contains a slash or is repeated')
     }
     if (provider.key.length === 0) return err(`provider "${provider.id}" has no key`)
-    const origin = parseOrigin(provider.origin)
+    const origin = parseUpstreamOrigin(provider.origin)
     if (origin === null) return err(`provider "${provider.id}" has an upstream that is not a plain https origin`)
     states.set(provider.id, {
       id: provider.id,
@@ -245,6 +294,12 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
   const providers = buildProviders(options.providers)
   if (!providers.success) return err(providers.error)
   const byId = providers.data
+  const mcp = buildMcpRoutes(options.mcp ?? [])
+  if (!mcp.success) return err(mcp.error)
+  const mcpById = mcp.data
+  const mcpSecrets = new Map([...mcpById].map(([id, route]) => [id, route.secrets.flatMap(secretsFor)]))
+  // A provider named `mcp` would answer under the MCP prefix, so the two route classes could not stay apart.
+  if (mcpById.size > 0 && byId.has(KEY_PROXY_MCP_PATH_PREFIX)) return err('a provider id collides with the MCP prefix')
 
   const agent = new https.Agent({
     keepAlive: false,
@@ -314,19 +369,38 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
     }
   }
 
-  /** Reads a non-2xx body whole, redacts the key and forwards it; or replaces it with the fixed generic error. */
+  /** The retry hints an error keeps, and the content type of a body that is forwarded. Never a challenge or a cookie. */
+  const copyErrorHeaders = (
+    res: ServerResponse,
+    source: IncomingHttpHeaders,
+    scope: ErrorScope,
+    withContentType: boolean,
+  ): void => {
+    if (withContentType) copyHeaders(res, source, ['content-type'])
+    if (scope.retryAfter === 'raw') {
+      copyHeaders(res, source, ['retry-after', 'retry-after-ms'])
+      return
+    }
+    const seconds = sanitizeRetryAfter(headerValue(source['retry-after']))
+    if (seconds !== undefined) res.setHeader('retry-after', seconds)
+  }
+
+  /**
+   * Reads a non-2xx body whole, redacts the route's credentials from it and forwards it with its content type; or replaces
+   * it with the fixed generic error when it is compressed or over the bound. The same for a provider and an MCP route.
+   */
   const forwardError = (
     upstreamRes: IncomingMessage,
     status: number,
-    provider: ProviderState,
+    scope: ErrorScope,
     res: ServerResponse,
     stop: () => void,
   ): void => {
     const generic = (category: string): void => {
       upstreamRes.destroy()
       stop()
-      logger.warning('key-proxy: upstream error replaced', {category, status, provider: provider.id})
-      copyHeaders(res, upstreamRes.headers, GENERIC_ERROR_RESPONSE_HEADERS)
+      logger.warning('key-proxy: upstream error replaced', {category, status, provider: scope.label})
+      copyErrorHeaders(res, upstreamRes.headers, scope, false)
       res.setHeader('content-type', 'application/json')
       res.setHeader('content-length', String(Buffer.byteLength(GENERIC_UPSTREAM_ERROR)))
       res.statusCode = status
@@ -355,51 +429,62 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
     upstreamRes.once('error', () => {
       if (overflowed || res.headersSent) return
       stop()
-      refuse(res, 502, 'upstream-error', provider.id)
+      refuse(res, 502, 'upstream-error', scope.label)
     })
     upstreamRes.once('end', () => {
       if (overflowed || res.headersSent) return
       stop()
       let body: Buffer = Buffer.concat(chunks)
-      for (const secret of provider.secrets) body = replaceAll(body, secret, Buffer.from(REDACTED))
-      copyHeaders(res, upstreamRes.headers, ERROR_RESPONSE_HEADERS)
+      for (const secret of scope.secrets) body = replaceAll(body, secret, Buffer.from(REDACTED))
+      copyErrorHeaders(res, upstreamRes.headers, scope, true)
       res.setHeader('content-length', String(body.length))
       res.statusCode = status
       res.end(body)
     })
   }
 
-  const handle = (req: IncomingMessage, res: ServerResponse): void => {
-    if (req.headers.expect !== undefined) return refuse(res, 417, 'expect')
-    if (req.headers.upgrade !== undefined) return refuse(res, 404, 'upgrade')
+  /** Copies the allowlisted headers of a 2xx and streams its body to the client, with backpressure. */
+  const streamSuccess = (
+    upstreamRes: IncomingMessage,
+    status: number,
+    res: ServerResponse,
+    names: readonly string[],
+    control: RelayControl,
+    flushHeaders: boolean,
+  ): void => {
+    copyHeaders(res, upstreamRes.headers, names)
+    res.statusCode = status
+    // An MCP stream may sit silent for a long time after its headers: the client waits on them (the 2025 GET stream, a tool
+    // call's SSE), so they go out now rather than with the first byte of the body.
+    if (flushHeaders) res.flushHeaders()
+    pipeline(upstreamRes, res)
+      .catch(() => {
+        // The upstream died or the client left. The head is out, so the only honest ending is an aborted stream.
+        control.upstream.destroy()
+        res.destroy()
+      })
+      .finally(control.stop)
+  }
 
-    const found: {route?: MatchedRoute} = {}
-    const forwardable = isForwardableTarget(req.method, req.url, (method, path, query) => {
-      found.route = resolveRoute(method, path, query)
-      return found.route !== undefined
-    })
-    if (!forwardable || found.route === undefined) return refuse(res, 404, 'route')
-    const target = found.route
-
-    const declared = req.headers['content-length']
-    const declaredBytes = declared === undefined ? 0 : Number(declared)
-    if (declaredBytes > limits.maxRequestBodyBytes) {
-      res.setHeader('connection', 'close')
-      return refuse(res, 413, 'body-too-large', target.provider.id)
-    }
-    const hasBody = declaredBytes > 0 || req.headers['transfer-encoding'] !== undefined
-
+  /**
+   * Sends one request upstream and relays the answer: timers, the request body bound, upstream failures, and the refusal of
+   * every redirect and upgrade. What differs between a provider route and an MCP route is `spec`: the target, the headers
+   * and how a response that is not a redirect is answered.
+   */
+  const relay = (req: IncomingMessage, res: ServerResponse, spec: RelaySpec): void => {
     let settled = false
     let timer: ReturnType<typeof setTimeout> | undefined
     let activeUpstream: ClientRequest | undefined
     const arm = (ms: number, category: 'connect' | 'headers' | 'idle'): void => {
       if (settled) return
       if (timer !== undefined) clearTimeout(timer)
+      timer = undefined
+      if (spec.timeouts === 'connect-only' && category !== 'connect') return
       timer = setTimeout(() => {
-        logger.warning('key-proxy: upstream timed out', {category, provider: target.provider.id})
+        logger.warning('key-proxy: upstream timed out', {category, provider: spec.label})
         activeUpstream?.destroy()
         if (res.headersSent) res.destroy()
-        else refuse(res, 504, 'upstream-timeout', target.provider.id)
+        else refuse(res, 504, 'upstream-timeout', spec.label)
       }, ms)
     }
     const stop = (): void => {
@@ -410,11 +495,11 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
 
     const upstream = https.request({
       agent,
-      hostname: target.provider.hostname,
-      port: target.provider.port,
+      hostname: spec.hostname,
+      port: spec.port,
       method: req.method,
-      path: target.query === '' ? target.route.upstreamPath : `${target.route.upstreamPath}?${target.query}`,
-      headers: outboundHeaders(req, target, hasBody),
+      path: spec.path,
+      headers: spec.headers,
     })
     activeUpstream = upstream
     inflight.add(upstream)
@@ -444,8 +529,8 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
         return
       }
       stop()
-      logger.warning('key-proxy: upstream request failed', {category: 'upstream-error', provider: target.provider.id})
-      refuse(res, 502, 'upstream-error', target.provider.id)
+      logger.warning('key-proxy: upstream request failed', {category: 'upstream-error', provider: spec.label})
+      refuse(res, 502, 'upstream-error', spec.label)
     })
 
     upstream.once('upgrade', (_upstreamRes, socket) => {
@@ -456,9 +541,9 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
       socket.destroy()
       upstream.destroy()
       stop()
-      logger.warning('key-proxy: upstream upgrade refused', {category: 'upgrade', provider: target.provider.id})
+      logger.warning('key-proxy: upstream upgrade refused', {category: 'upgrade', provider: spec.label})
       if (res.headersSent) res.destroy()
-      else refuse(res, 502, 'upgrade', target.provider.id)
+      else refuse(res, 502, 'upgrade', spec.label)
     })
 
     upstream.once('response', upstreamRes => {
@@ -469,26 +554,14 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
         // A redirect is never followed and never passed on: its Location could name any host.
         upstreamRes.destroy()
         stop()
-        logger.warning('key-proxy: upstream redirect refused', {category: 'redirect', provider: target.provider.id})
-        refuse(res, 502, 'redirect', target.provider.id)
+        logger.warning('key-proxy: upstream redirect refused', {category: 'redirect', provider: spec.label})
+        refuse(res, 502, 'redirect', spec.label)
         return
       }
-      if (status >= 400) {
-        forwardError(upstreamRes, status, target.provider, res, stop)
-        return
-      }
-      copyHeaders(res, upstreamRes.headers, SUCCESS_RESPONSE_HEADERS)
-      res.statusCode = status
-      pipeline(upstreamRes, res)
-        .catch(() => {
-          // The upstream died or the client left. The head is out, so the only honest ending is an aborted stream.
-          upstream.destroy()
-          res.destroy()
-        })
-        .finally(stop)
+      spec.onResponse(upstreamRes, status, {upstream, stop})
     })
 
-    if (!hasBody) {
+    if (!spec.hasBody) {
       upstream.end()
       return
     }
@@ -506,12 +579,84 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
       if (res.headersSent) return
       stop()
       res.setHeader('connection', 'close')
-      refuse(res, 413, 'body-too-large', target.provider.id)
+      refuse(res, 413, 'body-too-large', spec.label)
       res.once('finish', () => req.socket.destroy())
     })
     // `pipe`, not `pipeline`: a failure upstream must not destroy the client request, whose socket carries the answer.
     req.pipe(counter).pipe(upstream)
     upstream.once('finish', () => arm(limits.headersTimeoutMs, 'headers'))
+  }
+
+  const handle = (req: IncomingMessage, res: ServerResponse): void => {
+    if (req.headers.expect !== undefined) return refuse(res, 417, 'expect')
+    if (req.headers.upgrade !== undefined) return refuse(res, 404, 'upgrade')
+
+    // An MCP route is looked up first and a provider route second; startup refuses a provider id that could shadow `/mcp`.
+    const found: {target?: ResolvedTarget} = {}
+    const forwardable = isForwardableTarget(req.method, req.url, (method, path, query) => {
+      const mcp = matchMcpRoute(mcpById, method, path)
+      if (mcp !== undefined) {
+        found.target = {kind: 'mcp', route: mcp, query}
+        return true
+      }
+      const matched = resolveRoute(method, path, query)
+      if (matched !== undefined) found.target = {kind: 'provider', matched}
+      return matched !== undefined
+    })
+    if (!forwardable || found.target === undefined) return refuse(res, 404, 'route')
+    const target = found.target
+    const label = target.kind === 'mcp' ? `mcp/${target.route.id}` : target.matched.provider.id
+
+    const declared = req.headers['content-length']
+    const declaredBytes = declared === undefined ? 0 : Number(declared)
+    if (declaredBytes > limits.maxRequestBodyBytes) {
+      res.setHeader('connection', 'close')
+      return refuse(res, 413, 'body-too-large', label)
+    }
+    const hasBody = declaredBytes > 0 || req.headers['transfer-encoding'] !== undefined
+
+    if (target.kind === 'mcp') {
+      const {route, query} = target
+      // Node adds no chunked framing to an outbound GET or DELETE, so a body the client sent would be cut short or left on the
+      // upstream's connection. Neither method has a body in the protocol: refuse it here, with nothing sent.
+      if (hasBody && (req.method === 'GET' || req.method === 'DELETE')) {
+        res.setHeader('connection', 'close')
+        return refuse(res, 400, 'body-on-bodyless-method', label)
+      }
+      relay(req, res, {
+        label,
+        hostname: route.hostname,
+        port: route.port,
+        path: query === '' ? route.path : `${route.path}?${query}`,
+        headers: buildMcpRequestHeaders(req.headers, route, hasBody),
+        hasBody,
+        timeouts: 'connect-only',
+        onResponse: (upstreamRes, status, control) => {
+          if (status >= 400) {
+            const scope: ErrorScope = {label, secrets: mcpSecrets.get(route.id) ?? [], retryAfter: 'seconds'}
+            forwardError(upstreamRes, status, scope, res, control.stop)
+          } else streamSuccess(upstreamRes, status, res, MCP_SUCCESS_RESPONSE_HEADERS, control, true)
+        },
+      })
+      return
+    }
+
+    const {matched} = target
+    relay(req, res, {
+      label,
+      hostname: matched.provider.hostname,
+      port: matched.provider.port,
+      path: matched.query === '' ? matched.route.upstreamPath : `${matched.route.upstreamPath}?${matched.query}`,
+      headers: outboundHeaders(req, matched, hasBody),
+      hasBody,
+      timeouts: 'all',
+      onResponse: (upstreamRes, status, control) => {
+        if (status >= 400) {
+          const scope: ErrorScope = {label, secrets: matched.provider.secrets, retryAfter: 'raw'}
+          forwardError(upstreamRes, status, scope, res, control.stop)
+        } else streamSuccess(upstreamRes, status, res, SUCCESS_RESPONSE_HEADERS, control, false)
+      },
+    })
   }
 
   const server: Server = http.createServer({maxHeaderSize: limits.maxHeaderBytes}, (req, res) => {
@@ -522,7 +667,10 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
       refuse(res, 500, 'internal')
     }
   })
-  server.maxConnections = limits.maxConnections
+  // One cap for every connection, provider or MCP. An MCP route holds a stream open for the whole run, so the cap carries
+  // shared headroom of a few connections per route on top of the provider limit. It is shared, not reserved: nothing stops
+  // MCP connections from using more than their route's share, or providers from using headroom the MCP routes leave.
+  server.maxConnections = limits.maxConnections + MCP_CONNECTIONS_PER_ROUTE * mcpById.size
   server.requestTimeout = limits.requestTimeoutMs
   server.headersTimeout = Math.min(30_000, limits.requestTimeoutMs)
   server.keepAliveTimeout = 60_000
@@ -581,7 +729,7 @@ export async function startKeyProxy(options: StartKeyProxyOptions): Promise<Resu
   // A late socket error must not become an uncaught exception.
   server.on('error', () => undefined)
 
-  logger.info('key-proxy: listening', {providers: [...byId.keys()]})
+  logger.info('key-proxy: listening', {providers: [...byId.keys()], mcpRoutes: mcpById.size})
   return ok({
     port: listening.data,
     address: LOOPBACK,

@@ -1,5 +1,6 @@
 import type {Result} from '@bfra.me/es/result'
 import type {BuiltConfigV2, CredentialDisposition} from '@fro-bot/runtime'
+import type {BrokeredMcpV2} from './mcp-servers-v2.js'
 import type {Logger} from './types.js'
 
 import * as path from 'node:path'
@@ -15,7 +16,7 @@ import {
   RESPONSE_FILE_DIR_SEGMENT,
   WEBSEARCH_ACTION_V2,
 } from '@fro-bot/runtime'
-import {applyOperatorMcpV2} from './mcp-servers-v2.js'
+import {applyBrokeredMcpV2, applyOperatorMcpV2} from './mcp-servers-v2.js'
 
 export interface CIConfigV2Inputs {
   /** The `opencode-config` action input, or null. */
@@ -66,6 +67,13 @@ export interface CIConfigV2Inputs {
    * the model, so the operator's `mcp` is cut to its static local servers (`applyOperatorMcpV2`).
    */
   readonly credential: CredentialDisposition
+  /**
+   * `isolate-agent` runs: how to rewrite each remote MCP server that has `headers` (`planMcpBrokerV2`). Each routed entry
+   * points at the key proxy's loopback route with no headers and `oauth: false`; each stripped one only loses its headers.
+   * Present (even with no servers) means the run is brokered: the build then fails if any entry keeps a `headers` it did
+   * not account for. Absent leaves the operator's `mcp` as the credential disposition left it.
+   */
+  readonly brokeredMcp?: BrokeredMcpV2
   /**
    * True when this run traces (the relay is up and the plugin was told so). Only then is the Fro Bot plugin listed after the
    * operator's plugins, because a plugin sees only the edits of plugins listed before it and the tracing plugin must see the
@@ -256,14 +264,15 @@ function withProxiedProviders(
 }
 
 /**
- * Build the V2 `OPENCODE_CONFIG_CONTENT` for an Action run, plus what the permission gate must find after spawn.
- *
- * Pure: the run identity and `RUNNER_TEMP` come in as inputs. The spawn sets `OPENCODE_DISABLE_PROJECT_CONFIG=1`.
- * The response-file and attachment directories are run-scoped and live outside the checkout, so a hostile checkout
- * cannot plant or read them; every other external directory stays denied. Fails when `RUNNER_TEMP`, the run identity or
- * the integration workdir would make an exception directory contain `*` or `?`, which the server reads as wildcards.
+ * The operator's `opencode-config` as the build starts from it: parsed, with the `{env:}` refusal of a withheld run, the
+ * permission keys stripped, and `mcp` filtered or validated for the run's credential disposition. Pure but for the
+ * logger. The one place this happens: the build starts from it, and so does the broker's plan, which classifies the
+ * servers that survive the filter and no others.
  */
-export function buildCIConfigV2(inputs: CIConfigV2Inputs, logger: Logger): Result<BuiltConfigV2, string> {
+export function prepareOperatorConfigV2(
+  inputs: Pick<CIConfigV2Inputs, 'credential' | 'opencodeConfig'>,
+  logger: Logger,
+): Result<Record<string, unknown>, string> {
   let operator: Record<string, unknown> = {}
   if (inputs.opencodeConfig != null) {
     let parsed: unknown
@@ -292,7 +301,29 @@ export function buildCIConfigV2(inputs: CIConfigV2Inputs, logger: Logger): Resul
   // rule is added: the default agents already allow `*`, and the read-only subagents deny it.
   const withMcpApplied = applyOperatorMcpV2(operator, inputs.credential, logger)
   if (!withMcpApplied.success) return err(withMcpApplied.error.message)
-  operator = withMcpApplied.data
+  return ok(withMcpApplied.data)
+}
+
+/**
+ * Build the V2 `OPENCODE_CONFIG_CONTENT` for an Action run, plus what the permission gate must find after spawn.
+ *
+ * Pure: the run identity and `RUNNER_TEMP` come in as inputs. The spawn sets `OPENCODE_DISABLE_PROJECT_CONFIG=1`.
+ * The response-file and attachment directories are run-scoped and live outside the checkout, so a hostile checkout
+ * cannot plant or read them; every other external directory stays denied. Fails when `RUNNER_TEMP`, the run identity or
+ * the integration workdir would make an exception directory contain `*` or `?`, which the server reads as wildcards.
+ */
+export function buildCIConfigV2(inputs: CIConfigV2Inputs, logger: Logger): Result<BuiltConfigV2, string> {
+  const prepared = prepareOperatorConfigV2(inputs, logger)
+  if (!prepared.success) return prepared
+  let operator = prepared.data
+
+  // `isolate-agent`: each credentialed remote server now points at the key proxy, on both config variants (this build
+  // runs once per variant). Fails closed on any `headers` the plan did not cover.
+  if (inputs.brokeredMcp !== undefined) {
+    const brokered = applyBrokeredMcpV2(operator, inputs.brokeredMcp)
+    if (!brokered.success) return brokered
+    operator = brokered.data
+  }
 
   const runnerTemp = inputs.runnerTemp?.trim()
   const hasRunnerTemp = runnerTemp != null && runnerTemp.length > 0

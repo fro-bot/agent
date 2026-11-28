@@ -18,7 +18,9 @@ import type {AddressInfo} from 'node:net'
 import type {CredentialDisposition, OpenCodeV2ServerHandle} from '@fro-bot/runtime'
 import type {BootstrapPhaseResult} from './bootstrap.js'
 import type {CacheRestorePhaseResult} from './cache-restore.js'
+import type {KeyProxyProcess} from './key-proxy-process.js'
 import type {RoutingPhaseResult} from './routing.js'
+import type {SandboxLifecycle} from './sandbox-lifecycle.js'
 import type {SessionPrepPhaseResult} from './session-prep.js'
 import {Buffer} from 'node:buffer'
 import {execFileSync} from 'node:child_process'
@@ -28,8 +30,11 @@ import os from 'node:os'
 import path from 'node:path'
 import process from 'node:process'
 import {DatabaseSync} from 'node:sqlite'
+import {fileURLToPath} from 'node:url'
+import {ok} from '@bfra.me/es/result'
 import {ACTION_TRACING_OFF, buildSessionTitle, evaluatePermissionV2} from '@fro-bot/runtime'
 import {afterAll, beforeAll, describe, expect, it, vi} from 'vitest'
+import {startTlsUpstream, type TlsUpstream} from '../../../packages/runtime/src/agent/key-proxy-test-kit.js'
 import pin from '../../../packages/runtime/src/shared/opencode-v2-pin.json'
 import {createActionClientV2} from '../../features/agent/execution-v2.js'
 import {checkpointDatabase} from '../../services/cache/checkpoint.js'
@@ -37,6 +42,8 @@ import {createExecAdapter} from '../../services/setup/adapters.js'
 import {installPluginsV2, resolvePluginSpecsV2} from '../../services/setup/plugin-install-v2.js'
 import {createMockLogger, unwrapOk} from '../../shared/test-helpers.js'
 import {computeDrainDeadlineMs, runExecute} from './execute.js'
+import {startKeyProxyProcess} from './key-proxy-process.js'
+import {createMcpUpstream, forwardToModel} from './mcp-upstream.fixture.js'
 import {findServicesOwnedByState, killOwnedServices} from './owned-service-processes.js'
 import {releaseOptionsFromExecution, runReleaseV2} from './release-v2.js'
 import {createSessionReaderV2, resolveSessionForLogicalKeyV2} from './session-v2.js'
@@ -615,6 +622,176 @@ async function runWithheld(box: Sandbox, extra: Record<string, unknown>) {
   return {result, listed: listed.data}
 }
 
+// --- A remote MCP server behind the broker (`isolate-agent`) ------------------------------------------------------------
+//
+// The real key-proxy child, the real config plan and rewrite (`startActionOpenCodeV2` with a sandbox), the real binary and a
+// recording HTTPS MCP upstream that speaks the 2025 stateful Streamable HTTP the pinned client uses. Only the sandbox account
+// is faked: the server runs as the test's own user, so the proof here is the wire and the config, not the OS boundary (the
+// sandbox suite covers that).
+
+const BUN = ((): string | null => {
+  try {
+    return execFileSync('which', ['bun'], {encoding: 'utf8'}).trim() || null
+  } catch {
+    return null
+  }
+})()
+const KEY_PROXY_SOURCE_ENTRY = fileURLToPath(new URL('../../../apps/action/src/key-proxy.ts', import.meta.url))
+
+const MCP_TOKEN = 'mcp-broker-token-7d91c3ab2e'
+const MCP_AUTHORIZATION = `Bearer ${MCP_TOKEN}`
+const MODEL_KEY = 'sk-fake-broker-model-key-3e8a'
+/**
+ * The sandbox lifecycle of a run whose server is not actually sandboxed: it owns the key proxy the way the real one does
+ * (`startKeyProxy`), accepts the handoff, and launches with no sandbox spec, so the server starts as the test's user.
+ */
+function createUnsandboxedLifecycle(): SandboxLifecycle {
+  const controller = new AbortController()
+  const startKeyProxy = async (start: Parameters<SandboxLifecycle['startKeyProxy']>[0]) => {
+    const report = await start({signal: controller.signal})
+    return ok(report.proxy)
+  }
+  const launch = async (spawn: Parameters<SandboxLifecycle['launch']>[0]) => {
+    const report = await spawn({spec: undefined as never, signal: controller.signal, noteSpawn: () => undefined})
+    return ok(report.value)
+  }
+  return {
+    prepare: async () => ok(undefined as never),
+    release: async () => ({stop: 'stopped' as const, restore: 'restored' as const}),
+    launch,
+    startKeyProxy,
+    registerSignalStop: () => undefined,
+  } as unknown as SandboxLifecycle
+}
+
+interface BrokeredRun {
+  readonly handle: OpenCodeV2ServerHandle
+  readonly proxy: () => KeyProxyProcess | null
+  /** The config and environment the server was spawned with. */
+  readonly spawned: () => {readonly config: string; readonly env: string}
+  readonly stop: () => Promise<void>
+}
+
+/** `startActionOpenCodeV2` for an isolated run with one brokered remote MCP server, through the real child and the real rewrite. */
+async function startBrokeredServer(
+  box: Sandbox,
+  upstream: TlsUpstream,
+  layout: 'flat' | 'native',
+): Promise<BrokeredRun> {
+  process.env.RUNNER_TEMP = box.env.RUNNER_TEMP
+  process.env.GITHUB_WORKSPACE = box.repo
+  process.env.GITHUB_RUN_ID = '79'
+  process.env.GITHUB_RUN_ATTEMPT = '1'
+  const specs = unwrapOk(resolvePluginSpecsV2('latest')).specs
+  unwrapOk(
+    await installPluginsV2({
+      logger: createMockLogger(),
+      execAdapter: createExecAdapter(),
+      opencodeBinaryPath: BINARY as string,
+      specs,
+      cacheHome: box.cacheHome,
+      env: box.env,
+    }),
+  )
+  const server = {type: 'remote', url: `${upstream.origin}/mcp`, headers: {Authorization: MCP_AUTHORIZATION}}
+  const lifecycle = createUnsandboxedLifecycle()
+  const spawned = {config: '', env: ''}
+  let proxy: KeyProxyProcess | null = null
+  const started = await startActionOpenCodeV2({
+    binaryPath: BINARY as string,
+    workspacePath: box.repo,
+    // An isolated run refuses a provider with no key, so the model goes through the child too (to the same upstream).
+    authJson: JSON.stringify({fake: {type: 'api', key: MODEL_KEY}}),
+    opencodeConfig: JSON.stringify({
+      share: 'disabled',
+      mcp: layout === 'flat' ? {broker: server} : {servers: {broker: server}},
+      provider: {
+        fake: {
+          npm: '@ai-sdk/openai-compatible',
+          name: 'Fake',
+          options: {baseURL: `${upstream.origin}/v1`},
+          models: {'fixture-model': {name: 'Fixture', tool_call: true, limit: {context: 100_000, output: 8000}}},
+        },
+      },
+    }),
+    credential: 'provision',
+    systematicVersion: 'latest',
+    model: MODEL,
+    dbPath: box.dbPath,
+    authPath: box.authPath,
+    env: box.env,
+    runId: 79,
+    runAttempt: 1,
+    tracing: ACTION_TRACING_OFF,
+    logger: createMockLogger(),
+    sandbox: lifecycle,
+    deps: {
+      // The real supervisor and the real child (`apps/action/src/key-proxy.ts`, as the bundle's `key-proxy.js`), trusting the
+      // recording upstream's certificate.
+      keyProxyOptions: {
+        launcher: {command: BUN ?? '', args: [KEY_PROXY_SOURCE_ENTRY]},
+        testing: {upstreamCa: upstream.ca},
+      },
+      startKeyProxy: async options => {
+        const result = await startKeyProxyProcess(options)
+        if (result.success) proxy = result.data
+        return result
+      },
+      startServer: async (spawnOptions, spawnLogger) => {
+        spawned.config = JSON.stringify(spawnOptions.config ?? null)
+        spawned.env = JSON.stringify(spawnOptions.env)
+        const {startOpenCodeV2Server} = await import('@fro-bot/runtime')
+        return startOpenCodeV2Server({...spawnOptions, timeouts: {agentReadyTimeoutMs: 90_000}}, spawnLogger)
+      },
+    },
+  })
+  const handle = unwrapOk(started)
+  return {
+    handle,
+    proxy: () => proxy,
+    spawned: () => spawned,
+    stop: async () => {
+      await handle.shutdown()
+      await proxy?.stop()
+    },
+  }
+}
+
+/** Runs one brokered turn against `upstream` and returns what the run left behind, after everything is stopped. */
+async function brokeredTurn(options: {
+  readonly upstream: ReturnType<typeof createMcpUpstream>
+  readonly script: readonly ScriptStep[]
+  readonly layout: 'flat' | 'native'
+}) {
+  const box = createSandbox()
+  sandboxes.push(box)
+  const provider = await startScriptedProvider(options.script, 'unexpected extra turn')
+  providers.push(provider)
+  // One HTTPS upstream for both: `/mcp` is the MCP server, anything else is the model, reached through the child with its key.
+  const toModel = forwardToModel(Number(new URL(provider.baseURL).port))
+  const upstream = await startTlsUpstream((request, res, raw) =>
+    request.url.startsWith('/mcp') ? options.upstream.handler(request, res, raw) : toModel(request, res, raw),
+  )
+  let run: BrokeredRun | undefined
+  try {
+    run = await startBrokeredServer(box, upstream, options.layout)
+    await waitForMcpConnected(run.handle, 'broker')
+    const result = await executePhase(run.handle, box, 120_000)
+    const proxy = run.proxy()
+    return {
+      result,
+      provider,
+      mcpRequests: upstream.requests.filter(request => request.url.startsWith('/mcp')),
+      spawned: run.spawned(),
+      proxyRoute: proxy?.mcpUrl('s1') ?? null,
+      proxyCrashed: proxy?.crashed() ?? null,
+    }
+  } finally {
+    await run?.stop()
+    await upstream.close()
+  }
+}
+
 const SHELL_MARKER = 'release-fixture-job-d41'
 const AUTOMATION_REJECT_MESSAGE = "This automated run does not allow this action. Don't retry it; continue without it."
 
@@ -1117,6 +1294,95 @@ describe.skipIf(!hasBinary)('runExecute on OpenCode V2 against the real stock bi
         expect(listed).toEqual([])
       }, 300_000)
     })
+  })
+
+  describe.skipIf(BUN === null)('a brokered remote MCP server under isolate-agent (fro-bot/agent#2371)', () => {
+    const CALL = (text: string) =>
+      ({tool: 'execute', args: {code: `return await tools.broker.echo({text: ${JSON.stringify(text)}})`}}) as const
+
+    const transcript = (provider: Provider): string =>
+      provider.requests
+        .filter(item => item.hasTools)
+        .flatMap(item => (JSON.parse(item.raw) as {messages: {role: string; content: unknown}[]}).messages)
+        .filter(message => message.role === 'tool')
+        .map(message => JSON.stringify(message.content))
+        .join('\n')
+
+    it.each([['flat'], ['native']] as const)(
+      'lists and calls a tool through the child, with the configured header on every request and none in the config: %s',
+      async layout => {
+        // #given a stateful HTTPS MCP upstream that refuses any request without the credential, and a model that lists the
+        // server's tools and then calls one
+        const fake = createMcpUpstream({authorization: MCP_AUTHORIZATION})
+
+        // #when the run starts through the real child and the real rewrite, and executes
+        const turn = await brokeredTurn({
+          upstream: fake,
+          layout,
+          script: [
+            {tool: 'execute', args: {code: 'return Object.keys(tools.broker).join(",")'}},
+            CALL('one'),
+            {text: 'Done.'},
+          ],
+        })
+
+        // #then the run succeeded and the tool's result reached the transcript
+        expect(turn.result).toMatchObject({success: true, exitCode: 0, llmError: null})
+        expect(transcript(turn.provider)).toContain('"echo"')
+        expect(transcript(turn.provider)).toContain('"echo:one"')
+
+        // #and the upstream saw the whole flow, and every request carried the credential
+        expect(fake.state.initializes).toBe(1)
+        expect(fake.state.toolLists).toBeGreaterThanOrEqual(1)
+        expect(fake.state.executed).toBe(1)
+        expect(fake.state.unauthorized).toBe(0)
+        expect(turn.mcpRequests.length).toBeGreaterThan(3)
+        for (const request of turn.mcpRequests) {
+          expect(request.headers.authorization).toBe(MCP_AUTHORIZATION)
+          // The client never had a credential of its own to send, and the child did not take one from it.
+          expect(request.headers.cookie).toBeUndefined()
+        }
+
+        // #and what the server was handed names the child's loopback route and holds no header and no value
+        expect(turn.spawned.config).not.toContain(MCP_TOKEN)
+        expect(turn.spawned.env).not.toContain(MCP_TOKEN)
+        const config = JSON.parse(turn.spawned.config) as {mcp?: Record<string, unknown>}
+        const entry = (
+          layout === 'flat' ? config.mcp?.broker : (config.mcp?.servers as Record<string, unknown>)?.broker
+        ) as Record<string, unknown> | undefined
+        expect(entry).toMatchObject({type: 'remote', oauth: false})
+        expect(entry).not.toHaveProperty('headers')
+        expect(entry?.url).toBe(turn.proxyRoute)
+        expect(String(entry?.url)).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/mcp\/s1$/)
+        expect(turn.proxyCrashed).toBe(false)
+      },
+      300_000,
+    )
+
+    it('reinitializes after one expired-session 400 and the next call succeeds', async () => {
+      // #given an upstream that forgets its sessions once, after the first call
+      const fake = createMcpUpstream({authorization: MCP_AUTHORIZATION, expireAfterCalls: 1})
+
+      // #when the model calls the tool twice
+      const turn = await brokeredTurn({
+        upstream: fake,
+        layout: 'flat',
+        script: [CALL('one'), CALL('two'), {text: 'Done.'}],
+      })
+
+      // #then the client saw the real 400 at least once, ran the whole flow again, and the second call came back
+      expect(turn.result).toMatchObject({success: true, exitCode: 0, llmError: null})
+      expect(fake.state.expiredAnswers).toBeGreaterThanOrEqual(1)
+      expect(fake.state.initializes).toBeGreaterThanOrEqual(2)
+      expect(fake.state.executed).toBe(2)
+      expect(transcript(turn.provider)).toContain('"echo:one"')
+      expect(transcript(turn.provider)).toContain('"echo:two"')
+
+      // #and the reconnect carried the credential too: not one request, the refused ones included, went without it
+      expect(fake.state.unauthorized).toBe(0)
+      for (const request of turn.mcpRequests) expect(request.headers.authorization).toBe(MCP_AUTHORIZATION)
+      expect(turn.spawned.config).not.toContain(MCP_TOKEN)
+    }, 300_000)
   })
 
   it('holds the run for a background shell: the final answer arrives after it, and the saved database is consistent', async () => {

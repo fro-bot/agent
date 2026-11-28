@@ -9,6 +9,7 @@ import type {KeyProxyProbeResult} from './key-proxy-probe.js'
 import type {KeyProxyProcess} from './key-proxy-process.js'
 import type {SandboxLifecycle} from './sandbox-lifecycle.js'
 import type {StartActionOpenCodeV2Deps, StartActionOpenCodeV2Options} from './v2-server.js'
+import {execFileSync} from 'node:child_process'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
@@ -16,13 +17,21 @@ import {DatabaseSync} from 'node:sqlite'
 import {err} from '@bfra.me/es/result'
 import {ACTION_TRACING_OFF, clearHeldClaims} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi, type Mock} from 'vitest'
+import {checkConfigForKeys} from '../../services/setup/key-proxy-providers.js'
 import {pluginCacheDir, resolvePluginSpecsV2} from '../../services/setup/plugin-install-v2.js'
 import {createRepoSkillsStagingRoot} from '../../services/setup/repo-skills.js'
 import {markRunCancelled, resetRunCancellation} from '../../shared/cancellation.js'
 import {createRecordingTracer, spanNamed} from '../../shared/lifecycle-tracer.testing.js'
 import {createMockLogger, serializeLoggerCalls, unwrapErr, unwrapOk} from '../../shared/test-helpers.js'
 import {ok} from '../../shared/types.js'
+import {startKeyProxyProcess} from './key-proxy-process.js'
 import {startActionOpenCodeV2} from './v2-server.js'
+
+// Passes straight through to the real scan; the spy lets one test read what the start hands it (both config variants).
+vi.mock('../../services/setup/key-proxy-providers.js', async importOriginal => {
+  const actual = await importOriginal<typeof import('../../services/setup/key-proxy-providers.js')>()
+  return {...actual, checkConfigForKeys: vi.fn(actual.checkConfigForKeys)}
+})
 
 const CANARY = 'sk-ant-CANARY-v2-server-1234'
 const SYSTEMATIC = 'systematic'
@@ -1681,6 +1690,7 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
       port: 43_111,
       placeholder: PROXY_PLACEHOLDER,
       baseUrl: providerId => `http://127.0.0.1:43111/${providerId}`,
+      mcpUrl: routeId => `http://127.0.0.1:43111/mcp/${routeId}`,
       died: died.signal,
       crashed: () => false,
       stop,
@@ -2343,6 +2353,576 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
       expect(result.success).toBe(true)
       expect(deps.startKeyProxy).not.toHaveBeenCalled()
       expect(sandbox.startKeyProxy).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('the MCP credential broker', () => {
+    const TOKEN = 'mcp-broker-TOKEN-0123456789'
+    const HEADER = `Bearer ${TOKEN}`
+    const REMOTE = {type: 'remote', url: 'https://mcp.example.com/mcp', headers: {Authorization: HEADER}} as const
+    const LOOPBACK = 'http://127.0.0.1:43111/mcp/s1'
+    const ROUTE = {id: 's1', origin: 'https://mcp.example.com', path: '/mcp', headers: {Authorization: HEADER}} as const
+    const TRACING_ON: OpenCodeV2ActionTracingHost = {
+      host: 'action',
+      tracing: 'on',
+      relayPort: 43_210,
+      identity: {repository: 'owner/repo', runId: '42', attempt: '1', job: 'review', trigger: 'workflow_dispatch'},
+    }
+
+    /** An isolated start with an MCP-only config by default: no provider key, no model. */
+    async function startMcp(
+      sandbox: SandboxLifecycle | null,
+      deps: Partial<StartActionOpenCodeV2Deps>,
+      overrides: Partial<StartActionOpenCodeV2Options> = {},
+    ) {
+      return startActionOpenCodeV2({
+        binaryPath: '/opt/opencode',
+        workspacePath: '/workspace',
+        authJson: '{}',
+        opencodeConfig: JSON.stringify({mcp: {search: REMOTE}}),
+        credential: 'provision',
+        systematicVersion: 'latest',
+        model: null,
+        dbPath,
+        authPath,
+        env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
+        runId: 42,
+        runAttempt: 1,
+        tracing: ACTION_TRACING_OFF,
+        logger: createMockLogger(),
+        sandbox,
+        deps,
+        ...overrides,
+      })
+    }
+
+    const spawnedConfig = (deps: ReturnType<typeof depsFor>) =>
+      vi.mocked(deps.startServer).mock.calls[0]?.[0].config as Record<string, unknown>
+
+    it('plans the routes, starts the child with them, rewrites the entry to its loopback route and masks the values', async () => {
+      // #given an isolated provisioning run with one credentialed remote and no provider key
+      const deps = depsFor(fakeServer())
+      const sandbox = fakeSandbox()
+      const logger = createMockLogger()
+      const masked: string[] = []
+
+      // #when it starts
+      const result = await startMcp(sandbox.sandbox, deps, {logger, maskSecret: value => masked.push(value)})
+
+      // #then the child got the route, with the header, and no provider
+      expect(result.success).toBe(true)
+      expect(order).toEqual(['proxy-start', 'clear-claims', 'prepare', 'spawn'])
+      const started = vi.mocked(deps.startKeyProxy).mock.calls[0]?.[0]
+      expect(started?.providers).toEqual([])
+      expect(started?.mcpRoutes).toEqual([ROUTE])
+
+      // #then the server reads the loopback route, with no header and `oauth: false`, and no value anywhere in the config
+      const content = spawnedConfig(deps)
+      expect(content.mcp).toEqual({search: {type: 'remote', url: LOOPBACK, oauth: false}})
+      expect(JSON.stringify(content)).not.toContain(TOKEN)
+
+      // #then the whole header and the token behind its scheme are masked, and no log line holds either
+      expect(masked).toEqual(expect.arrayContaining([HEADER, TOKEN]))
+      expect(serializeLoggerCalls(logger)).not.toContain(TOKEN)
+    })
+
+    it('does the same for the native `mcp.servers.<name>` layout', async () => {
+      const deps = depsFor(fakeServer())
+
+      const result = await startMcp(fakeSandbox().sandbox, deps, {
+        opencodeConfig: JSON.stringify({mcp: {servers: {search: REMOTE}}}),
+      })
+
+      expect(result.success).toBe(true)
+      expect(spawnedConfig(deps).mcp).toEqual({servers: {search: {type: 'remote', url: LOOPBACK, oauth: false}}})
+    })
+
+    it('masks the values before the child starts, so no log line between can hold them', async () => {
+      const events: string[] = []
+      const deps = depsFor(fakeServer(), {
+        startKeyProxy: vi.fn<StartActionOpenCodeV2Deps['startKeyProxy']>(async () => {
+          events.push('child')
+          return ok(keyProxy.proxy)
+        }),
+      })
+
+      await startMcp(fakeSandbox().sandbox, deps, {maskSecret: value => events.push(value === TOKEN ? 'masked' : '')})
+
+      expect(events.indexOf('masked')).toBeGreaterThanOrEqual(0)
+      expect(events.indexOf('masked')).toBeLessThan(events.indexOf('child'))
+    })
+
+    it('serves a provider and an MCP server from one child, and still probes the selected provider', async () => {
+      // #given a provider key and a credentialed remote
+      const deps = depsFor(fakeServer())
+
+      // #when started with a model on that provider
+      const result = await startMcp(fakeSandbox().sandbox, deps, {
+        authJson: JSON.stringify({anthropic: {type: 'api', key: CANARY}}),
+        model: 'anthropic/claude-sonnet',
+      })
+
+      // #then one child holds both, the probe ran for the provider, and both entries point at the child
+      expect(result.success).toBe(true)
+      expect(deps.startKeyProxy).toHaveBeenCalledTimes(1)
+      const started = vi.mocked(deps.startKeyProxy).mock.calls[0]?.[0]
+      expect(started?.providers.map(provider => provider.providerId)).toEqual(['anthropic'])
+      expect(started?.mcpRoutes).toEqual([ROUTE])
+      expect(vi.mocked(deps.probeKeyProxy).mock.calls.map(call => call[0].plan.providerId)).toEqual(['anthropic'])
+      const content = spawnedConfig(deps)
+      expect(content.mcp).toEqual({search: {type: 'remote', url: LOOPBACK, oauth: false}})
+      expect((content.provider as Record<string, {options: Record<string, unknown>}>).anthropic?.options.baseURL).toBe(
+        'http://127.0.0.1:43111/anthropic',
+      )
+    })
+
+    it('starts the child for MCP routes alone, skips the provider probe with its own reason, and launches', async () => {
+      // #given no provider is proxied
+      const deps = depsFor(fakeServer())
+      const logger = createMockLogger()
+      const sandbox = fakeSandbox()
+
+      // #when
+      const result = await startMcp(sandbox.sandbox, deps, {logger})
+
+      // #then the child started, no provider was probed, the reason is not the provider one, and the server launched
+      expect(result.success).toBe(true)
+      expect(deps.startKeyProxy).toHaveBeenCalledTimes(1)
+      expect(deps.probeKeyProxy).not.toHaveBeenCalled()
+      expect(logger.info).toHaveBeenCalledWith(expect.stringContaining('no provider is proxied'), expect.anything())
+      expect(sandbox.launch).toHaveBeenCalledTimes(1)
+    })
+
+    it('starts the child for `headers: {}`, which is brokered with no headers', async () => {
+      const deps = depsFor(fakeServer())
+
+      await startMcp(fakeSandbox().sandbox, deps, {
+        opencodeConfig: JSON.stringify({
+          mcp: {search: {type: 'remote', url: 'https://mcp.example.com/mcp', headers: {}}},
+        }),
+      })
+
+      expect(vi.mocked(deps.startKeyProxy).mock.calls[0]?.[0].mcpRoutes).toEqual([{...ROUTE, headers: {}}])
+      expect(spawnedConfig(deps).mcp).toEqual({search: {type: 'remote', url: LOOPBACK, oauth: false}})
+    })
+
+    it('starts no child, and leaves the entry as written, when no entry has headers', async () => {
+      // #given a headerless remote (an `http://` one, which carries no credential and is not the broker's business)
+      const direct = {type: 'remote', url: 'http://mcp.example.com/mcp'}
+      const deps = depsFor(fakeServer())
+      const sandbox = fakeSandbox()
+
+      // #when
+      const result = await startMcp(sandbox.sandbox, deps, {opencodeConfig: JSON.stringify({mcp: {direct}})})
+
+      // #then no child, no probe, and the entry is unchanged
+      expect(result.success).toBe(true)
+      expect(deps.startKeyProxy).not.toHaveBeenCalled()
+      expect(sandbox.startKeyProxy).not.toHaveBeenCalled()
+      expect(spawnedConfig(deps).mcp).toEqual({direct})
+    })
+
+    it('strips the headers of a definitively disabled entry and starts no child for it', async () => {
+      const deps = depsFor(fakeServer())
+
+      const result = await startMcp(fakeSandbox().sandbox, deps, {
+        opencodeConfig: JSON.stringify({mcp: {off: {...REMOTE, enabled: false}}}),
+      })
+
+      expect(result.success).toBe(true)
+      expect(deps.startKeyProxy).not.toHaveBeenCalled()
+      expect(spawnedConfig(deps).mcp).toEqual({
+        off: {type: 'remote', url: 'https://mcp.example.com/mcp', enabled: false},
+      })
+      expect(JSON.stringify(spawnedConfig(deps))).not.toContain(TOKEN)
+    })
+
+    it('fails the run, with no value in the reason and no server started, when the child never becomes ready', async () => {
+      // #given a child that cannot start
+      const deps = depsFor(fakeServer(), {
+        startKeyProxy: vi.fn<StartActionOpenCodeV2Deps['startKeyProxy']>(async () =>
+          err({kind: 'ready-timeout', message: 'The key proxy did not become ready in time'}),
+        ),
+      })
+      const sandbox = fakeSandbox()
+      const logger = createMockLogger()
+
+      // #when
+      const result = await startMcp(sandbox.sandbox, deps, {logger})
+
+      // #then the run failed at the key-proxy stage, nothing was handed over or spawned, and no direct fallback exists
+      const error = unwrapErr(result)
+      expect(error.stage).toBe('key-proxy')
+      expect(error.message).toContain('did not become ready')
+      expect(error.message).not.toContain(TOKEN)
+      expect(serializeLoggerCalls(logger)).not.toContain(TOKEN)
+      expect(deps.startServer).not.toHaveBeenCalled()
+      expect(sandbox.prepare).not.toHaveBeenCalled()
+      expect(sandbox.release).toHaveBeenCalledTimes(1)
+    })
+
+    it('aborts the server signal when the MCP-only child exits after ready, so the run fails and its session is not saved', async () => {
+      // #given the real supervisor and child serving one MCP route and no provider, with the server started against it
+      const bun = (() => {
+        try {
+          return execFileSync('which', ['bun'], {encoding: 'utf8'}).trim()
+        } catch {
+          return ''
+        }
+      })()
+      if (bun === '') return
+      const deps = depsFor(fakeServer(), {
+        startKeyProxy: startKeyProxyProcess,
+        keyProxyOptions: {
+          launcher: {command: bun, args: [path.resolve(import.meta.dirname, '../../../apps/action/src/key-proxy.ts')]},
+          timeouts: {readyMs: 5000, exitGraceMs: 1500, killConfirmMs: 1500},
+        },
+      })
+      const sandbox = fakeSandbox()
+      const result = await startMcp(sandbox.sandbox, deps, {})
+      const proxy = sandbox.log.proxyReports[0]?.proxy as KeyProxyProcess | undefined
+      if (!result.success || proxy === undefined) throw new Error('the start should have succeeded')
+
+      try {
+        // #when the child exits on its own after it said ready
+        const signal = vi.mocked(deps.startServer).mock.calls[0]?.[0].signal
+        expect(signal?.aborted).toBe(false)
+        const aborted = new Promise<void>(resolve => signal?.addEventListener('abort', () => resolve(), {once: true}))
+        process.kill(proxy.pid, 'SIGKILL')
+        await aborted
+
+        // #then the server's own signal fired, and the proxy reports the exit as a crash: the lifecycle turns that into
+        // `proxy: 'crashed'`, which the run answers by failing and declining to save the session
+        expect(signal?.aborted).toBe(true)
+        expect((await proxy.stop()).crashed).toBe(true)
+      } finally {
+        await proxy.stop()
+      }
+    })
+
+    it('starts the real child with the route and points the server config at it, with no value anywhere', async () => {
+      // #given the real supervisor and the real child, which now serves MCP routes
+      const bun = (() => {
+        try {
+          return execFileSync('which', ['bun'], {encoding: 'utf8'}).trim()
+        } catch {
+          return ''
+        }
+      })()
+      if (bun === '') return
+      const deps = depsFor(fakeServer(), {
+        startKeyProxy: startKeyProxyProcess,
+        keyProxyOptions: {
+          launcher: {command: bun, args: [path.resolve(import.meta.dirname, '../../../apps/action/src/key-proxy.ts')]},
+          timeouts: {readyMs: 5000, exitGraceMs: 1500, killConfirmMs: 1500},
+        },
+      })
+      const sandbox = fakeSandbox()
+      const logger = createMockLogger()
+
+      // #when the run starts with a credentialed remote
+      const result = await startMcp(sandbox.sandbox, deps, {logger})
+      const proxy = sandbox.log.proxyReports[0]?.proxy as KeyProxyProcess | undefined
+
+      try {
+        // #then the child started and the server was launched against its loopback route, with no value in the config
+        expect(result.success).toBe(true)
+        expect(spawnedConfig(deps).mcp).toEqual({
+          search: {type: 'remote', url: proxy?.mcpUrl('s1'), oauth: false},
+        })
+        expect(JSON.stringify(spawnedConfig(deps))).not.toContain(TOKEN)
+        expect(serializeLoggerCalls(logger)).not.toContain(TOKEN)
+      } finally {
+        await proxy?.stop()
+      }
+    })
+
+    it.each([
+      ['plain http', {...REMOTE, url: 'http://mcp.example.com/mcp'}, 'is not https'],
+      ['a query string', {...REMOTE, url: 'https://mcp.example.com/mcp?k=1'}, 'a query string'],
+      ['an oauth object', {...REMOTE, oauth: {}}, 'sets `oauth`'],
+      ['a reference in a header', {...REMOTE, headers: {Authorization: 'Bearer {env:TOKEN}'}}, 'holds an `{env:}`'],
+      [
+        'a local server with headers',
+        {type: 'local', command: ['node'], headers: {Authorization: HEADER}},
+        'is a local server',
+      ],
+    ])(
+      'refuses %s before the child starts, naming the server and a fix, with no value',
+      async (_label, entry, reason) => {
+        // #given an entry the broker cannot protect
+        const deps = depsFor(fakeServer())
+        const sandbox = fakeSandbox()
+
+        // #when
+        const result = await startMcp(sandbox.sandbox, deps, {opencodeConfig: JSON.stringify({mcp: {search: entry}})})
+
+        // #then the run stops at the config stage: no child, no handoff, no server
+        const error = unwrapErr(result)
+        expect(error.stage).toBe('config')
+        expect(error.message).toContain('MCP server "search"')
+        expect(error.message).toContain(reason)
+        expect(error.message).toContain('Fix: ')
+        expect(error.message).not.toContain(TOKEN)
+        expect(deps.startKeyProxy).not.toHaveBeenCalled()
+        expect(sandbox.prepare).not.toHaveBeenCalled()
+        expect(deps.startServer).not.toHaveBeenCalled()
+      },
+    )
+
+    it.each(['mcp', 'MCP'])(
+      'refuses a provider named `%s` when MCP routes exist, because it would own the `/mcp/` prefix',
+      async providerId => {
+        const deps = depsFor(fakeServer())
+        const opencodeConfig = JSON.stringify({
+          provider: {[providerId]: {npm: '@ai-sdk/openai-compatible', options: {baseURL: 'https://gw.example/v1'}}},
+          mcp: {search: REMOTE},
+        })
+
+        const result = await startMcp(fakeSandbox().sandbox, deps, {
+          opencodeConfig,
+          authJson: JSON.stringify({[providerId]: {type: 'api', key: CANARY}}),
+        })
+
+        const error = unwrapErr(result)
+        expect(error.stage).toBe('config')
+        expect(error.message).toContain(`provider "${providerId}"`)
+        expect(error.message).toContain('Fix: ')
+        expect(error.message).not.toContain(TOKEN)
+        expect(error.message).not.toContain(CANARY)
+        expect(deps.startKeyProxy).not.toHaveBeenCalled()
+      },
+    )
+
+    it('allows a provider named `mcp` when no MCP route exists', async () => {
+      const deps = depsFor(fakeServer())
+
+      const result = await startMcp(fakeSandbox().sandbox, deps, {
+        opencodeConfig: JSON.stringify({
+          provider: {mcp: {npm: '@ai-sdk/openai-compatible', options: {baseURL: 'https://gw.example/v1'}}},
+        }),
+        authJson: JSON.stringify({mcp: {type: 'api', key: CANARY}}),
+        model: 'mcp/x',
+      })
+
+      expect(result.success).toBe(true)
+    })
+
+    it('refuses a copy of a header token elsewhere in the config after the child is ready, and releases it', async () => {
+      // #given the token also written into a local server's environment, which the broker cannot reach
+      const deps = depsFor(fakeServer())
+      const sandbox = fakeSandbox()
+      const logger = createMockLogger()
+
+      // #when
+      const result = await startMcp(sandbox.sandbox, deps, {
+        logger,
+        opencodeConfig: JSON.stringify({
+          mcp: {search: REMOTE, docs: {type: 'local', command: ['node'], environment: {COPY: TOKEN}}},
+        }),
+      })
+
+      // #then the child had started, the run stops at the config stage with a remedy and no value, and the lifecycle (which
+      // owns the child) is released before any handoff or spawn
+      const error = unwrapErr(result)
+      expect(error.stage).toBe('config')
+      expect(error.message).toContain('MCP server "search"')
+      expect(error.message).toContain('Fix: ')
+      expect(error.message).not.toContain(TOKEN)
+      expect(deps.startKeyProxy).toHaveBeenCalledTimes(1)
+      expect(sandbox.prepare).not.toHaveBeenCalled()
+      expect(deps.startServer).not.toHaveBeenCalled()
+      expect(sandbox.release).toHaveBeenCalledTimes(1)
+      expect(serializeLoggerCalls(logger)).not.toContain(TOKEN)
+    })
+
+    it.each([
+      ['the whole header value', `Bearer ${TOKEN}`],
+      ['the token behind its scheme', TOKEN],
+      ['a value that embeds the token', `prefix-${TOKEN}-suffix`],
+    ])('refuses the run, before any handoff, when %s is in an inherited OPENCODE_ variable', async (_label, value) => {
+      // #given the credential also set in a variable the environment filter admits by its prefix
+      const deps = depsFor(fakeServer())
+      const sandbox = fakeSandbox()
+      const logger = createMockLogger()
+
+      // #when the isolated run starts
+      const result = await startMcp(sandbox.sandbox, deps, {
+        logger,
+        env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome, OPENCODE_EXTRA_HEADER: value},
+      })
+
+      // #then it stops at the config stage naming the server and the variable, never the value, with nothing handed over
+      const error = unwrapErr(result)
+      expect(error.stage).toBe('config')
+      expect(error.message).toContain('MCP server "search"')
+      expect(error.message).toContain('OPENCODE_EXTRA_HEADER')
+      expect(error.message).toContain('Fix: ')
+      expect(error.message).not.toContain(TOKEN)
+      expect(serializeLoggerCalls(logger)).not.toContain(TOKEN)
+      expect(sandbox.prepare).not.toHaveBeenCalled()
+      expect(deps.startServer).not.toHaveBeenCalled()
+      expect(sandbox.release).toHaveBeenCalledTimes(1)
+    })
+
+    it('does not refuse a variable the environment filter drops, or one that holds something else', async () => {
+      // #given the token in a variable the sandbox never inherits, and an admitted variable with another value
+      const deps = depsFor(fakeServer())
+
+      // #when
+      const result = await startMcp(fakeSandbox().sandbox, deps, {
+        env: {
+          RUNNER_TEMP: runnerTemp,
+          PATH: '/usr/bin',
+          XDG_CACHE_HOME: cacheHome,
+          SEARCH_API_TOKEN: TOKEN,
+          OPENCODE_FLAG: 'unrelated-value',
+        },
+      })
+
+      // #then the run starts
+      expect(result.success).toBe(true)
+    })
+
+    it('scans both config variants for the header values, and hands the scan every value it masked', async () => {
+      // #given a run that traces, so both variants are built
+      const deps = depsFor(fakeServer())
+      vi.mocked(checkConfigForKeys).mockClear()
+
+      // #when
+      await startMcp(fakeSandbox().sandbox, deps, {tracing: TRACING_ON})
+
+      // #then one scan covers the untraced and the traced config, with the values the plan found
+      const scan = vi.mocked(checkConfigForKeys).mock.calls[0]?.[0]
+      expect(scan?.configs.map(config => config.label)).toEqual([
+        'the OpenCode config (OPENCODE_CONFIG_CONTENT)',
+        'the traced OpenCode config (OPENCODE_CONFIG_CONTENT)',
+      ])
+      expect(scan?.configs.every(config => !config.text.includes(TOKEN))).toBe(true)
+      expect(scan?.mcpSecrets).toEqual([
+        {server: 'search', value: HEADER},
+        {server: 'search', value: TOKEN},
+      ])
+    })
+
+    it('does not refuse a short header value that appears elsewhere in the config', async () => {
+      const deps = depsFor(fakeServer())
+
+      const result = await startMcp(fakeSandbox().sandbox, deps, {
+        opencodeConfig: JSON.stringify({
+          username: 'v1',
+          mcp: {
+            search: {type: 'remote', url: 'https://mcp.example.com/mcp', headers: {'X-Version': 'v1'}},
+            docs: {type: 'local', command: ['v1'], environment: {X: 'v1'}},
+          },
+        }),
+      })
+
+      expect(result.success).toBe(true)
+      expect(vi.mocked(deps.startKeyProxy).mock.calls[0]?.[0].mcpRoutes?.[0]?.headers).toEqual({'X-Version': 'v1'})
+    })
+
+    it('drops a credentialed remote on a withholding trigger, with no broker error, no route and no child', async () => {
+      // #given an `issue_comment`-style run, which provisions no credential
+      const deps = depsFor(fakeServer())
+      const sandbox = fakeSandbox()
+
+      // #when
+      const result = await startMcp(sandbox.sandbox, deps, {
+        credential: 'withhold',
+        opencodeConfig: JSON.stringify({
+          mcp: {search: REMOTE, bad: {...REMOTE, url: 'http://mcp.example.com/mcp'}},
+        }),
+      })
+
+      // #then the remote servers are gone, whatever is wrong with them, and the broker started nothing
+      expect(result.success).toBe(true)
+      expect(deps.startKeyProxy).not.toHaveBeenCalled()
+      expect(spawnedConfig(deps)).not.toHaveProperty('mcp')
+      expect(JSON.stringify(spawnedConfig(deps))).not.toContain(TOKEN)
+    })
+
+    it('refuses a kept static local server that carries headers on a withholding trigger', async () => {
+      const deps = depsFor(fakeServer())
+
+      const result = await startMcp(fakeSandbox().sandbox, deps, {
+        credential: 'withhold',
+        opencodeConfig: JSON.stringify({
+          mcp: {docs: {type: 'local', command: ['node'], headers: {Authorization: HEADER}}},
+        }),
+      })
+
+      const error = unwrapErr(result)
+      expect(error.stage).toBe('config')
+      expect(error.message).not.toContain(TOKEN)
+      expect(deps.startKeyProxy).not.toHaveBeenCalled()
+    })
+
+    it.each(['{env:KEY}', '{file:./key}', 'a{env:K}b'])(
+      'refuses a top-level key built from a reference (%s), which could add MCP servers the broker never sees',
+      async key => {
+        // #given a provisioned isolated run whose config has a top-level key that holds a reference
+        const deps = depsFor(fakeServer())
+        const sandbox = fakeSandbox()
+
+        // #when
+        const result = await startMcp(sandbox.sandbox, deps, {
+          opencodeConfig: JSON.stringify({[key]: {x: {...REMOTE}}, mcp: {}}),
+        })
+
+        // #then it stops at the config stage, with a fix and no value, before any child or handoff
+        const error = unwrapErr(result)
+        expect(error.stage).toBe('config')
+        expect(error.message).toContain('top-level key built from a reference')
+        expect(error.message).toContain('Fix: ')
+        expect(error.message).not.toContain(TOKEN)
+        expect(error.message).not.toContain(key)
+        expect(deps.startKeyProxy).not.toHaveBeenCalled()
+        expect(sandbox.prepare).not.toHaveBeenCalled()
+      },
+    )
+
+    it('does not refuse a top-level key built from a reference on a non-isolated run', async () => {
+      const deps = depsFor(fakeServer())
+
+      const result = await startMcp(null, deps, {opencodeConfig: JSON.stringify({'{file:./key}': {a: 1}})})
+
+      expect(result.success).toBe(true)
+    })
+
+    it('leaves a withheld run as it was: the `{file:}` key is dropped, the run goes on', async () => {
+      const deps = depsFor(fakeServer())
+
+      const result = await startMcp(fakeSandbox().sandbox, deps, {
+        credential: 'withhold',
+        opencodeConfig: JSON.stringify({'{file:./key}': {a: 1}}),
+      })
+
+      expect(result.success).toBe(true)
+      expect(JSON.stringify(spawnedConfig(deps))).not.toContain('{file:./key}')
+    })
+
+    it('keeps the entry exactly as written, and plans nothing, when isolation is off', async () => {
+      // #given a non-isolated run with a credentialed remote the broker would refuse
+      const entry = {...REMOTE, url: 'http://mcp.example.com/mcp'}
+      const deps = depsFor(fakeServer())
+
+      // #when
+      const result = await startMcp(null, deps, {opencodeConfig: JSON.stringify({mcp: {search: entry}})})
+
+      // #then it is kept as written, with its headers, and no child was asked for
+      expect(result.success).toBe(true)
+      expect(spawnedConfig(deps).mcp).toEqual({search: entry})
+      expect(deps.startKeyProxy).not.toHaveBeenCalled()
+    })
+
+    it('masks nothing about MCP when isolation is off', async () => {
+      const masked: string[] = []
+
+      await startMcp(null, depsFor(fakeServer()), {maskSecret: value => masked.push(value)})
+
+      expect(masked).not.toContain(TOKEN)
+      expect(masked).not.toContain(HEADER)
     })
   })
 

@@ -140,11 +140,19 @@ export {
   encodeKeyProxyConfig,
   KEY_PROXY_CONFIG_VERSION,
   KEY_PROXY_MAX_CONFIG_BYTES,
+  KEY_PROXY_MCP_FORBIDDEN_HEADERS,
+  KEY_PROXY_MCP_PATH_PREFIX,
+  mcpHeaderSecrets,
   parseKeyProxyChildLine,
   parseKeyProxyConfig,
   readKeyProxyFrameLength,
 } from './key-proxy-wire.js'
-export type {KeyProxyChildErrorCode, KeyProxyChildLine, KeyProxyWireConfig} from './key-proxy-wire.js'
+export type {
+  KeyProxyChildErrorCode,
+  KeyProxyChildLine,
+  KeyProxyMcpRouteConfig,
+  KeyProxyWireConfig,
+} from './key-proxy-wire.js'
 export type {KeyProxyLimits, KeyProxyProviderConfig, KeyProxyServer, StartKeyProxyOptions} from './key-proxy.js'
 export {
   createV2LedgerReconcileAdapter,

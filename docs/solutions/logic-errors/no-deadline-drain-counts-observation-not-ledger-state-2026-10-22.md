@@ -1,6 +1,7 @@
 ---
 title: With timeout 0, drain waits on observed running work and exits on consecutive passes that observe nothing
 date: 2026-10-22
+last_updated: 2026-11-27
 category: logic-errors
 module: agent-execution
 problem_type: logic_error
@@ -81,7 +82,7 @@ Overflow recovery in `src/harness/phases/execute.ts:212-216` treats `timeoutMs <
 
 ## Prevention
 
-- A rule that gives up waiting must use what the last pass observed, never ledger state that cannot move back.
+- A rule that gives up waiting must use what the last pass observed, not ledger state: reconcile does not move an entry back, while `resume` can reopen a settled or unknown entry.
 - Code that derives a budget from `timeoutMs` handles `0` itself. `computeDrainDeadlineMs` and overflow recovery each check `timeoutMs <= 0`, and `createExecutionDeadline`'s caller maps it to no deadline.
 - Tests in `src/harness/phases/execute.test.ts`:
   - `keeps waiting past 3 passes and settles it when it finishes (%s)` pins the rejected ledger-state streak.
