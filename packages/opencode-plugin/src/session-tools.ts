@@ -98,9 +98,9 @@ function parseEndOfDayDate(value: string | undefined): Date | undefined {
   return endOfDay
 }
 
-/** Any limit below 1 (including negative values) means "no limit". */
+/** Any limit below 1 (including negative values) means "no limit"; a fractional limit is floored. */
 function normalizeLimit(value: number | undefined): number | undefined {
-  return value == null || value < 1 ? undefined : value
+  return value == null || value < 1 ? undefined : Math.floor(value)
 }
 
 function formatTimestamp(ms: number): string {
@@ -153,8 +153,12 @@ const CONTEXT_WINDOW_NOTE =
  * handler runs, so a plain `Schema.Number` rejects it. Accept a number or a plain decimal string and DECODE it to a
  * number here: the handler's `asNumber` ignores strings, so a merely widened schema would run the read uncapped.
  * Blank, malformed (hex, trailing junk) and non-finite strings stay schema errors.
+ *
+ * The `u` flag and no `i` flag are deliberate: Effect exports a regex's JSON Schema `pattern` only for flags in
+ * `/^[dg]*uy?$/`, and otherwise publishes the string branch as accepting anything.
  */
-const DECIMAL_STRING = /^\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?\s*$/i
+// eslint-disable-next-line regexp/use-ignore-case -- the `i` flag would drop the exported JSON Schema `pattern`
+const DECIMAL_STRING = /^\s*[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?\s*$/u
 
 const LimitInput = Schema.Union([
   Schema.Number,
