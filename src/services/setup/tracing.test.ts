@@ -285,6 +285,32 @@ describe('buildTracingRunLink', () => {
     expect(value).not.toContain(CREDENTIAL_CANARY)
   })
 
+  it('writes the same bytes as before the plugin learned serverUrl: no key for it, so the pinned plugin keeps accepting the document', () => {
+    // #given today's Action inputs: the run identity and the link the harness builds, with no server URL anywhere
+    const identity = unwrapOk(buildTracingRunIdentity(FACTS))
+    const link = buildTracingRunLink(ids, 'fro-bot/agent:issue-42')
+    expect(Object.keys(link)).toEqual(['rootSpan', 'invocationId', 'sessionId'])
+    const {repository, runId, attempt, job, trigger} = identity
+
+    // #when
+    const value = buildTracingLauncherValue(buildActionTracingHost(43_210, identity, link))
+
+    // #then the document is, byte for byte, the one the writer produced before the field existed
+    expect(value).toBe(
+      JSON.stringify({
+        version: 1,
+        host: 'action',
+        tracing: 'on',
+        relay: 'http://127.0.0.1:43210/v1/traces',
+        identity: {repository, runId, attempt, job, trigger},
+        rootSpan: {traceId: ids.traceId, spanId: ids.rootSpanId},
+        sessionId: 'fro-bot/agent:issue-42',
+        invocationId: ids.invocationId,
+      }),
+    )
+    expect(value).not.toContain('serverUrl')
+  })
+
   it('keeps the link through every read of a live source, and drops all of it with the relay', () => {
     // #given
     const identity = unwrapOk(buildTracingRunIdentity(FACTS))

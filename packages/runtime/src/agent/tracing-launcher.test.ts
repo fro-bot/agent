@@ -111,6 +111,21 @@ describe('the run link fields', () => {
     })
   })
 
+  it('writes no serverUrl key, and the same bytes as before the field existed, when none is supplied', () => {
+    // #given the run link as the Action builds it today
+    const link = {rootSpan: ROOT_SPAN, sessionId: SESSION_ID, invocationId: INVOCATION_ID}
+    const prefix =
+      '{"version":1,"host":"action","tracing":"on","relay":"http://127.0.0.1:43210/v1/traces","identity":' +
+      `{"repository":"fro-bot/agent","runId":"123456789","attempt":"2","job":"review-m1a2b3c4d","trigger":"pull_request"}`
+
+    // #then a bare host and a fully linked one are exactly the old documents, with no key for the server
+    expect(buildTracingLauncherValue(on())).toBe(`${prefix}}`)
+    expect(buildTracingLauncherValue(on(link))).toBe(
+      `${prefix},"rootSpan":{"traceId":"${ROOT_SPAN.traceId}","spanId":"${ROOT_SPAN.spanId}"},"sessionId":"${SESSION_ID}","invocationId":"${INVOCATION_ID}"}`,
+    )
+    expect(buildTracingLauncherValue(on(link))).not.toContain('serverUrl')
+  })
+
   it('carries the GitHub server as an origin when it is given, and no key for it when it is not', () => {
     // #given a host with a server, and one without
     const given = JSON.parse(buildTracingLauncherValue(on({serverUrl: 'https://github.com'}))) as Record<
