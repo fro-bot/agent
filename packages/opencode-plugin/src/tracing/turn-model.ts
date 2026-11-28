@@ -352,6 +352,8 @@ interface RequestState {
    * an incomplete outcome and its hook-time metadata.
    */
   bindUncertain: boolean
+  /** Shared with every tool call that took this request's offered list: cleared when the request becomes uncertain. */
+  readonly certainty: {certain: boolean}
 }
 
 interface ToolState {
@@ -367,6 +369,8 @@ interface ToolState {
   readonly ownerAgent: string | undefined
   /** The names the asking request offered, when that request is known and its list was captured. Shared, never copied. */
   offeredNames: ReadonlySet<string> | undefined
+  /** The asking request's certainty token, shared with it: it turns uncertain if the request later does, and the verdict goes with it. */
+  offerBasis: {certain: boolean} | undefined
   input: unknown
   /** The call event's arguments, kept until a hook's replace them. */
   callInput: unknown
@@ -449,7 +453,8 @@ const CREATING_KINDS: ReadonlySet<Observation['kind']> = new Set([
 
 /** Whether the call's name was offered, or undefined when it cannot be said: no known list, no known name, or a call the provider ran. */
 function offeredFlag(tool: ToolState): boolean | undefined {
-  if (tool.offeredNames === undefined || tool.providerExecuted || tool.tool === 'unknown') return undefined
+  if (tool.offeredNames === undefined || tool.offerBasis?.certain !== true) return undefined
+  if (tool.providerExecuted || tool.tool === 'unknown') return undefined
   return tool.offeredNames.has(tool.tool)
 }
 
@@ -1242,6 +1247,7 @@ export function createTurnModel(options: {
       marks: new Set(),
       closed: false,
       bindUncertain: false,
+      certainty: {certain: true},
       stepAgent: undefined,
       stepModel: undefined,
       stepProvider: undefined,
@@ -1249,7 +1255,10 @@ export function createTurnModel(options: {
     if (o.content === undefined) request.gaps.add('request')
     node.requests.push(request)
     if (o.requestKind === 'primary') {
-      if (node.withheld) request.bindUncertain = true
+      if (node.withheld) {
+        request.bindUncertain = true
+        request.certainty.certain = false
+      }
       recordHook(node, o.at, request)
     }
   }
@@ -1336,6 +1345,8 @@ export function createTurnModel(options: {
     for (const request of node.requests) {
       if (request.requestKind !== 'primary' || request.closed || request.bindUncertain) continue
       request.bindUncertain = true
+      // Tool calls that already took this request's offered list lose the verdict with the certainty.
+      request.certainty.certain = false
       for (const call of request.toolCalls) discard(call.input)
       request.toolCalls = []
     }
@@ -1598,6 +1609,7 @@ export function createTurnModel(options: {
       agent: undefined,
       ownerAgent: node.agent,
       offeredNames: undefined,
+      offerBasis: undefined,
       input: undefined,
       callInput: undefined,
       inputFromHook: false,
@@ -1659,7 +1671,10 @@ export function createTurnModel(options: {
     const asked = o.messageId === undefined ? undefined : node.stepOwner.get(o.messageId)
     // Taken now, while the request is still held: it is gone from the session once its step ends. Only a request whose step is
     // known to be its own can say what it offered.
-    if (asked !== undefined && !asked.bindUncertain) tool.offeredNames = offeredToolNames(asked.request)
+    if (asked !== undefined && !asked.bindUncertain) {
+      tool.offeredNames = offeredToolNames(asked.request)
+      tool.offerBasis = asked.certainty
+    }
     if (!tool.inputFromHook) tool.input = o.input
     else if (o.input !== undefined) tool.discarded.push(o.input)
     // An uncertain request's chat span carries no tool calls, so it takes no second owner of the arguments (nothing would release it).

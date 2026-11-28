@@ -143,6 +143,21 @@ describe('whether a called tool was offered', () => {
     expect(byCall(records, 'c1')?.offered).toBeUndefined()
   })
 
+  it('is unset when attribution is lost after the call captured its request’s list, before the call ends', () => {
+    // #given a call whose request was certain when it was published, and a loss that arrives while the tool still runs
+    const records = turn(
+      [
+        {id: 'c1', name: 'write', messageId: STEP, succeeded: false, lossBeforeEnd: true},
+        {id: 'c2', name: 'read', messageId: STEP, succeeded: true, lossBeforeEnd: true},
+      ],
+      {request: OFFERED},
+    )
+
+    // #then the verdict taken earlier is not exported, whichever way it would have gone
+    expect(byCall(records, 'c1')?.offered).toBeUndefined()
+    expect(byCall(records, 'c2')?.offered).toBeUndefined()
+  })
+
   it('is unset when the step could not be bound to its request', () => {
     // #given a step that carries no start time, so no request can be said to be its own
     const records = turn([{id: 'c1', name: 'read', messageId: STEP, succeeded: true}], {

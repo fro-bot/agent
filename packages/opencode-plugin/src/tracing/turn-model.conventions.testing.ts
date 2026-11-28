@@ -35,6 +35,8 @@ export interface Call {
   readonly hookAgent?: string | undefined
   readonly succeeded: boolean
   readonly message?: string
+  /** An observation was lost after the call was published and before it ended: its request may no longer be its own. */
+  readonly lossBeforeEnd?: boolean
 }
 
 /** One primary request and its step, with the given calls made during the step. */
@@ -89,6 +91,7 @@ export function turn(calls: readonly Call[], options: TurnOptions = {}): SpanRec
         input: {},
       })
     }
+    if (call.lossBeforeEnd === true) add({kind: 'loss', sessionIds: [SES], reason: 'test'})
     add({
       kind: 'tool.ended',
       sessionId: SES,
