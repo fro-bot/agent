@@ -208,6 +208,98 @@ describe('buildCIConfigV2', () => {
     })
   })
 
+  describe('isolated agent temp directory (fro-bot/agent#2404)', () => {
+    const SCRATCH = '/home/fro-bot-sandbox/tmp'
+
+    it('allows the scratch directory and everything under it for the external-directory check', () => {
+      // #given / #when
+      const rules = permissionsOf(build({agentTmpDirectory: SCRATCH}).content)
+
+      // #then the check `write`, `edit` and `shell` all go through
+      expect(evaluatePermissionV2('external_directory', `${SCRATCH}/*`, rules)).toBe('allow')
+      expect(evaluatePermissionV2('external_directory', `${SCRATCH}/nested/deeper/*`, rules)).toBe('allow')
+    })
+
+    it('keeps a sibling of the scratch directory, its parent and /tmp denied', () => {
+      // #given / #when
+      const rules = permissionsOf(build({agentTmpDirectory: SCRATCH}).content)
+
+      // #then
+      for (const resource of [
+        '/home/fro-bot-sandbox/tmp-other/*',
+        '/home/fro-bot-sandbox/tmpfile/*',
+        '/home/fro-bot-sandbox/*',
+        '/home/fro-bot-sandbox/.ssh/*',
+        '/home/*',
+        '/tmp/*',
+        '/tmp/x/*',
+      ]) {
+        expect(evaluatePermissionV2('external_directory', resource, rules)).toBe('deny')
+      }
+    })
+
+    it('adds exactly one allow, after the response-file and attachment exceptions, which stay as they were', () => {
+      // #given / #when
+      const {content, expectations} = build({agentTmpDirectory: SCRATCH})
+
+      // #then
+      expect(permissionsOf(content).filter(rule => rule.action === 'external_directory')).toEqual([
+        {action: 'external_directory', resource: '*', effect: 'deny'},
+        {action: 'external_directory', resource: `${RESPONSE_DIR}/*`, effect: 'allow'},
+        {action: 'external_directory', resource: `${ATTACHMENT_DIR}/*`, effect: 'allow'},
+        {action: 'external_directory', resource: `${SCRATCH}/*`, effect: 'allow'},
+      ])
+      expect(expectations.allowedDirectories).toEqual([RESPONSE_DIR, ATTACHMENT_DIR, SCRATCH])
+    })
+
+    it('adds no rule and no expectation when the run is not isolated', () => {
+      // #given / #when
+      const {content, expectations} = build()
+
+      // #then
+      expect(JSON.stringify(content)).not.toContain('fro-bot-sandbox')
+      expect(expectations.allowedDirectories).toEqual([RESPONSE_DIR, ATTACHMENT_DIR])
+    })
+
+    it('does not depend on RUNNER_TEMP', () => {
+      // #given / #when
+      const {content, expectations} = build({runnerTemp: undefined, agentTmpDirectory: SCRATCH})
+
+      // #then
+      expect(permissionsOf(content).filter(rule => rule.action === 'external_directory')).toEqual([
+        {action: 'external_directory', resource: '*', effect: 'deny'},
+        {action: 'external_directory', resource: `${SCRATCH}/*`, effect: 'allow'},
+      ])
+      expect(expectations.allowedDirectories).toEqual([SCRATCH])
+    })
+
+    it('is in the traced and the untraced config alike', () => {
+      // #given / #when
+      const untraced = build({agentTmpDirectory: SCRATCH, tracing: false})
+      const traced = build({agentTmpDirectory: SCRATCH, tracing: true})
+
+      // #then
+      for (const built of [untraced, traced]) {
+        expect(evaluatePermissionV2('external_directory', `${SCRATCH}/*`, permissionsOf(built.content))).toBe('allow')
+        expect(built.expectations.allowedDirectories).toContain(SCRATCH)
+      }
+      expect(permissionsOf(traced.content)).toEqual(permissionsOf(untraced.content))
+    })
+
+    it('refuses a directory the server would read as a pattern, or that is not absolute', () => {
+      // #given / #when
+      const wildcard = buildCIConfigV2(
+        {...BASE_INPUTS, agentTmpDirectory: '/home/fro-bot-sandbox/tm*'},
+        createMockLogger(),
+      )
+      const relative = buildCIConfigV2({...BASE_INPUTS, agentTmpDirectory: 'tmp'}, createMockLogger())
+
+      // #then
+      expect(wildcard.success).toBe(false)
+      expect(relative.success).toBe(false)
+    })
+  })
+
   describe('without RUNNER_TEMP', () => {
     it('keeps a flat outside deny with no exceptions', () => {
       // #given / #when

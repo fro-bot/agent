@@ -43,6 +43,7 @@ import {
   parseMountInfo,
   prependPathDirectory,
   readCliShimProbe,
+  SANDBOX_TMP_DIRECTORY,
   SANDBOX_VIEW_TEMP_MOUNTS,
   stopLaunch,
   stopSandboxProcesses,
@@ -1103,6 +1104,13 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       }
       account = created.data
       if (cancelled) return await failAndRelease('isolate-agent setup was cancelled by a signal')
+      // The CI permission rules allow `SANDBOX_TMP_DIRECTORY` and were built before this account existed: the agent's `TMPDIR`
+      // must be exactly that path, or its own scratch directory would be refused again (fro-bot/agent#2404).
+      if (path.join(account.home, 'tmp') !== SANDBOX_TMP_DIRECTORY) {
+        return await failAndRelease(
+          `isolate-agent: the sandbox home is not the expected one, so the agent temp directory would not be ${SANDBOX_TMP_DIRECTORY}`,
+        )
+      }
 
       const runnerTemp = env.RUNNER_TEMP
       if (runnerTemp === undefined || runnerTemp.length === 0) {
@@ -1183,7 +1191,7 @@ export function createSandboxLifecycle(options: SandboxLifecycleOptions): Sandbo
       journal = handed.data
       if (cancelled) return await failAndRelease('isolate-agent setup was cancelled by a signal')
 
-      const sandboxTmp = path.join(account.home, 'tmp')
+      const sandboxTmp = SANDBOX_TMP_DIRECTORY
       await runAsSandbox([tools.mkdir, '-m', '0700', sandboxTmp])
       // The runner's own runtime directory (`/run/user/<uid>`) is not the agent's; tools that keep sockets there need one.
       const runtimeDir = path.join(account.home, '.run')

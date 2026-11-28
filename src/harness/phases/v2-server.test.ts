@@ -15,7 +15,7 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import {DatabaseSync} from 'node:sqlite'
 import {err} from '@bfra.me/es/result'
-import {ACTION_TRACING_OFF, clearHeldClaims} from '@fro-bot/runtime'
+import {ACTION_TRACING_OFF, clearHeldClaims, evaluatePermissionV2, SANDBOX_TMP_DIRECTORY} from '@fro-bot/runtime'
 import {afterEach, beforeEach, describe, expect, it, vi, type Mock} from 'vitest'
 import {checkConfigForKeys} from '../../services/setup/key-proxy-providers.js'
 import {pluginCacheDir, resolvePluginSpecsV2} from '../../services/setup/plugin-install-v2.js'
@@ -1874,6 +1874,41 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
 
     // #then the spawn options are exactly the unisolated ones
     expect('sandbox' in (vi.mocked(deps.startServer).mock.calls[0]?.[0] ?? {})).toBe(false)
+  })
+
+  it('allows the sandbox TMPDIR, and only that directory, in the config the isolated child receives (fro-bot/agent#2404)', async () => {
+    // #given an isolated run, whose agent gets TMPDIR=<launch tmpdir>
+    const server = fakeServer()
+    const sandbox = fakeSandbox()
+    const deps = depsFor(server)
+
+    // #when started
+    const result = await run(sandbox.sandbox, deps)
+
+    // #then the config allows the directory the account's TMPDIR points at, and nothing wider
+    expect(result.success).toBe(true)
+    const spawned = vi.mocked(deps.startServer).mock.calls[0]?.[0]
+    const rules = (spawned?.config as {permissions: readonly {action: string; resource: string; effect: string}[]})
+      .permissions
+    expect(SANDBOX_TMP_DIRECTORY).toBe(LAUNCH.tmpdir)
+    expect(rules.filter(rule => rule.action === 'external_directory' && rule.effect === 'allow')).toContainEqual({
+      action: 'external_directory',
+      resource: `${LAUNCH.tmpdir}/*`,
+      effect: 'allow',
+    })
+    expect(evaluatePermissionV2('external_directory', `${LAUNCH.account.home}/*`, rules as never)).toBe('deny')
+    expect(evaluatePermissionV2('external_directory', '/tmp/*', rules as never)).toBe('deny')
+  })
+
+  it('adds no temp-directory exception when isolation is off', async () => {
+    // #given no lifecycle
+    const deps = depsFor(fakeServer())
+
+    // #when started
+    await run(null, deps)
+
+    // #then the rules name no sandbox directory
+    expect(JSON.stringify(vi.mocked(deps.startServer).mock.calls[0]?.[0].config)).not.toContain(SANDBOX_TMP_DIRECTORY)
   })
 
   it('hands over only the provisioned gh config dir and drops an ambient one from the child env', async () => {

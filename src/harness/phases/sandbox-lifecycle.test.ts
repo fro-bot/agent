@@ -971,6 +971,22 @@ describe('createSandboxLifecycle', () => {
     expect(harness.mocks.deleteAccount).toHaveBeenCalledTimes(1)
   })
 
+  it('fails closed, before any handoff, when the account home is not where the permission rules expect its TMPDIR', async () => {
+    // #given an account whose home differs from the fixed one the CI rules name (fro-bot/agent#2404)
+    const harness = createHarness()
+    harness.mocks.createAccount.mockResolvedValue(ok({...ACCOUNT, home: '/srv/elsewhere'}))
+    const lifecycle = create(harness)
+
+    // #when
+    const prepared = await lifecycle.prepare({keyFilePaths: [], ghConfigDir: null, repoSkills: null})
+
+    // #then the account is stopped and deleted, and nothing was handed over
+    expect(!prepared.success && prepared.error).toContain('/home/fro-bot-sandbox/tmp')
+    expect(harness.mocks.handOff).not.toHaveBeenCalled()
+    expect(harness.mocks.stop).toHaveBeenCalledTimes(1)
+    expect(harness.mocks.deleteAccount).toHaveBeenCalledTimes(1)
+  })
+
   it('stops, takes back and deletes in that order, once, however often release is called', async () => {
     // #given a prepared lifecycle
     const harness = createHarness()
