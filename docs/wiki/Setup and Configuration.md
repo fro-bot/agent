@@ -326,7 +326,7 @@ On `schedule` and `workflow_dispatch`, the only triggers that keep remote MCP se
 What the proxy does for an MCP route:
 
 - It serves `POST`, `GET` and `DELETE` on that route's path and passes the query through. It forwards the request's headers except the client's `Authorization`, cookies, hop-by-hop and forwarding headers, so MCP protocol headers such as `Mcp-Session-Id` and `Mcp-Param-*` reach the server.
-- Responses stream through, including SSE. A redirect or protocol upgrade from the server becomes a local 502, and the client never follows it. An error body has every copy of a configured header value (8 characters or more, and the token after `Bearer`, `Basic` or `Token`) replaced with `[redacted]`, and `WWW-Authenticate` is dropped.
+- Responses stream through, including SSE. A redirect or protocol upgrade from the server becomes a local 502, and the client never follows it. In an error body, every copy of a configured header value, or of the token after `Bearer`, `Basic` or `Token`, is replaced with `[redacted]` when the value or token is 8 characters or more, and `WWW-Authenticate` is dropped.
 - MCP routes have no first-byte or idle timeout, so a long tool call is not cut. Streams end when the run ends.
 - An upstream 401, 403, 5xx or timeout makes only that server unavailable to the agent. The run goes on.
 
@@ -334,7 +334,7 @@ What this does not protect:
 
 - **What the token can do.** The agent's shell can call any tool through the loopback route, so give the server a token scoped to what the run needs.
 - **An upstream that returns its own credential** in a response, for example a debug tool that echoes request headers. The server is trusted with its credential.
-- **Header values shorter than 8 characters.** The proxy still holds them, but setup doesn't scan the config for them or mask them in logs.
+- **Header values and scheme tokens shorter than 8 characters.** The proxy still holds them, but setup doesn't scan the config for copies of them, mask them in logs, or redact them from error bodies.
 - **Local servers' `environment`**, and anything else in `opencode-config`.
 - **Runs without `isolate-agent`.** There the agent can read every value, as described above.
 
@@ -343,7 +343,7 @@ Setup refuses a config the proxy can't protect. The run fails before the sandbox
 | Refused | Fix |
 | --- | --- |
 | A `{env:...}` or `{file:...}` reference anywhere in a server that has `headers` | Write the value literally in a secret-backed `opencode-config` |
-| A top-level key whose name holds a reference | Name the key literally |
+| A top-level key, or any key under `mcp`, whose name holds a reference | Name the key literally |
 | `oauth` set on a server that has `headers` | Remove `oauth` and use a static header, or drop `headers` and let OpenCode log in |
 | A URL that isn't `https`, or has credentials, a query, a fragment, a cloud metadata host or a non-canonical path | Use a plain `https://host/path` URL and move any secret into a header |
 | A header name that is invalid, framing or hop-by-hop (`Host`, `Connection`, `Transfer-Encoding`, ...), or that repeats another header's name in a different case | Remove it; the proxy sets framing itself |
