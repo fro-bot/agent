@@ -75,15 +75,13 @@ function writeSettings(
 
 function resolve(
   env: Record<string, string | undefined> = {},
-  extra: {platform?: NodeJS.Platform; uid?: number; hostname?: () => string; argv?: readonly string[]} = {},
+  extra: {platform?: NodeJS.Platform; uid?: number; hostname?: () => string} = {},
 ) {
   return resolveTracingSettings({
     env: {HOME: home, XDG_CONFIG_HOME: configHome, ...env},
     directory: project,
     log: line => lines.push(line),
     hostname: () => HOSTNAME,
-    // Not the test runner's own: an interactive `opencode` with no subcommand.
-    argv: ['bun', '/$bunfs/root/opencode'],
     ...extra,
   })
 }
@@ -303,42 +301,57 @@ describe('headless host without a launcher variable', () => {
   })
 })
 
-describe('a server embedded by a parent process (`serve --stdio`)', () => {
-  // `opencode serve --stdio` deletes OPENCODE_PASSWORD and OPENCODE_SERVER_PASSWORD from the process environment before a
-  // plugin loads (measured on 2.3.2), so a server a parent embeds (an SDK client, a gateway, the Action) may show none of
-  // the markers above. The command line still says `serve --stdio`. A `serve` you start by hand, or the background
-  // service, is not embedded: the user's file covers it (see the README).
+/** Runs `fn` with `process.argv` replaced, which is where the plugin would read the command line if it read one. */
+function withArgv<T>(argv: readonly string[], fn: () => T): T {
+  const original = process.argv
+  process.argv = [...argv]
+  try {
+    return fn()
+  } finally {
+    process.argv = original
+  }
+}
+
+describe.skipIf(!isPosix)('a stdio server on a workstation (`serve --stdio`)', () => {
+  // `opencode --standalone`, `opencode run` and ACP start their backend as `serve --stdio --port 0` when no background
+  // service runs. The command line does not tell those apart from an SDK client, so it decides nothing: only the launcher
+  // variable and the headless markers do (#2393). The user file is consent for the whole machine.
   it.each([
-    ['serve --stdio', ['bun', '/$bunfs/root/opencode', 'serve', '--stdio', '--port', '0']],
+    ['the standalone backend', ['bun', '/$bunfs/root/opencode', 'serve', '--stdio', '--port', '0']],
     ['serve with the flag first', ['bun', '/$bunfs/root/opencode', 'serve', '--port', '0', '--stdio']],
     ['a global option before serve', ['bun', '/$bunfs/root/opencode', '--print-logs', 'serve', '--stdio']],
-  ])('resolves to off for %s with no launcher variable and no marker, even with a valid user file', (_label, argv) => {
+  ])('resolves to on for %s with a valid user file and no launcher variable or marker', (_label, argv) => {
     // #given a valid user file naming this machine, and nothing else that says headless
     writeSettings()
 
-    // #when
-    const settings = resolve({}, {argv})
+    // #when settings resolve in a process whose command line is `serve --stdio`
+    const settings = withArgv(argv, () => resolve())
 
-    // #then
-    expect(settings).toEqual({mode: 'off', reason: 'headless-host'})
-    expect(lines).toEqual(['tracing off (headless-host)'])
+    // #then the file applies, as it does for any other local session
+    expect(settings).toMatchObject({mode: 'on', host: 'local'})
+    expect(lines).toEqual(['tracing on, destination host collector.example'])
   })
 
-  it.each([
-    ['serve by hand', ['bun', '/$bunfs/root/opencode', 'serve']],
-    ['serve on a port', ['bun', '/$bunfs/root/opencode', 'serve', '--port', '4096']],
-    ['the background service', ['bun', '/$bunfs/root/opencode', 'serve', '--service']],
-    ['no subcommand', ['bun', '/$bunfs/root/opencode']],
-    ['run', ['bun', '/$bunfs/root/opencode', 'run', 'fix the build']],
-    ['a path that merely contains serve', ['bun', '/home/me/serve/opencode', '--stdio']],
-    ['an argument that merely contains stdio', ['bun', '/$bunfs/root/opencode', 'run', 'serve --stdio please']],
-    ['an empty command line', []],
-  ])('does not call %s embedded: the user file applies', (_label, argv) => {
-    // #given a valid file
+  it.each(HEADLESS_MARKERS)('still resolves to off for `serve --stdio` when %s is set', marker => {
+    // #given a valid user file and a marker, as an SDK embedder that passes its config inline has
     writeSettings()
 
-    // #when / #then
-    expect(resolve({}, {argv})).toMatchObject({mode: 'on', host: 'local'})
+    // #when / #then the marker decides, not the command line
+    const settings = withArgv(['bun', '/$bunfs/root/opencode', 'serve', '--stdio', '--port', '0'], () =>
+      resolve({[marker]: 'x'}),
+    )
+    expect(settings).toEqual({mode: 'off', reason: 'headless-host'})
+  })
+
+  it('lets a launcher that says off win over a stdio command line and a valid user file', () => {
+    // #given a valid user file and an Action launcher that declares tracing off
+    writeSettings()
+
+    // #when / #then the launcher decides alone
+    const settings = withArgv(['bun', '/$bunfs/root/opencode', 'serve', '--stdio', '--port', '0'], () =>
+      resolve({[TRACING_LAUNCHER_ENV]: launcher({tracing: 'off'})}),
+    )
+    expect(settings).toEqual({mode: 'off', reason: 'action-off'})
   })
 
   it('does not change the Action launcher: `serve --stdio` is how the Action starts the server', () => {
@@ -346,7 +359,10 @@ describe('a server embedded by a parent process (`serve --stdio`)', () => {
     const argv = ['bun', '/$bunfs/root/opencode', 'serve', '--stdio', '--port', '0']
 
     // #when / #then
-    expect(resolve({[TRACING_LAUNCHER_ENV]: launcher()}, {argv})).toMatchObject({mode: 'on', host: 'action'})
+    expect(withArgv(argv, () => resolve({[TRACING_LAUNCHER_ENV]: launcher()}))).toMatchObject({
+      mode: 'on',
+      host: 'action',
+    })
   })
 })
 

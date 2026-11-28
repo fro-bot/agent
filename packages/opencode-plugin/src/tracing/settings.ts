@@ -34,20 +34,6 @@ export const TRACING_SETTINGS_VERSION = 1
 /** Variables a headless server (the Action, the workspace, any `opencode serve`) always has and a local session lacks. */
 export const HEADLESS_MARKERS = ['OPENCODE_PASSWORD', 'OPENCODE_CONFIG_CONTENT'] as const
 
-/**
- * True when the command line is `opencode … serve … --stdio`: a server a parent process embeds (an SDK client, a gateway,
- * the Action). `opencode serve --stdio` deletes `OPENCODE_PASSWORD` and `OPENCODE_SERVER_PASSWORD` from the process
- * environment before a plugin loads (measured on 2.3.2), so such a server started with only a password shows none of the
- * markers above. The command line is what still says so. A `serve` started by hand, or the background service
- * (`serve --service`; `--stdio` cannot be combined with it), is not embedded: the user's file is consent for those too.
- * The subcommand is the first non-option word after the program path; `--stdio` must come after it.
- */
-function isEmbeddedServe(argv: readonly string[]): boolean {
-  const rest = argv.slice(2)
-  const serve = rest.indexOf('serve')
-  return serve !== -1 && rest.slice(serve + 1).includes('--stdio')
-}
-
 /** The user file, relative to the user's config directory. Not under `opencode/`: OpenCode reads nothing from here. */
 export const USER_SETTINGS_RELATIVE_PATH = path.join('fro-bot', 'opencode-plugin', 'tracing.json')
 
@@ -141,8 +127,6 @@ export interface ResolveTracingSettingsInput {
   readonly platform?: NodeJS.Platform
   /** The current user's id. Defaults to `process.getuid()`. */
   readonly uid?: number | undefined
-  /** The command line. Defaults to `process.argv`. A `serve --stdio` command is a server a parent embeds: headless. */
-  readonly argv?: readonly string[] | undefined
   /** The machine's name. Defaults to `os.hostname()`. Read only for a local session with a valid user file. */
   readonly hostname?: (() => string) | undefined
 }
@@ -511,8 +495,11 @@ export function resolveTracingSettings(input: ResolveTracingSettingsInput): Trac
     // The launcher decides alone: a declared off or a workspace host is never overridden by a user file.
     if (launcher !== undefined) return finish(resolveLauncher(launcher))
 
-    // No launcher: something that is not this repo's Action started the server. A headless server stays off.
-    if (HEADLESS_MARKERS.some(marker => env[marker] !== undefined) || isEmbeddedServe(input.argv ?? process.argv)) {
+    // No launcher: something that is not this repo's Action started the server. A headless server stays off. The command
+    // line says nothing: `serve --stdio` is also how the interactive app's private backend starts (`--standalone`, `run`,
+    // ACP), and every launcher of this repo sets the variable above. Any other stdio server on this machine, an SDK
+    // embedder included, falls under the user file unless it passes `OPENCODE_CONFIG_CONTENT`.
+    if (HEADLESS_MARKERS.some(marker => env[marker] !== undefined)) {
       return finish(off('headless-host'))
     }
 

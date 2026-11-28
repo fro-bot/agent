@@ -708,7 +708,6 @@ describe.skipIf(!runnable)('tracing in a real opencode V2', () => {
         await run(
           {
             steps: [{all: ['V-ONE'], text: 'tls answer'}],
-            // Plain serve: `serve --stdio` is treated as embedded, so a local file would not apply there.
             plain: true,
             env: () => ({NODE_TLS_REJECT_UNAUTHORIZED: '0'}),
             beforeStart: sandbox => {
@@ -813,21 +812,39 @@ describe.skipIf(!runnable)('tracing in a real opencode V2', () => {
     }, 120_000)
   })
 
-  it('stays off in a server started with `serve` that shows no headless marker, whatever a user file says', async () => {
-    // #given a server whose plugin sees neither OPENCODE_PASSWORD nor OPENCODE_CONFIG_CONTENT (the stdio server deletes
-    // the password before plugins load), no launcher variable, and a valid user file naming this machine
-    await run(
-      {
-        steps: simpleSteps,
-        localMode: true,
-        env: () => ({}),
-        beforeStart: (sandbox, sink) => {
-          const file = userSettingsFilePath({XDG_CONFIG_HOME: path.join(sandbox.home, 'config')})
-          mkdirSync(path.dirname(file), {recursive: true})
-          writeFileSync(file, JSON.stringify({version: 1, endpoint: sink.url, hosts: [os.hostname()]}), {mode: 0o600})
+  describe("the user file in a `serve --stdio` server (the interactive app's standalone backend)", () => {
+    const writeFile = (sandbox: SandboxPaths, sink: OtlpSink) => {
+      const file = userSettingsFilePath({XDG_CONFIG_HOME: path.join(sandbox.home, 'config')})
+      mkdirSync(path.dirname(file), {recursive: true})
+      writeFileSync(file, JSON.stringify({version: 1, endpoint: sink.url, hosts: [os.hostname()]}), {mode: 0o600})
+    }
+
+    it('exports a traced turn with no launcher variable and no headless marker, as `opencode --standalone` runs it', async () => {
+      // #given a `serve --stdio` server whose plugin sees neither OPENCODE_PASSWORD nor OPENCODE_CONFIG_CONTENT (the stdio
+      // server deletes the password before plugins load), no launcher variable, and a valid user file naming this machine
+      await run(
+        {steps: [{all: ['S-ONE'], text: 'stdio answer'}], localMode: true, env: () => ({}), beforeStart: writeFile},
+        async h => {
+          const session = await h.session()
+
+          // #when a turn runs
+          await prompt(h.api, session, 'S-ONE hello')
+          await waitUntil('the root span', () => h.spans().some(isRoot), 60_000)
+          await h.stop()
+
+          // #then the trace reached the sink: the command line decides nothing, the user file is consent for this machine
+          const spans = h.spans()
+          expect(spans.some(isRoot)).toBe(true)
+          expect(spans.some(span => span.attrs['gen_ai.operation.name'] === 'chat')).toBe(true)
+          expect(spans.every(span => span.attrs['fro_bot.repository'] === undefined)).toBe(true)
         },
-      },
-      async h => {
+      )
+    }, 120_000)
+
+    it('sends nothing when OPENCODE_CONFIG_CONTENT is set, whatever the user file says', async () => {
+      // #given the same server and file, but started as an SDK embedder that passes its config inline would: both headless
+      // markers set (not local mode), no launcher variable
+      await run({steps: simpleSteps, env: () => ({}), beforeStart: writeFile}, async h => {
         const session = await h.session()
 
         // #when a turn runs and the server stops
@@ -838,7 +855,7 @@ describe.skipIf(!runnable)('tracing in a real opencode V2', () => {
         // #then nothing was sent, and the plugin said why with a fixed reason
         expect(h.sink.requests).toHaveLength(0)
         expect(h.server.stderr()).toContain('[fro-bot/opencode-plugin] tracing off (headless-host)')
-      },
-    )
-  }, 90_000)
+      })
+    }, 90_000)
+  })
 })
