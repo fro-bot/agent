@@ -2,7 +2,7 @@
 
 import {describe, expect, it} from 'vitest'
 
-import {omittedContent} from './snapshot.js'
+import {omittedContent, snapshotRequest} from './snapshot.js'
 import {byCall, STEP, turn} from './turn-model.conventions.testing.js'
 
 const OFFERED = {tools: {read: {description: 'Read a file'}, grep: {description: 'Search'}}}
@@ -101,6 +101,34 @@ describe('whether a called tool was offered', () => {
     const records = turn([{id: 'c1', name: 'read', messageId: STEP, succeeded: true, ...overrides}], {request})
 
     // #then no flag is recorded: unset, not false
+    expect(byCall(records, 'c1')?.offered).toBeUndefined()
+  })
+
+  it('is unset for every call of a request whose tool snapshot dropped an entry, never false', () => {
+    // #given a request whose list held a tool the snapshot could not keep (not an object), so the list is incomplete
+    const request = snapshotRequest({tools: {read: {description: 'Read'}, broken: 'not a tool'}})
+    const records = turn(
+      [
+        {id: 'c1', name: 'read', messageId: STEP, succeeded: true},
+        {id: 'c2', name: 'broken', messageId: STEP, succeeded: false},
+        {id: 'c3', name: 'write', messageId: STEP, succeeded: false},
+      ],
+      {request},
+    )
+
+    // #then no call gets a verdict: a name missing from an incomplete list proves nothing, and neither does one present in it
+    for (const id of ['c1', 'c2', 'c3']) expect(byCall(records, id)?.offered).toBeUndefined()
+  })
+
+  it('is unset when the request’s tool list was cut by the snapshot’s bound', () => {
+    // #given a list over the snapshot's character bound
+    const tools = Object.fromEntries(
+      Array.from({length: 20}, (_, index) => [`t${index}`, {description: 'd'.repeat(200)}]),
+    )
+    const request = snapshotRequest({tools}, {limits: {toolDefinitionChars: 1_000}})
+    const records = turn([{id: 'c1', name: 'write', messageId: STEP, succeeded: false}], {request})
+
+    // #then
     expect(byCall(records, 'c1')?.offered).toBeUndefined()
   })
 

@@ -295,6 +295,11 @@ export interface RequestSnapshot {
    * array's length, so it is an upper bound: it also counts entries that were not messages.
    */
   readonly droppedMessages?: number
+  /**
+   * Set when `tools` left out an entry of the host's list (one that is not an object, or named `__proto__`): the list holds
+   * only what was kept, so it cannot say a tool was NOT offered. A list cut by a bound is `OmittedContent` instead.
+   */
+  readonly toolsIncomplete?: true
   /** Characters this snapshot holds; what the ledger counts. */
   readonly size: number
 }
@@ -432,28 +437,35 @@ function pruneTools(
   limit: number,
   limits: SnapshotLimits,
   shared: NodeCount,
-): {value: RequestSnapshot['tools']; chars: number} | undefined {
+): {value: RequestSnapshot['tools']; chars: number; incomplete: boolean} | undefined {
   if (!isRecord(tools)) return undefined
   const meter = meterFor(limit, limits, shared)
   const copy: Record<string, {description?: string; input?: unknown}> = {}
+  let incomplete = false
   for (const name of Object.keys(tools)) {
-    if (name === '__proto__') continue
+    if (name === '__proto__') {
+      incomplete = true
+      continue
+    }
     spend(meter, 0, 1)
-    if (meter.over) return {value: omittedContent('snapshot-bound'), chars: 0}
+    if (meter.over) return {value: omittedContent('snapshot-bound'), chars: 0, incomplete: false}
     const tool = readKey(tools, name)
-    if (!isRecord(tool)) continue
+    if (!isRecord(tool)) {
+      incomplete = true
+      continue
+    }
     spend(meter, name.length, 1)
     const description = asString(readKey(tool, 'description'))
     if (description !== undefined) spend(meter, description.length, 0)
     const rawInput = readKey(tool, 'input')
     const input = isRecord(rawInput) ? copyValue(rawInput, meter, 1) : undefined
-    if (meter.over) return {value: omittedContent('snapshot-bound'), chars: 0}
+    if (meter.over) return {value: omittedContent('snapshot-bound'), chars: 0, incomplete: false}
     copy[name] = Object.freeze({
       ...(description === undefined ? {} : {description}),
       ...(input === undefined ? {} : {input}),
     })
   }
-  return {value: Object.freeze(copy), chars: meter.chars}
+  return {value: Object.freeze(copy), chars: meter.chars, incomplete}
 }
 
 function omittedRequest(reason: OmissionReason): RequestSnapshot {
@@ -516,6 +528,7 @@ export function snapshotRequest(
       ...(system === undefined ? {} : {system: system.value}),
       ...(messages === undefined ? {} : {messages}),
       ...(tools === undefined ? {} : {tools: tools.value}),
+      ...(tools?.incomplete === true ? {toolsIncomplete: true as const} : {}),
       ...(droppedMessages > 0 ? {droppedMessages} : {}),
       size: used,
     })

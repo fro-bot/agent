@@ -48,8 +48,14 @@ export function toolDefinitionStats(tools: unknown): ToolDefinitionStats | undef
   return stats
 }
 
-/** The offered tool names of a request snapshot (the object a `request` observation carries as its content), if known. */
+/**
+ * The offered tool names of a request snapshot (the object a `request` observation carries as its content), only when the list
+ * is the whole of what was offered. A snapshot that dropped an entry (`toolsIncomplete`) or left the list out is not: a name
+ * missing from it proves nothing, so no names are given.
+ */
 export function offeredToolNames(request: unknown): ReadonlySet<string> | undefined {
   if (typeof request !== 'object' || request === null || Array.isArray(request)) return undefined
-  return toolDefinitionStats((request as {readonly tools?: unknown}).tools)?.names
+  const {tools, toolsIncomplete} = request as {readonly tools?: unknown; readonly toolsIncomplete?: unknown}
+  if (toolsIncomplete === true) return undefined
+  return toolDefinitionStats(tools)?.names
 }
