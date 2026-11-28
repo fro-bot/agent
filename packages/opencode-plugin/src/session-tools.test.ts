@@ -1,6 +1,6 @@
 import type {SessionClientV2} from '@fro-bot/runtime/session-v2'
 
-import {Schema} from 'effect'
+import {Effect, Schema} from 'effect'
 import {beforeEach, describe, expect, it, vi} from 'vitest'
 
 import {createSessionTools, SESSION_TOOL_NAMES, TRANSCRIPT_CHAR_CAP} from './session-tools.js'
@@ -494,5 +494,102 @@ describe('error text', () => {
 
     // #when / #then
     expect(await t.list.run({})).toBe('session store unavailable: Session.NotFoundError')
+  })
+})
+
+/**
+ * The host's argument path (`validateInput` in OpenCode's tool runtime): `Schema.decodeUnknownEffect` with
+ * `errors: 'all'`, and the DECODED value is what `execute` receives. A string `limit` must arrive as a number.
+ */
+async function throughHost(
+  spec: {readonly input: Schema.Top & {readonly DecodingServices: never}; readonly run: (a: never) => Promise<string>},
+  raw: unknown,
+): Promise<string> {
+  const decoded = await Effect.runPromise(Schema.decodeUnknownEffect(spec.input)(raw, {errors: 'all'}))
+  return spec.run(decoded as never)
+}
+
+const rejectsAtSchema = async (spec: {readonly input: Schema.Top & {readonly DecodingServices: never}}, raw: unknown) =>
+  Effect.runPromise(Schema.decodeUnknownEffect(spec.input)(raw, {errors: 'all'}))
+
+describe('numeric-string limit (host argument validation)', () => {
+  it.each([1, '1'])('session_read caps the transcript to one message for limit %j', async limit => {
+    // #given
+    const t = tools()
+
+    // #when
+    const output = await throughHost(t.read, {session_id: 'ses_a', include_transcript: true, limit})
+
+    // #then
+    expect(output).toContain('Transcript:\n  [user] please fix the Flaky cache test')
+    expect(output).not.toContain('[assistant]')
+  })
+
+  it.each([1, '1'])('session_list returns one session for limit %j', async limit => {
+    // #given
+    const t = tools()
+
+    // #when
+    const output = await throughHost(t.list, {limit})
+
+    // #then
+    expect(output.split('\n')).toHaveLength(1)
+  })
+
+  it.each([1, '1'])('session_search returns one matching session for limit %j', async limit => {
+    // #given
+    const t = tools()
+
+    // #when
+    const output = await throughHost(t.search, {query: 'cache', limit})
+
+    // #then
+    expect(output.split('\n')).toHaveLength(2)
+  })
+
+  it('decodes a numeric string to a number inside the schema', async () => {
+    // #given
+    const t = tools()
+
+    // #when
+    const decoded = await Effect.runPromise(
+      Schema.decodeUnknownEffect(t.read.input)({session_id: 'ses_a', limit: ' 15 '}),
+    )
+
+    // #then the handler never sees a string, so it cannot fall through to an uncapped read
+    expect(decoded.limit).toBe(15)
+  })
+
+  it('keeps an omitted limit omitted', async () => {
+    // #given
+    const t = tools()
+
+    // #when
+    const decoded = await Effect.runPromise(Schema.decodeUnknownEffect(t.list.input)({}))
+
+    // #then
+    expect(Object.hasOwn(decoded, 'limit')).toBe(false)
+  })
+
+  it.each(['', '   ', 'abc', '1x', 'NaN', 'Infinity', '-Infinity', '0x10', '1e999'])(
+    'rejects limit %j at the schema for every tool',
+    async limit => {
+      // #given
+      const t = tools()
+
+      // #when / #then
+      await expect(rejectsAtSchema(t.read, {session_id: 'ses_a', limit})).rejects.toThrow()
+      await expect(rejectsAtSchema(t.list, {limit})).rejects.toThrow()
+      await expect(rejectsAtSchema(t.search, {query: 'cache', limit})).rejects.toThrow()
+    },
+  )
+
+  it('still rejects non-numeric, non-string limits', async () => {
+    // #given
+    const t = tools()
+
+    // #when / #then
+    await expect(rejectsAtSchema(t.list, {limit: true})).rejects.toThrow()
+    await expect(rejectsAtSchema(t.list, {limit: null})).rejects.toThrow()
   })
 })
