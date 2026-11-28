@@ -342,6 +342,22 @@ describe('the built plugin', () => {
         expect({chunk, holdsLauncher: read(chunk).includes(name)}).toEqual({chunk, holdsLauncher: false})
     })
 
+    it('reads its own version from the package.json one level above dist/, where the published tarball puts it', () => {
+      // #given the release job stamps the version into the staged package.json after the build, so the build cannot know it
+      // #when / #then the built code locates the manifest from its own file's URL, and every emitted file sits directly in dist/
+      const readers = files.filter(file => read(file).includes('../package.json'))
+      expect(readers.length).toBeGreaterThan(0)
+      for (const file of readers)
+        expect({
+          file,
+          locates: /new URL\(\s*["']\.\.\/package\.json["']\s*,\s*import\.meta\.url\s*\)/.test(read(file)),
+        }).toEqual({
+          file,
+          locates: true,
+        })
+      expect(readdirSync(distDir, {withFileTypes: true}).filter(entry => entry.isDirectory())).toEqual([])
+    })
+
     it('contains none of the loading or evaluation primitives that would get around the import scan', () => {
       // #given every emitted JavaScript file, entry included
       for (const file of files) {

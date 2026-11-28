@@ -20,6 +20,8 @@ type ToolInfo = Parameters<ToolEditor['add']>[0]
  */
 export interface HostSurface {
   readonly location: {readonly directory: string}
+  /** The host application (`Plugin.Context.app`). Only its version is read, for the trace resource. */
+  readonly app?: {readonly version?: string | undefined} | undefined
   readonly session: PluginSessionApi & ObserverHost['session']
   readonly tool: {
     transform: (callback: (editor: Pick<ToolEditor, 'add'>) => void) => Promise<unknown>
@@ -58,7 +60,7 @@ async function startTracing(
         event: host.event,
       },
       settings,
-      {env, log},
+      {env, log, ...(typeof host.app?.version === 'string' ? {opencodeVersion: host.app.version} : {})},
     )
     return async () => {
       try {

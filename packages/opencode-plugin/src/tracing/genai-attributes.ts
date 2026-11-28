@@ -49,6 +49,8 @@ export const GENAI_SEMCONV_REVISION = 'open-telemetry/semantic-conventions-genai
 export interface AttributeOptions extends ActionRunContext {
   /** Set in Action mode: repository and run identity go on every span. Absent in local mode: none do. */
   readonly identity?: ActionIdentity | undefined
+  /** The plugin's own version: Langfuse's `release`, on each trace's root span. Absent when it could not be read. */
+  readonly release?: string | undefined
 }
 
 type Attributes = Record<string, PendingAttributeValue>
@@ -74,6 +76,9 @@ function identityAttributes(record: SpanRecord, options: AttributeOptions): Attr
     'langfuse.session.id': options.sessionId ?? record.rootSessionId,
   }
   set(attributes, 'gen_ai.agent.name', record.agent)
+  // Langfuse reads `release` from the span (then the resource) of each observation it ingests, and takes the trace's from the root.
+  // `service.version` on the resource feeds its `version`, a different field, so the release is said here, on the span.
+  if (record.parentSpanId === undefined) set(attributes, 'langfuse.release', options.release)
   if (options.identity !== undefined) {
     Object.assign(attributes, actionIdentityAttributes(options.identity, options.invocationId))
   }

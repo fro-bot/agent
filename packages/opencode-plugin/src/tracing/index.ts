@@ -10,6 +10,7 @@
 import type {TracingSettings} from './settings.js'
 
 import {createSpanExporter} from '@fro-bot/runtime/tracing/exporter'
+import {readPackageVersion} from '../package-version.js'
 import {createScrubber, type Scrubber} from './content.js'
 import {createTracePipeline} from './pipeline.js'
 import {registerObservers, type ObserverHost} from './record-observations.js'
@@ -52,6 +53,38 @@ export interface StartTracingOptions {
   readonly drainBoundMs?: number
   /** Replaces the scrubber (tests that force the safety net). Production builds its own from `env`. */
   readonly scrubber?: Scrubber
+  /** The host's OpenCode version (`Plugin.Context.app.version`). Absent or not a plain version: the resource carries none. */
+  readonly opencodeVersion?: string | undefined
+  /** Reads this plugin's own version. Tests replace it; production reads the `package.json` beside the built files. */
+  readonly readVersion?: () => string | undefined
+}
+
+/** A version as a resource value: short, printable, no spaces. Anything else is not trusted as a label. */
+const RESOURCE_VERSION = /^[\da-z][\w.+-]{0,63}$/i
+
+/**
+ * A version that is safe to put on the resource, or `undefined`. The resource is built once and no span's scrub pass reaches
+ * it, so the text passes the same scrubber here and goes out only when the scrubber leaves it exactly as it was and the
+ * safety net does not recognise it: a value that would need redacting is left unset, never sent altered.
+ */
+function resourceVersion(value: string | undefined, scrubber: Scrubber): string | undefined {
+  if (value === undefined || !RESOURCE_VERSION.test(value)) return undefined
+  try {
+    const result = scrubber.scrub(value)
+    if (!result.ok || result.text !== value || scrubber.survived?.(value) === true) return undefined
+    return value
+  } catch {
+    return undefined
+  }
+}
+
+/** The plugin's own version. Reading it must never stop tracing from starting. */
+function pluginVersion(options: StartTracingOptions): string | undefined {
+  try {
+    return (options.readVersion ?? readPackageVersion)()
+  } catch {
+    return undefined
+  }
 }
 
 export async function startTracing(
@@ -68,9 +101,15 @@ export async function startTracing(
       // The collector credential is a literal secret too: it must not come back in a tool result or an error message.
       extraSecrets: local ? Object.values(settings.headers) : [],
     })
+  const version = resourceVersion(pluginVersion(options), scrubber)
+  const opencodeVersion = resourceVersion(options.opencodeVersion, scrubber)
   const exporter = createSpanExporter({
     url: settings.endpoint,
     serviceName: PLUGIN_SERVICE_NAME,
+    resourceAttributes: {
+      ...(version === undefined ? {} : {'service.version': version}),
+      ...(opencodeVersion === undefined ? {} : {'fro_bot.opencode.version': opencodeVersion}),
+    },
     headers: local ? settings.headers : {},
     // Action mode only: a local collector did not ask for the header.
     reportCounts: !local,
@@ -84,6 +123,7 @@ export async function startTracing(
     sink: exporter,
     scrubber,
     ledger,
+    ...(version === undefined ? {} : {release: version}),
     ...(settings.host === 'action'
       ? {
           identity: settings.identity,
