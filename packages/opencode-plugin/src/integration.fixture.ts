@@ -275,7 +275,8 @@ export async function startOpenCodeServer(options: {
   /**
    * Start so that the plugin sees none of the headless markers: the config goes in the user's global config file instead
    * of `OPENCODE_CONFIG_CONTENT`, and the password goes in `OPENCODE_SERVER_PASSWORD`, which `serve --stdio` deletes from
-   * the process environment before any plugin loads (measured on 2.3.2). The command line still says `serve`.
+   * the process environment before any plugin loads (measured on 2.3.2). It is `serve --stdio` with a user file in play, as the
+   * interactive app's standalone backend starts.
    */
   readonly localMode?: boolean
   /**
