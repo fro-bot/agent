@@ -130,6 +130,7 @@ export async function startTracing(
           rootSpan: settings.rootSpan,
           sessionId: settings.sessionId,
           invocationId: settings.invocationId,
+          serverUrl: settings.serverUrl,
         }
       : {}),
     ...(options.now === undefined ? {} : {now: options.now}),

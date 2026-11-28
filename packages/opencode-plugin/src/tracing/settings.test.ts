@@ -48,6 +48,7 @@ const ROOT_SPAN = {traceId: '0af7651916cd43dd8448eb211c80319c', spanId: 'b7ad6b7
 const SESSION_ID = 'fro-bot/agent:issue-42'
 const INVOCATION_ID = '3f2a9c1e-7b4d-4e8a-9d6c-1a2b3c4d5e6f'
 const RUN_LINK = {rootSpan: ROOT_SPAN, sessionId: SESSION_ID, invocationId: INVOCATION_ID}
+const SERVER_URL = 'https://github.com'
 
 function launcher(overrides: Record<string, unknown> = {}): string {
   return JSON.stringify({version: 1, host: 'action', tracing: 'on', relay: RELAY, identity: IDENTITY, ...overrides})
@@ -133,6 +134,38 @@ describe('Action host', () => {
       identity: IDENTITY,
       ...fields,
     })
+  })
+
+  it('carries the GitHub server when the launcher has it, as its origin', () => {
+    // #given the launcher the Action will send once it names the server, with and without a trailing slash
+    for (const serverUrl of [SERVER_URL, `${SERVER_URL}/`]) {
+      // #then it is on, with the origin and every other field unchanged
+      expect(resolve({[TRACING_LAUNCHER_ENV]: launcher({...RUN_LINK, serverUrl})})).toEqual({
+        mode: 'on',
+        host: 'action',
+        endpoint: RELAY,
+        identity: IDENTITY,
+        ...RUN_LINK,
+        serverUrl: SERVER_URL,
+      })
+    }
+  })
+
+  it.each([
+    ['an enterprise host', 'https://ghe.example.com'],
+    ['a port', 'https://ghe.example.com:8443'],
+    ['a server url of exactly 200 characters', `https://${'a'.repeat(190)}.example`.slice(0, 200)],
+  ])('accepts %s as the server', (_label, serverUrl) => {
+    expect(resolve({[TRACING_LAUNCHER_ENV]: launcher({serverUrl})})).toMatchObject({mode: 'on', serverUrl})
+  })
+
+  it('reads a launcher from before the server field existed exactly as it always did', () => {
+    // #given the launcher an older Action writes, with the whole run link and no server
+    const settings = resolve({[TRACING_LAUNCHER_ENV]: launcher(RUN_LINK)})
+
+    // #then it is on, and the settings hold no key for the server
+    expect(settings).toMatchObject({mode: 'on', host: 'action'})
+    expect('serverUrl' in settings).toBe(false)
   })
 
   it('carries none of the run link fields when the launcher has none, as before', () => {
@@ -255,6 +288,28 @@ describe('Action host', () => {
     ['a session id that is not a string', launcher({sessionId: 42}), 'launcher-run-invalid'],
     ['a session id over 200 characters', launcher({sessionId: 's'.repeat(201)}), 'launcher-run-invalid'],
     ['a session id with a control character', launcher({sessionId: 'a/b:c\nd'}), 'launcher-run-invalid'],
+    ['an empty server url', launcher({serverUrl: ''}), 'launcher-run-invalid'],
+    ['a server url that is not a string', launcher({serverUrl: 443}), 'launcher-run-invalid'],
+    ['a server url that is null', launcher({serverUrl: null}), 'launcher-run-invalid'],
+    ['a plain http server', launcher({serverUrl: 'http://github.com'}), 'launcher-run-invalid'],
+    ['a server with no scheme', launcher({serverUrl: 'github.com'}), 'launcher-run-invalid'],
+    ['a server on another scheme', launcher({serverUrl: 'javascript://github.com'}), 'launcher-run-invalid'],
+    ['a server with a path', launcher({serverUrl: 'https://github.com/SENTINEL'}), 'launcher-run-invalid'],
+    ['a server with a query', launcher({serverUrl: 'https://github.com?token=SENTINEL'}), 'launcher-run-invalid'],
+    ['a server with a fragment', launcher({serverUrl: 'https://github.com/#SENTINEL'}), 'launcher-run-invalid'],
+    ['a server with userinfo', launcher({serverUrl: 'https://user:hunter2@github.com'}), 'launcher-run-invalid'],
+    ['a server with a user only', launcher({serverUrl: 'https://SENTINEL@github.com'}), 'launcher-run-invalid'],
+    ['a server with two trailing slashes', launcher({serverUrl: 'https://github.com//'}), 'launcher-run-invalid'],
+    ['a server with an upper-case host', launcher({serverUrl: 'https://GitHub.com'}), 'launcher-run-invalid'],
+    [
+      'a server with the default port spelled out',
+      launcher({serverUrl: 'https://github.com:443'}),
+      'launcher-run-invalid',
+    ],
+    ['a server with a control character', launcher({serverUrl: 'https://github\n.com'}), 'launcher-run-invalid'],
+    ['a server with a space', launcher({serverUrl: 'https://github .com'}), 'launcher-run-invalid'],
+    ['a server over 200 characters', launcher({serverUrl: `https://${'a'.repeat(200)}.com`}), 'launcher-run-invalid'],
+    ['an extra key beside the server', launcher({serverUrl: SERVER_URL, extra: 'SENTINEL'}), 'launcher-malformed'],
     ['an empty invocation id', launcher({invocationId: ''}), 'launcher-run-invalid'],
     ['an invocation id over 200 characters', launcher({invocationId: 'i'.repeat(201)}), 'launcher-run-invalid'],
   ] as const)('resolves %s to off, logging a fixed reason and no value', (_label, value, reason) => {

@@ -11,9 +11,11 @@ import {TRACE_RELAY_PATH} from './trace-relay-wire.js'
  *
  * The document never carries a credential, a collector address or a header: the Action's relay holds those.
  *
- * An "on" document may also carry three optional fields that tie a turn trace to the run: `rootSpan` (the run's root span, to
- * link to), `sessionId` (the telemetry session, used verbatim) and `invocationId`. None is required, and a document without
- * them reads as it always has; any other key makes the plugin refuse the document.
+ * An "on" document may also carry four optional fields that tie a turn trace to the run: `rootSpan` (the run's root span, to
+ * link to), `sessionId` (the telemetry session, used verbatim), `invocationId` and `serverUrl` (the GitHub server's origin,
+ * from which the plugin builds the run's URL). None is required, and a document without them reads as it always has; any
+ * other key makes the plugin refuse the document. A plugin that predates `serverUrl` refuses a document that carries it, so
+ * the Action sends it only to a plugin that reads it.
  */
 
 export const TRACING_LAUNCHER_VERSION = 1
@@ -46,6 +48,8 @@ export interface TracingRunLink {
   readonly rootSpan?: TracingRootSpanContext | undefined
   readonly sessionId?: string | undefined
   readonly invocationId?: string | undefined
+  /** `GITHUB_SERVER_URL`: an `https` origin and nothing more (no path, query, fragment or credentials). */
+  readonly serverUrl?: string | undefined
 }
 
 /** The run identity every span of an Action run carries. All strings, as the plugin's attributes are. */
@@ -142,12 +146,33 @@ export function isUsableTracingRootSpan(rootSpan: unknown): rootSpan is TracingR
   )
 }
 
-/** Whether every field that is present is one the plugin would accept. Absent fields are fine: all three are optional. */
+/**
+ * Whether the plugin would accept `value` as the server: exactly an `https` origin (a host and an optional port), with at
+ * most one trailing slash, and written the way the URL parser writes it back (so no upper-case host, no spelled-out default
+ * port, no non-ASCII host). Bounded like an identity field.
+ */
+export function isUsableTracingServerUrl(value: unknown): value is string {
+  if (!isUsableTracingField(value)) return false
+  try {
+    const url = new URL(value)
+    return (
+      url.protocol === 'https:' &&
+      url.username === '' &&
+      url.password === '' &&
+      (value === url.origin || value === `${url.origin}/`)
+    )
+  } catch {
+    return false
+  }
+}
+
+/** Whether every field that is present is one the plugin would accept. Absent fields are fine: all four are optional. */
 function isUsableTracingRunLink(link: TracingRunLink): boolean {
   return (
     (link.rootSpan === undefined || isUsableTracingRootSpan(link.rootSpan)) &&
     (link.sessionId === undefined || isUsableTracingField(link.sessionId)) &&
-    (link.invocationId === undefined || isUsableTracingField(link.invocationId))
+    (link.invocationId === undefined || isUsableTracingField(link.invocationId)) &&
+    (link.serverUrl === undefined || isUsableTracingServerUrl(link.serverUrl))
   )
 }
 
@@ -186,6 +211,7 @@ export function buildTracingLauncherValue(host: OpenCodeV2TracingHost): string {
         : {rootSpan: {traceId: host.rootSpan.traceId, spanId: host.rootSpan.spanId}}),
       ...(host.sessionId === undefined ? {} : {sessionId: host.sessionId}),
       ...(host.invocationId === undefined ? {} : {invocationId: host.invocationId}),
+      ...(host.serverUrl === undefined ? {} : {serverUrl: host.serverUrl}),
     })
     // Measured on the serialized value: escapes make it longer than its fields, and the plugin refuses a document over its ceiling.
     if (value.length <= TRACING_LAUNCHER_MAX_CHARS) return value

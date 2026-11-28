@@ -227,6 +227,7 @@ export function createTracePipeline(options: TracePipelineOptions): TracePipelin
     rootSpan: options.rootSpan,
     sessionId: options.sessionId,
     invocationId: options.invocationId,
+    serverUrl: options.serverUrl,
   }
   /** Observations waiting for the model, each with the raw text it holds against `maxInboxChars`. */
   const inbox: {readonly observation: Observation; readonly chars: number}[] = []

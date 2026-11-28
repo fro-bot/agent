@@ -81,7 +81,7 @@ function identityAttributes(record: SpanRecord, options: AttributeOptions): Attr
   // `service.version` on the resource feeds its `version`, a different field, so the release is said here, on the span.
   if (record.parentSpanId === undefined) set(attributes, 'langfuse.release', options.release)
   if (options.identity !== undefined) {
-    Object.assign(attributes, actionIdentityAttributes(options.identity, options.invocationId))
+    Object.assign(attributes, actionIdentityAttributes(options.identity, options.invocationId, options.serverUrl))
   }
   return attributes
 }
