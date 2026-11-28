@@ -3,6 +3,7 @@ import type {
   OpenCodeV2ServerHandle,
   OpenCodeV2ShutdownResult,
   OpenCodeV2TracingDecision,
+  PermissionRuleV2,
 } from '@fro-bot/runtime'
 import type {ActionTracingSource} from '../../services/setup/tracing.js'
 import type {KeyProxyProbeResult} from './key-proxy-probe.js'
@@ -1898,6 +1899,48 @@ describe('startActionOpenCodeV2 with isolate-agent', () => {
     })
     expect(evaluatePermissionV2('external_directory', `${LAUNCH.account.home}/*`, rules as never)).toBe('deny')
     expect(evaluatePermissionV2('external_directory', '/tmp/*', rules as never)).toBe('deny')
+  })
+
+  it('allows the sandbox TMPDIR, and not its parent or a sibling, in the traced config the child receives too', async () => {
+    // #given an isolated run that traces, so the launch is given the traced config
+    const deps = depsFor(fakeServer())
+    const tracingOn: OpenCodeV2ActionTracingHost = {
+      host: 'action',
+      tracing: 'on',
+      relayPort: 43_210,
+      identity: {repository: 'owner/repo', runId: '42', attempt: '1', job: 'review', trigger: 'workflow_dispatch'},
+    }
+    const started = await startActionOpenCodeV2({
+      binaryPath: '/opt/opencode',
+      workspacePath: '/workspace',
+      authJson: JSON.stringify({anthropic: {type: 'api', key: CANARY}}),
+      opencodeConfig: null,
+      credential: 'provision',
+      systematicVersion: 'latest',
+      model: 'anthropic/claude-sonnet',
+      dbPath,
+      authPath,
+      env: {RUNNER_TEMP: runnerTemp, PATH: '/usr/bin', XDG_CACHE_HOME: cacheHome},
+      runId: 42,
+      runAttempt: 1,
+      tracing: tracingOn,
+      logger: createMockLogger(),
+      sandbox: fakeSandbox().sandbox,
+      deps,
+    })
+
+    // #when the spawn asks for its tracing decision
+    expect(started.success).toBe(true)
+    const decision = decisionOf(deps)
+
+    // #then it is the traced config, and its rules allow the scratch directory and nothing around it
+    expect(decision.host).toEqual(tracingOn)
+    const rules = (decision.config as {permissions: readonly PermissionRuleV2[]}).permissions
+    expect(evaluatePermissionV2('external_directory', `${LAUNCH.tmpdir}/*`, rules)).toBe('allow')
+    expect(evaluatePermissionV2('external_directory', `${LAUNCH.tmpdir}/nested/*`, rules)).toBe('allow')
+    expect(evaluatePermissionV2('external_directory', `${LAUNCH.account.home}/*`, rules)).toBe('deny')
+    expect(evaluatePermissionV2('external_directory', `${LAUNCH.tmpdir}-sibling/*`, rules)).toBe('deny')
+    expect(evaluatePermissionV2('external_directory', '/tmp/*', rules)).toBe('deny')
   })
 
   it('adds no temp-directory exception when isolation is off', async () => {

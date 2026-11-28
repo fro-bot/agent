@@ -249,9 +249,21 @@ describe.skipIf(!hasBinary)('isolated agent temp directory (real binary, fro-bot
     expect(fs.existsSync(path.join(root, 'parent.txt'))).toBe(false)
   })
 
-  it('reports each of the four refusals to the model as an external-directory denial', () => {
-    // The request after the last tool call carries every tool result.
-    const history = provider.turns.at(-1) ?? ''
-    expect(history.match(/external_directory/g)?.length ?? 0).toBe(4)
+  it('tells the model each refused call was an external-directory denial, and no allowed call was', () => {
+    // The request after the last tool call carries every tool result, keyed by the id the stub gave the call.
+    const body = JSON.parse(provider.turns.at(-1) ?? '{}') as {
+      messages?: {role?: string; tool_call_id?: string; content?: unknown}[]
+    }
+    const results = new Map(
+      (body.messages ?? [])
+        .filter(message => message.role === 'tool')
+        .map(message => [message.tool_call_id, JSON.stringify(message.content)]),
+    )
+    // Call ids are `call_<position in the script>`: the scratch calls are 1, 3 and 5; the sibling and parent calls 2, 4, 6 and 7.
+    for (const id of [2, 4, 6, 7]) expect(results.get(`call_${id}`)).toContain('external_directory')
+    for (const id of [1, 3, 5]) {
+      expect(results.has(`call_${id}`)).toBe(true)
+      expect(results.get(`call_${id}`)).not.toContain('external_directory')
+    }
   })
 })

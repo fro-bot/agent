@@ -19,6 +19,7 @@ import * as path from 'node:path'
 import process from 'node:process'
 import {setTimeout as delay} from 'node:timers/promises'
 import {ok} from '@bfra.me/es/result'
+import {SANDBOX_ACCOUNT_HOME} from '@fro-bot/runtime'
 import {postComment} from '../features/comments/writer.js'
 import {createExecAdapter} from '../services/setup/adapters.js'
 import {createLifecycleTracer} from '../shared/lifecycle-tracer.js'
@@ -68,7 +69,7 @@ const signalTrace = {
 const exec = createExecAdapter()
 
 if (mode === 'isolated') {
-  const account = {name: 'fixture', uid: 998, gid: 997, home: '/nonexistent'}
+  const account = {name: 'fixture', uid: 998, gid: 997, home: SANDBOX_ACCOUNT_HOME}
   const tools = Object.fromEntries(
     [
       'sudo',
