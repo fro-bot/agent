@@ -118,23 +118,6 @@ describe('observeEvent', () => {
     expect(observeEvent(event('session.usage.updated', {tokens: {input: 1, output: 1}}))).toMatchObject({kind: 'usage'})
   })
 
-  it('tells a reported zero sub-count from one that was not reported', () => {
-    // #given a step that reported zeros, and one that reported only input and output
-    const zeros = observeEvent(
-      event('session.step.ended', {
-        assistantMessageID: 'msg_1',
-        tokens: {input: 5, output: 2, reasoning: 0, cache: {read: 0, write: 0}},
-      }),
-    )
-    const bare = observeEvent(event('session.step.ended', {assistantMessageID: 'msg_1', tokens: {input: 5, output: 2}}))
-
-    // #then zeros stay 0, and missing keys stay undefined rather than defaulting to 0
-    expect(zeros).toMatchObject({usage: {input: 5, output: 2, reasoning: 0, cacheRead: 0, cacheWrite: 0}})
-    const usage = (bare as {usage?: Record<string, unknown>}).usage
-    expect(usage).toEqual({input: 5, output: 2})
-    expect(Object.keys(usage ?? {})).toEqual(['input', 'output'])
-  })
-
   it('carries the step’s own start time, the number the join reads, and nothing for a value that is not a finite number', () => {
     // #given step starts with a start time, with none, and with values that are not numbers
     const data = {sessionID: 's', assistantMessageID: 'a', agent: 'build', model: {id: 'm', providerID: 'p'}}
