@@ -1,0 +1,66 @@
+/** The agent of tool spans and of title and compaction requests (fro-bot/agent#2403). */
+
+import type {Observation} from './observation.js'
+
+import {describe, expect, it} from 'vitest'
+
+import {byCall, SES, STEP, turn} from './turn-model.conventions.testing.js'
+import {replay} from './turn-model.testing.js'
+
+describe('the agent of a tool span', () => {
+  it('falls back to the owning session’s agent when the hook never fired', () => {
+    // #given a refused call: no execute.before hook ran for it
+    const records = turn([{id: 'c1', name: 'write', messageId: STEP, succeeded: false}])
+
+    // #then the span still names the agent that owns the session
+    expect(byCall(records, 'c1')?.agent).toBe('build')
+  })
+
+  it('prefers the agent the hook reported', () => {
+    // #given a hook that names another agent
+    const records = turn([{id: 'c1', name: 'read', messageId: STEP, succeeded: true, hookAgent: 'plan'}])
+
+    // #then
+    expect(byCall(records, 'c1')?.agent).toBe('plan')
+  })
+
+  it('stays unset when neither the hook nor the session has an agent', () => {
+    // #given a request that named no agent
+    const records = turn([{id: 'c1', name: 'write', messageId: STEP, succeeded: false}], {agent: undefined})
+
+    // #then nothing is guessed
+    expect(byCall(records, 'c1')?.agent).toBeUndefined()
+  })
+})
+
+describe('requests that are not an agent’s', () => {
+  it.each(['title', 'compaction'] as const)(
+    'records no agent for a %s request, whose name is a framework constant',
+    requestKind => {
+      // #given a request of that kind that reports an agent name
+      const observations: Observation[] = [
+        {kind: 'prompt', at: 1, sessionId: SES, messageId: 'm1', delivery: 'steer', content: 'hi'},
+        {kind: 'inbox.enqueued', at: 2, sessionId: SES, inboxId: 'm1', item: 'user'},
+        {kind: 'execution.started', at: 3, sessionId: SES},
+        {kind: 'inbox.delivered', at: 4, sessionId: SES, inboxId: 'm1'},
+        {kind: 'request', at: 5, sessionId: SES, requestKind, agent: requestKind, model: 'm', provider: 'p'},
+        {kind: 'execution.ended', at: 7, sessionId: SES, outcome: 'succeeded'},
+      ]
+
+      // #when it is replayed
+      const chat = replay(observations).records.find(record => record.kind === 'chat')
+
+      // #then the span has no agent: the request kind says what it is
+      expect(chat).toMatchObject({kind: 'chat', requestKind})
+      expect(chat?.agent).toBeUndefined()
+    },
+  )
+
+  it('still records the agent of a primary request', () => {
+    // #given a primary request
+    const records = turn([])
+
+    // #then
+    expect(records.find(record => record.kind === 'chat')?.agent).toBe('build')
+  })
+})

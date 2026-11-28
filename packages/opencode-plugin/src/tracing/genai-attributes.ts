@@ -281,7 +281,8 @@ function invokeSpan(record: InvokeRecord, options: AttributeOptions): PendingSpa
     traceId: record.traceId,
     spanId: record.spanId,
     parentSpanId: record.parentSpanId,
-    name: `invoke_agent ${record.agent ?? 'unknown'}`,
+    // The convention names the span `invoke_agent {agent}` when the name is readily available and plain `invoke_agent` when not.
+    name: record.agent === undefined || record.agent === '' ? 'invoke_agent' : `invoke_agent ${record.agent}`,
     kind: 'internal',
     startMs: record.start,
     endMs: record.end,

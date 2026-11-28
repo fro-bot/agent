@@ -355,6 +355,8 @@ interface ToolState {
   tool: string
   readonly start: number
   agent: string | undefined
+  /** The agent of the session that owns the call, when the span opened: what a call that no hook reached falls back to. */
+  readonly ownerAgent: string | undefined
   input: unknown
   /** The call event's arguments, kept until a hook's replace them. */
   callInput: unknown
@@ -656,7 +658,7 @@ export function createTurnModel(options: {
       spanId: invoke.spanId,
       traceId: trace.id,
       parentSpanId: invoke.parentSpanId,
-      name: `invoke_agent ${invoke.agent ?? 'unknown'}`,
+      name: invoke.agent === undefined || invoke.agent === '' ? 'invoke_agent' : `invoke_agent ${invoke.agent}`,
       start: invoke.start,
       end: Math.max(at, invoke.start),
       status: invoke.status,
@@ -753,7 +755,7 @@ export function createTurnModel(options: {
       error: failed ? {type: extra.errorType ?? 'tool.execution', message: extra.message} : undefined,
       sessionId: tool.sessionId,
       rootSessionId: tool.trace.rootSessionId,
-      agent: tool.agent,
+      agent: tool.agent ?? tool.ownerAgent,
       gaps: [...tool.gaps],
       marks: [...(extra.marks ?? [])],
       tool: tool.tool,
@@ -1202,7 +1204,9 @@ export function createTurnModel(options: {
       parentSpanId: invoke.spanId,
       requestKind: o.requestKind,
       start: o.at,
-      agent: o.requestKind === 'title' ? 'title' : o.agent,
+      // A title or compaction request is the framework's own, not an agent's turn: `fro_bot.request.kind` says what it is, and the
+      // convention says not to record a framework constant as an agent name.
+      agent: o.requestKind === 'title' || o.requestKind === 'compaction' ? undefined : o.agent,
       model: o.model,
       provider: o.provider,
       request: o.content,
@@ -1575,6 +1579,7 @@ export function createTurnModel(options: {
       tool: init.tool ?? note?.tool ?? note?.before?.tool ?? note?.after?.tool ?? 'unknown',
       start: at,
       agent: undefined,
+      ownerAgent: node.agent,
       input: undefined,
       callInput: undefined,
       inputFromHook: false,
