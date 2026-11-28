@@ -21,6 +21,8 @@
 
 import type {ErrorInfo, InboxItemKind, Observation, RequestKind, Usage} from './observation.js'
 
+import {offeredToolNames} from './tool-definitions.js'
+
 export type {ErrorInfo, ExecutionOutcome, InboxItemKind, Observation, RequestKind, Usage} from './observation.js'
 
 export type ToolOutcome = 'success' | 'error' | 'rejected' | 'interrupted'
@@ -111,6 +113,12 @@ export interface ToolRecord extends RecordBase {
   readonly childSessionId?: string | undefined
   /** The provider ran the tool: the session events are all there is, no hook fires for it. */
   readonly providerExecuted: boolean
+  /**
+   * Whether the tool's name was in the tool list of the request that asked for the call: true or false when that list is known,
+   * unset when it is not (no step to name the request, a step that could not be bound, a list the snapshot left out, a call the
+   * provider ran). Never a guess.
+   */
+  readonly offered?: boolean | undefined
   /** Snapshots this span replaced (the call event's arguments, when a hook's replaced them). For whoever counts them. */
   readonly discarded: readonly unknown[]
 }
@@ -357,6 +365,8 @@ interface ToolState {
   agent: string | undefined
   /** The agent of the session that owns the call, when the span opened: what a call that no hook reached falls back to. */
   readonly ownerAgent: string | undefined
+  /** The names the asking request offered, when that request is known and its list was captured. Shared, never copied. */
+  offeredNames: ReadonlySet<string> | undefined
   input: unknown
   /** The call event's arguments, kept until a hook's replace them. */
   callInput: unknown
@@ -436,6 +446,12 @@ const CREATING_KINDS: ReadonlySet<Observation['kind']> = new Set([
   'execution.started',
   'request',
 ])
+
+/** Whether the call's name was offered, or undefined when it cannot be said: no known list, no known name, or a call the provider ran. */
+function offeredFlag(tool: ToolState): boolean | undefined {
+  if (tool.offeredNames === undefined || tool.providerExecuted || tool.tool === 'unknown') return undefined
+  return tool.offeredNames.has(tool.tool)
+}
 
 function applyBefore(tool: ToolState, o: Extract<Observation, {kind: 'tool.before'}>): void {
   tool.agent = o.agent ?? tool.agent
@@ -767,6 +783,7 @@ export function createTurnModel(options: {
       toolTruncated: extra.truncated,
       childSessionId: tool.childSessionId,
       providerExecuted: tool.providerExecuted,
+      offered: offeredFlag(tool),
       discarded: tool.discarded,
     })
   }
@@ -1580,6 +1597,7 @@ export function createTurnModel(options: {
       start: at,
       agent: undefined,
       ownerAgent: node.agent,
+      offeredNames: undefined,
       input: undefined,
       callInput: undefined,
       inputFromHook: false,
@@ -1638,9 +1656,12 @@ export function createTurnModel(options: {
     }
     tool.providerExecuted = o.executed
     tool.callInput = o.input
+    const asked = o.messageId === undefined ? undefined : node.stepOwner.get(o.messageId)
+    // Taken now, while the request is still held: it is gone from the session once its step ends. Only a request whose step is
+    // known to be its own can say what it offered.
+    if (asked !== undefined && !asked.bindUncertain) tool.offeredNames = offeredToolNames(asked.request)
     if (!tool.inputFromHook) tool.input = o.input
     else if (o.input !== undefined) tool.discarded.push(o.input)
-    const asked = o.messageId === undefined ? undefined : node.stepOwner.get(o.messageId)
     // An uncertain request's chat span carries no tool calls, so it takes no second owner of the arguments (nothing would release it).
     if (asked !== undefined && !asked.bindUncertain) {
       if (asked.toolCalls.length >= limits.maxOutputParts) asked.gaps.add('tool-calls-over-limit')
