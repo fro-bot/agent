@@ -314,6 +314,7 @@ function traceAttributes(state: DeadlineStateV2): Record<string, string> {
     ...(firstOpen === undefined
       ? {}
       : {
+          'fro_bot.compaction.role': firstOpen.role,
           'fro_bot.compaction.reason': firstOpen.reason ?? 'unknown',
           'fro_bot.compaction.started_ms': String(firstOpen.startedMs),
         }),

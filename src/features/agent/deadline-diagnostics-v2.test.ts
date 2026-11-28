@@ -525,8 +525,33 @@ describe('reportDeadlineDiagnosticsV2', () => {
 
     // #then
     expect(addEvent.mock.calls[0]?.[1]).toMatchObject({
+      'fro_bot.compaction.role': 'root',
       'fro_bot.compaction.reason': 'auto',
       'fro_bot.compaction.started_ms': '-2000',
+    })
+  })
+
+  it('says in the trace when only a child is compacting', () => {
+    // #given a child that began compacting and never finished, and a root that did not compact
+    const tracker = createActivityTrackerV2()
+    record(tracker.eventTrail, typed('session.compaction.started', CHILD, {reason: 'manual'}), 1_000, [CHILD])
+    const addEvent = vi.fn()
+
+    // #when
+    reportDeadlineDiagnosticsV2({
+      tracker,
+      rootSessionId: ROOT,
+      logger: createMockLogger(),
+      traceSpan: {addEvent} as unknown as LifecycleSpan,
+      nowMs: 5_000,
+    })
+
+    // #then
+    expect(addEvent.mock.calls[0]?.[1]).toMatchObject({
+      'fro_bot.compaction': 'started-not-ended',
+      'fro_bot.compaction.role': 'child',
+      'fro_bot.compaction.reason': 'manual',
+      'fro_bot.compaction.started_ms': '-4000',
     })
   })
 

@@ -351,7 +351,9 @@ Setup refuses a config the proxy can't protect. The run fails before the sandbox
 | `headers` on a local server, on a server whose `type` is a reference, or on an `enabled`-only entry | Remove `headers` or give the server a literal `type: remote` |
 | `enabled` or `disabled` that isn't a literal `true` or `false`, or the two set against each other | Use one literal flag: `enabled: false` (`mcp.<name>`) or `disabled: true` (`mcp.servers.<name>`) |
 | A provider named `mcp` | Rename the provider |
+| A header value with spaces or tabs at either end | Trim the value |
 | A header value that also appears elsewhere in the config | Remove the copy |
+| A header value that also appears in the step's environment, in a variable the sandbox inherits (such as an `OPENCODE_*` variable) | Remove the copy from the step's `env` |
 
 The lifecycle owns the proxy. It starts it under the same signal handling as the sandbox, stops it after the sandbox is stopped and taken back, and treats an exit it can't confirm as `unsafe`. A proxy that died before the teardown fails the run: nothing is published and no session state is saved.
 
